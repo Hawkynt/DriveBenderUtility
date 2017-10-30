@@ -3,18 +3,78 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using DriveBender;
 
 namespace DriveBenderUtility {
   internal class Program {
     private static void Main(string[] args) {
       var pools = Pool.Detect();
+      var pool = pools.FirstOrDefault();
+      if (pool == null)
+        return; /* no pool found */
+
+      _RebalancePool(pool);
+    }
+
+    /// <summary>
+    /// Rebalances files on pool to ensure a good average across all drives.
+    /// </summary>
+    /// <param name="pool">The pool.</param>
+    private static void _RebalancePool(IPool pool) {
+      var drives = pool.Drives.ToArray();
+      var avgBytesFree = drives.Sum(i => i.BytesFree) / (ulong)drives.Length;
+
+      const ulong MIN_BYTES_DIFFERENCE_BEFORE_ACTING = 512 * 1024 * 1024UL;
+      if (avgBytesFree < MIN_BYTES_DIFFERENCE_BEFORE_ACTING)
+        return;
+
+      var valueBeforeGettingDataFrom = avgBytesFree - MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
+      var valueBeforePuttingDataTo = avgBytesFree + MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
+
+      var drivesToGetFilesFrom = drives.Where(i => i.BytesFree < valueBeforeGettingDataFrom).ToArray();
+      var drivesToPutFilesTo = drives.Where(i => i.BytesFree > valueBeforePuttingDataTo).ToArray();
+
+      if (!(drivesToPutFilesTo.Any() && drivesToGetFilesFrom.Any()))
+        return;
+
+      // TODO: move files from min drive to max drive until both are nearly equal
+
+
       Debugger.Break();
     }
+
   }
 }
 
 namespace DriveBender {
+
+  #region NativeMethods
+
+  internal static class NativeMethods {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetDiskFreeSpaceEx(
+      string lpDirectoryName,
+      out ulong lpFreeBytesAvailable,
+      out ulong lpTotalNumberOfBytes,
+      out ulong lpTotalNumberOfFreeBytes
+    );
+
+    public static Tuple<ulong, ulong> GetDiskFreeSpace(DirectoryInfo path) {
+      ulong freeBytesAvailable;
+      ulong totalNumberOfBytes;
+      ulong totalNumberOfFreeBytes;
+
+      var success = GetDiskFreeSpaceEx(path.FullName, out freeBytesAvailable, out totalNumberOfBytes, out totalNumberOfFreeBytes);
+      if (!success)
+        throw new System.ComponentModel.Win32Exception();
+
+      return Tuple.Create(totalNumberOfFreeBytes, totalNumberOfBytes);
+    }
+  }
+
+  #endregion
 
   #region interface
 
@@ -39,6 +99,9 @@ namespace DriveBender {
     string Name { get; }
     string Description { get; }
     Guid Id { get; }
+    ulong BytesTotal { get; }
+    ulong BytesFree { get; }
+    ulong BytesUsed { get; }
   }
 
   public interface IPool {
@@ -46,6 +109,7 @@ namespace DriveBender {
     string Name { get; }
     string Description { get; }
     Guid Id { get; }
+    // TODO: allow enumeration of all pool files and link them to all pool drives on which they are present
   }
 
   #endregion
@@ -129,13 +193,16 @@ namespace DriveBender {
     public string Name { get; }
     public string Description { get; }
     public Guid Id { get; }
+    public ulong BytesTotal { get { throw new NotImplementedException(); } }
+    public ulong BytesFree { get { throw new NotImplementedException(); } }
+    public ulong BytesUsed { get { throw new NotImplementedException(); } }
 
     #endregion
 
     public PoolDrive AttachTo(IPool pool) => new PoolDrive(pool, this.Name, this.Description, this.Id, this._root);
   }
 
-  [DebuggerDisplay("{Name}")]
+  [DebuggerDisplay("{_root.FullName}:{Name}")]
   public class PoolDrive : IPoolDrive {
     private readonly DirectoryInfo _root;
 
@@ -154,6 +221,15 @@ namespace DriveBender {
     public string Name { get; }
     public string Description { get; }
     public Guid Id { get; }
+    public ulong BytesTotal => NativeMethods.GetDiskFreeSpace(this._root).Item2;
+    public ulong BytesFree => NativeMethods.GetDiskFreeSpace(this._root).Item1;
+
+    public ulong BytesUsed {
+      get {
+        var result = NativeMethods.GetDiskFreeSpace(this._root);
+        return result.Item2 - result.Item1;
+      }
+    }
 
     #endregion
   }

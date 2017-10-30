@@ -46,6 +46,12 @@
     <Compile Include="..\..\Framework\System.Collections.Generic.DictionaryExtensions.cs">
       <Link>Framework\System.Collections.Generic.DictionaryExtensions.cs</Link>
     </Compile>
+    <Compile Include="..\..\Framework\System.Collections.Generic.EnumerableExtensions.Statistics.cs">
+      <Link>Framework\System.Collections.Generic.EnumerableExtensions.Statistics.cs</Link>
+      <AutoGen>True</AutoGen>
+      <DesignTime>True</DesignTime>
+      <DependentUpon>System.Collections.Generic.EnumerableExtensions.Statistics.tt</DependentUpon>
+    </Compile>
     <Compile Include="..\..\Framework\System.IO.DirectoryInfoExtensions.cs">
       <Link>Framework\System.IO.DirectoryInfoExtensions.cs</Link>
     </Compile>
@@ -65,6 +71,11 @@
     <None Include="App.config" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="..\..\Framework\System.Collections.Generic.EnumerableExtensions.Statistics.tt">
+      <Link>Framework\System.Collections.Generic.EnumerableExtensions.Statistics.tt</Link>
+      <Generator>TextTemplatingFileGenerator</Generator>
+      <LastGenOutput>System.Collections.Generic.EnumerableExtensions.Statistics.cs</LastGenOutput>
+    </Content>
     <Content Include="..\..\Framework\System.IO.FileInfoExtensions.tt">
       <Link>Framework\System.IO.FileInfoExtensions.tt</Link>
       <Generator>TextTemplatingFileGenerator</Generator>
@@ -82,4 +93,5 @@
   <Target Name="AfterBuild">
   </Target>
   -->
+  <Import Project="..\..\VersionSpecificSymbols.Common.prop" />
 </Project>
