@@ -23,26 +23,65 @@ namespace DriveBenderUtility {
     /// <param name="pool">The pool.</param>
     private static void _RebalancePool(IPool pool) {
       var drives = pool.Drives.ToArray();
-      var avgBytesFree = drives.Sum(i => i.BytesFree) / (ulong)drives.Length;
+      var drivesWithSpaceFree = drives.ToDictionary(d => d, d => d.BytesFree);
 
-      const ulong MIN_BYTES_DIFFERENCE_BEFORE_ACTING = 512 * 1024 * 1024UL;
+      var avgBytesFree = drives.Sum(i => drivesWithSpaceFree[i]) / (ulong)drives.Length;
+
+      const ulong MIN_BYTES_DIFFERENCE_BEFORE_ACTING = 2 * 1024 * 1024UL;
       if (avgBytesFree < MIN_BYTES_DIFFERENCE_BEFORE_ACTING)
         return;
 
       var valueBeforeGettingDataFrom = avgBytesFree - MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
       var valueBeforePuttingDataTo = avgBytesFree + MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
 
-      var drivesToGetFilesFrom = drives.Where(i => i.BytesFree < valueBeforeGettingDataFrom).ToArray();
-      var drivesToPutFilesTo = drives.Where(i => i.BytesFree > valueBeforePuttingDataTo).ToArray();
+      var drivesToGetFilesFrom = drives.Where(i => drivesWithSpaceFree[i] < valueBeforeGettingDataFrom).ToArray();
+      var drivesToPutFilesTo = drives.Where(i => drivesWithSpaceFree[i] > valueBeforePuttingDataTo).ToArray();
 
       if (!(drivesToPutFilesTo.Any() && drivesToGetFilesFrom.Any()))
         return;
 
-      // TODO: move files from min drive to max drive until both are nearly equal
+      foreach (var sourceDrive in drivesToGetFilesFrom) {
 
+        // get all files which could be moved somewhere else
+        var files =
+          sourceDrive
+          .Items
+          .EnumerateFiles(true)
+          .OrderByDescending(t => t.Size)
+          .ToList()
+          ;
 
-      Debugger.Break();
-    }
+        // as long as the source drive has less than the calculated average bytes free
+        while (drivesWithSpaceFree[sourceDrive] < avgBytesFree) {
+
+          // calculate how many bytes are left until the average is reached
+          var bestFit = avgBytesFree - drivesWithSpaceFree[sourceDrive];
+
+          // find the first file, that is nearly big enough
+          var fileToMove = files.FirstOrDefault(f => f.Size <= bestFit);
+          if (fileToMove == null)
+            break; /* no file found to move */
+
+          var fileSize = fileToMove.Size;
+
+          // avoid to move file again
+          files.Remove(fileToMove);
+
+          // find a drive to put the file onto (basically it should not be already there and the drive should have enough free bytes available)
+          var targetDrive = drivesToPutFilesTo.FirstOrDefault(d => drivesWithSpaceFree[d] > fileSize && !fileToMove.ExistsOnDrive(d));
+          if (targetDrive == null)
+            continue; /* no target drive big enough */
+
+          // move file to target drive
+          fileToMove.MoveToDrive(targetDrive);
+
+          drivesWithSpaceFree[targetDrive] -= fileSize;
+          drivesWithSpaceFree[sourceDrive] += fileSize;
+        }
+
+      } /* next overloaded drive */
+
+    } /* end of Rebalance method */
 
   }
 }
@@ -78,6 +117,43 @@ namespace DriveBender {
 
   #region interface
 
+  internal static class DriveBenderConstants {
+    public const string SHADOW_COPY_FOLDER_NAME = "Folder.Duplicate.$DriveBender";
+    public const string INFO_EXTENSION = "$DriveBender";
+  }
+
+  internal static class DriveBenderExtensions {
+
+    public static IEnumerable<IFile> EnumerateFiles(this IEnumerable<IFileSystemItem> items, bool suppressExceptions = false) {
+      var emptyFileSystemItems = new IFileSystemItem[0];
+      var stack = new Stack<IEnumerable<IFileSystemItem>>();
+      stack.Push(items);
+      while (stack.Count > 0) {
+        var current = stack.Pop();
+        IFileSystemItem[] cached;
+        if (suppressExceptions) {
+          try {
+            cached = current.ToArray();
+          } catch {
+            cached = emptyFileSystemItems;
+          }
+        } else
+          cached = current.ToArray();
+
+        foreach (var item in cached) {
+          var file = item as IFile;
+          if (file != null)
+            yield return file;
+
+          var folder = item as IFolder;
+          if (folder != null)
+            stack.Push(folder.Items);
+        }
+      }
+    }
+
+  }
+
   public interface IFileSystemItem {
     string Name { get; }
     string FullName { get; }
@@ -86,6 +162,9 @@ namespace DriveBender {
 
   public interface IFile : IFileSystemItem {
     bool IsShadowCopy { get; }
+    ulong Size { get; }
+    bool ExistsOnDrive(IPoolDrive poolDrive);
+    void MoveToDrive(IPoolDrive targetDrive);
   }
 
   public interface IFolder : IFileSystemItem {
@@ -128,13 +207,11 @@ namespace DriveBender {
     #endregion
 
     public static IPool[] Detect() {
-      const string INFO_EXTENSION = "$DriveBender";
-
       var drives = new List<PrivatePoolDrive>();
       for (var i = 0; i < 26; ++i) {
         var letter = (char)('A' + i);
         try {
-          var infoFiles = new DirectoryInfo(letter + ":\\").EnumerateFiles("*." + INFO_EXTENSION);
+          var infoFiles = new DirectoryInfo(letter + ":\\").EnumerateFiles("*." + DriveBenderConstants.INFO_EXTENSION);
           foreach (var file in infoFiles) {
             var content = file.ReadAllLines();
             var data = (
@@ -202,31 +279,31 @@ namespace DriveBender {
     public PoolDrive AttachTo(IPool pool) => new PoolDrive(pool, this.Name, this.Description, this.Id, this._root);
   }
 
-  [DebuggerDisplay("{_root.FullName}:{Name}")]
+  [DebuggerDisplay("{Root.FullName}:{Name}")]
   public class PoolDrive : IPoolDrive {
-    private readonly DirectoryInfo _root;
+    public DirectoryInfo Root { get; }
 
     internal PoolDrive(IPool pool, string name, string description, Guid id, DirectoryInfo root) {
       this.Pool = pool;
       this.Name = name;
       this.Description = description;
       this.Id = id;
-      this._root = root;
+      this.Root = root;
     }
 
     #region Implementation of IPoolDrive
 
-    public IEnumerable<IFileSystemItem> Items => Folder.Enumerate(this._root, this, null);
+    public IEnumerable<IFileSystemItem> Items => Folder.Enumerate(this.Root, this, null);
     public IPool Pool { get; }
     public string Name { get; }
     public string Description { get; }
     public Guid Id { get; }
-    public ulong BytesTotal => NativeMethods.GetDiskFreeSpace(this._root).Item2;
-    public ulong BytesFree => NativeMethods.GetDiskFreeSpace(this._root).Item1;
+    public ulong BytesTotal => NativeMethods.GetDiskFreeSpace(this.Root).Item2;
+    public ulong BytesFree => NativeMethods.GetDiskFreeSpace(this.Root).Item1;
 
     public ulong BytesUsed {
       get {
-        var result = NativeMethods.GetDiskFreeSpace(this._root);
+        var result = NativeMethods.GetDiskFreeSpace(this.Root);
         return result.Item2 - result.Item1;
       }
     }
@@ -236,8 +313,6 @@ namespace DriveBender {
 
   [DebuggerDisplay("{Name}")]
   public class Folder : IFolder {
-
-    private const string FOLDER_NAME = "Folder.Duplicate.$DriveBender";
 
     private readonly DirectoryInfo _physical;
     public Folder(DirectoryInfo physical, IFolder parent, IPoolDrive drive) {
@@ -269,7 +344,7 @@ namespace DriveBender {
           continue;
         }
 
-        if (string.Equals(folder.Name, FOLDER_NAME, StringComparison.OrdinalIgnoreCase)) {
+        if (string.Equals(folder.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase)) {
           foreach (var file in folder.EnumerateFiles())
             yield return new File(file, parent, true);
 
@@ -303,6 +378,32 @@ namespace DriveBender {
     #region Implementation of IFile
 
     public bool IsShadowCopy { get; }
+    public ulong Size => (ulong)this._physical.Length;
+
+    public bool ExistsOnDrive(IPoolDrive poolDrive) {
+      var fullName = this.FullName;
+      var shadowCopyName = Path.Combine(Path.GetDirectoryName(fullName), DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, Path.GetFileName(fullName));
+
+      var internalPoolDrive = (PoolDrive)poolDrive;
+      return
+        System.IO.File.Exists(Path.Combine(internalPoolDrive.Root.FullName, fullName))
+        || System.IO.File.Exists(Path.Combine(internalPoolDrive.Root.FullName, shadowCopyName))
+        ;
+    }
+
+    public void MoveToDrive(IPoolDrive targetDrive) {
+      var internalPoolDrive = (PoolDrive)targetDrive;
+
+      var sourceFile = this._physical;
+      var fullName = this.FullName;
+      var targetFileName = Path.Combine(internalPoolDrive.Root.FullName, Path.GetDirectoryName(fullName));
+      if (this.IsShadowCopy)
+        targetFileName = Path.Combine(targetFileName, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+
+      targetFileName = Path.Combine(targetFileName, Path.GetFileName(fullName));
+      Trace.WriteLine($"Moving {sourceFile.FullName} to {targetFileName}, {sourceFile.Length} Bytes");
+      sourceFile.MoveTo(targetFileName);
+    }
 
     #endregion
   }
