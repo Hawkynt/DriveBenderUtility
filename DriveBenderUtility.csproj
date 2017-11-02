@@ -64,6 +64,9 @@
     <Compile Include="..\..\Framework\System.StringExtensions.cs">
       <Link>Framework\System.StringExtensions.cs</Link>
     </Compile>
+    <Compile Include="..\..\Libraries\FilesizeFormatter.cs">
+      <Link>FilesizeFormatter.cs</Link>
+    </Compile>
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>

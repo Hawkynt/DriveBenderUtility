@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using DriveBender;
+using Libraries;
 
 namespace DriveBenderUtility {
   internal class Program {
@@ -15,6 +16,8 @@ namespace DriveBenderUtility {
         return; /* no pool found */
 
       _RebalancePool(pool);
+      Console.WriteLine("READY.");
+      Console.ReadKey(false);
     }
 
     /// <summary>
@@ -22,12 +25,24 @@ namespace DriveBenderUtility {
     /// </summary>
     /// <param name="pool">The pool.</param>
     private static void _RebalancePool(IPool pool) {
+
+      Action<string> logger = Console.WriteLine;
+
+
+      logger($"Pool {pool.Name}({pool.Description})");
+
       var drives = pool.Drives.ToArray();
       var drivesWithSpaceFree = drives.ToDictionary(d => d, d => d.BytesFree);
 
+      foreach (var drive in drives.OrderBy(i => i.Name))
+        logger($@" + Drive {drive.Name} {drive.BytesUsed * 100f / drive.BytesTotal:0.#}% ({FilesizeFormatter.FormatIEC(drive.BytesUsed, "0.#")} used, {FilesizeFormatter.FormatIEC(drive.BytesFree, "0.#")} free, {FilesizeFormatter.FormatIEC(drive.BytesTotal, "0.#")} total)");
+
       var avgBytesFree = drives.Sum(i => drivesWithSpaceFree[i]) / (ulong)drives.Length;
+      logger($@" * Average free {FilesizeFormatter.FormatIEC(avgBytesFree, "0.#")}");
 
       const ulong MIN_BYTES_DIFFERENCE_BEFORE_ACTING = 2 * 1024 * 1024UL;
+      logger($@" * Difference per drive before balancing {FilesizeFormatter.FormatIEC(MIN_BYTES_DIFFERENCE_BEFORE_ACTING, "0.#")}");
+
       if (avgBytesFree < MIN_BYTES_DIFFERENCE_BEFORE_ACTING)
         return;
 
@@ -39,6 +54,9 @@ namespace DriveBenderUtility {
 
       if (!(drivesToPutFilesTo.Any() && drivesToGetFilesFrom.Any()))
         return;
+
+      logger($@" * Drives overfilled {string.Join(", ", drivesToGetFilesFrom.Select(i => i.Name))}");
+      logger($@" * Drives underfilled {string.Join(", ", drivesToPutFilesTo.Select(i => i.Name))}");
 
       foreach (var sourceDrive in drivesToGetFilesFrom) {
 
@@ -73,6 +91,7 @@ namespace DriveBenderUtility {
             continue; /* no target drive big enough */
 
           // move file to target drive
+          logger($@" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {FilesizeFormatter.FormatIEC(fileSize, "0.#")}");
           fileToMove.MoveToDrive(targetDrive);
 
           drivesWithSpaceFree[targetDrive] -= fileSize;
@@ -175,6 +194,7 @@ namespace DriveBender {
   public interface IPoolDrive {
     IEnumerable<IFileSystemItem> Items { get; }
     IPool Pool { get; }
+    string Label { get; }
     string Name { get; }
     string Description { get; }
     Guid Id { get; }
@@ -200,7 +220,7 @@ namespace DriveBender {
     #region Implementation of IPool
 
     public IEnumerable<IPoolDrive> Drives { get; private set; }
-    public string Name => this.Drives.First().Name;
+    public string Name => this.Drives.First().Label;
     public string Description => this.Drives.First().Description;
     public Guid Id => this.Drives.First().Id;
 
@@ -256,8 +276,8 @@ namespace DriveBender {
 
     private readonly DirectoryInfo _root;
 
-    public PrivatePoolDrive(string name, string description, Guid id, DirectoryInfo root) {
-      this.Name = name;
+    public PrivatePoolDrive(string label, string description, Guid id, DirectoryInfo root) {
+      this.Label = label;
       this.Description = description;
       this.Id = id;
       this._root = root;
@@ -267,7 +287,8 @@ namespace DriveBender {
 
     public IEnumerable<IFileSystemItem> Items => null;
     public IPool Pool => null;
-    public string Name { get; }
+    public string Label { get; }
+    public string Name => this._root.Parent.Name;
     public string Description { get; }
     public Guid Id { get; }
     public ulong BytesTotal { get { throw new NotImplementedException(); } }
@@ -276,16 +297,16 @@ namespace DriveBender {
 
     #endregion
 
-    public PoolDrive AttachTo(IPool pool) => new PoolDrive(pool, this.Name, this.Description, this.Id, this._root);
+    public PoolDrive AttachTo(IPool pool) => new PoolDrive(pool, this.Label, this.Description, this.Id, this._root);
   }
 
-  [DebuggerDisplay("{Root.FullName}:{Name}")]
+  [DebuggerDisplay("{Root.FullName}:{Label}")]
   public class PoolDrive : IPoolDrive {
     public DirectoryInfo Root { get; }
 
-    internal PoolDrive(IPool pool, string name, string description, Guid id, DirectoryInfo root) {
+    internal PoolDrive(IPool pool, string label, string description, Guid id, DirectoryInfo root) {
       this.Pool = pool;
-      this.Name = name;
+      this.Label = label;
       this.Description = description;
       this.Id = id;
       this.Root = root;
@@ -295,7 +316,8 @@ namespace DriveBender {
 
     public IEnumerable<IFileSystemItem> Items => Folder.Enumerate(this.Root, this, null);
     public IPool Pool { get; }
-    public string Name { get; }
+    public string Label { get; }
+    public string Name => this.Root.Parent.Name;
     public string Description { get; }
     public Guid Id { get; }
     public ulong BytesTotal => NativeMethods.GetDiskFreeSpace(this.Root).Item2;
