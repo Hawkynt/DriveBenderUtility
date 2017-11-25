@@ -49,29 +49,40 @@ namespace DriveBenderUtility {
       var valueBeforeGettingDataFrom = avgBytesFree - MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
       var valueBeforePuttingDataTo = avgBytesFree + MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
 
+      while (_DoRebalanceRun(drives, drivesWithSpaceFree, valueBeforeGettingDataFrom, valueBeforePuttingDataTo, logger, avgBytesFree)) {
+        ;
+      }
+
+    }
+
+    private static bool _DoRebalanceRun(
+      IPoolDrive[] drives,
+      Dictionary<IPoolDrive, ulong> drivesWithSpaceFree,
+      ulong valueBeforeGettingDataFrom,
+      ulong valueBeforePuttingDataTo,
+      Action<string> logger,
+      ulong avgBytesFree) {
       var drivesToGetFilesFrom = drives.Where(i => drivesWithSpaceFree[i] < valueBeforeGettingDataFrom).ToArray();
       var drivesToPutFilesTo = drives.Where(i => drivesWithSpaceFree[i] > valueBeforePuttingDataTo).ToArray();
 
       if (!(drivesToPutFilesTo.Any() && drivesToGetFilesFrom.Any()))
-        return;
+        return false;
 
       logger($@" * Drives overfilled {string.Join(", ", drivesToGetFilesFrom.Select(i => i.Name))}");
       logger($@" * Drives underfilled {string.Join(", ", drivesToPutFilesTo.Select(i => i.Name))}");
 
       foreach (var sourceDrive in drivesToGetFilesFrom) {
-
         // get all files which could be moved somewhere else
         var files =
           sourceDrive
-          .Items
-          .EnumerateFiles(true)
-          .OrderByDescending(t => t.Size)
-          .ToList()
+            .Items
+            .EnumerateFiles(true)
+            .OrderByDescending(t => t.Size)
+            .ToList()
           ;
 
         // as long as the source drive has less than the calculated average bytes free
         while (drivesWithSpaceFree[sourceDrive] < avgBytesFree) {
-
           // calculate how many bytes are left until the average is reached
           var bestFit = avgBytesFree - drivesWithSpaceFree[sourceDrive];
 
@@ -86,20 +97,23 @@ namespace DriveBenderUtility {
           files.Remove(fileToMove);
 
           // find a drive to put the file onto (basically it should not be already there and the drive should have enough free bytes available)
-          var targetDrive = drivesToPutFilesTo.FirstOrDefault(d => drivesWithSpaceFree[d] > fileSize && !fileToMove.ExistsOnDrive(d));
+          var targetDrive =
+            drivesToPutFilesTo.FirstOrDefault(d => drivesWithSpaceFree[d] > fileSize && !fileToMove.ExistsOnDrive(d));
           if (targetDrive == null)
             continue; /* no target drive big enough */
 
           // move file to target drive
-          logger($@" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {FilesizeFormatter.FormatIEC(fileSize, "0.#")}");
+          logger(
+            $@" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {
+              FilesizeFormatter.FormatIEC(fileSize, "0.#")}");
           fileToMove.MoveToDrive(targetDrive);
 
           drivesWithSpaceFree[targetDrive] -= fileSize;
           drivesWithSpaceFree[sourceDrive] += fileSize;
         }
-
       } /* next overloaded drive */
 
+      return true;
     } /* end of Rebalance method */
 
   }
