@@ -88,8 +88,10 @@ namespace DriveBenderUtility {
 
           // find the first file, that is nearly big enough
           var fileToMove = files.FirstOrDefault(f => f.Size <= bestFit);
-          if (fileToMove == null)
-            break; /* no file found to move */
+          if (fileToMove == null) {
+            logger($@" # No more files available to move");
+            return false; /* no file found to move */
+          }
 
           var fileSize = fileToMove.Size;
 
@@ -99,8 +101,10 @@ namespace DriveBenderUtility {
           // find a drive to put the file onto (basically it should not be already there and the drive should have enough free bytes available)
           var targetDrive =
             drivesToPutFilesTo.FirstOrDefault(d => drivesWithSpaceFree[d] > fileSize && !fileToMove.ExistsOnDrive(d));
-          if (targetDrive == null)
+          if (targetDrive == null) {
+            //logger($@" # Trying to move file {fileToMove.FullName} but it is already present allowed target drive");
             continue; /* no target drive big enough */
+          }
 
           // move file to target drive
           logger(
