@@ -7,7 +7,7 @@ using Libraries;
 namespace DriveBenderUtility {
   internal class Program {
     private static void Main(string[] args) {
-      var pools = Pool.Detect();
+      var pools = Pool.DetectedPools;
       var pool = pools.FirstOrDefault();
       if (pool == null)
         return; /* no pool found */

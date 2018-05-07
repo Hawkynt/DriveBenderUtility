@@ -126,20 +126,34 @@ namespace DriveBender {
 
     #endregion
 
-    public static IPool[] Detect() {
-      var drives = _PoolDrives;
+    /// <summary>
+    /// Gets the detected pools on the current system.
+    /// </summary>
+    /// <value>
+    /// The detected pools.
+    /// </value>
+    public static IPool[] DetectedPools {
+      get {
+        var drives = _PoolDrives;
 
-      var results = new List<Pool>();
-      foreach (var poolGroup in drives.GroupBy(d => d.Id)) {
-        var pool = new Pool();
-        pool.Drives = poolGroup.Select(i => i.AttachTo(pool)).ToArray();
-        results.Add(pool);
+        var results = new List<Pool>();
+        foreach (var poolGroup in drives.GroupBy(d => d.Id)) {
+          var pool = new Pool();
+          pool.Drives = poolGroup.Select(i => i.AttachTo(pool)).ToArray();
+          results.Add(pool);
+        }
+        return results.Cast<IPool>().ToArray();
       }
-      return results.Cast<IPool>().ToArray();
     }
 
+    /// <summary>
+    /// Gets the pool drives.
+    /// </summary>
+    /// <value>
+    /// The pool drives.
+    /// </value>
     public static IEnumerable<IPoolDrive> PoolDrives {
-      get { return Detect().SelectMany(p => p.Drives).OrderBy(d => d.Name); }
+      get { return DetectedPools.SelectMany(p => p.Drives).OrderBy(d => d.Name); }
     }
 
     private static IEnumerable<PrivatePoolDrive> _PoolDrives {
@@ -173,7 +187,7 @@ namespace DriveBender {
 
               drives.Add(new PrivatePoolDrive(label, description, id, file.Directory.Directory($"{{{id}}}")));
             }
-          } catch (IOException e) {
+          } catch (IOException) {
             // ignore missing drives
           }
         }
