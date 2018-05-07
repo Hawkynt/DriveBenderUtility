@@ -46,6 +46,10 @@ namespace DriveBenderUtility {
       var valueBeforeGettingDataFrom = avgBytesFree - MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
       var valueBeforePuttingDataTo = avgBytesFree + MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
 
+      Console.WriteLine("Now going to rebalance, press any key to continue or ESC to cancel");
+      if (Console.ReadKey().Key == ConsoleKey.Escape)
+        return;
+
       while (_DoRebalanceRun(drives, drivesWithSpaceFree, valueBeforeGettingDataFrom, valueBeforePuttingDataTo, logger, avgBytesFree)) {
         ;
       }
@@ -54,11 +58,12 @@ namespace DriveBenderUtility {
 
     private static bool _DoRebalanceRun(
       IPoolDrive[] drives,
-      Dictionary<IPoolDrive, ulong> drivesWithSpaceFree,
+      IDictionary<IPoolDrive, ulong> drivesWithSpaceFree,
       ulong valueBeforeGettingDataFrom,
       ulong valueBeforePuttingDataTo,
       Action<string> logger,
-      ulong avgBytesFree) {
+      ulong avgBytesFree
+    ) {
       var drivesToGetFilesFrom = drives.Where(i => drivesWithSpaceFree[i] < valueBeforeGettingDataFrom).ToArray();
       var drivesToPutFilesTo = drives.Where(i => drivesWithSpaceFree[i] > valueBeforePuttingDataTo).ToArray();
 
@@ -68,6 +73,7 @@ namespace DriveBenderUtility {
       logger($@" * Drives overfilled {string.Join(", ", drivesToGetFilesFrom.Select(i => i.Name))}");
       logger($@" * Drives underfilled {string.Join(", ", drivesToPutFilesTo.Select(i => i.Name))}");
 
+      var movedAtLeastOneFile = false;
       foreach (var sourceDrive in drivesToGetFilesFrom) {
         // get all files which could be moved somewhere else
         var files =
@@ -87,7 +93,7 @@ namespace DriveBenderUtility {
           var fileToMove = files.FirstOrDefault(f => f.Size <= bestFit);
           if (fileToMove == null) {
             logger($@" # No more files available to move");
-            return false; /* no file found to move */
+            return movedAtLeastOneFile; /* no file found to move */
           }
 
           var fileSize = fileToMove.Size;
@@ -96,8 +102,7 @@ namespace DriveBenderUtility {
           files.Remove(fileToMove);
 
           // find a drive to put the file onto (basically it should not be already there and the drive should have enough free bytes available)
-          var targetDrive =
-            drivesToPutFilesTo.FirstOrDefault(d => drivesWithSpaceFree[d] > fileSize && !fileToMove.ExistsOnDrive(d));
+          var targetDrive = drivesToPutFilesTo.FirstOrDefault(d => drivesWithSpaceFree[d] > fileSize && !fileToMove.ExistsOnDrive(d));
           if (targetDrive == null) {
             //logger($@" # Trying to move file {fileToMove.FullName} but it is already present allowed target drive");
             continue; /* no target drive big enough */
@@ -111,12 +116,14 @@ namespace DriveBenderUtility {
 
           drivesWithSpaceFree[targetDrive] -= fileSize;
           drivesWithSpaceFree[sourceDrive] += fileSize;
+          movedAtLeastOneFile = true;
         }
       } /* next overloaded drive */
 
-      return true;
+      return movedAtLeastOneFile;
     } /* end of Rebalance method */
 
   }
+
 }
 
