@@ -37,6 +37,7 @@ namespace DriveBender {
   #region interface
 
   internal static class DriveBenderConstants {
+    public const string TEMP_EXTENSION = "TEMP.$DriveBender";
     public const string SHADOW_COPY_FOLDER_NAME = "Folder.Duplicate.$DriveBender";
     public const string INFO_EXTENSION = "$DriveBender";
   }
@@ -341,14 +342,40 @@ namespace DriveBender {
       var internalPoolDrive = (PoolDrive)targetDrive;
 
       var sourceFile = this._physical;
-      var fullName = this.FullName;
-      var targetFileName = Path.Combine(internalPoolDrive.Root.FullName, Path.GetDirectoryName(fullName));
-      if (this.IsShadowCopy)
-        targetFileName = Path.Combine(targetFileName, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+      sourceFile.Refresh();
+      if (!sourceFile.Exists)
+        return;
 
-      targetFileName = Path.Combine(targetFileName, Path.GetFileName(fullName));
-      Trace.WriteLine($"Moving {sourceFile.FullName} to {targetFileName}, {sourceFile.Length} Bytes");
-      sourceFile.MoveTo(targetFileName);
+      var targetDirectory = internalPoolDrive.Root.Directory(this.Parent?.FullName);
+      if (this.IsShadowCopy)
+        targetDirectory = targetDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+
+      var targetFile = targetDirectory.File(this.Name);
+      var tempFile = targetDirectory.File(targetFile.Name + "." + DriveBenderConstants.TEMP_EXTENSION);
+
+      Trace.WriteLine($"Moving {sourceFile.FullName} to {targetFile}, {sourceFile.Length} Bytes");
+      targetDirectory.Create();
+
+      try {
+        sourceFile.CopyTo(tempFile);
+        tempFile.Refresh();
+        if (!tempFile.Exists)
+          return;
+
+        tempFile.MoveTo(targetFile.FullName);
+        try {
+          sourceFile.Delete();
+        } catch (UnauthorizedAccessException) {
+
+          // could not delete source file - delete target file, otherwise we have too many copies
+          targetFile.Delete();
+        }
+
+      } finally {
+        tempFile.Refresh();
+        if (tempFile.Exists)
+          tempFile.Delete();
+      }
     }
 
     #endregion
