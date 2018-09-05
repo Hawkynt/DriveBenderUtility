@@ -52,6 +52,9 @@
       <DesignTime>True</DesignTime>
       <DependentUpon>System.Collections.Generic.EnumerableExtensions.Statistics.tt</DependentUpon>
     </Compile>
+    <Compile Include="..\..\Framework\System.Collections.Generic.HashSetExtensions.cs">
+      <Link>Framework\System.Collections.Generic.HashSetExtensions.cs</Link>
+    </Compile>
     <Compile Include="..\..\Framework\System.IO.DirectoryInfoExtensions.cs">
       <Link>Framework\System.IO.DirectoryInfoExtensions.cs</Link>
     </Compile>
@@ -68,8 +71,10 @@
       <Link>FilesizeFormatter.cs</Link>
     </Compile>
     <Compile Include="Classes\DriveBender.cs" />
+    <Compile Include="Classes\Repairer.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="Classes\Rebalancer.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="App.config" />

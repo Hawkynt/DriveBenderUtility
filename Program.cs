@@ -1,8 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using DriveBender;
-using Libraries;
 
 namespace DriveBenderUtility {
   internal class Program {
@@ -12,116 +12,78 @@ namespace DriveBenderUtility {
       if (pool == null)
         return; /* no pool found */
 
-      _RebalancePool(pool);
+      Action<string> logger = Console.WriteLine;
+      Console.WriteLine();
+
+      logger("Restoring primaries from doubles where needed");
+      pool.RestoreMissingPrimaries(logger);
+
+      logger("Restoring doubles from primaries where needed");
+      pool.CreateMissingShadowCopies(logger);
+
+      //_DeleteFilesAlsoOnPool(new DirectoryInfo(@"A:\{94C96B74-F849-4D1F-BCEE-0C18A66EFFFC}"), pool);
+
+      logger("NFO files wihtout movie file");
+      _FindDeletedMovieFiles(pool);
+
+      //pool.Rebalance(logger);
+
       Console.WriteLine("READY.");
       Console.ReadKey(false);
     }
 
-    /// <summary>
-    /// Rebalances files on pool to ensure a good average across all drives.
-    /// </summary>
-    /// <param name="pool">The pool.</param>
-    private static void _RebalancePool(IPool pool) {
-
-      Action<string> logger = Console.WriteLine;
-
-
-      logger($"Pool {pool.Name}({pool.Description})");
-
-      var drives = pool.Drives.ToArray();
-      var drivesWithSpaceFree = drives.ToDictionary(d => d, d => d.BytesFree);
-
-      foreach (var drive in drives.OrderBy(i => i.Name))
-        logger($@" + Drive {drive.Name} {drive.BytesUsed * 100f / drive.BytesTotal:0.#}% ({FilesizeFormatter.FormatIEC(drive.BytesUsed, "0.#")} used, {FilesizeFormatter.FormatIEC(drive.BytesFree, "0.#")} free, {FilesizeFormatter.FormatIEC(drive.BytesTotal, "0.#")} total)");
-
-      var avgBytesFree = drives.Sum(i => drivesWithSpaceFree[i]) / (ulong)drives.Length;
-      logger($@" * Average free {FilesizeFormatter.FormatIEC(avgBytesFree, "0.#")}");
-
-      const ulong MIN_BYTES_DIFFERENCE_BEFORE_ACTING = 2 * 1024 * 1024UL;
-      logger($@" * Difference per drive before balancing {FilesizeFormatter.FormatIEC(MIN_BYTES_DIFFERENCE_BEFORE_ACTING, "0.#")}");
-
-      if (avgBytesFree < MIN_BYTES_DIFFERENCE_BEFORE_ACTING)
-        return;
-
-      var valueBeforeGettingDataFrom = avgBytesFree - MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
-      var valueBeforePuttingDataTo = avgBytesFree + MIN_BYTES_DIFFERENCE_BEFORE_ACTING;
-
-      Console.WriteLine("Now going to rebalance, press any key to continue or ESC to cancel");
-      if (Console.ReadKey().Key == ConsoleKey.Escape)
-        return;
-
-      while (_DoRebalanceRun(drives, drivesWithSpaceFree, valueBeforeGettingDataFrom, valueBeforePuttingDataTo, logger, avgBytesFree)) {
-        ;
+    private static void _DeleteFilesAlsoOnPool(DirectoryInfo root, IPool pool) {
+      foreach (var t in _FilesAlsoOnPool(root, pool)) {
+        Console.WriteLine($"File also on pool: {t.Item2[0].FullName} - deleting");
+        t.Item1.TryDelete();
       }
+    }
+
+    private static IEnumerable<Tuple<FileInfo, IFile[]>> _FilesAlsoOnPool(DirectoryInfo root, IPool pool) {
+      var poolFiles = new Dictionary<string, List<IFile>>(StringComparer.OrdinalIgnoreCase);
+      foreach (var drive in pool.Drives)
+        foreach (var file in drive.Items.EnumerateFiles(true))
+          poolFiles.GetOrAdd(file.FullName, _ => new List<IFile>()).Add(file);
+
+      var length = root.FullName.Length;
+      foreach (var file in root.EnumerateFiles("*.*", SearchOption.AllDirectories)) {
+        var fileName = file.FullName;
+        if (string.Equals(file.Directory.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
+          fileName = Path.Combine(file.Directory.Parent.FullName, file.Name);
+
+        var relativeNameToRoot = fileName.Substring(length + 1);
+        List<IFile> value;
+        if (!poolFiles.TryGetValue(relativeNameToRoot, out value))
+          continue;
+
+        yield return Tuple.Create(file, value.ToArray());
+      }
+    }
+
+    private static void _FindDeletedMovieFiles(IPool pool) {
+
+      // get all files
+      var hash = new HashSet<string>();
+      foreach (var drive in pool.Drives)
+        foreach (var file in drive.Items.EnumerateFiles(true))
+          hash.TryAdd(file.FullName);
+
+      // find all nfo without video
+      var count = 0;
+      foreach (var nfo in hash.Where(i => Path.GetExtension(i) == ".nfo" && Path.GetFileNameWithoutExtension(i) != "tvshow").OrderBy(i => i))
+        if (!(
+          hash.Contains(Path.ChangeExtension(nfo, ".mkv"))
+          || hash.Contains(Path.ChangeExtension(nfo, ".avi"))
+          || hash.Contains(Path.ChangeExtension(nfo, ".flv"))
+          || hash.Contains(Path.ChangeExtension(nfo, ".mpg"))
+          || hash.Contains(Path.ChangeExtension(nfo, ".mp4"))
+          || hash.Contains(Path.ChangeExtension(nfo, ".mp2"))
+          ))
+          Console.WriteLine($"{++count}:{nfo}");
 
     }
 
-    private static bool _DoRebalanceRun(
-      IPoolDrive[] drives,
-      IDictionary<IPoolDrive, ulong> drivesWithSpaceFree,
-      ulong valueBeforeGettingDataFrom,
-      ulong valueBeforePuttingDataTo,
-      Action<string> logger,
-      ulong avgBytesFree
-    ) {
-      var drivesToGetFilesFrom = drives.Where(i => drivesWithSpaceFree[i] < valueBeforeGettingDataFrom).ToArray();
-      var drivesToPutFilesTo = drives.Where(i => drivesWithSpaceFree[i] > valueBeforePuttingDataTo).ToArray();
-
-      if (!(drivesToPutFilesTo.Any() && drivesToGetFilesFrom.Any()))
-        return false;
-
-      logger($@" * Drives overfilled {string.Join(", ", drivesToGetFilesFrom.Select(i => i.Name))}");
-      logger($@" * Drives underfilled {string.Join(", ", drivesToPutFilesTo.Select(i => i.Name))}");
-
-      var movedAtLeastOneFile = false;
-      foreach (var sourceDrive in drivesToGetFilesFrom) {
-        // get all files which could be moved somewhere else
-        var files =
-          sourceDrive
-            .Items
-            .EnumerateFiles(true)
-            .OrderByDescending(t => t.Size)
-            .ToList()
-          ;
-
-        // as long as the source drive has less than the calculated average bytes free
-        while (drivesWithSpaceFree[sourceDrive] < avgBytesFree) {
-          // calculate how many bytes are left until the average is reached
-          var bestFit = avgBytesFree - drivesWithSpaceFree[sourceDrive];
-
-          // find the first file, that is nearly big enough
-          var fileToMove = files.FirstOrDefault(f => f.Size <= bestFit);
-          if (fileToMove == null) {
-            logger($@" # No more files available to move");
-            return movedAtLeastOneFile; /* no file found to move */
-          }
-
-          var fileSize = fileToMove.Size;
-
-          // avoid to move file again
-          files.Remove(fileToMove);
-
-          // find a drive to put the file onto (basically it should not be already there and the drive should have enough free bytes available)
-          var targetDrive = drivesToPutFilesTo.FirstOrDefault(d => drivesWithSpaceFree[d] > fileSize && !fileToMove.ExistsOnDrive(d));
-          if (targetDrive == null) {
-            //logger($@" # Trying to move file {fileToMove.FullName} but it is already present allowed target drive");
-            continue; /* no target drive big enough */
-          }
-
-          // move file to target drive
-          logger(
-            $@" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {
-              FilesizeFormatter.FormatIEC(fileSize, "0.#")}");
-          fileToMove.MoveToDrive(targetDrive);
-
-          drivesWithSpaceFree[targetDrive] -= fileSize;
-          drivesWithSpaceFree[sourceDrive] += fileSize;
-          movedAtLeastOneFile = true;
-        }
-      } /* next overloaded drive */
-
-      return movedAtLeastOneFile;
-    } /* end of Rebalance method */
+    /* end of Rebalance method */
 
   }
 

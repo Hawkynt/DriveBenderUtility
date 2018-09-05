@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace DriveBender {
 
@@ -81,10 +82,12 @@ namespace DriveBender {
   }
 
   public interface IFile : IFileSystemItem {
+    FileInfo Source { get; }
     bool IsShadowCopy { get; }
     ulong Size { get; }
     bool ExistsOnDrive(IPoolDrive poolDrive);
     void MoveToDrive(IPoolDrive targetDrive);
+    void CopyToDrive(IPoolDrive targetDrive, bool asPrimary);
   }
 
   public interface IFolder : IFileSystemItem {
@@ -109,6 +112,9 @@ namespace DriveBender {
     string Name { get; }
     string Description { get; }
     Guid Id { get; }
+    void Rebalance(Action<string> logger);
+    void RestoreMissingPrimaries(Action<string> logger);
+    void CreateMissingShadowCopies(Action<string> logger);
     // TODO: allow enumeration of all pool files and link them to all pool drives on which they are present
   }
 
@@ -116,7 +122,7 @@ namespace DriveBender {
 
   #region concrete
 
-  public class Pool : IPool {
+  public partial class Pool : IPool {
 
     #region Implementation of IPool
 
@@ -190,6 +196,8 @@ namespace DriveBender {
             }
           } catch (IOException) {
             // ignore missing drives
+          } catch (UnauthorizedAccessException) {
+            // ignore locked drives
           }
         }
         return drives;
@@ -306,17 +314,15 @@ namespace DriveBender {
 
   [DebuggerDisplay("{Name}")]
   public class File : IFile {
-
-    private readonly FileInfo _physical;
     public File(FileInfo physical, IFolder parent, bool isShadowCopy) {
-      this._physical = physical;
+      this.Source = physical;
       this.Parent = parent;
       this.IsShadowCopy = isShadowCopy;
     }
 
     #region Implementation of IFileSystemItem
-
-    public string Name => this._physical.Name;
+    public FileInfo Source { get; }
+    public string Name => this.Source.Name;
     public string FullName => this.Parent == null ? this.Name : Path.Combine(this.Parent.FullName, this.Name);
     public IFolder Parent { get; }
 
@@ -325,7 +331,7 @@ namespace DriveBender {
     #region Implementation of IFile
 
     public bool IsShadowCopy { get; }
-    public ulong Size => (ulong)this._physical.Length;
+    public ulong Size => (ulong)this.Source.Length;
 
     public bool ExistsOnDrive(IPoolDrive poolDrive) {
       var fullName = this.FullName;
@@ -338,10 +344,42 @@ namespace DriveBender {
         ;
     }
 
+    public void CopyToDrive(IPoolDrive targetDrive, bool asPrimary) {
+      var internalPoolDrive = (PoolDrive)targetDrive;
+
+      var sourceFile = this.Source;
+      sourceFile.Refresh();
+      if (!sourceFile.Exists)
+        return;
+
+      var targetDirectory = internalPoolDrive.Root.Directory(this.Parent?.FullName);
+      if (!asPrimary)
+        targetDirectory = targetDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+
+      var targetFile = targetDirectory.File(this.Name);
+      var tempFile = targetDirectory.File(targetFile.Name + "." + DriveBenderConstants.TEMP_EXTENSION).FullName;
+
+      Trace.WriteLine($"Copying {sourceFile.FullName} to {targetFile}, {sourceFile.Length} Bytes");
+      targetDirectory.Create();
+
+      try {
+        sourceFile.CopyTo(tempFile);
+        if (!System.IO.File.Exists(tempFile))
+          return;
+
+        System.IO.File.Move(tempFile, targetFile.FullName);
+
+      } finally {
+        if (!System.IO.File.Exists(tempFile))
+          System.IO.File.Delete(tempFile);
+      }
+
+    }
+
     public void MoveToDrive(IPoolDrive targetDrive) {
       var internalPoolDrive = (PoolDrive)targetDrive;
 
-      var sourceFile = this._physical;
+      var sourceFile = this.Source;
       sourceFile.Refresh();
       if (!sourceFile.Exists)
         return;
@@ -351,30 +389,41 @@ namespace DriveBender {
         targetDirectory = targetDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
 
       var targetFile = targetDirectory.File(this.Name);
-      var tempFile = targetDirectory.File(targetFile.Name + "." + DriveBenderConstants.TEMP_EXTENSION);
+      var tempFile = targetDirectory.File(targetFile.Name + "." + DriveBenderConstants.TEMP_EXTENSION).FullName;
 
       Trace.WriteLine($"Moving {sourceFile.FullName} to {targetFile}, {sourceFile.Length} Bytes");
       targetDirectory.Create();
 
       try {
         sourceFile.CopyTo(tempFile);
-        tempFile.Refresh();
-        if (!tempFile.Exists)
+        if (!System.IO.File.Exists(tempFile))
           return;
 
-        tempFile.MoveTo(targetFile.FullName);
+        System.IO.File.Move(tempFile, targetFile.FullName);
         try {
           sourceFile.Delete();
         } catch (UnauthorizedAccessException) {
 
           // could not delete source file - delete target file, otherwise we have too many copies
-          targetFile.Delete();
+          var tries = 3;
+          Exception ex = null;
+          while (tries-- > 0) {
+            try {
+              targetFile.Delete();
+            } catch (Exception e) {
+              ex = e;
+              Thread.Sleep(100);
+            }
+          }
+
+          if (ex != null)
+            throw (ex);
+
         }
 
       } finally {
-        tempFile.Refresh();
-        if (tempFile.Exists)
-          tempFile.Delete();
+        if (!System.IO.File.Exists(tempFile))
+          System.IO.File.Delete(tempFile);
       }
     }
 
