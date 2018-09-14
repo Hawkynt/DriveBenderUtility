@@ -14,16 +14,17 @@ namespace DriveBender {
     private static IEnumerable<IFile> _ShadowCopiesWithoutPrimary(IPool pool) {
       var primaries = new Dictionary<string, IFile>(StringComparer.OrdinalIgnoreCase);
       var shadows = new Dictionary<string, IFile>(StringComparer.OrdinalIgnoreCase);
-      foreach (var drive in pool.Drives)
-        foreach (var file in drive.Items.EnumerateFiles(true))
-          if (file.IsShadowCopy)
-            shadows.TryAdd(file.FullName, file);
-          else
-            primaries.TryAdd(file.FullName, file);
+      foreach (var file in pool.Drives.SelectMany(drive => drive.Items.EnumerateFiles(true)))
+        if (file.IsShadowCopy)
+          shadows.TryAdd(file.FullName, file);
+        else
+          primaries.TryAdd(file.FullName, file);
 
-      foreach (var kvp in shadows)
-        if (!primaries.ContainsKey(kvp.Key))
-          yield return kvp.Value;
+      return
+        from kvp in shadows
+        where !primaries.ContainsKey(kvp.Key)
+        select kvp.Value
+        ;
     }
 
     /// <summary>
@@ -34,23 +35,24 @@ namespace DriveBender {
     private static IEnumerable<IFile> _PrimariesWithoutShadowCopy(IPool pool) {
       var primaries = new Dictionary<string, IFile>(StringComparer.OrdinalIgnoreCase);
       var shadows = new Dictionary<string, IFile>(StringComparer.OrdinalIgnoreCase);
-      foreach (var drive in pool.Drives)
-        foreach (var file in drive.Items.EnumerateFiles(true))
-          if (file.IsShadowCopy)
-            shadows.TryAdd(file.FullName, file);
-          else
-            primaries.TryAdd(file.FullName, file);
+      foreach (var file in pool.Drives.SelectMany(drive => drive.Items.EnumerateFiles(true)))
+        if (file.IsShadowCopy)
+          shadows.TryAdd(file.FullName, file);
+        else
+          primaries.TryAdd(file.FullName, file);
 
-      foreach (var kvp in primaries)
-        if (!shadows.ContainsKey(kvp.Key))
-          yield return kvp.Value;
+      return
+        from kvp in primaries
+        where !shadows.ContainsKey(kvp.Key)
+        select kvp.Value
+        ;
     }
 
     public void RestoreMissingPrimaries(Action<string> logger) {
       var pool = this;
       foreach (var file in _ShadowCopiesWithoutPrimary(pool)) {
         var target = pool.Drives.OrderByDescending(d => d.BytesFree).FirstOrDefault(d => !file.ExistsOnDrive(d));
-        logger($@" - Restoring primary file {file.Name} from {file.Source.Directory.Root.Name}, {FilesizeFormatter.FormatIEC(file.Size, "0.#")}");
+        logger($@" - Restoring primary file {file.Name} from {file.Source.Directory?.Root.Name}, {FilesizeFormatter.FormatIEC(file.Size, "0.#")}");
         file.CopyToDrive(target, true);
       }
     }
@@ -59,7 +61,7 @@ namespace DriveBender {
       var pool = this;
       foreach (var file in _PrimariesWithoutShadowCopy(pool)) {
         var target = pool.Drives.OrderByDescending(d => d.BytesFree).FirstOrDefault(d => !file.ExistsOnDrive(d));
-        logger($@" - Restoring shadow file {file.Name} from {file.Source.Directory.Root.Name}, {FilesizeFormatter.FormatIEC(file.Size, "0.#")}");
+        logger($@" - Restoring shadow file {file.Name} from {file.Source.Directory?.Root.Name}, {FilesizeFormatter.FormatIEC(file.Size, "0.#")}");
         file.CopyToDrive(target, false);
       }
     }
