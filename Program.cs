@@ -12,23 +12,24 @@ namespace DriveBensderUtility {
       if (pool == null)
         return; /* no pool found */
 
-      Action<string> logger = Console.WriteLine;
+      DriveBender.Logger = Console.WriteLine;
+
       Console.WriteLine();
 
-        logger($"Pool:{pool.Name}({pool.Description}) [{string.Join(", ", pool.Drives.Select(d=>d.Name))}]");
+      DriveBender.Logger($"Pool:{pool.Name}({pool.Description}) [{string.Join(", ", pool.Drives.Select(d=>d.Name))}]");
 
-      logger("Restoring primaries from doubles where needed");
-      pool.RestoreMissingPrimaries(logger);
+      DriveBender.Logger("Restoring primaries from doubles where needed");
+      pool.RestoreMissingPrimaries();
 
-      logger("Restoring doubles from primaries where needed");
-      pool.CreateMissingShadowCopies(logger);
+      DriveBender.Logger("Restoring doubles from primaries where needed");
+      pool.CreateMissingShadowCopies();
 
       //_DeleteFilesAlsoOnPool(new DirectoryInfo(@"A:\{94C96B74-F849-4D1F-BCEE-0C18A66EFFFC}"), pool);
 
-      logger("NFO files without movie file");
+      DriveBender.Logger("NFO files without movie file");
       _FindDeletedMovieFiles(pool);
 
-      //pool.Rebalance(logger);
+      //pool.Rebalance();
 
       Console.WriteLine("READY.");
       Console.ReadKey(false);

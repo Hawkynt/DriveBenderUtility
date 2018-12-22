@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using Libraries;
 
 namespace DivisonM {
   partial class DriveBender {
@@ -53,20 +52,20 @@ namespace DivisonM {
           ;
       }
 
-      public void RestoreMissingPrimaries(Action<string> logger) {
+      public void RestoreMissingPrimaries() {
         var pool = this;
         foreach (var file in _ShadowCopiesWithoutPrimary(pool)) {
           var target = pool.Drives.OrderByDescending(d => d.BytesFree).FirstOrDefault(d => !file.ExistsOnDrive(d));
-          logger($@" - Restoring primary file {file.FullName} from {file.Source.Directory?.Root.Name}, {FilesizeFormatter.FormatIEC(file.Size, "0.#")}");
+          Logger($@" - Restoring primary file {file.FullName} from {file.Source.Directory?.Root.Name}, {_FormatSize(file.Size)}");
           file.CopyToDrive(target, true);
         }
       }
 
-      public void CreateMissingShadowCopies(Action<string> logger) {
+      public void CreateMissingShadowCopies() {
         var pool = this;
         foreach (var file in _PrimariesWithoutShadowCopy(pool)) {
           var target = pool.Drives.OrderByDescending(d => d.BytesFree).FirstOrDefault(d => !file.ExistsOnDrive(d));
-          logger($@" - Restoring shadow file {file.FullName} from {file.Source.Directory?.Root.Name}, {FilesizeFormatter.FormatIEC(file.Size, "0.#")}");
+          Logger($@" - Restoring shadow file {file.FullName} from {file.Source.Directory?.Root.Name}, {_FormatSize(file.Size)}");
           file.CopyToDrive(target, false);
         }
       }

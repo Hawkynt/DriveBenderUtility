@@ -1,4 +1,5 @@
 ﻿using System;
+using System.CodeDom;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -41,7 +42,7 @@ namespace DivisonM {
   }
 
   public static partial class DriveBender {
-
+    
     #region NativeMethods
 
     private static class NativeMethods {
@@ -111,23 +112,33 @@ namespace DivisonM {
       string Name { get; }
       string Description { get; }
       Guid Id { get; }
-      void Rebalance(Action<string> logger);
-      void RestoreMissingPrimaries(Action<string> logger);
-
-      void CreateMissingShadowCopies(Action<string> logger);
+      ulong BytesTotal { get; }
+      ulong BytesFree { get; }
+      ulong BytesUsed { get; }
+      void Rebalance();
+      void RestoreMissingPrimaries();
+      void CreateMissingShadowCopies();
       // TODO: allow enumeration of all pool files and link them to all pool drives on which they are present
     }
 
     #endregion
 
+    private static Action<string> _logger;
+    private static readonly Action<string> _DEFAULT_LOGGER = s => { Trace.WriteLine(s); };
+
+    public static Action<string> Logger {
+      get => _logger?? _DEFAULT_LOGGER;
+      set => _logger = value;
+    }
+
     public static IPool[] DetectedPools => (
       from drive in _FindAllPoolDrives()
       group drive by drive.Id
       into pool
-      select (IPool)new Pool(pool)
+      select (IPool) new Pool(pool)
     ).ToArray();
 
-    #region concrete
+#region concrete
 
     [DebuggerDisplay("{" + nameof(Name) + "}({" + nameof(Description) + "})")]
     private partial class Pool : IPool {
@@ -146,14 +157,32 @@ namespace DivisonM {
 
       }
 
-      #region Implementation of IPool
+#region Implementation of IPool
 
       public IEnumerable<IPoolDrive> Drives => this._drives;
-      public string Name {get; }
+      public string Name { get; }
       public string Description { get; }
       public Guid Id { get; }
 
-      #endregion
+      [DebuggerDisplay("{" + nameof(_FormatBytesTotal) + "}")]
+      public ulong BytesTotal => this._drives.Sum(d=>d.BytesTotal);
+
+      [DebuggerHidden]
+      private string _FormatBytesTotal => _FormatSize(this.BytesTotal);
+
+      [DebuggerDisplay("{" + nameof(_FormatBytesFree) + "}")]
+      public ulong BytesFree => this._drives.Sum(d => d.BytesFree);
+
+      [DebuggerHidden]
+      private string _FormatBytesFree => _FormatSize(this.BytesFree);
+
+      [DebuggerDisplay("{" + nameof(_FormatBytesUsed) + "}")]
+      public ulong BytesUsed => this._drives.Sum(d => d.BytesUsed);
+
+      [DebuggerHidden]
+      private string _FormatBytesUsed => _FormatSize(this.BytesUsed);
+
+#endregion
 
     }
 
@@ -191,7 +220,7 @@ namespace DivisonM {
         this.Root = root;
       }
 
-      #region Implementation of IPoolDrive
+#region Implementation of IPoolDrive
 
       public IEnumerable<IFileSystemItem> Items => _EnumeratePoolDirectory(this.Root, this, null);
       public IPool Pool { get; }
@@ -200,16 +229,19 @@ namespace DivisonM {
       public string Description { get; }
       public Guid Id { get; }
 
-      [DebuggerDisplay("{"+nameof(_FormatBytesTotal)+"}")]
+      [DebuggerDisplay("{" + nameof(_FormatBytesTotal) + "}")]
       public ulong BytesTotal => NativeMethods.GetDiskFreeSpace(this.Root).total;
+
       [DebuggerHidden]
       private string _FormatBytesTotal => _FormatSize(this.BytesTotal);
 
       [DebuggerDisplay("{" + nameof(_FormatBytesFree) + "}")]
       public ulong BytesFree => NativeMethods.GetDiskFreeSpace(this.Root).free;
+
       [DebuggerHidden]
       private string _FormatBytesFree => _FormatSize(this.BytesFree);
 
+      [DebuggerDisplay("{" + nameof(_FormatBytesUsed) + "}")]
       public ulong BytesUsed {
         get {
           var result = NativeMethods.GetDiskFreeSpace(this.Root);
@@ -217,7 +249,10 @@ namespace DivisonM {
         }
       }
 
-      #endregion
+      [DebuggerHidden]
+      private string _FormatBytesUsed => _FormatSize(this.BytesUsed);
+
+#endregion
     }
 
     [DebuggerDisplay("{" + nameof(Name) + "}")]
@@ -228,25 +263,25 @@ namespace DivisonM {
       private readonly Folder _parent;
 
       public Folder(PoolDrive drive, DirectoryInfo physical, Folder parent) {
-        this._drive = drive??throw new ArgumentNullException(nameof(drive));
-        this._physical = physical??throw new ArgumentNullException(nameof(physical));
+        this._drive = drive ?? throw new ArgumentNullException(nameof(drive));
+        this._physical = physical ?? throw new ArgumentNullException(nameof(physical));
         this._parent = parent;
       }
 
-      #region Implementation of IFileSystemItem
+#region Implementation of IFileSystemItem
 
       public string Name => this._physical.Name;
       public string FullName => this.Parent == null ? this.Name : Path.Combine(this.Parent.FullName, this.Name);
       public IFolder Parent => this._parent;
 
-      #endregion
+#endregion
 
-      #region Implementation of IFolder
+#region Implementation of IFolder
 
       public IEnumerable<IFileSystemItem> Items => _EnumeratePoolDirectory(this._physical, this._drive, this);
       public IPoolDrive Drive => this._drive;
 
-      #endregion
+#endregion
 
     }
 
@@ -254,40 +289,40 @@ namespace DivisonM {
     private class File : IFile {
 
       private readonly Folder _parent;
-      
+
       public File(FileInfo physical, Folder parent, bool isShadowCopy) {
-        this.Source = physical??throw new ArgumentNullException(nameof(physical));
+        this.Source = physical ?? throw new ArgumentNullException(nameof(physical));
         this._parent = parent;
         this.IsShadowCopy = isShadowCopy;
       }
 
-      #region Implementation of IFileSystemItem
+#region Implementation of IFileSystemItem
 
       public FileInfo Source { get; }
       public string Name => this.Source.Name;
       public string FullName => this.Parent == null ? this.Name : Path.Combine(this.Parent.FullName, this.Name);
       public IFolder Parent => this._parent;
 
-      #endregion
+#endregion
 
-      #region Implementation of IFile
+#region Implementation of IFile
 
       public bool IsShadowCopy { get; }
 
       [DebuggerDisplay("{" + nameof(_FormatSize) + "}")]
-      public ulong Size => (ulong)this.Source.Length;
+      public ulong Size => (ulong) this.Source.Length;
 
       [DebuggerHidden]
       private string _FormatSize => _FormatSize(this.Size);
 
-      public bool ExistsOnDrive(IPoolDrive poolDrive) => _ExistsOnDrive(this, (PoolDrive)poolDrive);
-      public void CopyToDrive(IPoolDrive targetDrive, bool asPrimary) => _CopyToDrive(this, (PoolDrive)targetDrive, asPrimary);
-      public void MoveToDrive(IPoolDrive targetDrive) => _MoveToDrive(this, (PoolDrive)targetDrive);
+      public bool ExistsOnDrive(IPoolDrive poolDrive) => _ExistsOnDrive(this, (PoolDrive) poolDrive);
+      public void CopyToDrive(IPoolDrive targetDrive, bool asPrimary) => _CopyToDrive(this, (PoolDrive) targetDrive, asPrimary);
+      public void MoveToDrive(IPoolDrive targetDrive) => _MoveToDrive(this, (PoolDrive) targetDrive);
 
-      #endregion
+#endregion
     }
 
-    #endregion
+#endregion
 
     private static void _CopyToDrive(File file, PoolDrive targetDrive, bool asPrimary) {
       var sourceFile = file.Source;
@@ -368,14 +403,14 @@ namespace DivisonM {
       }
     }
 
-    private static bool _ExistsOnDrive(File file,PoolDrive poolDrive) {
+    private static bool _ExistsOnDrive(File file, PoolDrive poolDrive) {
       var fullName = file.FullName;
       var parentDirectoryName = Path.GetDirectoryName(fullName);
       var fileNameOnly = Path.GetFileName(fullName);
-      if(fileNameOnly==null)
+      if (fileNameOnly == null)
         throw new NotSupportedException("Need valid filename");
 
-      var shadowCopyName = parentDirectoryName==null?Path.Combine(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, fileNameOnly) :  Path.Combine(parentDirectoryName, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, fileNameOnly);
+      var shadowCopyName = parentDirectoryName == null ? Path.Combine(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, fileNameOnly) : Path.Combine(parentDirectoryName, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, fileNameOnly);
 
       return
         System.IO.File.Exists(Path.Combine(poolDrive.Root.FullName, fullName))
@@ -409,7 +444,7 @@ namespace DivisonM {
               continue;
 
             var rootDirectory = file.Directory.Directory($"{{{id}}}");
-            if(!rootDirectory.Exists)
+            if (!rootDirectory.Exists)
               continue;
 
             var description = data.GetValueOrDefault("description");
@@ -437,7 +472,7 @@ namespace DivisonM {
           continue;
         }
 
-        if(!(item is DirectoryInfo folder))
+        if (!(item is DirectoryInfo folder))
           continue;
 
         if (string.Equals(folder.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase)) {
@@ -452,44 +487,19 @@ namespace DivisonM {
     }
 
     private static string _FormatSize(ulong size) {
-      const float factor = 1.5f;
-      if (size < 1024 * factor)
-        return $"{size}B";
+      const double factor = 1.5;
+      const ulong KiB = 1024;
+      const ulong MiB = KiB * 1024;
+      const ulong GiB = MiB * 1024;
+      const ulong TiB = GiB * 1024;
+      const ulong PiB = TiB * 1024;
+      const ulong EiB = PiB * 1024;
 
-      size /= 1024;
-      if (size < 1024 * factor)
-        return $"{size}KiB";
+      foreach (var (d, t) in new[] {(EiB, "EiB"), (PiB, "PiB"), (TiB, "TiB"), (GiB, "GiB"), (MiB, "MiB"), (KiB, "KiB")})
+        if (size / factor >= d)
+          return $"{((double) size / d):0.#}{t}";
 
-      size /= 1024;
-      if (size < 1024 * factor)
-        return $"{size}MiB";
-
-      size /= 1024;
-      if (size < 1024 * factor)
-        return $"{size}GiB";
-
-      size /= 1024;
-      if (size < 1024 * factor)
-        return $"{size}TiB";
-
-      size /= 1024;
-      if (size < 1024 * factor)
-        return $"{size}PiB";
-
-      size /= 1024;
-      if (size < 1024 * factor)
-        return $"{size}EiB";
-
-      size /= 1024;
-      if (size < 1024 * factor)
-        return $"{size}ZiB";
-      
-      size /= 1024;
-      if (size < 1024 * factor)
-        return $"{size}YiB";
-
-      size /= 1024;
-      return $"{size}BiB";
+      return $"{size:format}B";
     }
 
   }

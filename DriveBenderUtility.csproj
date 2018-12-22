@@ -68,9 +68,6 @@
     <Compile Include="..\..\Framework\System.StringExtensions.cs">
       <Link>Framework\System.StringExtensions.cs</Link>
     </Compile>
-    <Compile Include="..\..\Libraries\FilesizeFormatter.cs">
-      <Link>FilesizeFormatter.cs</Link>
-    </Compile>
     <Compile Include="Classes\DriveBender.cs" />
     <Compile Include="Classes\Repairer.cs" />
     <Compile Include="Program.cs" />

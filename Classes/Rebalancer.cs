@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using Libraries;
 
 namespace DivisonM {
   partial class DriveBender {
@@ -9,29 +8,26 @@ namespace DivisonM {
       /// <summary>
       /// Rebalances files on pool to ensure a good average across all drives.
       /// </summary>
-      /// <param name="logger">The logger.</param>
-      public void Rebalance(Action<string> logger) {
+      public void Rebalance() {
         var pool = this;
 
-        logger?.Invoke($"Pool {pool.Name}({pool.Description})");
+        Logger($"Pool {pool.Name}({pool.Description})");
 
         var drives = pool.Drives.ToArray();
         var drivesWithSpaceFree = drives.ToDictionary(d => d, d => d.BytesFree);
 
         foreach (var drive in drives.OrderBy(i => i.Name))
-          logger?.Invoke(
+          Logger(
             $@" + Drive {drive.Name} {drive.BytesUsed * 100f / drive.BytesTotal:0.#}% ({
-                FilesizeFormatter.FormatIEC(drive.BytesUsed, "0.#")} used, {
-                FilesizeFormatter.FormatIEC(drive.BytesFree, "0.#")} free, {
-                FilesizeFormatter.FormatIEC(drive.BytesTotal, "0.#")} total)");
+                _FormatSize(drive.BytesUsed)} used, {
+                _FormatSize(drive.BytesFree)} free, {
+                _FormatSize(drive.BytesTotal)} total)");
 
         var avgBytesFree = drives.Sum(i => drivesWithSpaceFree[i]) / (ulong) drives.Length;
-        logger?.Invoke($@" * Average free {FilesizeFormatter.FormatIEC(avgBytesFree, "0.#")}");
+        Logger($" * Average free {_FormatSize(avgBytesFree)}");
 
         const ulong MIN_BYTES_DIFFERENCE_BEFORE_ACTING = 2 * 1024 * 1024UL;
-        logger?.Invoke(
-          $@" * Difference per drive before balancing {
-            FilesizeFormatter.FormatIEC(MIN_BYTES_DIFFERENCE_BEFORE_ACTING, "0.#")}");
+        Logger($" * Difference per drive before balancing {_FormatSize(MIN_BYTES_DIFFERENCE_BEFORE_ACTING)}");
 
         if (avgBytesFree < MIN_BYTES_DIFFERENCE_BEFORE_ACTING)
           return;
@@ -44,7 +40,6 @@ namespace DivisonM {
           drivesWithSpaceFree,
           valueBeforeGettingDataFrom,
           valueBeforePuttingDataTo,
-          logger,
           avgBytesFree)) {
           ;
         }
@@ -56,7 +51,6 @@ namespace DivisonM {
         IDictionary<IPoolDrive, ulong> drivesWithSpaceFree,
         ulong valueBeforeGettingDataFrom,
         ulong valueBeforePuttingDataTo,
-        Action<string> logger,
         ulong avgBytesFree
       ) {
         var drivesToGetFilesFrom = drives.Where(i => drivesWithSpaceFree[i] < valueBeforeGettingDataFrom).ToArray();
@@ -65,8 +59,8 @@ namespace DivisonM {
         if (!(drivesToPutFilesTo.Any() && drivesToGetFilesFrom.Any()))
           return false;
 
-        logger($@" * Drives overfilled {string.Join(", ", drivesToGetFilesFrom.Select(i => i.Name))}");
-        logger($@" * Drives underfilled {string.Join(", ", drivesToPutFilesTo.Select(i => i.Name))}");
+        Logger($@" * Drives overfilled {string.Join(", ", drivesToGetFilesFrom.Select(i => i.Name))}");
+        Logger($@" * Drives underfilled {string.Join(", ", drivesToPutFilesTo.Select(i => i.Name))}");
 
         var movedAtLeastOneFile = false;
         foreach (var sourceDrive in drivesToGetFilesFrom) {
@@ -87,7 +81,7 @@ namespace DivisonM {
             // find the first file, that is nearly big enough
             var fileToMove = files.FirstOrDefault(f => f.Size <= bestFit);
             if (fileToMove == null) {
-              logger($@" # No more files available to move");
+              Logger($" # No more files available to move");
               return movedAtLeastOneFile; /* no file found to move */
             }
 
@@ -105,9 +99,7 @@ namespace DivisonM {
             }
 
             // move file to target drive
-            logger(
-              $@" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {
-                FilesizeFormatter.FormatIEC(fileSize, "0.#")}");
+            Logger($" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {_FormatSize(fileSize)}");
             fileToMove.MoveToDrive(targetDrive);
 
             drivesWithSpaceFree[targetDrive] -= fileSize;
