@@ -7,27 +7,30 @@ using DivisonM;
 namespace DriveBensderUtility {
   internal class Program {
     private static void Main(string[] args) {
-      var pools = DriveBender.DetectedPools;
-      var pool = pools.FirstOrDefault();
-      if (pool == null)
+      var mountPoints = DriveBender.DetectedMountPoints;
+      var mountPoint = mountPoints.FirstOrDefault();
+      if (mountPoint == null)
         return; /* no pool found */
 
       DriveBender.Logger = Console.WriteLine;
 
       Console.WriteLine();
 
-      DriveBender.Logger($"Pool:{pool.Name}({pool.Description}) [{string.Join(", ", pool.Drives.Select(d=>d.Name))}]");
+      var items = mountPoint.GetItems("Movies", SearchOption.AllDirectories).OrderBy(d=>d.FullName).Select(d=>$"{d.FullName}({(d is DriveBender.IFile file?DriveBender.FormatSize(file.Size):string.Empty)},{d.Parent.Drive.Name})").ToArray();
+      
+
+      DriveBender.Logger($"Pool:{mountPoint.Name}({mountPoint.Description}) [{string.Join(", ", mountPoint.Volumes.Select(d=>d.Name))}]");
 
       DriveBender.Logger("Restoring primaries from doubles where needed");
-      pool.RestoreMissingPrimaries();
+      mountPoint.RestoreMissingPrimaries();
 
       DriveBender.Logger("Restoring doubles from primaries where needed");
-      pool.CreateMissingShadowCopies();
+      mountPoint.CreateMissingShadowCopies();
 
       //_DeleteFilesAlsoOnPool(new DirectoryInfo(@"A:\{94C96B74-F849-4D1F-BCEE-0C18A66EFFFC}"), pool);
 
       DriveBender.Logger("NFO files without movie file");
-      _FindDeletedMovieFiles(pool);
+      _FindDeletedMovieFiles(mountPoint);
 
       //pool.Rebalance();
 
@@ -35,17 +38,17 @@ namespace DriveBensderUtility {
       Console.ReadKey(false);
     }
 
-    private static void _DeleteFilesAlsoOnPool(DirectoryInfo root, DriveBender.IPool pool) {
-      foreach (var t in _FilesAlsoOnPool(root, pool)) {
+    private static void _DeleteFilesAlsoOnPool(DirectoryInfo root, DriveBender.IMountPoint mountPoint) {
+      foreach (var t in _FilesAlsoOnPool(root, mountPoint)) {
         Console.WriteLine($"File also on pool: {t.Item2[0].FullName} - deleting");
         t.Item1.TryDelete();
       }
     }
 
-    private static IEnumerable<Tuple<FileInfo, DriveBender.IFile[]>> _FilesAlsoOnPool(DirectoryInfo root, DriveBender.IPool pool) {
+    private static IEnumerable<Tuple<FileInfo, DriveBender.IFile[]>> _FilesAlsoOnPool(DirectoryInfo root, DriveBender.IMountPoint mountPoint) {
       var poolFiles = new Dictionary<string, List<DriveBender.IFile>>(StringComparer.OrdinalIgnoreCase);
-      foreach (var drive in pool.Drives)
-        foreach (var file in drive.Items.EnumerateFiles(true))
+      foreach (var volume in mountPoint.Volumes)
+        foreach (var file in volume.Items.EnumerateFiles(true))
           poolFiles.GetOrAdd(file.FullName, _ => new List<DriveBender.IFile>()).Add(file);
 
       var length = root.FullName.Length;
@@ -62,12 +65,12 @@ namespace DriveBensderUtility {
       }
     }
 
-    private static void _FindDeletedMovieFiles(DriveBender.IPool pool) {
+    private static void _FindDeletedMovieFiles(DriveBender.IMountPoint mountPoint) {
 
       // get all files
       var hash = new HashSet<string>();
-      foreach (var drive in pool.Drives)
-        foreach (var file in drive.Items.EnumerateFiles(true))
+      foreach (var volume in mountPoint.Volumes)
+        foreach (var file in volume.Items.EnumerateFiles(true))
           hash.TryAdd(file.FullName);
 
       // find all nfo without video

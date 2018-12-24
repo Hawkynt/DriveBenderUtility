@@ -4,7 +4,7 @@ using System.Linq;
 
 namespace DivisonM {
   partial class DriveBender {
-    partial class Pool {
+    partial class MountPoint {
       /// <summary>
       /// Rebalances files on pool to ensure a good average across all drives.
       /// </summary>
@@ -13,21 +13,21 @@ namespace DivisonM {
 
         Logger($"Pool {pool.Name}({pool.Description})");
 
-        var drives = pool.Drives.ToArray();
+        var drives = pool.Volumes.ToArray();
         var drivesWithSpaceFree = drives.ToDictionary(d => d, d => d.BytesFree);
 
         foreach (var drive in drives.OrderBy(i => i.Name))
           Logger(
             $@" + Drive {drive.Name} {drive.BytesUsed * 100f / drive.BytesTotal:0.#}% ({
-                _FormatSize(drive.BytesUsed)} used, {
-                _FormatSize(drive.BytesFree)} free, {
-                _FormatSize(drive.BytesTotal)} total)");
+                FormatSize(drive.BytesUsed)} used, {
+                FormatSize(drive.BytesFree)} free, {
+                FormatSize(drive.BytesTotal)} total)");
 
         var avgBytesFree = drives.Sum(i => drivesWithSpaceFree[i]) / (ulong) drives.Length;
-        Logger($" * Average free {_FormatSize(avgBytesFree)}");
+        Logger($" * Average free {FormatSize(avgBytesFree)}");
 
         const ulong MIN_BYTES_DIFFERENCE_BEFORE_ACTING = 2 * 1024 * 1024UL;
-        Logger($" * Difference per drive before balancing {_FormatSize(MIN_BYTES_DIFFERENCE_BEFORE_ACTING)}");
+        Logger($" * Difference per drive before balancing {FormatSize(MIN_BYTES_DIFFERENCE_BEFORE_ACTING)}");
 
         if (avgBytesFree < MIN_BYTES_DIFFERENCE_BEFORE_ACTING)
           return;
@@ -47,8 +47,8 @@ namespace DivisonM {
       }
 
       private static bool _DoRebalanceRun(
-        IPoolDrive[] drives,
-        IDictionary<IPoolDrive, ulong> drivesWithSpaceFree,
+        IVolume[] drives,
+        IDictionary<IVolume, ulong> drivesWithSpaceFree,
         ulong valueBeforeGettingDataFrom,
         ulong valueBeforePuttingDataTo,
         ulong avgBytesFree
@@ -99,7 +99,7 @@ namespace DivisonM {
             }
 
             // move file to target drive
-            Logger($" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {_FormatSize(fileSize)}");
+            Logger($" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {FormatSize(fileSize)}");
             fileToMove.MoveToDrive(targetDrive);
 
             drivesWithSpaceFree[targetDrive] -= fileSize;
