@@ -11,13 +11,13 @@ namespace DivisonM {
 
   internal static class DriveBenderExtensions {
 
-    public static IEnumerable<DriveBender.IFile> EnumerateFiles(this IEnumerable<DriveBender.IFileSystemItem> items, bool suppressExceptions = false) {
-      var emptyFileSystemItems = new DriveBender.IFileSystemItem[0];
-      var stack = new Stack<IEnumerable<DriveBender.IFileSystemItem>>();
+    public static IEnumerable<DriveBender.IPhysicalFile> EnumerateFiles(this IEnumerable<DriveBender.IPhysicalFileSystemItem> items, bool suppressExceptions = false) {
+      var emptyFileSystemItems = new DriveBender.IPhysicalFileSystemItem[0];
+      var stack = new Stack<IEnumerable<DriveBender.IPhysicalFileSystemItem>>();
       stack.Push(items);
       while (stack.Count > 0) {
         var current = stack.Pop();
-        DriveBender.IFileSystemItem[] cached;
+        DriveBender.IPhysicalFileSystemItem[] cached;
         if (suppressExceptions) {
           try {
             cached = current.ToArray();
@@ -29,10 +29,10 @@ namespace DivisonM {
 
         foreach (var item in cached)
           switch (item) {
-            case DriveBender.IFile file:
+            case DriveBender.IPhysicalFile file:
               yield return file;
               break;
-            case DriveBender.IFolder folder:
+            case DriveBender.IPhysicalFolder folder:
               stack.Push(folder.Items);
               break;
           }
@@ -42,7 +42,7 @@ namespace DivisonM {
   }
 
   public static partial class DriveBender {
-    
+
     #region NativeMethods
 
     private static class NativeMethods {
@@ -66,15 +66,42 @@ namespace DivisonM {
 
     #endregion
 
+    #region utils
+
+    internal class SizeFormatter {
+
+      private const ulong KiB = 1024;
+      private const ulong MiB = KiB * 1024;
+      private const ulong GiB = MiB * 1024;
+      private const ulong TiB = GiB * 1024;
+      private const ulong PiB = TiB * 1024;
+      private const ulong EiB = PiB * 1024;
+
+      private static readonly ValueTuple<ulong, string>[] SIZE_VALUES = { (EiB, "EiB"), (PiB, "PiB"), (TiB, "TiB"), (GiB, "GiB"), (MiB, "MiB"), (KiB, "KiB") };
+
+      public static string Format(ulong size) {
+        const double factor = 1.5;
+        foreach (var (d, t) in SIZE_VALUES)
+          if (size / factor >= d)
+            return $"{((double)size / d):0.#}{t}";
+
+        return $"{size:format}B";
+      }
+    }
+
+    #endregion
+
     #region interface
 
     internal static class DriveBenderConstants {
-      public const string TEMP_EXTENSION = "TEMP.$DriveBender";
-      public const string SHADOW_COPY_FOLDER_NAME = "Folder.Duplicate.$DriveBender";
-      public const string INFO_EXTENSION = "MP.$DriveBender";
+      public const string TEMP_EXTENSION = "TEMP.$DRIVEBENDER";
+      public const string SHADOW_COPY_FOLDER_NAME = "FOLDER.DUPLICATE.$DRIVEBENDER";
+      public const string INFO_EXTENSION = "MP.$DRIVEBENDER";
     }
 
     // ReSharper disable UnusedMember.Global
+
+    #region virtual file/folder stuff
 
     public interface IFileSystemItem {
       string Name { get; }
@@ -82,7 +109,29 @@ namespace DivisonM {
       IFolder Parent { get; }
     }
 
+    public interface IFolder : IFileSystemItem {
+      IEnumerable<IFileSystemItem> Items { get; }
+    }
+
     public interface IFile : IFileSystemItem {
+      ulong Size { get; }
+      IVolume Primary { get; }
+      IEnumerable<IVolume> Primaries { get; }
+      IVolume ShadowCopy { get; }
+      IEnumerable<IVolume> ShadowCopies { get; }
+    }
+
+    #endregion
+
+    #region physical file/folder stuff
+
+    public interface IPhysicalFileSystemItem {
+      string Name { get; }
+      string FullName { get; }
+      IPhysicalFolder Parent { get; }
+    }
+
+    public interface IPhysicalFile : IPhysicalFileSystemItem {
       FileInfo Source { get; }
       bool IsShadowCopy { get; }
       ulong Size { get; }
@@ -91,13 +140,15 @@ namespace DivisonM {
       void CopyToDrive(IVolume targetDrive, bool asPrimary);
     }
 
-    public interface IFolder : IFileSystemItem {
-      IEnumerable<IFileSystemItem> Items { get; }
+    public interface IPhysicalFolder : IPhysicalFileSystemItem {
+      IEnumerable<IPhysicalFileSystemItem> Items { get; }
       IVolume Drive { get; }
     }
 
+    #endregion
+
     public interface IVolume {
-      IEnumerable<IFileSystemItem> Items { get; }
+      IEnumerable<IPhysicalFileSystemItem> Items { get; }
       IMountPoint MountPoint { get; }
       string Label { get; }
       string Name { get; }
@@ -117,10 +168,10 @@ namespace DivisonM {
       ulong BytesFree { get; }
       ulong BytesUsed { get; }
       void Rebalance();
-      void RestoreMissingPrimaries();
-      void CreateMissingShadowCopies();
       IEnumerable<IFileSystemItem> GetItems(string path, SearchOption searchOption);
       IEnumerable<IFileSystemItem> GetItems(SearchOption searchOption);
+      void FixMissingShadowCopies();
+      void FixMissingPrimaries();
     }
 
     // ReSharper restore UnusedMember.Global
@@ -131,7 +182,7 @@ namespace DivisonM {
     private static readonly Action<string> _DEFAULT_LOGGER = s => { Trace.WriteLine(s); };
 
     public static Action<string> Logger {
-      get => _logger?? _DEFAULT_LOGGER;
+      get => _logger ?? _DEFAULT_LOGGER;
       set => _logger = value;
     }
 
@@ -142,19 +193,19 @@ namespace DivisonM {
       select (IMountPoint) new MountPoint(pool)
     ).ToArray();
 
-#region concrete
+    #region concrete
 
     [DebuggerDisplay("{" + nameof(Name) + "}({" + nameof(Description) + "})")]
     private partial class MountPoint : IMountPoint {
 
-      private readonly Volume[] _volumes;
+      public readonly Volume[] volumes;
 
       public MountPoint(IEnumerable<PoolDriveWithoutPool> drives) {
         if (drives == null)
           throw new ArgumentNullException(nameof(drives));
 
-        this._volumes = drives.Select(d => d.AttachTo(this)).ToArray();
-        var first = this._volumes.First();
+        this.volumes = drives.Select(d => d.AttachTo(this)).ToArray();
+        var first = this.volumes.First();
         this.Name = first.Label;
         this.Description = first.Description;
         this.Id = first.Id;
@@ -163,83 +214,39 @@ namespace DivisonM {
 
       #region Implementation of IMountPoint
 
-      public IEnumerable<IVolume> Volumes => this._volumes;
+      public IEnumerable<IVolume> Volumes => this.volumes;
       public string Name { get; }
       public string Description { get; }
       public Guid Id { get; }
 
       [DebuggerDisplay("{" + nameof(_FormatBytesTotal) + "}")]
-      public ulong BytesTotal => this._volumes.Sum(d=>d.BytesTotal);
+      public ulong BytesTotal => this.volumes.Sum(d => d.BytesTotal);
 
       [DebuggerHidden]
-      private string _FormatBytesTotal => FormatSize(this.BytesTotal);
+      private string _FormatBytesTotal => SizeFormatter.Format(this.BytesTotal);
 
       [DebuggerDisplay("{" + nameof(_FormatBytesFree) + "}")]
-      public ulong BytesFree => this._volumes.Sum(d => d.BytesFree);
+      public ulong BytesFree => this.volumes.Sum(d => d.BytesFree);
 
       [DebuggerHidden]
-      private string _FormatBytesFree => FormatSize(this.BytesFree);
+      private string _FormatBytesFree => SizeFormatter.Format(this.BytesFree);
 
       [DebuggerDisplay("{" + nameof(_FormatBytesUsed) + "}")]
-      public ulong BytesUsed => this._volumes.Sum(d => d.BytesUsed);
+      public ulong BytesUsed => this.volumes.Sum(d => d.BytesUsed);
 
       [DebuggerHidden]
-      private string _FormatBytesUsed => FormatSize(this.BytesUsed);
+      private string _FormatBytesUsed => SizeFormatter.Format(this.BytesUsed);
 
       public IEnumerable<IFileSystemItem> GetItems(SearchOption searchOption)
-        => this.GetItems(string.Empty, searchOption)
-      ;
+        => this.GetItems(string.Empty, searchOption);
 
-      public IEnumerable<IFileSystemItem> GetItems(string path,SearchOption searchOption) {
+      public IEnumerable<IFileSystemItem> GetItems(string path, SearchOption searchOption)
+        => _EnumerateItems(this,path, searchOption);
 
-        var alreadySeen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      public void FixMissingShadowCopies() => _FixMissingShadowCopies(this);
+      public void FixMissingPrimaries() => _FixMissingPrimaries(this);
 
-        // TODO: folder loop
-        alreadySeen.Clear();
-        
-        // return primaries first
-        foreach (var volume in this._volumes) {
-          var primaryDirectory= volume.Root.Directory(path);
-          var parent = new Folder(volume, primaryDirectory, null);
-
-          foreach (var item in primaryDirectory.EnumerateFileSystemInfos()) {
-            if(string.Equals(item.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
-              continue;
-            if (alreadySeen.Contains(item.Name))
-              continue;
-
-            alreadySeen.Add(item.Name);
-            switch (item) {
-              case FileInfo file:
-                yield return new File(file,parent, false);
-                break;
-              case DirectoryInfo directory:
-                yield return new Folder(volume,directory, parent);
-                break;
-            }
-          }
-        }
-
-        // search for shadow copies without primary
-        foreach (var volume in this._volumes) {
-          var primaryDirectory = volume.Root.Directory(path);
-          var shadowDirectory = primaryDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
-          var parent = new Folder(volume, primaryDirectory, null);
-
-          foreach (var file in shadowDirectory.EnumerateFiles()) {
-            if (string.Equals(file.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
-              continue;
-            if (alreadySeen.Contains(file.Name))
-              continue;
-
-            alreadySeen.Add(file.Name);
-
-            yield return new File(file, parent, true);
-          }
-        }
-      }
-
-#endregion
+      #endregion
 
     }
 
@@ -265,11 +272,11 @@ namespace DivisonM {
     }
 
     [DebuggerDisplay("{Root.FullName}:{" + nameof(Label) + "}")]
-    private class Volume : IVolume {
+    private class Volume : IVolume,IEquatable<Volume> {
 
       public DirectoryInfo Root { get; }
 
-      internal Volume(IMountPoint mountPoint, string label, string description, Guid id, DirectoryInfo root) {
+      public Volume(IMountPoint mountPoint, string label, string description, Guid id, DirectoryInfo root) {
         this.MountPoint = mountPoint;
         this.Label = label;
         this.Description = description;
@@ -277,9 +284,9 @@ namespace DivisonM {
         this.Root = root;
       }
 
-#region Implementation of IPoolDrive
+      #region Implementation of IPoolDrive
 
-      public IEnumerable<IFileSystemItem> Items => _EnumeratePoolDirectory(this.Root, this, null);
+      public IEnumerable<IPhysicalFileSystemItem> Items => _EnumeratePoolDirectory(this.Root, this, null);
       public IMountPoint MountPoint { get; }
       public string Label { get; }
       public string Name => this.Root.Parent?.Name;
@@ -290,13 +297,13 @@ namespace DivisonM {
       public ulong BytesTotal => NativeMethods.GetDiskFreeSpace(this.Root).total;
 
       [DebuggerHidden]
-      private string _FormatBytesTotal => FormatSize(this.BytesTotal);
+      private string _FormatBytesTotal => SizeFormatter.Format(this.BytesTotal);
 
       [DebuggerDisplay("{" + nameof(_FormatBytesFree) + "}")]
       public ulong BytesFree => NativeMethods.GetDiskFreeSpace(this.Root).free;
 
       [DebuggerHidden]
-      private string _FormatBytesFree => FormatSize(this.BytesFree);
+      private string _FormatBytesFree => SizeFormatter.Format(this.BytesFree);
 
       [DebuggerDisplay("{" + nameof(_FormatBytesUsed) + "}")]
       public ulong BytesUsed {
@@ -307,62 +314,89 @@ namespace DivisonM {
       }
 
       [DebuggerHidden]
-      private string _FormatBytesUsed => FormatSize(this.BytesUsed);
+      private string _FormatBytesUsed => SizeFormatter.Format(this.BytesUsed);
 
-#endregion
+      #endregion
+
+      #region Equality members
+
+      public bool Equals(Volume other) {
+        if (ReferenceEquals(null, other))
+          return false;
+        if (ReferenceEquals(this, other))
+          return true;
+        return string.Equals(this.Root.FullName,other.Root.FullName,StringComparison.OrdinalIgnoreCase);
+      }
+
+      public override bool Equals(object obj) {
+        if (ReferenceEquals(null, obj))
+          return false;
+        if (ReferenceEquals(this, obj))
+          return true;
+        if (obj.GetType() != this.GetType())
+          return false;
+        return this.Equals((Volume) obj);
+      }
+
+      public override int GetHashCode() => this.Root.FullName.ToLower().GetHashCode();
+
+      public static bool operator ==(Volume left, Volume right) => Equals(left, right);
+      public static bool operator !=(Volume left, Volume right) => !Equals(left, right);
+
+      #endregion
     }
 
-    [DebuggerDisplay("{" + nameof(Name) + "}")]
-    private class Folder : IFolder {
+    [DebuggerDisplay("{" + nameof(FullName) + "}")]
+    private class PhysicalFolder : IPhysicalFolder {
 
       private readonly DirectoryInfo _physical;
       private readonly Volume _drive;
-      private readonly Folder _parent;
+      private readonly PhysicalFolder _parent;
 
-      public Folder(Volume drive, DirectoryInfo physical, Folder parent) {
+      public PhysicalFolder(Volume drive, DirectoryInfo physical, PhysicalFolder parent) {
         this._drive = drive ?? throw new ArgumentNullException(nameof(drive));
         this._physical = physical ?? throw new ArgumentNullException(nameof(physical));
         this._parent = parent;
       }
 
-#region Implementation of IFileSystemItem
+      #region Implementation of IFileSystemItem
 
       public string Name => this._physical.Name;
       public string FullName => this.Parent == null ? this.Name : Path.Combine(this.Parent.FullName, this.Name);
-      public IFolder Parent => this._parent;
+      public IPhysicalFolder Parent => this._parent;
 
-#endregion
+      #endregion
 
-#region Implementation of IFolder
+      #region Implementation of IFolder
 
-      public IEnumerable<IFileSystemItem> Items => _EnumeratePoolDirectory(this._physical, this._drive, this);
+      public IEnumerable<IPhysicalFileSystemItem> Items => _EnumeratePoolDirectory(this._physical, this._drive, this);
       public IVolume Drive => this._drive;
 
-#endregion
+      #endregion
 
     }
 
-    [DebuggerDisplay("{" + nameof(Name) + "}")]
-    private class File : IFile {
+    [DebuggerDisplay("{" + nameof(FullName) + "}")]
+    private class PhysicalFile : IPhysicalFile {
 
-      private readonly Folder _parent;
+      private readonly PhysicalFolder _parent;
 
-      public File(FileInfo physical, Folder parent, bool isShadowCopy) {
+      public PhysicalFile(FileInfo physical, PhysicalFolder parent, bool isShadowCopy) {
         this.Source = physical ?? throw new ArgumentNullException(nameof(physical));
         this._parent = parent;
         this.IsShadowCopy = isShadowCopy;
       }
 
-#region Implementation of IFileSystemItem
+      #region Implementation of IFileSystemItem
 
       public FileInfo Source { get; }
       public string Name => this.Source.Name;
       public string FullName => this.Parent == null ? this.Name : Path.Combine(this.Parent.FullName, this.Name);
-      public IFolder Parent => this._parent;
+      public IPhysicalFolder Parent => this._parent;
 
-#endregion
+      #endregion
 
-#region Implementation of IFile
+      #region Implementation of IFile
 
       public bool IsShadowCopy { get; }
 
@@ -370,28 +404,251 @@ namespace DivisonM {
       public ulong Size => (ulong) this.Source.Length;
 
       [DebuggerHidden]
-      private string _FormatSize => FormatSize(this.Size);
+      private string _FormatSize => SizeFormatter.Format(this.Size);
 
       public bool ExistsOnDrive(IVolume volume) => _ExistsOnDrive(this, (Volume) volume);
       public void CopyToDrive(IVolume targetDrive, bool asPrimary) => _CopyToDrive(this, (Volume) targetDrive, asPrimary);
       public void MoveToDrive(IVolume targetDrive) => _MoveToDrive(this, (Volume) targetDrive);
 
-#endregion
+      #endregion
     }
 
-#endregion
+    [DebuggerDisplay("{" + nameof(FullName) + "}")]
+    private class Folder : IFolder {
+      private readonly MountPoint _mountpoint;
+      private readonly Folder _parent;
 
-    private static void _CopyToDrive(File file, Volume targetDrive, bool asPrimary) {
-      var sourceFile = file.Source;
+      public Folder(MountPoint mountpoint, string fullName) {
+        this._mountpoint = mountpoint;
+        this.FullName = fullName;
+        this._parent = _GetParentFolder(fullName,mountpoint);
+      }
+      
+      #region Implementation of IFileSystemItem
+
+      public string Name => Path.GetFileName(this.FullName);
+    
+      public string FullName { get; }
+
+      public IFolder Parent => this._parent;
+
+      #endregion
+
+      #region Implementation of IFolder
+
+      public IEnumerable<IFileSystemItem> Items => _EnumerateItems(this._mountpoint, this.FullName, SearchOption.TopDirectoryOnly);
+
+      #endregion
+    }
+
+    [DebuggerDisplay("{" + nameof(FullName) + "}")]
+    private class File : IFile {
+      public readonly MountPoint mountpoint;
+      private readonly Folder _parent;
+
+      public File(MountPoint mountpoint, string fullName) {
+        this.mountpoint = mountpoint;
+        this.FullName = fullName;
+        this._parent = _GetParentFolder(fullName, mountpoint);
+      }
+
+      public string ShadowCopyFullName => Path.Combine(this._parent?.FullName ?? string.Empty, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, this.Name);
+
+      #region Implementation of IFileSystemItem
+
+      public string Name => Path.GetFileName(this.FullName);
+
+      public string FullName { get; }
+
+      public IFolder Parent => this._parent;
+
+      #endregion
+
+      #region Implementation of IFile
+
+      public ulong Size => _GetFileSize(this);
+
+      public IVolume Primary => this.Primaries.FirstOrDefault();
+
+      public IEnumerable<IVolume> Primaries => _GetPrimaryFileLocations(this).Select(t=>t.volume);
+
+      public IVolume ShadowCopy => this.ShadowCopies.FirstOrDefault();
+
+      public IEnumerable<IVolume> ShadowCopies => _GetShadowCopyFileLocations(this).Select(t => t.volume);
+
+      #endregion
+    }
+
+    #endregion
+
+    private static void _FixMissingPrimaries(MountPoint mountPoint) {
+      Logger("Promoting shadow-copies when primaries are missing where needed");
+      var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().Where(f => f.Primary == null);
+      foreach (var file in files) {
+        var volume = (Volume)file.ShadowCopy;
+        Logger($@" - Promoting shadow-copy file {file.FullName} to primary from {volume.Name}, {SizeFormatter.Format(file.Size)}");
+        _SetPrimary(file, volume);
+      }
+    }
+
+    private static void _FixMissingShadowCopies(MountPoint mountPoint) {
+      Logger("Restoring shadow-copies from primaries where needed");
+      var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().Where(f => f.ShadowCopy == null);
+      foreach (var file in files) {
+        var volume = mountPoint.volumes.OrderByDescending(v => v.BytesFree).First(v => (Volume)file.Primary != v);
+        Logger($@" - Restoring shadow-copy file {file.FullName} from {file.Primary.Name}, {SizeFormatter.Format(file.Size)} to {volume.Name}");
+        _SetShadow(file, volume);
+      }
+    }
+
+    private static void _SetPrimary(File file, Volume targetDrive) {
+      if (file == null)
+        throw new ArgumentNullException(nameof(file));
+      if (targetDrive == null)
+        throw new ArgumentNullException(nameof(targetDrive));
+
+      var target = targetDrive.Root.File(file.FullName);
+      var targetTempFileName = target.FullName + "." + DriveBenderConstants.TEMP_EXTENSION;
+      _TryDelete(targetTempFileName);
+
+      var primaryFileLocation =  _GetPrimaryFileLocation(file);
+      var currentPrimaryVolume = primaryFileLocation.volume;
+      var shadowCopyFileLocation = _GetShadowCopyFileLocation(file);
+      var currentShadowVolume = shadowCopyFileLocation.volume;
+
+      // if target already primary - nothing to do
+      if (targetDrive == currentPrimaryVolume)
+        return;
+
+      // target is shadow
+      if (targetDrive == currentShadowVolume) {
+        var problemAfterRename = false;
+        var hasPrimaryLocation = currentPrimaryVolume != null;
+        try {
+
+          // rename from shadow
+          _Rename(shadowCopyFileLocation.file.FullName, target.FullName);
+          problemAfterRename = true;
+          if (hasPrimaryLocation) {
+
+            // rename old primary to a shadow - effectively switching volumes
+            _Rename(primaryFileLocation.file.FullName, currentPrimaryVolume.Root.File(file.ShadowCopyFullName).FullName);
+          }
+
+          problemAfterRename = false;
+        } finally {
+          if (problemAfterRename && hasPrimaryLocation)
+            _Rename(target.FullName, shadowCopyFileLocation.file.FullName);
+        }
+
+        return;
+      }
+
+      var hasPrimary = currentPrimaryVolume != null;
+      var source = hasPrimary ? primaryFileLocation.file : shadowCopyFileLocation.file;
+
+      var problemAfterSecondPrimary = false;
+      try {
+        _Copy(source.FullName, targetTempFileName);
+        _Rename(targetTempFileName, target.FullName);
+        problemAfterSecondPrimary = true;
+
+        if (hasPrimary)
+          _TryDelete(primaryFileLocation.file.FullName);
+
+        problemAfterSecondPrimary = false;
+      } finally {
+        _TryDelete(targetTempFileName);
+
+        if (problemAfterSecondPrimary && hasPrimary)
+          _TryDelete(target.FullName);
+      }
+    }
+
+    private static void _SetShadow(File file, Volume targetDrive) {
+      if (file == null)
+        throw new ArgumentNullException(nameof(file));
+      if (targetDrive == null)
+        throw new ArgumentNullException(nameof(targetDrive));
+
+      var target = targetDrive.Root.File(file.ShadowCopyFullName);
+      var targetTempFileName = target.FullName + "." + DriveBenderConstants.TEMP_EXTENSION;
+      _TryDelete(targetTempFileName);
+
+      var primaryFileLocation = _GetPrimaryFileLocation(file);
+      var currentPrimaryVolume = primaryFileLocation.volume;
+      var shadowCopyFileLocation = _GetShadowCopyFileLocation(file);
+      var currentShadowVolume = shadowCopyFileLocation.volume;
+
+      // if target already shadow - nothing to do
+      if (targetDrive == currentShadowVolume)
+        return;
+
+      // target is primary
+      if (targetDrive == currentPrimaryVolume) {
+        var problemAfterRename = false;
+        var hasShadowLocation = currentShadowVolume != null;
+        try {
+
+          // rename from primary
+          _Rename(primaryFileLocation.file.FullName, target.FullName);
+          problemAfterRename = true;
+          if (hasShadowLocation) {
+
+            // rename old shadow to a primary - effectively switching volumes
+            _Rename(shadowCopyFileLocation.file.FullName, currentShadowVolume.Root.File(file.FullName).FullName);
+          }
+
+          problemAfterRename = false;
+        } finally {
+          if (problemAfterRename && hasShadowLocation)
+            _Rename(target.FullName, primaryFileLocation.file.FullName);
+        }
+
+        return;
+      }
+
+      var hasShadow = currentShadowVolume != null;
+      var source = currentPrimaryVolume != null ? primaryFileLocation.file : shadowCopyFileLocation.file;
+
+      var problemAfterSecondShadow = false;
+      try {
+        _Copy(source.FullName, targetTempFileName);
+        _Rename(targetTempFileName, target.FullName);
+        problemAfterSecondShadow = true;
+
+        if (hasShadow)
+          _TryDelete(shadowCopyFileLocation.file.FullName);
+
+        problemAfterSecondShadow = false;
+      } finally {
+        _TryDelete(targetTempFileName);
+
+        if (problemAfterSecondShadow && hasShadow)
+          _TryDelete(target.FullName);
+      }
+    }
+
+    private static void _Copy(string source, string target) => System.IO.File.Copy(source, target);
+    private static void _Move(string source, string target) => System.IO.File.Move(source, target);
+    private static void _Rename(string source, string target) => _Move(source, target);
+
+    private static void _TryDelete(string fileName) {
+      if (System.IO.File.Exists(fileName))
+        System.IO.File.Delete(fileName);
+    }
+
+    private static void _CopyToDrive(PhysicalFile physicalFile, Volume targetDrive, bool asPrimary) {
+      var sourceFile = physicalFile.Source;
       sourceFile.Refresh();
       if (!sourceFile.Exists)
         return;
 
-      var targetDirectory = targetDrive.Root.Directory(file.Parent?.FullName);
+      var targetDirectory = targetDrive.Root.Directory(physicalFile.Parent?.FullName);
       if (!asPrimary)
         targetDirectory = targetDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
 
-      var targetFile = targetDirectory.File(file.Name);
+      var targetFile = targetDirectory.File(physicalFile.Name);
       var tempFile = targetDirectory.File(targetFile.Name + "." + DriveBenderConstants.TEMP_EXTENSION).FullName;
 
       Trace.WriteLine($"Copying {sourceFile.FullName} to {targetFile}, {sourceFile.Length} Bytes");
@@ -410,18 +667,18 @@ namespace DivisonM {
       }
     }
 
-    private static void _MoveToDrive(File file, Volume targetDrive) {
+    private static void _MoveToDrive(PhysicalFile physicalFile, Volume targetDrive) {
 
-      var sourceFile = file.Source;
+      var sourceFile = physicalFile.Source;
       sourceFile.Refresh();
       if (!sourceFile.Exists)
         return;
 
-      var targetDirectory = targetDrive.Root.Directory(file.Parent?.FullName);
-      if (file.IsShadowCopy)
+      var targetDirectory = targetDrive.Root.Directory(physicalFile.Parent?.FullName);
+      if (physicalFile.IsShadowCopy)
         targetDirectory = targetDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
 
-      var targetFile = targetDirectory.File(file.Name);
+      var targetFile = targetDirectory.File(physicalFile.Name);
       var tempFile = targetDirectory.File(targetFile.Name + "." + DriveBenderConstants.TEMP_EXTENSION).FullName;
 
       Trace.WriteLine($"Moving {sourceFile.FullName} to {targetFile}, {sourceFile.Length} Bytes");
@@ -460,8 +717,8 @@ namespace DivisonM {
       }
     }
 
-    private static bool _ExistsOnDrive(File file, Volume volume) {
-      var fullName = file.FullName;
+    private static bool _ExistsOnDrive(PhysicalFile physicalFile, Volume volume) {
+      var fullName = physicalFile.FullName;
       var parentDirectoryName = Path.GetDirectoryName(fullName);
       var fileNameOnly = Path.GetFileName(fullName);
       if (fileNameOnly == null)
@@ -516,16 +773,16 @@ namespace DivisonM {
           continue;
         }
 
-        if (results.Count>0)
-          foreach(var result in results)
+        if (results.Count > 0)
+          foreach (var result in results)
             yield return result;
       }
     }
 
-    private static IEnumerable<IFileSystemItem> _EnumeratePoolDirectory(DirectoryInfo di, Volume drive, Folder parent) {
+    private static IEnumerable<IPhysicalFileSystemItem> _EnumeratePoolDirectory(DirectoryInfo di, Volume drive, PhysicalFolder parent) {
       foreach (var item in di.EnumerateFileSystemInfos()) {
         if (item is FileInfo f) {
-          yield return new File(f, parent, false);
+          yield return new PhysicalFile(f, parent, false);
           continue;
         }
 
@@ -534,30 +791,136 @@ namespace DivisonM {
 
         if (string.Equals(folder.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase)) {
           foreach (var file in folder.EnumerateFiles())
-            yield return new File(file, parent, true);
+            yield return new PhysicalFile(file, parent, true);
 
           continue;
         }
 
-        yield return new Folder(drive, folder, parent);
+        yield return new PhysicalFolder(drive, folder, parent);
       }
     }
 
-    internal static string FormatSize(ulong size) {
-      const double factor = 1.5;
-      const ulong KiB = 1024;
-      const ulong MiB = KiB * 1024;
-      const ulong GiB = MiB * 1024;
-      const ulong TiB = GiB * 1024;
-      const ulong PiB = TiB * 1024;
-      const ulong EiB = PiB * 1024;
+    private static IEnumerable<IFileSystemItem> _EnumerateItems(MountPoint mountpoint, string path, SearchOption searchOption) {
+      var alreadySeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-      foreach (var (d, t) in new[] {(EiB, "EiB"), (PiB, "PiB"), (TiB, "TiB"), (GiB, "GiB"), (MiB, "MiB"), (KiB, "KiB")})
-        if (size / factor >= d)
-          return $"{((double) size / d):0.#}{t}";
+      var queue=new Queue<string>();
+      queue.Enqueue(path);
 
-      return $"{size:format}B";
+      var recursive = searchOption == SearchOption.AllDirectories;
+      do {
+        path = queue.Dequeue();
+        alreadySeen.Clear();
+
+        // return primaries first
+        foreach (var volume in mountpoint.volumes) {
+          var primaryDirectory = volume.Root.Directory(path);
+          if(!primaryDirectory.Exists)
+            continue;
+
+          IEnumerable<FileSystemInfo> fileSystemInfos;
+          try {
+            fileSystemInfos = primaryDirectory.EnumerateFileSystemInfos();
+          } catch (UnauthorizedAccessException) {
+            
+            // ignore inaccessible paths
+            continue;
+          }
+
+          foreach (var item in fileSystemInfos) {
+            if (string.Equals(item.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
+              continue;
+            if (alreadySeen.Contains(item.Name))
+              continue;
+
+            alreadySeen.Add(item.Name);
+            var fullName = Path.Combine(path, item.Name);
+
+            switch (item) {
+              case FileInfo _:
+                yield return new File(mountpoint, fullName);
+                break;
+              case DirectoryInfo _:
+                yield return new Folder(mountpoint, fullName);
+                queue.Enqueue(fullName);
+                break;
+            }
+          }
+        }
+
+        // search for shadow copies without primary
+        foreach (var volume in mountpoint.volumes) {
+          var primaryDirectory = volume.Root.Directory(path);
+          var shadowDirectory = primaryDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+
+          if(!shadowDirectory.Exists)
+            continue;
+
+          IEnumerable<FileInfo> fileInfos;
+          try {
+            fileInfos = primaryDirectory.EnumerateFiles();
+          } catch (UnauthorizedAccessException) {
+
+            // ignore inaccessible paths
+            continue;
+          }
+
+          foreach (var file in fileInfos) {
+            if (string.Equals(file.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
+              continue;
+            if (alreadySeen.Contains(file.Name))
+              continue;
+
+            alreadySeen.Add(file.Name);
+
+            yield return new File(mountpoint, Path.Combine(path, file.Name));
+          }
+        }
+
+      } while (queue.Count > 0 && recursive);
     }
 
+    private static (Volume volume,FileInfo file) _GetPrimaryFileLocation(File file) 
+      => _GetPrimaryFileLocations(file).FirstOrDefault()
+    ;
+
+    private static IEnumerable<(Volume volume, FileInfo file)> _GetPrimaryFileLocations(File file) {
+      var fullname = file.FullName;
+      foreach (var volume in file.mountpoint.volumes) {
+        var current = _GetFileIfExists(volume, fullname);
+        if (current != null)
+          yield return (volume, current);
+      }
+    }
+
+    private static (Volume volume, FileInfo file) _GetShadowCopyFileLocation(File file)
+      => _GetShadowCopyFileLocations(file).FirstOrDefault()
+    ;
+
+    private static IEnumerable<(Volume volume, FileInfo file)> _GetShadowCopyFileLocations(File file) {
+      var fullname = file.ShadowCopyFullName;
+      foreach (var volume in file.mountpoint.volumes) {
+        var current = _GetFileIfExists(volume, fullname);
+        if (current != null)
+          yield return (volume, current);
+      }
+    }
+
+    private static FileInfo _GetFileIfExists(Volume volume, string fullName) {
+      var fileInfo = volume.Root.File(fullName);
+      return fileInfo.Exists ? fileInfo : null;
+    }
+
+    private static Folder _GetParentFolder(string fullName, MountPoint mountpoint) {
+      var parent = Path.GetDirectoryName(fullName);
+      if (parent.IsNullOrEmpty())
+        return null;
+
+      return new Folder(mountpoint, parent);
+    }
+
+    private static ulong _GetFileSize(File file) 
+      => (ulong) (_GetPrimaryFileLocation(file).file?.Length ?? _GetShadowCopyFileLocation(file).file?.Length ?? throw new FileNotFoundException("File missing in pool", file.FullName))
+    ;
+    
   }
 }

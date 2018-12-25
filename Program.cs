@@ -1,10 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using DivisonM;
 
-namespace DriveBensderUtility {
+namespace DriveBenderUtility {
   internal class Program {
     private static void Main(string[] args) {
       var mountPoints = DriveBender.DetectedMountPoints;
@@ -16,16 +17,23 @@ namespace DriveBensderUtility {
 
       Console.WriteLine();
 
-      var items = mountPoint.GetItems("Movies", SearchOption.AllDirectories).OrderBy(d=>d.FullName).Select(d=>$"{d.FullName}({(d is DriveBender.IFile file?DriveBender.FormatSize(file.Size):string.Empty)},{d.Parent.Drive.Name})").ToArray();
-      
+      Func<DriveBender.IFileSystemItem, string> formatter = d => 
+        d is DriveBender.IFile file
+          ?$"{d.FullName}{($" ({DriveBender.SizeFormatter.Format(file.Size)}, {(file.Primary != null ? $"{(file.Primaries.Count()<2?"Primary": "Primaries")} on {string.Join(", ", file.Primaries.Select(i=>i.Name))}" : "Missing primary")}, {(file.ShadowCopy != null ? $"{(file.ShadowCopies.Count()<2 ?"Shadow-Copy":"Shadow-Copies")} on {string.Join(", ",file.ShadowCopies.Select(i=>i.Name))}" : "Missing shadow copy")})")}"
+          :$"[{d.FullName}]"
+        ;
+      var items = mountPoint.GetItems("Movies",SearchOption.AllDirectories).OrderBy(d=>d is DriveBender.IFile).ThenBy(d=>d.FullName).Select(formatter).ToArray();
 
-      DriveBender.Logger($"Pool:{mountPoint.Name}({mountPoint.Description}) [{string.Join(", ", mountPoint.Volumes.Select(d=>d.Name))}]");
+      var filesWithoutShadowCopy = mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>().Where(f => f.ShadowCopy == null).OrderBy(d => d.FullName).Select(formatter).ToArray();
+      var filesWithoutPrimary = mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>().Where(f => f.Primary == null).OrderBy(d => d.FullName).Select(formatter).ToArray();
+      var filesWithDuplicateShadowCopy=mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>().Where(f => f.ShadowCopies.Count()>1).OrderBy(d => d.FullName).Select(formatter).ToArray();
+      var filesWithDuplicatePrimary = mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>().Where(f => f.Primaries.Count() > 1).OrderBy(d => d.FullName).Select(formatter).ToArray();
 
-      DriveBender.Logger("Restoring primaries from doubles where needed");
-      mountPoint.RestoreMissingPrimaries();
+      DriveBender.Logger($"Pool:{mountPoint.Name}({mountPoint.Description}) [{string.Join(", ", mountPoint.Volumes.Select(d => d.Name))}]");
 
-      DriveBender.Logger("Restoring doubles from primaries where needed");
-      mountPoint.CreateMissingShadowCopies();
+      mountPoint.FixMissingPrimaries();
+      mountPoint.FixMissingShadowCopies();
+      Debugger.Break();
 
       //_DeleteFilesAlsoOnPool(new DirectoryInfo(@"A:\{94C96B74-F849-4D1F-BCEE-0C18A66EFFFC}"), pool);
 
@@ -45,11 +53,11 @@ namespace DriveBensderUtility {
       }
     }
 
-    private static IEnumerable<Tuple<FileInfo, DriveBender.IFile[]>> _FilesAlsoOnPool(DirectoryInfo root, DriveBender.IMountPoint mountPoint) {
-      var poolFiles = new Dictionary<string, List<DriveBender.IFile>>(StringComparer.OrdinalIgnoreCase);
+    private static IEnumerable<Tuple<FileInfo, DriveBender.IPhysicalFile[]>> _FilesAlsoOnPool(DirectoryInfo root, DriveBender.IMountPoint mountPoint) {
+      var poolFiles = new Dictionary<string, List<DriveBender.IPhysicalFile>>(StringComparer.OrdinalIgnoreCase);
       foreach (var volume in mountPoint.Volumes)
         foreach (var file in volume.Items.EnumerateFiles(true))
-          poolFiles.GetOrAdd(file.FullName, _ => new List<DriveBender.IFile>()).Add(file);
+          poolFiles.GetOrAdd(file.FullName, _ => new List<DriveBender.IPhysicalFile>()).Add(file);
 
       var length = root.FullName.Length;
       foreach (var file in root.EnumerateFiles("*.*", SearchOption.AllDirectories)) {

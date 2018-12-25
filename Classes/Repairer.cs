@@ -11,9 +11,9 @@ namespace DivisonM {
       /// </summary>
       /// <param name="mountPoint">The pool.</param>
       /// <returns></returns>
-      private static IEnumerable<IFile> _ShadowCopiesWithoutPrimary(IMountPoint mountPoint) {
-        var primaries = new Dictionary<string, IFile>(StringComparer.OrdinalIgnoreCase);
-        var shadows = new Dictionary<string, IFile>(StringComparer.OrdinalIgnoreCase);
+      private static IEnumerable<IPhysicalFile> _ShadowCopiesWithoutPrimary(IMountPoint mountPoint) {
+        var primaries = new Dictionary<string, IPhysicalFile>(StringComparer.OrdinalIgnoreCase);
+        var shadows = new Dictionary<string, IPhysicalFile>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in mountPoint.Volumes.SelectMany(drive => drive.Items.EnumerateFiles(true)))
           if (file.IsShadowCopy)
             shadows.TryAdd(file.FullName, file);
@@ -34,9 +34,9 @@ namespace DivisonM {
       /// </summary>
       /// <param name="mountPoint">The pool.</param>
       /// <returns></returns>
-      private static IEnumerable<IFile> _PrimariesWithoutShadowCopy(IMountPoint mountPoint) {
-        var primaries = new Dictionary<string, IFile>(StringComparer.OrdinalIgnoreCase);
-        var shadows = new Dictionary<string, IFile>(StringComparer.OrdinalIgnoreCase);
+      private static IEnumerable<IPhysicalFile> _PrimariesWithoutShadowCopy(IMountPoint mountPoint) {
+        var primaries = new Dictionary<string, IPhysicalFile>(StringComparer.OrdinalIgnoreCase);
+        var shadows = new Dictionary<string, IPhysicalFile>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in mountPoint.Volumes.SelectMany(drive => drive.Items.EnumerateFiles(true)))
           if (file.IsShadowCopy)
             shadows.TryAdd(file.FullName, file);
@@ -51,30 +51,7 @@ namespace DivisonM {
           select kvp.Value
           ;
       }
-
-      public void RestoreMissingPrimaries() {
-        var pool = this;
-        foreach (var file in _ShadowCopiesWithoutPrimary(pool)) {
-          var target = pool.Volumes.OrderByDescending(d => d.BytesFree).FirstOrDefault(d => !file.ExistsOnDrive(d));
-          if (target == null)
-            continue;
-
-          Logger($@" - Restoring primary file {file.FullName} from {file.Source.Directory?.Root.Name}, {FormatSize(file.Size)} to {target.Name}");
-          file.CopyToDrive(target, true);
-        }
-      }
-
-      public void CreateMissingShadowCopies() {
-        var pool = this;
-        foreach (var file in _PrimariesWithoutShadowCopy(pool)) {
-          var target = pool.Volumes.OrderByDescending(d => d.BytesFree).FirstOrDefault(d => !file.ExistsOnDrive(d));
-          if(target==null)
-            continue;
-
-          Logger($@" - Restoring shadow file {file.FullName} from {file.Source.Directory?.Root.Name}, {FormatSize(file.Size)} to {target.Name}");
-          file.CopyToDrive(target, false);
-        }
-      }
+      
     }
   }
 }

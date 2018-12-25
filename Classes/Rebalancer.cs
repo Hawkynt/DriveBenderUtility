@@ -19,15 +19,15 @@ namespace DivisonM {
         foreach (var drive in drives.OrderBy(i => i.Name))
           Logger(
             $@" + Drive {drive.Name} {drive.BytesUsed * 100f / drive.BytesTotal:0.#}% ({
-                FormatSize(drive.BytesUsed)} used, {
-                FormatSize(drive.BytesFree)} free, {
-                FormatSize(drive.BytesTotal)} total)");
+                SizeFormatter.Format(drive.BytesUsed)} used, {
+                SizeFormatter.Format(drive.BytesFree)} free, {
+                SizeFormatter.Format(drive.BytesTotal)} total)");
 
         var avgBytesFree = drives.Sum(i => drivesWithSpaceFree[i]) / (ulong) drives.Length;
-        Logger($" * Average free {FormatSize(avgBytesFree)}");
+        Logger($" * Average free {SizeFormatter.Format(avgBytesFree)}");
 
         const ulong MIN_BYTES_DIFFERENCE_BEFORE_ACTING = 2 * 1024 * 1024UL;
-        Logger($" * Difference per drive before balancing {FormatSize(MIN_BYTES_DIFFERENCE_BEFORE_ACTING)}");
+        Logger($" * Difference per drive before balancing {SizeFormatter.Format(MIN_BYTES_DIFFERENCE_BEFORE_ACTING)}");
 
         if (avgBytesFree < MIN_BYTES_DIFFERENCE_BEFORE_ACTING)
           return;
@@ -99,7 +99,7 @@ namespace DivisonM {
             }
 
             // move file to target drive
-            Logger($" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {FormatSize(fileSize)}");
+            Logger($" - Moving file {fileToMove.FullName} from {sourceDrive.Name} to {targetDrive.Name}, {SizeFormatter.Format(fileSize)}");
             fileToMove.MoveToDrive(targetDrive);
 
             drivesWithSpaceFree[targetDrive] -= fileSize;
