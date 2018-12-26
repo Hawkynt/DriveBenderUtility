@@ -31,6 +31,7 @@ namespace DriveBenderUtility {
 
       DriveBender.Logger($"Pool:{mountPoint.Name}({mountPoint.Description}) [{string.Join(", ", mountPoint.Volumes.Select(d => d.Name))}]");
 
+      mountPoint.FixDuplicatePrimaries();
       mountPoint.FixMissingPrimaries();
       mountPoint.FixMissingShadowCopies();
       

@@ -85,7 +85,7 @@ namespace DivisonM {
           if (size / factor >= d)
             return $"{((double)size / d):0.#}{t}";
 
-        return $"{size:format}B";
+        return $"{size}B";
       }
     }
 
@@ -173,6 +173,7 @@ namespace DivisonM {
       IEnumerable<IFileSystemItem> GetItems(SearchOption searchOption);
       void FixMissingShadowCopies();
       void FixMissingPrimaries();
+      void FixDuplicatePrimaries();
     }
 
     // ReSharper restore UnusedMember.Global
@@ -246,6 +247,7 @@ namespace DivisonM {
 
       public void FixMissingShadowCopies() => _FixMissingShadowCopies(this);
       public void FixMissingPrimaries() => _FixMissingPrimaries(this);
+      public void FixDuplicatePrimaries() => _FixDuplicatePrimaries(this);
 
       #endregion
 
@@ -482,6 +484,23 @@ namespace DivisonM {
     }
 
     #endregion
+
+    private static void _FixDuplicatePrimaries(MountPoint mountPoint) {
+      Logger("Removing duplicate primaries when both have equal content");
+      var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().Where(f => f.Primaries.Count()>1);
+      foreach (var file in files) {
+        var primaries = _GetPrimaryFileLocations(file).ToArray();
+        var first = primaries[0].file;
+        for (var i = 1; i < primaries.Length; ++i) {
+          var current = primaries[i].file;
+          if (!first.IsContentEqualTo(current))
+            continue;
+
+          Logger($@" - Deleting redundant primary {current.FullName} from {primaries[i].volume.Name}, {SizeFormatter.Format(file.Size)}");
+          _TryDelete(current.FullName);
+        }
+      }
+    }
 
     private static void _FixMissingPrimaries(MountPoint mountPoint) {
       Logger("Promoting shadow-copies when primaries are missing where needed");
