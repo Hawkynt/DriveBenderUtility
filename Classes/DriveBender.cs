@@ -111,6 +111,7 @@ namespace DivisonM {
 
     public interface IFolder : IFileSystemItem {
       IEnumerable<IFileSystemItem> Items { get; }
+      ulong Size { get; }
     }
 
     public interface IFile : IFileSystemItem {
@@ -289,7 +290,7 @@ namespace DivisonM {
       public IEnumerable<IPhysicalFileSystemItem> Items => _EnumeratePoolDirectory(this.Root, this, null);
       public IMountPoint MountPoint { get; }
       public string Label { get; }
-      public string Name => this.Root.Parent?.Name;
+      public string Name => this.Root.Parent?.Name.TrimEnd('\\','/');
       public string Description { get; }
       public Guid Id { get; }
 
@@ -431,6 +432,7 @@ namespace DivisonM {
       public string FullName { get; }
 
       public IFolder Parent => this._parent;
+      public ulong Size => this.Items.OfType<File>().Sum(f => f.Size);
 
       #endregion
 
@@ -857,7 +859,7 @@ namespace DivisonM {
 
           IEnumerable<FileInfo> fileInfos;
           try {
-            fileInfos = primaryDirectory.EnumerateFiles();
+            fileInfos = shadowDirectory.EnumerateFiles();
           } catch (UnauthorizedAccessException) {
 
             // ignore inaccessible paths
