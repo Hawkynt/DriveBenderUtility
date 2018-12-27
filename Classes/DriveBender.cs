@@ -173,6 +173,7 @@ namespace DivisonM {
       IEnumerable<IFileSystemItem> GetItems(SearchOption searchOption);
       void FixMissingShadowCopies();
       void FixMissingPrimaries();
+      void FixDuplicateShadowCopies();
       void FixDuplicatePrimaries();
     }
 
@@ -247,6 +248,7 @@ namespace DivisonM {
 
       public void FixMissingShadowCopies() => _FixMissingShadowCopies(this);
       public void FixMissingPrimaries() => _FixMissingPrimaries(this);
+      public void FixDuplicateShadowCopies() => _FixDuplicateShadowCopies(this);
       public void FixDuplicatePrimaries() => _FixDuplicatePrimaries(this);
 
       #endregion
@@ -489,14 +491,31 @@ namespace DivisonM {
       Logger("Removing duplicate primaries when both have equal content");
       var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().Where(f => f.Primaries.Count()>1);
       foreach (var file in files) {
-        var primaries = _GetPrimaryFileLocations(file).ToArray();
-        var first = primaries[0].file;
-        for (var i = 1; i < primaries.Length; ++i) {
-          var current = primaries[i].file;
+        var locations = _GetPrimaryFileLocations(file).ToArray();
+        var first = locations[0].file;
+        for (var i = 1; i < locations.Length; ++i) {
+          var current = locations[i].file;
           if (!first.IsContentEqualTo(current))
             continue;
 
-          Logger($@" - Deleting redundant primary {current.FullName} from {primaries[i].volume.Name}, {SizeFormatter.Format(file.Size)}");
+          Logger($@" - Deleting redundant primary {current.FullName} from {locations[i].volume.Name}, {SizeFormatter.Format(file.Size)}");
+          _TryDelete(current.FullName);
+        }
+      }
+    }
+
+    private static void _FixDuplicateShadowCopies(MountPoint mountPoint) {
+      Logger("Removing duplicate shadow-copies when both have equal content");
+      var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().Where(f => f.ShadowCopies.Count() > 1);
+      foreach (var file in files) {
+        var locations = _GetShadowCopyFileLocations(file).ToArray();
+        var first = locations[0].file;
+        for (var i = 1; i < locations.Length; ++i) {
+          var current = locations[i].file;
+          if (!first.IsContentEqualTo(current))
+            continue;
+
+          Logger($@" - Deleting redundant shadow-copy {current.FullName} from {locations[i].volume.Name}, {SizeFormatter.Format(file.Size)}");
           _TryDelete(current.FullName);
         }
       }
