@@ -867,19 +867,23 @@ namespace DivisonM {
           }
 
           foreach (var item in fileSystemInfos) {
-            if (string.Equals(item.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
-              continue;
             if (alreadySeen.Contains(item.Name))
               continue;
-
+            
             alreadySeen.Add(item.Name);
             var fullName = Path.Combine(path, item.Name);
 
             switch (item) {
               case FileInfo _:
+                if (item.Name.EndsWith(DriveBenderConstants.TEMP_EXTENSION, StringComparison.OrdinalIgnoreCase))
+                  continue;
+
                 yield return new File(mountpoint, fullName);
                 break;
               case DirectoryInfo _:
+                if (string.Equals(item.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
+                  continue;
+
                 yield return new Folder(mountpoint, fullName);
                 queue.Enqueue(fullName);
                 break;
@@ -905,12 +909,15 @@ namespace DivisonM {
           }
 
           foreach (var file in fileInfos) {
-            if (string.Equals(file.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
-              continue;
             if (alreadySeen.Contains(file.Name))
               continue;
 
             alreadySeen.Add(file.Name);
+
+            if (string.Equals(file.Name, DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
+              continue;
+            if (file.Name.EndsWith(DriveBenderConstants.TEMP_EXTENSION, StringComparison.OrdinalIgnoreCase))
+              continue;
 
             yield return new File(mountpoint, Path.Combine(path, file.Name));
           }
