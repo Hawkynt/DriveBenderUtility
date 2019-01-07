@@ -83,7 +83,7 @@ namespace DriveBenderUtility {
 
       // find all nfo without video
       var count = 0;
-      foreach (var nfo in hash.Keys.Where(i => Path.GetExtension(i) == ".nfo" && Path.GetFileNameWithoutExtension(i) != "tvshow").OrderBy(i => i))
+      foreach (var nfo in hash.Keys.Where(i => Path.GetExtension(i) == ".nfo" && Path.GetFileNameWithoutExtension(i) != "tvshow").OrderBy(i => hash[i].Parent?.FullName).ThenBy(i=>hash[i].Name))
         if (!(
           hash.ContainsKey(Path.ChangeExtension(nfo, ".mkv"))
           || hash.ContainsKey(Path.ChangeExtension(nfo, ".avi"))
