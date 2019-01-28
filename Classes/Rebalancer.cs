@@ -9,11 +9,11 @@ namespace DivisonM {
       /// Rebalances files on pool to ensure a good average across all drives.
       /// </summary>
       public void Rebalance() {
-        var pool = this;
+        var mountPoint = this;
 
-        Logger($"Pool {pool.Name}({pool.Description})");
+        Logger($"Pool {mountPoint.Name}({mountPoint.Description})");
 
-        var drives = pool.Volumes.ToArray();
+        var drives = mountPoint.Volumes.ToArray();
         var drivesWithSpaceFree = drives.ToDictionary(d => d, d => d.BytesFree);
 
         foreach (var drive in drives.OrderBy(i => i.Name))

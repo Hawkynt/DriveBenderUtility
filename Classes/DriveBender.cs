@@ -175,6 +175,7 @@ namespace DivisonM {
       void FixMissingPrimaries();
       void FixDuplicateShadowCopies();
       void FixDuplicatePrimaries();
+      void FixMissingDuplicationOnAllFolders();
     }
 
     // ReSharper restore UnusedMember.Global
@@ -250,6 +251,7 @@ namespace DivisonM {
       public void FixMissingPrimaries() => _FixMissingPrimaries(this);
       public void FixDuplicateShadowCopies() => _FixDuplicateShadowCopies(this);
       public void FixDuplicatePrimaries() => _FixDuplicatePrimaries(this);
+      public void FixMissingDuplicationOnAllFolders() => _FixMissingDuplicationOnAllFolders(this);
 
       #endregion
 
@@ -487,6 +489,22 @@ namespace DivisonM {
 
     #endregion
 
+    private static void _FixMissingDuplicationOnAllFolders(MountPoint mountPoint) {
+      Logger("Enabling duplication on all folders");
+      var folders = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().GroupBy(f=>f.Parent?.FullName??string.Empty).Select(g=>g.Key);
+      var volumes = mountPoint.Volumes;
+      foreach (var folderName in folders) {
+        foreach (Volume volume in volumes) {
+          var path = volume.Root.Directory(folderName).Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+          if(path.Exists)
+            continue;
+
+          Logger($@" - Enabling duplication on {folderName} on {volume.Name}");
+          Directory.CreateDirectory(path.FullName);
+        }
+      }
+    }
+
     private static void _FixDuplicatePrimaries(MountPoint mountPoint) {
       Logger("Removing duplicate primaries when both have equal content");
       var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().Where(f => f.Primaries.Count()>1);
@@ -669,13 +687,25 @@ namespace DivisonM {
       }
     }
 
-    private static void _Copy(string source, string target) => System.IO.File.Copy(source, target);
-    private static void _Move(string source, string target) => System.IO.File.Move(source, target);
-    private static void _Rename(string source, string target) => _Move(source, target);
+    private static void _Copy(string source, string target) {
+      Directory.CreateDirectory(Path.GetDirectoryName(target));
+      System.IO.File.Copy(source, target);
+    }
+
+    private static void _Move(string source, string target) {
+      Directory.CreateDirectory(Path.GetDirectoryName(target));
+      System.IO.File.Move(source, target);
+    }
+
+    private static void _Rename(string source, string target) => System.IO.File.Move(source, target);
 
     private static void _TryDelete(string fileName) {
-      if (System.IO.File.Exists(fileName))
-        System.IO.File.Delete(fileName);
+      var file=new FileInfo(fileName);
+      if (!file.Exists)
+        return;
+
+      file.Attributes &= ~(FileAttributes.ReadOnly | FileAttributes.System | FileAttributes.Hidden);
+      file.Delete();
     }
 
     private static void _CopyToDrive(PhysicalFile physicalFile, Volume targetDrive, bool asPrimary) {
@@ -730,6 +760,7 @@ namespace DivisonM {
           return;
 
         System.IO.File.Move(tempFile, targetFile.FullName);
+        sourceFile.Attributes &= ~(FileAttributes.ReadOnly | FileAttributes.System | FileAttributes.Hidden);
         try {
           sourceFile.Delete();
         } catch (UnauthorizedAccessException) {
