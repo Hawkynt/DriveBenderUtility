@@ -500,7 +500,11 @@ namespace DivisonM {
             continue;
 
           Logger($@" - Enabling duplication on {folderName} on {volume.Name}");
-          Directory.CreateDirectory(path.FullName);
+          try { 
+            Directory.CreateDirectory(path.FullName);
+          } catch (Exception e) {
+            Logger($"[Error]Could not enable duplication: {e.Message}");
+          }
         }
       }
     }
@@ -543,9 +547,13 @@ namespace DivisonM {
       Logger("Promoting shadow-copies when primaries are missing where needed");
       var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().Where(f => f.Primary == null);
       foreach (var file in files) {
-        var volume = (Volume)file.ShadowCopy;
+        var volume = (Volume) file.ShadowCopy;
         Logger($@" - Promoting shadow-copy file {file.FullName} to primary from {volume.Name}, {SizeFormatter.Format(file.Size)}");
-        _SetPrimary(file, volume);
+        try {
+          _SetPrimary(file, volume);
+        } catch (Exception e) {
+          Logger($"[Error]Failed to promote shadow-copy: {e.Message}");
+        }
       }
     }
 
@@ -553,9 +561,25 @@ namespace DivisonM {
       Logger("Restoring shadow-copies from primaries where needed");
       var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().Where(f => f.ShadowCopy == null);
       foreach (var file in files) {
-        var volume = mountPoint.volumes.OrderByDescending(v => v.BytesFree).First(v => (Volume)file.Primary != v);
+        var volume = 
+          mountPoint
+            .volumes
+            .Where(v => (Volume)file.Primary != v)
+            .OrderByDescending(v => v.BytesFree)
+            .FirstOrDefault(v=>v.BytesFree>file.Size)
+          ;
+
+        if (volume == null) {
+          Logger($@"[Warning]Tried restoring shadow-copy file {file.FullName} from {file.Primary.Name}, {SizeFormatter.Format(file.Size)} but not enough space left");
+          continue;
+        }
+
         Logger($@" - Restoring shadow-copy file {file.FullName} from {file.Primary.Name}, {SizeFormatter.Format(file.Size)} to {volume.Name}");
-        _SetShadow(file, volume);
+        try {
+          _SetShadow(file, volume);
+        } catch (Exception e) {
+          Logger($"[Error]Failed to create shadow-copy: {e.Message}");
+        }
       }
     }
 

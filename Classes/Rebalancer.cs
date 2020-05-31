@@ -69,6 +69,7 @@ namespace DivisonM {
               sourceDrive
                 .Items
                 .EnumerateFiles(true)
+                .Where(t=>t.Size>=4096) /* minimum file size before moving file */
                 .OrderByDescending(t => t.Size)
                 .ToList()
             ;

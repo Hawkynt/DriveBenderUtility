@@ -105,5 +105,5 @@
   <Target Name="AfterBuild">
   </Target>
   -->
-  <Import Project="..\..\VersionSpecificSymbols.Common.prop" />
+  <Import Project="..\..\Framework\VersionSpecificSymbols.Common.prop" />
 </Project>
