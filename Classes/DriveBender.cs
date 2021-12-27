@@ -517,10 +517,13 @@ namespace DivisonM {
         var first = locations[0].file;
         for (var i = 1; i < locations.Length; ++i) {
           var current = locations[i].file;
-          if (!first.IsContentEqualTo(current))
+          Logger($@"  ! Comparing primaries {file.FullName} from {locations[0].volume.Name} and {locations[i].volume.Name}, possibly a duplicate");
+          if (!first.IsContentEqualTo(current)) {
+            Logger($@"  !!! WARNING: Different File content for {file.FullName} from {locations[0].volume.Name} and {locations[i].volume.Name}");
             continue;
+          }
 
-          Logger($@" - Deleting redundant primary {current.FullName} from {locations[i].volume.Name}, {SizeFormatter.Format(file.Size)}");
+          Logger($@" - Deleting redundant primary {file.FullName} from {locations[i].volume.Name}, {SizeFormatter.Format(file.Size)}");
           _TryDelete(current.FullName);
         }
       }
@@ -534,10 +537,13 @@ namespace DivisonM {
         var first = locations[0].file;
         for (var i = 1; i < locations.Length; ++i) {
           var current = locations[i].file;
-          if (!first.IsContentEqualTo(current))
+          Logger($@"  ! Comparing shadow-copies {file.FullName} from {locations[0].volume.Name} and {locations[i].volume.Name}, possibly a duplicate");
+          if (!first.IsContentEqualTo(current)) {
+            Logger($@"  !!! WARNING: Different File content for {file.FullName} from {locations[0].volume.Name} and {locations[i].volume.Name}");
             continue;
+          }
 
-          Logger($@" - Deleting redundant shadow-copy {current.FullName} from {locations[i].volume.Name}, {SizeFormatter.Format(file.Size)}");
+          Logger($@" - Deleting redundant shadow-copy {file.FullName} from {locations[i].volume.Name}, {SizeFormatter.Format(file.Size)}");
           _TryDelete(current.FullName);
         }
       }
@@ -548,8 +554,12 @@ namespace DivisonM {
       var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<File>().Where(f => f.Primary == null);
       foreach (var file in files) {
         var volume = (Volume) file.ShadowCopy;
-        Logger($@" - Promoting shadow-copy file {file.FullName} to primary from {volume.Name}, {SizeFormatter.Format(file.Size)}");
+        if (volume == null) {
+          Logger($@"[Warning]Tried restoring primary file {file.FullName}, but file is already gone");
+          continue;
+        }
         try {
+          Logger($@" - Promoting shadow-copy file {file.FullName} to primary from {volume.Name}, {SizeFormatter.Format(file.Size)}");
           _SetPrimary(file, volume);
         } catch (Exception e) {
           Logger($"[Error]Failed to promote shadow-copy: {e.Message}");
@@ -574,8 +584,8 @@ namespace DivisonM {
           continue;
         }
 
-        Logger($@" - Restoring shadow-copy file {file.FullName} from {file.Primary.Name}, {SizeFormatter.Format(file.Size)} to {volume.Name}");
         try {
+          Logger($@" - Restoring shadow-copy file {file.FullName} from {file.Primary.Name}, {SizeFormatter.Format(file.Size)} to {volume.Name}");
           _SetShadow(file, volume);
         } catch (Exception e) {
           Logger($"[Error]Failed to create shadow-copy: {e.Message}");

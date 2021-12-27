@@ -17,34 +17,16 @@ namespace DriveBenderUtility {
 
       Console.WriteLine();
 
-      Func<DriveBender.IFileSystemItem, string> formatter = d => 
-        d is DriveBender.IFile file
-          ?$"{d.FullName} ({DriveBender.SizeFormatter.Format(file.Size)}, {(file.Primary != null ? $"{(file.Primaries.Count()<2?"Primary": "Primaries")} on {string.Join(", ", file.Primaries.Select(i=>i.Name))}" : "Missing primary")}, {(file.ShadowCopy != null ? $"{(file.ShadowCopies.Count()<2 ?"Shadow-Copy":"Shadow-Copies")} on {string.Join(", ",file.ShadowCopies.Select(i=>i.Name))}" : "Missing shadow copy")})"
-          :$"[{d.FullName}] ({DriveBender.SizeFormatter.Format(((DriveBender.IFolder)d).Size)})"
-        ;
-
-      /*
-      Console.WriteLine("Gathering item infos");
-      
-      var items = mountPoint.GetItems("Movies",SearchOption.TopDirectoryOnly).OrderBy(d=>d is DriveBender.IFile).ThenBy(d=>d.FullName).Select(formatter).ToArray();
-
-      var filesWithoutShadowCopy = mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>().Where(f => f.ShadowCopy == null).OrderBy(d => d.FullName).Select(formatter).ToArray();
-      var filesWithoutPrimary = mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>().Where(f => f.Primary == null).OrderBy(d => d.FullName).Select(formatter).ToArray();
-      var filesWithDuplicateShadowCopy=mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>().Where(f => f.ShadowCopies.Count()>1).OrderBy(d => d.FullName).Select(formatter).ToArray();
-      var filesWithDuplicatePrimary = mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>().Where(f => f.Primaries.Count() > 1).OrderBy(d => d.FullName).Select(formatter).ToArray();
-      */
       DriveBender.Logger($"Pool:{mountPoint.Name}({mountPoint.Description}) [{string.Join(", ", mountPoint.Volumes.Select(d => d.Name))}]");
-
+      
       mountPoint.FixMissingDuplicationOnAllFolders();
       mountPoint.FixDuplicatePrimaries();
       mountPoint.FixDuplicateShadowCopies();
       mountPoint.FixMissingPrimaries();
       mountPoint.FixMissingShadowCopies();
 
-      mountPoint.Rebalance();
-
-      //_DeleteFilesAlsoOnPool(new DirectoryInfo(@"A:\{94C96B74-F849-4D1F-BCEE-0C18A66EFFFC}"), pool);
-
+      //mountPoint.Rebalance();
+      
       DriveBender.Logger("NFO files without movie file");
       _FindDeletedMovieFiles(mountPoint);
       
