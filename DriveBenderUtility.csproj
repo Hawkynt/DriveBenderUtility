@@ -51,30 +51,6 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="..\..\Framework\System.Collections.Generic.DictionaryExtensions.cs">
-      <Link>Framework\System.Collections.Generic.DictionaryExtensions.cs</Link>
-    </Compile>
-    <Compile Include="..\..\Framework\System.Collections.Generic.EnumerableExtensions.Statistics.cs">
-      <Link>Framework\System.Collections.Generic.EnumerableExtensions.Statistics.cs</Link>
-      <AutoGen>True</AutoGen>
-      <DesignTime>True</DesignTime>
-      <DependentUpon>System.Collections.Generic.EnumerableExtensions.Statistics.tt</DependentUpon>
-    </Compile>
-    <Compile Include="..\..\Framework\System.Collections.Generic.HashSetExtensions.cs">
-      <Link>Framework\System.Collections.Generic.HashSetExtensions.cs</Link>
-    </Compile>
-    <Compile Include="..\..\Framework\System.IO.DirectoryInfoExtensions.cs">
-      <Link>Framework\System.IO.DirectoryInfoExtensions.cs</Link>
-    </Compile>
-    <Compile Include="..\..\Framework\System.IO.FileInfoExtensions.cs">
-      <Link>Framework\System.IO.FileInfoExtensions.cs</Link>
-      <AutoGen>True</AutoGen>
-      <DesignTime>True</DesignTime>
-      <DependentUpon>System.IO.FileInfoExtensions.tt</DependentUpon>
-    </Compile>
-    <Compile Include="..\..\Framework\System.StringExtensions.cs">
-      <Link>Framework\System.StringExtensions.cs</Link>
-    </Compile>
     <Compile Include="Classes\DriveBender.cs" />
     <Compile Include="Classes\Repairer.cs" />
     <Compile Include="Program.cs" />
@@ -86,20 +62,16 @@
     <None Include="app.manifest" />
   </ItemGroup>
   <ItemGroup>
-    <Content Include="..\..\Framework\System.Collections.Generic.EnumerableExtensions.Statistics.tt">
-      <Link>Framework\System.Collections.Generic.EnumerableExtensions.Statistics.tt</Link>
-      <Generator>TextTemplatingFileGenerator</Generator>
-      <LastGenOutput>System.Collections.Generic.EnumerableExtensions.Statistics.cs</LastGenOutput>
-    </Content>
-    <Content Include="..\..\Framework\System.IO.FileInfoExtensions.tt">
-      <Link>Framework\System.IO.FileInfoExtensions.tt</Link>
-      <Generator>TextTemplatingFileGenerator</Generator>
-      <LastGenOutput>System.IO.FileInfoExtensions.cs</LastGenOutput>
-    </Content>
     <Content Include="app.ico" />
   </ItemGroup>
   <ItemGroup>
     <Service Include="{508349B6-6B84-4DF5-91F0-309BEEBAD82D}" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\Framework\Corlib.Extensions\Corlib.Extensions.csproj">
+      <Project>{7e517d83-164a-4cde-ad91-cce230db290b}</Project>
+      <Name>Corlib.Extensions</Name>
+    </ProjectReference>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
