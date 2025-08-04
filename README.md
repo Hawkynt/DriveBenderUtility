@@ -1,8 +1,10 @@
 # DriveBenderUtility
 
-[![Build](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/Build.yml/badge.svg)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/Build.yml)
-[![Last Commit](https://img.shields.io/github/last-commit/Hawkynt/DriveBenderUtility?branch=master)](https://github.com/Hawkynt/DriveBenderUtility/commits/master)
 ![License](https://img.shields.io/github/license/Hawkynt/DriveBenderUtility)
+![Language](https://img.shields.io/github/languages/top/Hawkynt/DriveBenderUtility?color=purple)
+[![Last Commit](https://img.shields.io/github/last-commit/Hawkynt/DriveBenderUtility?branch=master)![Activity](https://img.shields.io/github/commit-activity/y/Hawkynt/DriveBenderUtility?branch=master)](https://github.com/Hawkynt/DriveBenderUtility/commits/master)
+[![Tests](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/tests.yml/badge.svg)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/tests.yml)
+[![Build](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/Build.yml/badge.svg)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/Build.yml)
 
 ## Overview
 
