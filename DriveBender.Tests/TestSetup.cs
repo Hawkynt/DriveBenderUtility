@@ -10,7 +10,7 @@ namespace DriveBender.Tests {
     [OneTimeSetUp]
     public void GlobalSetup() {
       // Configure global test settings
-      DriveBender.Logger = message => {
+      DivisonM.DriveBender.Logger = message => {
         TestContext.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
       };
       
@@ -23,7 +23,7 @@ namespace DriveBender.Tests {
       TestContext.WriteLine($"Test run completed at: {DateTime.Now}");
       
       // Reset logger to prevent issues with other tests
-      DriveBender.Logger = null;
+      DivisonM.DriveBender.Logger = null;
     }
   }
   

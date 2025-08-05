@@ -14,17 +14,17 @@ namespace DriveBender.Tests.Unit.HappyPath {
   [Category("HappyPath")]
   public class ShadowCopyTests : TestBase {
     
-    private Mock<DriveBender.IMountPoint> _mockMountPoint;
-    private Mock<DriveBender.IVolume> _mockVolume1;
-    private Mock<DriveBender.IVolume> _mockVolume2;
-    private Mock<DriveBender.IFile> _mockFile;
+    private Mock<DivisonM.DriveBender.IMountPoint> _mockMountPoint;
+    private Mock<DivisonM.DriveBender.IVolume> _mockVolume1;
+    private Mock<DivisonM.DriveBender.IVolume> _mockVolume2;
+    private Mock<DivisonM.DriveBender.IFile> _mockFile;
     
     [SetUp]
-    public void SetUp() {
-      _mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      _mockVolume1 = new Mock<DriveBender.IVolume>();
-      _mockVolume2 = new Mock<DriveBender.IVolume>();
-      _mockFile = new Mock<DriveBender.IFile>();
+    public override void SetUp() {
+      _mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      _mockVolume1 = new Mock<DivisonM.DriveBender.IVolume>();
+      _mockVolume2 = new Mock<DivisonM.DriveBender.IVolume>();
+      _mockFile = new Mock<DivisonM.DriveBender.IFile>();
       
       _mockMountPoint.Setup(m => m.Name).Returns("TestPool");
       _mockMountPoint.Setup(m => m.Volumes).Returns(new[] { _mockVolume1.Object, _mockVolume2.Object });
@@ -91,7 +91,7 @@ namespace DriveBender.Tests.Unit.HappyPath {
     [Test]
     public void File_WithMultipleShadowCopies_ShouldTrackAllCopies() {
       // Arrange
-      var additionalVolume = new Mock<DriveBender.IVolume>();
+      var additionalVolume = new Mock<DivisonM.DriveBender.IVolume>();
       additionalVolume.Setup(v => v.Name).Returns("Volume3");
       
       _mockFile.Setup(f => f.ShadowCopies).Returns(new[] { 

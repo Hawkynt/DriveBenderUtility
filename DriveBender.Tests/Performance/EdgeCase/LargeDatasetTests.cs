@@ -18,7 +18,7 @@ namespace DriveBender.Tests.Performance.EdgeCase {
     [Timeout(30000)] // 30 seconds max
     public void IntegrityCheck_WithLargePool_ShouldHandleGracefully() {
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       var largeFileSet = CreateLargeFileSet(10000); // 10,000 files
       
       mockMountPoint.Setup(m => m.GetItems(It.IsAny<System.IO.SearchOption>()))
@@ -39,7 +39,7 @@ namespace DriveBender.Tests.Performance.EdgeCase {
     [Timeout(15000)] // 15 seconds max
     public void DuplicationManager_WithManyVolumes_ShouldScale() {
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       var volumes = CreateManyVolumes(100); // 100 volumes
       
       mockMountPoint.Setup(m => m.Volumes).Returns(volumes);
@@ -143,13 +143,13 @@ namespace DriveBender.Tests.Performance.EdgeCase {
       uniqueNames.Should().HaveCount(5000);
     }
     
-    private IEnumerable<DriveBender.IFile> CreateLargeFileSet(int count) {
-      var files = new List<Mock<DriveBender.IFile>>();
-      var volume = new Mock<DriveBender.IVolume>();
+    private IEnumerable<DivisonM.DriveBender.IFile> CreateLargeFileSet(int count) {
+      var files = new List<Mock<DivisonM.DriveBender.IFile>>();
+      var volume = new Mock<DivisonM.DriveBender.IVolume>();
       volume.Setup(v => v.Name).Returns("LargeVolume");
       
       for (int i = 0; i < count; i++) {
-        var file = new Mock<DriveBender.IFile>();
+        var file = new Mock<DivisonM.DriveBender.IFile>();
         file.Setup(f => f.FullName).Returns($"LargeFile{i}.dat");
         file.Setup(f => f.Size).Returns(ByteSize.FromMegabytes(i % 100 + 1));
         file.Setup(f => f.Primary).Returns(volume.Object);
@@ -159,11 +159,11 @@ namespace DriveBender.Tests.Performance.EdgeCase {
       return files.Select(f => f.Object);
     }
     
-    private IEnumerable<DriveBender.IVolume> CreateManyVolumes(int count) {
-      var volumes = new List<Mock<DriveBender.IVolume>>();
+    private IEnumerable<DivisonM.DriveBender.IVolume> CreateManyVolumes(int count) {
+      var volumes = new List<Mock<DivisonM.DriveBender.IVolume>>();
       
       for (int i = 0; i < count; i++) {
-        var volume = new Mock<DriveBender.IVolume>();
+        var volume = new Mock<DivisonM.DriveBender.IVolume>();
         volume.Setup(v => v.Name).Returns($"Volume{i}");
         volume.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(i % 500 + 10));
         volumes.Add(volume);

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using DivisonM;
 using NUnit.Framework;
@@ -30,17 +31,17 @@ namespace DriveBender.Tests.Unit.Exception {
     [Test]
     public void DuplicationManager_EnableDuplication_WithEmptyFolderPath_ShouldThrowArgumentException() {
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       
       // Act & Assert
       Assert.Throws<ArgumentException>(() => 
-        DuplicationManager.EnableDuplicationOnFolder(mockMountPoint.Object, "", DuplicationLevel.Single));
+        DuplicationManager.EnableDuplicationOnFolder(mockMountPoint.Object, (string)"", 1));
     }
     
     [Test]
     public void DuplicationManager_CreateAdditionalShadowCopy_WithNullFile_ShouldThrowArgumentNullException() {
       // Arrange
-      var mockVolume = new Mock<DriveBender.IVolume>();
+      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
       
       // Act & Assert
       Assert.Throws<ArgumentNullException>(() => 
@@ -50,7 +51,7 @@ namespace DriveBender.Tests.Unit.Exception {
     [Test]
     public void DuplicationManager_CreateAdditionalShadowCopy_WithNullVolume_ShouldThrowArgumentNullException() {
       // Arrange
-      var mockFile = new Mock<DriveBender.IFile>();
+      var mockFile = new Mock<DivisonM.DriveBender.IFile>();
       
       // Act & Assert
       Assert.Throws<ArgumentNullException>(() => 
@@ -114,16 +115,16 @@ namespace DriveBender.Tests.Unit.Exception {
       var nonExistentPath = @"C:\NonExistent\Directory\Path";
       
       // Act & Assert
-      var exception = Assert.Throws<DirectoryNotFoundException>(() => new DrivePath(nonExistentPath));
+      var exception = Assert.Throws<System.IO.DirectoryNotFoundException>(() => new DrivePath(nonExistentPath));
       exception.Message.Should().Contain(nonExistentPath);
     }
     
     [Test]
     public void IntegrityChecker_WithCorruptedPoolStructure_ShouldHandleGracefully() {
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       mockMountPoint.Setup(m => m.GetItems(It.IsAny<System.IO.SearchOption>()))
-                   .Throws<System.IO.IOException>("Simulated I/O error");
+                   .Throws(new System.IO.IOException("Simulated I/O error"));
       
       // Act & Assert
       Assert.DoesNotThrow(() => {
@@ -135,8 +136,8 @@ namespace DriveBender.Tests.Unit.Exception {
     [Test]
     public void DuplicationManager_WithInsufficientSpace_ShouldHandleGracefully() {
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      var mockVolume = new Mock<DriveBender.IVolume>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
       mockVolume.Setup(v => v.BytesFree).Returns(ByteSize.FromBytes(0)); // No free space
       
       mockMountPoint.Setup(m => m.Volumes).Returns(new[] { mockVolume.Object });

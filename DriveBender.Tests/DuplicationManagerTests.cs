@@ -11,31 +11,31 @@ using IVolume = DivisonM.DriveBender.IVolume;
 namespace DriveBender.Tests {
   
   [TestFixture]
-  public class DuplicationManagerTests {
+  public class DuplicationManagerTests : TestBase {
     
-    private Mock<DriveBender.IMountPoint> _mockMountPoint;
-    private Mock<DriveBender.IVolume> _mockVolume1;
-    private Mock<DriveBender.IVolume> _mockVolume2;
+    private Mock<DivisonM.DriveBender.IMountPoint> _mockMountPoint;
+    private Mock<DivisonM.DriveBender.IVolume> _mockVolume1;
+    private Mock<DivisonM.DriveBender.IVolume> _mockVolume2;
     private string _testDirectory;
     
     [SetUp]
-    public void SetUp() {
+    public override void SetUp() {
       _testDirectory = Path.Combine(Path.GetTempPath(), $"DuplicationTest_{Guid.NewGuid():N}");
       Directory.CreateDirectory(_testDirectory);
       
-      _mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      _mockVolume1 = new Mock<DriveBender.IVolume>();
-      _mockVolume2 = new Mock<DriveBender.IVolume>();
+      _mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      _mockVolume1 = new Mock<DivisonM.DriveBender.IVolume>();
+      _mockVolume2 = new Mock<DivisonM.DriveBender.IVolume>();
       
       _mockMountPoint.Setup(m => m.Volumes).Returns(new[] { _mockVolume1.Object, _mockVolume2.Object });
       _mockMountPoint.Setup(m => m.Name).Returns("TestPool");
       
       // Set up logger
-      DriveBender.Logger = message => TestContext.WriteLine($"[LOG] {message}");
+      DivisonM.DriveBender.Logger = message => TestContext.WriteLine($"[LOG] {message}");
     }
     
     [TearDown]
-    public void TearDown() {
+    public override void TearDown() {
       try {
         if (Directory.Exists(_testDirectory)) {
           Directory.Delete(_testDirectory, true);
@@ -85,11 +85,11 @@ namespace DriveBender.Tests {
     public void DisableDuplicationOnFolder_WithEmptyFolderPath_ShouldThrowException() {
       // Act & Assert
       Assert.Throws<ArgumentException>(() => 
-        DuplicationManager.DisableDuplicationOnFolder(_mockMountPoint.Object, ""));
+        DuplicationManager.DisableDuplicationOnFolder(_mockMountPoint.Object, (string)""));
       Assert.Throws<ArgumentException>(() => 
-        DuplicationManager.DisableDuplicationOnFolder(_mockMountPoint.Object, null));
+        DuplicationManager.DisableDuplicationOnFolder(_mockMountPoint.Object, (string)null));
       Assert.Throws<ArgumentException>(() => 
-        DuplicationManager.DisableDuplicationOnFolder(_mockMountPoint.Object, "   "));
+        DuplicationManager.DisableDuplicationOnFolder(_mockMountPoint.Object, (string)"   "));
     }
     
     [Test]
@@ -116,9 +116,9 @@ namespace DriveBender.Tests {
     [Test]
     public void GetDuplicationLevel_WithEmptyFolderPath_ShouldReturnZero() {
       // Act
-      var result1 = DuplicationManager.GetDuplicationLevel(_mockMountPoint.Object, "");
-      var result2 = DuplicationManager.GetDuplicationLevel(_mockMountPoint.Object, null);
-      var result3 = DuplicationManager.GetDuplicationLevel(_mockMountPoint.Object, "   ");
+      var result1 = DuplicationManager.GetDuplicationLevel(_mockMountPoint.Object, (string)"");
+      var result2 = DuplicationManager.GetDuplicationLevel(_mockMountPoint.Object, (string)null);
+      var result3 = DuplicationManager.GetDuplicationLevel(_mockMountPoint.Object, (string)"   ");
       
       // Assert
       result1.Should().Be(0);
@@ -136,7 +136,7 @@ namespace DriveBender.Tests {
     [Test]
     public void CreateAdditionalShadowCopy_WithNullVolume_ShouldThrowException() {
       // Arrange
-      var mockFile = new Mock<DriveBender.IFile>();
+      var mockFile = new Mock<DivisonM.DriveBender.IFile>();
       
       // Act & Assert
       Assert.Throws<ArgumentNullException>(() => 

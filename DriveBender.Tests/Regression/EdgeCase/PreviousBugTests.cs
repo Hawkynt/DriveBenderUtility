@@ -19,8 +19,8 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       // Regression test for a hypothetical bug where null files caused NullReferenceException
       
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      var mixedFiles = new List<DriveBender.IFile> {
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var mixedFiles = new List<DivisonM.DriveBender.IFile> {
         null, // This used to cause NullReferenceException
         CreateMockFile("ValidFile1.txt", 100),
         null, // Another null file
@@ -43,7 +43,7 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       // Regression test for infinite loop when enabling duplication on circular folder references
       
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       var circularPath = new FolderPath("Folder/SubFolder/../../Folder"); // Circular reference
       
       // Act & Assert - Should complete within reasonable time, not hang
@@ -61,7 +61,7 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       // Regression test for memory leak when processing many large files
       
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       var largeFileSet = CreateLargeFileSet(1000); // 1000 files
       
       mockMountPoint.Setup(m => m.GetItems(It.IsAny<SearchOption>()))
@@ -158,7 +158,7 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       
       // Arrange
       var poolName = "DeadlockTestPool";
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       var mockFiles = CreateMockFileSet(10);
       
       mockMountPoint.Setup(m => m.GetItems(It.IsAny<SearchOption>()))
@@ -175,9 +175,10 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       
       // Assert - Should complete within reasonable time, not deadlock
       Assert.DoesNotThrow(() => {
+        var allTasks = new System.Threading.Tasks.Task[] { deleteTask, integrityTask };
         var completed = System.Threading.Tasks.Task.WaitAll(
-          new[] { deleteTask, integrityTask }, 
-          TimeSpan.FromSeconds(10)
+          allTasks, 
+          (int)TimeSpan.FromSeconds(10).TotalMilliseconds
         );
         completed.Should().BeTrue("Operations should complete without deadlock");
       });
@@ -223,11 +224,11 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       // Regression test for issues when volume list is modified during iteration
       
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       var initialVolumes = CreateMultipleVolumes(5);
       
       // Setup dynamic volume list that changes during iteration
-      var volumeList = new List<DriveBender.IVolume>(initialVolumes);
+      var volumeList = new List<DivisonM.DriveBender.IVolume>(initialVolumes);
       mockMountPoint.Setup(m => m.Volumes).Returns(() => volumeList.ToArray());
       
       // Act & Assert - Modify list during processing
@@ -251,9 +252,9 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       });
     }
     
-    private DriveBender.IFile CreateMockFile(string name, int sizeMB) {
-      var mockFile = new Mock<DriveBender.IFile>();
-      var mockVolume = new Mock<DriveBender.IVolume>();
+    private DivisonM.DriveBender.IFile CreateMockFile(string name, int sizeMB) {
+      var mockFile = new Mock<DivisonM.DriveBender.IFile>();
+      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
       
       mockVolume.Setup(v => v.Name).Returns("TestVolume");
       mockFile.Setup(f => f.FullName).Returns(name);
@@ -263,8 +264,8 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       return mockFile.Object;
     }
     
-    private IEnumerable<DriveBender.IFile> CreateLargeFileSet(int count) {
-      var files = new List<DriveBender.IFile>();
+    private IEnumerable<DivisonM.DriveBender.IFile> CreateLargeFileSet(int count) {
+      var files = new List<DivisonM.DriveBender.IFile>();
       
       for (int i = 0; i < count; i++) {
         files.Add(CreateMockFile($"LargeFile{i:D4}.dat", i % 100 + 1));
@@ -273,8 +274,8 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       return files;
     }
     
-    private List<DriveBender.IVolume> CreateMultipleVolumes(int count) {
-      var volumes = new List<DriveBender.IVolume>();
+    private List<DivisonM.DriveBender.IVolume> CreateMultipleVolumes(int count) {
+      var volumes = new List<DivisonM.DriveBender.IVolume>();
       
       for (int i = 0; i < count; i++) {
         volumes.Add(CreateMockVolume($"Volume{i}", 1000 + i * 100));
@@ -283,14 +284,14 @@ namespace DriveBender.Tests.Regression.EdgeCase {
       return volumes;
     }
     
-    private DriveBender.IVolume CreateMockVolume(string name, int sizeGB) {
-      var mockVolume = new Mock<DriveBender.IVolume>();
+    private DivisonM.DriveBender.IVolume CreateMockVolume(string name, int sizeGB) {
+      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
       mockVolume.Setup(v => v.Name).Returns(name);
       mockVolume.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(sizeGB));
       return mockVolume.Object;
     }
     
-    private IEnumerable<DriveBender.IFile> CreateMockFileSet(int count) {
+    private IEnumerable<DivisonM.DriveBender.IFile> CreateMockFileSet(int count) {
       return Enumerable.Range(0, count)
                       .Select(i => CreateMockFile($"MockFile{i}.txt", i * 10 + 5));
     }

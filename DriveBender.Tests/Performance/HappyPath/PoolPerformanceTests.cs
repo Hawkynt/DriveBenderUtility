@@ -14,19 +14,19 @@ namespace DriveBender.Tests.Performance.HappyPath {
   [Category("HappyPath")]
   public class PoolPerformanceTests : TestBase {
     
-    private Mock<DriveBender.IMountPoint> _mockMountPoint;
-    private List<Mock<DriveBender.IVolume>> _mockVolumes;
-    private List<Mock<DriveBender.IFile>> _mockFiles;
+    private Mock<DivisonM.DriveBender.IMountPoint> _mockMountPoint;
+    private List<Mock<DivisonM.DriveBender.IVolume>> _mockVolumes;
+    private List<Mock<DivisonM.DriveBender.IFile>> _mockFiles;
     
     [SetUp]
-    public void SetUp() {
-      _mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      _mockVolumes = new List<Mock<DriveBender.IVolume>>();
-      _mockFiles = new List<Mock<DriveBender.IFile>>();
+    public override void SetUp() {
+      _mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      _mockVolumes = new List<Mock<DivisonM.DriveBender.IVolume>>();
+      _mockFiles = new List<Mock<DivisonM.DriveBender.IFile>>();
       
       // Create 10 mock volumes
       for (int i = 0; i < 10; i++) {
-        var volume = new Mock<DriveBender.IVolume>();
+        var volume = new Mock<DivisonM.DriveBender.IVolume>();
         volume.Setup(v => v.Name).Returns($"Volume{i}");
         volume.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(100));
         _mockVolumes.Add(volume);
@@ -34,7 +34,7 @@ namespace DriveBender.Tests.Performance.HappyPath {
       
       // Create 1000 mock files
       for (int i = 0; i < 1000; i++) {
-        var file = new Mock<DriveBender.IFile>();
+        var file = new Mock<DivisonM.DriveBender.IFile>();
         file.Setup(f => f.FullName).Returns($"File{i}.txt");
         file.Setup(f => f.Size).Returns(ByteSize.FromMegabytes(1));
         file.Setup(f => f.Primary).Returns(_mockVolumes[i % 10].Object);

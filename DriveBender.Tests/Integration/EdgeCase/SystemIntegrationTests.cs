@@ -36,7 +36,7 @@ namespace DriveBender.Tests.Integration.EdgeCase {
     [Test]
     public void IntegrityChecker_WithMixedValidInvalidFiles_ShouldContinueProcessing() {
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       var mixedFiles = CreateMixedValidityFileSet();
       
       mockMountPoint.Setup(m => m.GetItems(It.IsAny<SearchOption>()))
@@ -53,9 +53,9 @@ namespace DriveBender.Tests.Integration.EdgeCase {
     [Test]
     public void DuplicationManager_WithInsufficientSpaceScenario_ShouldHandleGracefully() {
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      var mockVolumeNoSpace = new Mock<DriveBender.IVolume>();
-      var mockVolumeLowSpace = new Mock<DriveBender.IVolume>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var mockVolumeNoSpace = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVolumeLowSpace = new Mock<DivisonM.DriveBender.IVolume>();
       
       mockVolumeNoSpace.Setup(v => v.Name).Returns("NoSpaceVolume");
       mockVolumeNoSpace.Setup(v => v.BytesFree).Returns(ByteSize.FromBytes(0));
@@ -65,7 +65,7 @@ namespace DriveBender.Tests.Integration.EdgeCase {
       
       mockMountPoint.Setup(m => m.Volumes).Returns(new[] { mockVolumeNoSpace.Object, mockVolumeLowSpace.Object });
       
-      var largeFile = new Mock<DriveBender.IFile>();
+      var largeFile = new Mock<DivisonM.DriveBender.IFile>();
       largeFile.Setup(f => f.Size).Returns(ByteSize.FromGigabytes(100)); // Larger than available space
       largeFile.Setup(f => f.Primary).Returns(mockVolumeNoSpace.Object);
       
@@ -102,7 +102,7 @@ namespace DriveBender.Tests.Integration.EdgeCase {
       var folderPath = new FolderPath("Users/Documents/ImportantData");
       var duplicationLevel = new DuplicationLevel(3);
       
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       var mockVolumes = CreateRealisticVolumeSet();
       var mockFiles = CreateRealisticFileSet(mockVolumes);
       
@@ -144,24 +144,24 @@ namespace DriveBender.Tests.Integration.EdgeCase {
     [Test]
     public void ErrorRecovery_WithPartialFailures_ShouldContinue() {
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      var problematicVolume = new Mock<DriveBender.IVolume>();
-      var workingVolume = new Mock<DriveBender.IVolume>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var problematicVolume = new Mock<DivisonM.DriveBender.IVolume>();
+      var workingVolume = new Mock<DivisonM.DriveBender.IVolume>();
       
       // Setup problematic volume that throws exceptions
       problematicVolume.Setup(v => v.Name).Returns("ProblematicVolume");
-      problematicVolume.Setup(v => v.BytesFree).Throws<IOException>("Disk error");
+      problematicVolume.Setup(v => v.BytesFree).Throws(new IOException("Disk error"));
       
       workingVolume.Setup(v => v.Name).Returns("WorkingVolume");
       workingVolume.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(100));
       
       mockMountPoint.Setup(m => m.Volumes).Returns(new[] { problematicVolume.Object, workingVolume.Object });
       
-      var mixedFiles = new List<Mock<DriveBender.IFile>>();
+      var mixedFiles = new List<Mock<DivisonM.DriveBender.IFile>>();
       
       // Create files on both volumes
       for (int i = 0; i < 10; i++) {
-        var file = new Mock<DriveBender.IFile>();
+        var file = new Mock<DivisonM.DriveBender.IFile>();
         file.Setup(f => f.FullName).Returns($"File{i}.txt");
         file.Setup(f => f.Size).Returns(ByteSize.FromMegabytes(i + 1));
         file.Setup(f => f.Primary).Returns(i % 2 == 0 ? problematicVolume.Object : workingVolume.Object);
@@ -179,23 +179,23 @@ namespace DriveBender.Tests.Integration.EdgeCase {
       });
     }
     
-    private IEnumerable<DriveBender.IFile> CreateMixedValidityFileSet() {
-      var files = new List<Mock<DriveBender.IFile>>();
-      var validVolume = new Mock<DriveBender.IVolume>();
+    private IEnumerable<DivisonM.DriveBender.IFile> CreateMixedValidityFileSet() {
+      var files = new List<Mock<DivisonM.DriveBender.IFile>>();
+      var validVolume = new Mock<DivisonM.DriveBender.IVolume>();
       validVolume.Setup(v => v.Name).Returns("ValidVolume");
       
-      var invalidVolume = new Mock<DriveBender.IVolume>();
-      invalidVolume.Setup(v => v.Name).Throws<InvalidOperationException>("Volume corrupted");
+      var invalidVolume = new Mock<DivisonM.DriveBender.IVolume>();
+      invalidVolume.Setup(v => v.Name).Throws(new InvalidOperationException("Volume corrupted"));
       
       // Mix of valid and invalid files
       for (int i = 0; i < 20; i++) {
-        var file = new Mock<DriveBender.IFile>();
+        var file = new Mock<DivisonM.DriveBender.IFile>();
         file.Setup(f => f.FullName).Returns($"MixedFile{i}.txt");
         file.Setup(f => f.Size).Returns(ByteSize.FromMegabytes(i + 1));
         
         if (i % 4 == 0) {
           // Some files throw exceptions
-          file.Setup(f => f.Primary).Throws<IOException>("File access error");
+          file.Setup(f => f.Primary).Throws(new IOException("File access error"));
         } else {
           file.Setup(f => f.Primary).Returns(validVolume.Object);
         }
@@ -206,8 +206,8 @@ namespace DriveBender.Tests.Integration.EdgeCase {
       return files.Select(f => f.Object);
     }
     
-    private IEnumerable<DriveBender.IVolume> CreateRealisticVolumeSet() {
-      var volumes = new List<Mock<DriveBender.IVolume>>();
+    private IEnumerable<DivisonM.DriveBender.IVolume> CreateRealisticVolumeSet() {
+      var volumes = new List<Mock<DivisonM.DriveBender.IVolume>>();
       
       var volumeConfigs = new[] {
         ("PrimaryVolume", 2000), // 2TB
@@ -217,7 +217,7 @@ namespace DriveBender.Tests.Integration.EdgeCase {
       };
       
       foreach (var (name, sizeGB) in volumeConfigs) {
-        var volume = new Mock<DriveBender.IVolume>();
+        var volume = new Mock<DivisonM.DriveBender.IVolume>();
         volume.Setup(v => v.Name).Returns(name);
         volume.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(sizeGB * 0.7)); // 70% free
         volumes.Add(volume);
@@ -226,8 +226,8 @@ namespace DriveBender.Tests.Integration.EdgeCase {
       return volumes.Select(v => v.Object);
     }
     
-    private IEnumerable<DriveBender.IFile> CreateRealisticFileSet(IEnumerable<DriveBender.IVolume> volumes) {
-      var files = new List<Mock<DriveBender.IFile>>();
+    private IEnumerable<DivisonM.DriveBender.IFile> CreateRealisticFileSet(IEnumerable<DivisonM.DriveBender.IVolume> volumes) {
+      var files = new List<Mock<DivisonM.DriveBender.IFile>>();
       var volumeArray = volumes.ToArray();
       
       var fileConfigs = new[] {
@@ -245,7 +245,7 @@ namespace DriveBender.Tests.Integration.EdgeCase {
       
       for (int i = 0; i < fileConfigs.Length; i++) {
         var (name, sizeMB) = fileConfigs[i];
-        var file = new Mock<DriveBender.IFile>();
+        var file = new Mock<DivisonM.DriveBender.IFile>();
         file.Setup(f => f.FullName).Returns(name);
         file.Setup(f => f.Size).Returns(ByteSize.FromMegabytes(sizeMB));
         file.Setup(f => f.Primary).Returns(volumeArray[i % volumeArray.Length]);
@@ -255,7 +255,7 @@ namespace DriveBender.Tests.Integration.EdgeCase {
           var shadowVolume = volumeArray[(i + 1) % volumeArray.Length];
           file.Setup(f => f.ShadowCopies).Returns(new[] { shadowVolume });
         } else {
-          file.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DriveBender.IVolume>());
+          file.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DivisonM.DriveBender.IVolume>());
         }
         
         files.Add(file);

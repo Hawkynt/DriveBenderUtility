@@ -132,6 +132,7 @@ namespace DivisonM {
     public static ByteSize FromKilobytes(double kb) => new ByteSize((ulong)(kb * 1024));
     public static ByteSize FromMegabytes(double mb) => new ByteSize((ulong)(mb * 1024 * 1024));
     public static ByteSize FromGigabytes(double gb) => new ByteSize((ulong)(gb * 1024 * 1024 * 1024));
+    public static ByteSize FromTerabytes(double tb) => new ByteSize((ulong)(tb * 1024 * 1024 * 1024 * 1024));
     
     public static implicit operator ulong(ByteSize size) => size.Bytes;
     public static implicit operator ByteSize(ulong bytes) => new ByteSize(bytes);

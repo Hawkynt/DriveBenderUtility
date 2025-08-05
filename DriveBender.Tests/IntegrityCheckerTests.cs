@@ -11,24 +11,24 @@ using IVolume = DivisonM.DriveBender.IVolume;
 namespace DriveBender.Tests {
   
   [TestFixture]
-  public class IntegrityCheckerTests {
+  public class IntegrityCheckerTests : TestBase {
     
-    private Mock<DriveBender.IMountPoint> _mockMountPoint;
-    private Mock<DriveBender.IFile> _mockFile;
-    private Mock<DriveBender.IVolume> _mockVolume;
+    private Mock<DivisonM.DriveBender.IMountPoint> _mockMountPoint;
+    private Mock<DivisonM.DriveBender.IFile> _mockFile;
+    private Mock<DivisonM.DriveBender.IVolume> _mockVolume;
     
     [SetUp]
-    public void SetUp() {
-      _mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      _mockFile = new Mock<DriveBender.IFile>();
-      _mockVolume = new Mock<DriveBender.IVolume>();
+    public override void SetUp() {
+      _mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      _mockFile = new Mock<DivisonM.DriveBender.IFile>();
+      _mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
       
       _mockMountPoint.Setup(m => m.Name).Returns("TestPool");
       _mockFile.Setup(f => f.FullName).Returns("TestFile.txt");
       _mockFile.Setup(f => f.Size).Returns(1024);
       
       // Set up logger
-      DriveBender.Logger = message => TestContext.WriteLine($"[LOG] {message}");
+      DivisonM.DriveBender.Logger = message => TestContext.WriteLine($"[LOG] {message}");
     }
     
     [Test]
@@ -42,7 +42,7 @@ namespace DriveBender.Tests {
     public void CheckPoolIntegrity_WithEmptyPool_ShouldReturnEmptyList() {
       // Arrange
       _mockMountPoint.Setup(m => m.GetItems(System.IO.SearchOption.AllDirectories))
-                    .Returns(Enumerable.Empty<DriveBender.IFileSystemItem>());
+                    .Returns(Enumerable.Empty<DivisonM.DriveBender.IFileSystemItem>());
       
       // Act
       var result = IntegrityChecker.CheckPoolIntegrity(_mockMountPoint.Object, false);
@@ -146,7 +146,8 @@ namespace DriveBender.Tests {
       var issueTypes = Enum.GetValues(typeof(IntegrityChecker.IntegrityIssueType));
       
       // Assert
-      issueTypes.Should().NotBeEmpty();
+      issueTypes.Should().NotBeNull();
+      issueTypes.Cast<object>().Should().NotBeEmpty();
       issueTypes.Length.Should().Be(8); // Expected number of issue types
     }
   }

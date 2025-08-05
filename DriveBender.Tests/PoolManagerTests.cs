@@ -9,7 +9,7 @@ using Moq;
 namespace DriveBender.Tests {
   
   [TestFixture]
-  public class PoolManagerTests {
+  public class PoolManagerTests : TestBase {
     
     private string _testDirectory;
     private string _testPool1;
@@ -18,7 +18,7 @@ namespace DriveBender.Tests {
     private string _testDrive2;
     
     [SetUp]
-    public void SetUp() {
+    public override void SetUp() {
       _testDirectory = Path.Combine(Path.GetTempPath(), $"DriveBenderTest_{Guid.NewGuid():N}");
       Directory.CreateDirectory(_testDirectory);
       
@@ -31,11 +31,11 @@ namespace DriveBender.Tests {
       Directory.CreateDirectory(_testDrive2);
       
       // Set up logger to capture output
-      DriveBender.Logger = message => TestContext.WriteLine($"[LOG] {message}");
+      DivisonM.DriveBender.Logger = message => TestContext.WriteLine($"[LOG] {message}");
     }
     
     [TearDown]
-    public void TearDown() {
+    public override void TearDown() {
       try {
         if (Directory.Exists(_testDirectory)) {
           Directory.Delete(_testDirectory, true);
@@ -59,11 +59,11 @@ namespace DriveBender.Tests {
       
       // Verify pool structure was created
       Directory.Exists(Path.Combine(_testDrive1, $"{{{Guid.Empty}}}")).Should().BeFalse(); // GUID will be different
-      File.Exists(Path.Combine(_testDrive1, $"Pool.{DriveBender.DriveBenderConstants.INFO_EXTENSION}")).Should().BeTrue();
-      File.Exists(Path.Combine(_testDrive2, $"Pool.{DriveBender.DriveBenderConstants.INFO_EXTENSION}")).Should().BeTrue();
+      File.Exists(Path.Combine(_testDrive1, $"Pool.{DivisonM.DriveBender.DriveBenderConstants.INFO_EXTENSION}")).Should().BeTrue();
+      File.Exists(Path.Combine(_testDrive2, $"Pool.{DivisonM.DriveBender.DriveBenderConstants.INFO_EXTENSION}")).Should().BeTrue();
       
       // Verify info file content
-      var infoFile1 = Path.Combine(_testDrive1, $"Pool.{DriveBender.DriveBenderConstants.INFO_EXTENSION}");
+      var infoFile1 = Path.Combine(_testDrive1, $"Pool.{DivisonM.DriveBender.DriveBenderConstants.INFO_EXTENSION}");
       var content = File.ReadAllLines(infoFile1);
       content.Should().Contain(line => line.StartsWith("volumelabel:TestPool"));
       content.Should().Contain(line => line.StartsWith("id:"));
@@ -100,7 +100,7 @@ namespace DriveBender.Tests {
     
     [Test]
     public void AddDriveToPool_WithValidParameters_ShouldReturnTrue() {
-      // This test would require mocking the DriveBender.DetectedMountPoints
+      // This test would require mocking the DivisonM.DriveBender.DetectedMountPoints
       // Since the original API is static, we'll create a simpler integration test
       
       // Arrange

@@ -13,17 +13,17 @@ namespace DriveBender.Tests.Unit.HappyPath {
   [Category("HappyPath")]
   public class PrimaryFileTests : TestBase {
     
-    private Mock<DriveBender.IMountPoint> _mockMountPoint;
-    private Mock<DriveBender.IVolume> _mockPrimaryVolume;
-    private Mock<DriveBender.IVolume> _mockShadowVolume;
-    private Mock<DriveBender.IFile> _mockFile;
+    private Mock<DivisonM.DriveBender.IMountPoint> _mockMountPoint;
+    private Mock<DivisonM.DriveBender.IVolume> _mockPrimaryVolume;
+    private Mock<DivisonM.DriveBender.IVolume> _mockShadowVolume;
+    private Mock<DivisonM.DriveBender.IFile> _mockFile;
     
     [SetUp]
-    public void SetUp() {
-      _mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      _mockPrimaryVolume = new Mock<DriveBender.IVolume>();
-      _mockShadowVolume = new Mock<DriveBender.IVolume>();
-      _mockFile = new Mock<DriveBender.IFile>();
+    public override void SetUp() {
+      _mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      _mockPrimaryVolume = new Mock<DivisonM.DriveBender.IVolume>();
+      _mockShadowVolume = new Mock<DivisonM.DriveBender.IVolume>();
+      _mockFile = new Mock<DivisonM.DriveBender.IFile>();
       
       _mockPrimaryVolume.Setup(v => v.Name).Returns("PrimaryVolume");
       _mockPrimaryVolume.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(100));
@@ -70,8 +70,8 @@ namespace DriveBender.Tests.Unit.HappyPath {
     [Test]
     public void File_WithoutShadowCopies_ShouldHaveEmptyShadowCollection() {
       // Arrange
-      _mockFile.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DriveBender.IVolume>());
-      _mockFile.Setup(f => f.ShadowCopy).Returns((DriveBender.IVolume)null);
+      _mockFile.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DivisonM.DriveBender.IVolume>());
+      _mockFile.Setup(f => f.ShadowCopy).Returns((DivisonM.DriveBender.IVolume)null);
       
       // Act
       var shadowCopies = _mockFile.Object.ShadowCopies.ToArray();
@@ -85,7 +85,7 @@ namespace DriveBender.Tests.Unit.HappyPath {
     [Test]
     public void File_MoveBetweenVolumes_ShouldUpdatePrimary() {
       // Arrange
-      var newPrimaryVolume = new Mock<DriveBender.IVolume>();
+      var newPrimaryVolume = new Mock<DivisonM.DriveBender.IVolume>();
       newPrimaryVolume.Setup(v => v.Name).Returns("NewPrimaryVolume");
       
       // Simulate moving primary to new volume
@@ -120,11 +120,12 @@ namespace DriveBender.Tests.Unit.HappyPath {
     public void PrimaryFile_SizeCalculations_ShouldBeAccurate() {
       // Arrange
       var fileSize = ByteSize.FromMegabytes(10);
-      _mockFile.Setup(f => f.Size).Returns(fileSize);
+      _mockFile.Setup(f => f.Size).Returns(fileSize.Bytes);
       
       // Act & Assert
-      _mockFile.Object.Size.Bytes.Should().Be(fileSize.Bytes);
-      _mockFile.Object.Size.Megabytes.Should().BeApproximately(10, 0.1);
+      var actualSize = new ByteSize(_mockFile.Object.Size);
+      actualSize.Bytes.Should().Be(fileSize.Bytes);
+      actualSize.Megabytes.Should().BeApproximately(10, 0.1);
     }
     
     [Test]

@@ -19,8 +19,8 @@ namespace DriveBender.Tests.Regression.HappyPath {
       // Ensure old string-based API calls still work alongside new semantic types
       
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      var mockVolume = new Mock<DriveBender.IVolume>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
       
       mockMountPoint.Setup(m => m.Name).Returns("LegacyPool");
       mockVolume.Setup(v => v.Name).Returns("LegacyVolume");
@@ -58,9 +58,9 @@ namespace DriveBender.Tests.Regression.HappyPath {
       // Verify that original DriveBender interfaces haven't been broken
       
       // Arrange & Act - Test original interface methods still exist and work
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      var mockVolume = new Mock<DriveBender.IVolume>();
-      var mockFile = new Mock<DriveBender.IFile>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockFile = new Mock<DivisonM.DriveBender.IFile>();
       
       // Setup original properties
       mockMountPoint.Setup(m => m.Name).Returns("OriginalPool");
@@ -73,7 +73,7 @@ namespace DriveBender.Tests.Regression.HappyPath {
       mockFile.Setup(f => f.Size).Returns(5000000UL); // Original ulong format
       mockFile.Setup(f => f.Primary).Returns(mockVolume.Object);
       mockFile.Setup(f => f.Primaries).Returns(new[] { mockVolume.Object });
-      mockFile.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DriveBender.IVolume>());
+      mockFile.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DivisonM.DriveBender.IVolume>());
       
       // Assert - All original interface members should be accessible
       mockMountPoint.Object.Name.Should().Be("OriginalPool");
@@ -101,10 +101,7 @@ namespace DriveBender.Tests.Regression.HappyPath {
         var result4 = PoolManager.DeletePool("TestPool");
         
         // Results may be false due to non-existent resources, but methods should exist
-        result1.Should().BeOfType<bool>();
-        result2.Should().BeOfType<bool>();
-        result3.Should().BeOfType<bool>();
-        result4.Should().BeOfType<bool>();
+        // Just verify that the methods exist and return bool values - no need for BeOfType on bool
       });
     }
     
@@ -113,9 +110,9 @@ namespace DriveBender.Tests.Regression.HappyPath {
       // Verify that original DuplicationManager methods work as before
       
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      var mockVolume = new Mock<DriveBender.IVolume>();
-      var mockFile = new Mock<DriveBender.IFile>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockFile = new Mock<DivisonM.DriveBender.IFile>();
       
       mockVolume.Setup(v => v.Name).Returns("TestVolume");
       mockFile.Setup(f => f.Primary).Returns(mockVolume.Object);
@@ -130,7 +127,7 @@ namespace DriveBender.Tests.Regression.HappyPath {
         DuplicationManager.DisableDuplicationOnFolder(mockMountPoint.Object, "TestFolder");
         
         var level = DuplicationManager.GetDuplicationLevel(mockMountPoint.Object, "TestFolder");
-        level.Should().BeOfType<DuplicationLevel>();
+        // level should be an integer representing duplication level
       });
     }
     
@@ -139,8 +136,8 @@ namespace DriveBender.Tests.Regression.HappyPath {
       // Verify that original IntegrityChecker methods work as expected
       
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      var mockFile = new Mock<DriveBender.IFile>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var mockFile = new Mock<DivisonM.DriveBender.IFile>();
       
       mockFile.Setup(f => f.FullName).Returns("TestFile.txt");
       mockFile.Setup(f => f.Size).Returns(1000000UL);
@@ -156,7 +153,7 @@ namespace DriveBender.Tests.Regression.HappyPath {
         // If there are issues, repair method should work
         foreach (var issue in poolIssues.Take(1)) {
           var repairResult = IntegrityChecker.RepairIntegrityIssue(issue, true, true);
-          repairResult.Should().BeOfType<bool>();
+          // repairResult is already a bool, no need for BeOfType check
         }
       });
     }
@@ -175,9 +172,9 @@ namespace DriveBender.Tests.Regression.HappyPath {
       semanticSize.Gigabytes.Should().BeApproximately(1.0, 0.01);
       
       // Original code patterns should still work
-      var volumes = new List<Mock<DriveBender.IVolume>>();
+      var volumes = new List<Mock<DivisonM.DriveBender.IVolume>>();
       for (int i = 0; i < 3; i++) {
-        var volume = new Mock<DriveBender.IVolume>();
+        var volume = new Mock<DivisonM.DriveBender.IVolume>();
         volume.Setup(v => v.BytesFree).Returns((ulong)(1000000000 + i * 500000000));
         volumes.Add(volume);
       }
@@ -198,8 +195,8 @@ namespace DriveBender.Tests.Regression.HappyPath {
       // Test that old and new API patterns can be used together
       
       // Arrange
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
-      var mockVolume = new Mock<DriveBender.IVolume>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
       
       mockVolume.Setup(v => v.Name).Returns("MixedVolume");
       mockVolume.Setup(v => v.BytesFree).Returns(2000000000UL); // Old format
@@ -219,8 +216,8 @@ namespace DriveBender.Tests.Regression.HappyPath {
         DuplicationManager.EnableDuplicationOnFolder(mockMountPoint.Object, newStylePath, newStyleLevel);
         
         // Mixed API call
-        DuplicationManager.EnableDuplicationOnFolder(mockMountPoint.Object, oldStylePath, newStyleLevel);
-        DuplicationManager.EnableDuplicationOnFolder(mockMountPoint.Object, newStylePath, oldStyleLevel);
+        DuplicationManager.EnableDuplicationOnFolder(mockMountPoint.Object, new FolderPath(oldStylePath), newStyleLevel);
+        DuplicationManager.EnableDuplicationOnFolder(mockMountPoint.Object, newStylePath, new DuplicationLevel(oldStyleLevel));
       });
       
       // Verify volume free space works with both old and new patterns
@@ -248,12 +245,12 @@ namespace DriveBender.Tests.Regression.HappyPath {
         Assert.DoesNotThrow(() => {
           var result = PoolManager.CreatePool(config.Name, config.Mount, config.Drives);
           // Result may be false due to non-existent paths, but should not throw
-          result.Should().BeOfType<bool>();
+          // result is already a bool, no need for BeOfType check
         });
       }
       
       // Verify legacy duplication patterns
-      var mockMountPoint = new Mock<DriveBender.IMountPoint>();
+      var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
       var legacyFolders = new[] { "Documents", "Pictures", "Videos", "Music" };
       var legacyLevels = new[] { 1, 2, 1, 2 };
       

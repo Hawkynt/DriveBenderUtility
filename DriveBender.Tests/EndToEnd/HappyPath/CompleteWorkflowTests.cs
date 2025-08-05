@@ -249,14 +249,14 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
       TestContext.WriteLine("Production simulation completed");
     }
     
-    private Mock<DriveBender.IMountPoint> CreateMockMountPoint(string name) {
-      var mock = new Mock<DriveBender.IMountPoint>();
+    private Mock<DivisonM.DriveBender.IMountPoint> CreateMockMountPoint(string name) {
+      var mock = new Mock<DivisonM.DriveBender.IMountPoint>();
       mock.Setup(m => m.Name).Returns(name);
       return mock;
     }
     
-    private List<DriveBender.IVolume> CreateMockVolumes() {
-      var volumes = new List<Mock<DriveBender.IVolume>>();
+    private List<DivisonM.DriveBender.IVolume> CreateMockVolumes() {
+      var volumes = new List<Mock<DivisonM.DriveBender.IVolume>>();
       
       var configs = new[] {
         ("PrimaryVolume", 1000),
@@ -265,7 +265,7 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
       };
       
       foreach (var (name, sizeGB) in configs) {
-        var volume = new Mock<DriveBender.IVolume>();
+        var volume = new Mock<DivisonM.DriveBender.IVolume>();
         volume.Setup(v => v.Name).Returns(name);
         volume.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(sizeGB));
         volumes.Add(volume);
@@ -274,11 +274,11 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
       return volumes.Select(v => v.Object).ToList();
     }
     
-    private List<DriveBender.IFile> CreateMockFiles(List<DriveBender.IVolume> volumes) {
-      var files = new List<Mock<DriveBender.IFile>>();
+    private List<DivisonM.DriveBender.IFile> CreateMockFiles(List<DivisonM.DriveBender.IVolume> volumes) {
+      var files = new List<Mock<DivisonM.DriveBender.IFile>>();
       
       for (int i = 0; i < 50; i++) {
-        var file = new Mock<DriveBender.IFile>();
+        var file = new Mock<DivisonM.DriveBender.IFile>();
         file.Setup(f => f.FullName).Returns($"TestFile{i:D3}.dat");
         file.Setup(f => f.Size).Returns(ByteSize.FromMegabytes(i * 10 + 5));
         file.Setup(f => f.Primary).Returns(volumes[i % volumes.Count]);
@@ -286,7 +286,7 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
         if (i % 3 == 0) {
           file.Setup(f => f.ShadowCopies).Returns(new[] { volumes[(i + 1) % volumes.Count] });
         } else {
-          file.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DriveBender.IVolume>());
+          file.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DivisonM.DriveBender.IVolume>());
         }
         
         files.Add(file);
@@ -295,7 +295,7 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
       return files.Select(f => f.Object).ToList();
     }
     
-    private List<DriveBender.IFile> CreateCorruptedFiles(List<DriveBender.IVolume> volumes) {
+    private List<DivisonM.DriveBender.IFile> CreateCorruptedFiles(List<DivisonM.DriveBender.IVolume> volumes) {
       var files = CreateMockFiles(volumes);
       
       // Simulate various corruption scenarios by modifying some mock setups
@@ -306,7 +306,7 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
         var random = new Random(f.FullName.GetHashCode());
         if (random.Next(4) == 0) {
           // Simulate missing primary
-          mock.Setup(x => x.Primary).Returns((DriveBender.IVolume)null);
+          mock.Setup(x => x.Primary).Returns((DivisonM.DriveBender.IVolume)null);
         }
         
         return f;
@@ -315,11 +315,11 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
       return corruptedFiles;
     }
     
-    private List<DriveBender.IVolume> CreateLargeVolumeSet() {
-      var volumes = new List<Mock<DriveBender.IVolume>>();
+    private List<DivisonM.DriveBender.IVolume> CreateLargeVolumeSet() {
+      var volumes = new List<Mock<DivisonM.DriveBender.IVolume>>();
       
       for (int i = 0; i < 8; i++) {
-        var volume = new Mock<DriveBender.IVolume>();
+        var volume = new Mock<DivisonM.DriveBender.IVolume>();
         volume.Setup(v => v.Name).Returns($"ProductionVolume{i:D2}");
         volume.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(500 + i * 100));
         volumes.Add(volume);
@@ -328,8 +328,8 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
       return volumes.Select(v => v.Object).ToList();
     }
     
-    private List<DriveBender.IFile> CreateProductionFileSet(List<DriveBender.IVolume> volumes) {
-      var files = new List<Mock<DriveBender.IFile>>();
+    private List<DivisonM.DriveBender.IFile> CreateProductionFileSet(List<DivisonM.DriveBender.IVolume> volumes) {
+      var files = new List<Mock<DivisonM.DriveBender.IFile>>();
       
       var fileTypes = new[] {
         ("Document", 5),
@@ -346,7 +346,7 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
       
       for (int i = 0; i < 100; i++) {
         var (type, sizeMB) = fileTypes[i % fileTypes.Length];
-        var file = new Mock<DriveBender.IFile>();
+        var file = new Mock<DivisonM.DriveBender.IFile>();
         file.Setup(f => f.FullName).Returns($"{type}_{i:D3}.{type.ToLower()}");
         file.Setup(f => f.Size).Returns(ByteSize.FromMegabytes(sizeMB + (i % 10)));
         file.Setup(f => f.Primary).Returns(volumes[i % volumes.Count]);
@@ -356,7 +356,7 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
           var shadowVolume = volumes[(i + 1) % volumes.Count];
           file.Setup(f => f.ShadowCopies).Returns(new[] { shadowVolume });
         } else {
-          file.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DriveBender.IVolume>());
+          file.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DivisonM.DriveBender.IVolume>());
         }
         
         files.Add(file);
@@ -365,9 +365,9 @@ namespace DriveBender.Tests.EndToEnd.HappyPath {
       return files.Select(f => f.Object).ToList();
     }
     
-    private void SetupMockMountPoint(Mock<DriveBender.IMountPoint> mountPoint, 
-                                   List<DriveBender.IVolume> volumes, 
-                                   List<DriveBender.IFile> files) {
+    private void SetupMockMountPoint(Mock<DivisonM.DriveBender.IMountPoint> mountPoint, 
+                                   List<DivisonM.DriveBender.IVolume> volumes, 
+                                   List<DivisonM.DriveBender.IFile> files) {
       mountPoint.Setup(m => m.Volumes).Returns(volumes);
       mountPoint.Setup(m => m.GetItems(It.IsAny<SearchOption>())).Returns(files);
     }
