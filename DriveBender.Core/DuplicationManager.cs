@@ -7,23 +7,24 @@ namespace DivisonM {
   public static class DuplicationManager {
     
     public static void EnableDuplicationOnFolder(DriveBender.IMountPoint mountPoint, string folderPath, int duplicationLevel = 1) {
+      EnableDuplicationOnFolder(mountPoint, new FolderPath(folderPath), new DuplicationLevel(duplicationLevel));
+    }
+    
+    public static void EnableDuplicationOnFolder(DriveBender.IMountPoint mountPoint, FolderPath folderPath, DuplicationLevel duplicationLevel) {
       if (mountPoint == null)
         throw new ArgumentNullException(nameof(mountPoint));
       
-      if (string.IsNullOrWhiteSpace(folderPath))
-        throw new ArgumentException("Folder path cannot be empty", nameof(folderPath));
-      
-      if (duplicationLevel < 1 || duplicationLevel > mountPoint.Volumes.Count() - 1)
+      if (duplicationLevel.Value < 1 || duplicationLevel.Value > mountPoint.Volumes.Count() - 1)
         throw new ArgumentException("Invalid duplication level", nameof(duplicationLevel));
       
       try {
         foreach (var volume in mountPoint.Volumes) {
           if (volume is DriveBender.Volume vol) {
-            var targetPath = Path.Combine(vol.Root.FullName, folderPath, DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+            var targetPath = Path.Combine(vol.Root.FullName, folderPath.Value, DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
             Directory.CreateDirectory(targetPath);
             
-            for (int i = 1; i < duplicationLevel; i++) {
-              var additionalShadowPath = Path.Combine(vol.Root.FullName, folderPath, $"{DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME}.{i}");
+            for (int i = 1; i < duplicationLevel.Value; i++) {
+              var additionalShadowPath = Path.Combine(vol.Root.FullName, folderPath.Value, $"{DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME}.{i}");
               Directory.CreateDirectory(additionalShadowPath);
             }
           }
@@ -37,14 +38,15 @@ namespace DivisonM {
     }
     
     public static void DisableDuplicationOnFolder(DriveBender.IMountPoint mountPoint, string folderPath) {
+      DisableDuplicationOnFolder(mountPoint, new FolderPath(folderPath));
+    }
+    
+    public static void DisableDuplicationOnFolder(DriveBender.IMountPoint mountPoint, FolderPath folderPath) {
       if (mountPoint == null)
         throw new ArgumentNullException(nameof(mountPoint));
       
-      if (string.IsNullOrWhiteSpace(folderPath))
-        throw new ArgumentException("Folder path cannot be empty", nameof(folderPath));
-      
       try {
-        var files = mountPoint.GetItems(folderPath, SearchOption.AllDirectories).OfType<DriveBender.IFile>();
+        var files = mountPoint.GetItems(folderPath.Value, SearchOption.AllDirectories).OfType<DriveBender.IFile>();
         
         foreach (var file in files) {
           var shadowCopies = GetShadowCopies(file).ToArray();
@@ -55,7 +57,7 @@ namespace DivisonM {
         
         foreach (var volume in mountPoint.Volumes) {
           if (volume is DriveBender.Volume vol) {
-            var shadowPath = Path.Combine(vol.Root.FullName, folderPath, DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+            var shadowPath = Path.Combine(vol.Root.FullName, folderPath.Value, DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
             if (Directory.Exists(shadowPath)) {
               Directory.Delete(shadowPath, true);
             }
@@ -63,7 +65,7 @@ namespace DivisonM {
             var i = 1;
             string additionalShadowPath;
             do {
-              additionalShadowPath = Path.Combine(vol.Root.FullName, folderPath, $"{DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME}.{i}");
+              additionalShadowPath = Path.Combine(vol.Root.FullName, folderPath.Value, $"{DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME}.{i}");
               if (Directory.Exists(additionalShadowPath)) {
                 Directory.Delete(additionalShadowPath, true);
                 i++;
@@ -82,28 +84,36 @@ namespace DivisonM {
     }
     
     public static void SetDuplicationLevel(DriveBender.IMountPoint mountPoint, string folderPath, int newLevel) {
-      if (newLevel == 0) {
+      SetDuplicationLevel(mountPoint, new FolderPath(folderPath), new DuplicationLevel(newLevel));
+    }
+    
+    public static void SetDuplicationLevel(DriveBender.IMountPoint mountPoint, FolderPath folderPath, DuplicationLevel newLevel) {
+      if (newLevel.IsDisabled) {
         DisableDuplicationOnFolder(mountPoint, folderPath);
         return;
       }
       
       var currentLevel = GetDuplicationLevel(mountPoint, folderPath);
       
-      if (newLevel > currentLevel) {
-        IncreaseduplicationLevel(mountPoint, folderPath, newLevel - currentLevel);
-      } else if (newLevel < currentLevel) {
-        DecreaseDuplicationLevel(mountPoint, folderPath, currentLevel - newLevel);
+      if (newLevel.Value > currentLevel.Value) {
+        IncreaseduplicationLevel(mountPoint, folderPath, newLevel.Value - currentLevel.Value);
+      } else if (newLevel.Value < currentLevel.Value) {
+        DecreaseDuplicationLevel(mountPoint, folderPath, currentLevel.Value - newLevel.Value);
       }
     }
     
     public static int GetDuplicationLevel(DriveBender.IMountPoint mountPoint, string folderPath) {
-      if (mountPoint == null || string.IsNullOrWhiteSpace(folderPath))
-        return 0;
+      return GetDuplicationLevel(mountPoint, new FolderPath(folderPath)).Value;
+    }
+    
+    public static DuplicationLevel GetDuplicationLevel(DriveBender.IMountPoint mountPoint, FolderPath folderPath) {
+      if (mountPoint == null)
+        return DuplicationLevel.Disabled;
       
       var maxLevel = 0;
       foreach (var volume in mountPoint.Volumes) {
         if (volume is DriveBender.Volume vol) {
-          var shadowPath = Path.Combine(vol.Root.FullName, folderPath, DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+          var shadowPath = Path.Combine(vol.Root.FullName, folderPath.Value, DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
           if (Directory.Exists(shadowPath)) {
             maxLevel = Math.Max(maxLevel, 1);
           }
@@ -111,7 +121,7 @@ namespace DivisonM {
           var i = 1;
           string additionalShadowPath;
           do {
-            additionalShadowPath = Path.Combine(vol.Root.FullName, folderPath, $"{DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME}.{i}");
+            additionalShadowPath = Path.Combine(vol.Root.FullName, folderPath.Value, $"{DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME}.{i}");
             if (Directory.Exists(additionalShadowPath)) {
               maxLevel = Math.Max(maxLevel, i + 1);
               i++;
@@ -122,7 +132,7 @@ namespace DivisonM {
         }
       }
       
-      return maxLevel;
+      return new DuplicationLevel(maxLevel);
     }
     
     public static void CreateAdditionalShadowCopy(DriveBender.IFile file, DriveBender.IVolume targetVolume) {
@@ -166,8 +176,8 @@ namespace DivisonM {
       }
     }
     
-    private static void IncreaseduplicationLevel(DriveBender.IMountPoint mountPoint, string folderPath, int levelsToAdd) {
-      var files = mountPoint.GetItems(folderPath, SearchOption.AllDirectories).OfType<DriveBender.IFile>();
+    private static void IncreaseduplicationLevel(DriveBender.IMountPoint mountPoint, FolderPath folderPath, int levelsToAdd) {
+      var files = mountPoint.GetItems(folderPath.Value, SearchOption.AllDirectories).OfType<DriveBender.IFile>();
       var availableVolumes = mountPoint.Volumes.ToArray();
       
       foreach (var file in files) {
@@ -184,8 +194,8 @@ namespace DivisonM {
       }
     }
     
-    private static void DecreaseDuplicationLevel(DriveBender.IMountPoint mountPoint, string folderPath, int levelsToRemove) {
-      var files = mountPoint.GetItems(folderPath, SearchOption.AllDirectories).OfType<DriveBender.IFile>();
+    private static void DecreaseDuplicationLevel(DriveBender.IMountPoint mountPoint, FolderPath folderPath, int levelsToRemove) {
+      var files = mountPoint.GetItems(folderPath.Value, SearchOption.AllDirectories).OfType<DriveBender.IFile>();
       
       foreach (var file in files) {
         var shadowCopies = GetShadowCopies(file).Take(levelsToRemove);
