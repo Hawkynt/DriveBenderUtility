@@ -11,10 +11,10 @@ using IMountPoint = DivisonM.DriveBender.IMountPoint;
 namespace DriveBender.UI {
   public partial class IntegrityCheckDialog : Window {
     
-    private readonly DriveBender.IMountPoint _mountPoint;
+    private readonly IMountPoint _mountPoint;
     public ObservableCollection<IntegrityIssueViewModel> Issues { get; set; }
     
-    public IntegrityCheckDialog(DriveBender.IMountPoint mountPoint) {
+    public IntegrityCheckDialog(IMountPoint mountPoint) {
       InitializeComponent();
       
       _mountPoint = mountPoint;
@@ -115,7 +115,7 @@ namespace DriveBender.UI {
                 Dispatcher.Invoke(() => Issues.Remove(issue));
               }
             } catch (Exception ex) {
-              DriveBender.Logger?.Invoke($"Failed to repair {issue.FilePath}: {ex.Message}");
+              DivisonM.DriveBender.Logger?.Invoke($"Failed to repair {issue.FilePath}: {ex.Message}");
             }
           }
         });
@@ -144,7 +144,7 @@ namespace DriveBender.UI {
           var lines = new[] { $"Integrity Report for Pool: {_mountPoint.Name}", $"Generated: {DateTime.Now}", "" }
             .Concat(Issues.Select(issue => $"{issue.FilePath}\t{issue.IssueType}\t{issue.Description}\t{issue.SuggestedAction}"));
           
-          File.WriteAllLines(dialog.FileName, lines);
+          System.IO.File.WriteAllLines(dialog.FileName, lines);
           MessageBox.Show("Report exported successfully.", "Export Complete", MessageBoxButton.OK, MessageBoxImage.Information);
         }
       } catch (Exception ex) {

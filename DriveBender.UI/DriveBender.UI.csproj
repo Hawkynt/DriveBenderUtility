@@ -19,7 +19,7 @@
     <Reference Include="System.Windows.Forms" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="..\app.manifest" Link="app.manifest" />
-    <Content Include="..\app.ico" Link="app.ico" />
+    <None Include="app.manifest" />
+    <Content Include="app.ico" />
   </ItemGroup>
 </Project>

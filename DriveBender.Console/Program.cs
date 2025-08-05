@@ -7,7 +7,7 @@ using IMountPoint = DivisonM.DriveBender.IMountPoint;
 namespace DriveBender.Console {
   class Program {
     static int Main(string[] args) {
-      DriveBender.Logger = System.Console.WriteLine;
+      DivisonM.DriveBender.Logger = System.Console.WriteLine;
       
       return Parser.Default.ParseArguments<
         ListPoolsOptions,
@@ -41,7 +41,7 @@ namespace DriveBender.Console {
     }
     
     static int ListPools(ListPoolsOptions opts) {
-      var pools = DriveBender.DetectedMountPoints;
+      var pools = DivisonM.DriveBender.DetectedMountPoints;
       
       if (pools.Length == 0) {
         System.Console.WriteLine("No Drive Bender pools found.");
@@ -53,13 +53,13 @@ namespace DriveBender.Console {
       foreach (var pool in pools) {
         System.Console.WriteLine($"Pool: {pool.Name} ({pool.Description})");
         System.Console.WriteLine($"  ID: {pool.Id}");
-        System.Console.WriteLine($"  Total Size: {DriveBender.SizeFormatter.Format(pool.BytesTotal)}");
-        System.Console.WriteLine($"  Used: {DriveBender.SizeFormatter.Format(pool.BytesUsed)} ({pool.BytesUsed * 100.0 / pool.BytesTotal:F1}%)");
-        System.Console.WriteLine($"  Free: {DriveBender.SizeFormatter.Format(pool.BytesFree)}");
+        System.Console.WriteLine($"  Total Size: {DivisonM.DriveBender.SizeFormatter.Format(pool.BytesTotal)}");
+        System.Console.WriteLine($"  Used: {DivisonM.DriveBender.SizeFormatter.Format(pool.BytesUsed)} ({pool.BytesUsed * 100.0 / pool.BytesTotal:F1}%)");
+        System.Console.WriteLine($"  Free: {DivisonM.DriveBender.SizeFormatter.Format(pool.BytesFree)}");
         System.Console.WriteLine($"  Volumes ({pool.Volumes.Count()}):");
         
         foreach (var volume in pool.Volumes.OrderBy(v => v.Name)) {
-          System.Console.WriteLine($"    - {volume.Name}: {DriveBender.SizeFormatter.Format(volume.BytesFree)} free / {DriveBender.SizeFormatter.Format(volume.BytesTotal)} total");
+          System.Console.WriteLine($"    - {volume.Name}: {DivisonM.DriveBender.SizeFormatter.Format(volume.BytesFree)} free / {DivisonM.DriveBender.SizeFormatter.Format(volume.BytesTotal)} total");
         }
         System.Console.WriteLine();
       }
@@ -243,17 +243,17 @@ namespace DriveBender.Console {
         System.Console.WriteLine($"Pool Information: {pool.Name}");
         System.Console.WriteLine($"Description: {pool.Description}");
         System.Console.WriteLine($"ID: {pool.Id}");
-        System.Console.WriteLine($"Total Capacity: {DriveBender.SizeFormatter.Format(pool.BytesTotal)}");
-        System.Console.WriteLine($"Used Space: {DriveBender.SizeFormatter.Format(pool.BytesUsed)} ({pool.BytesUsed * 100.0 / pool.BytesTotal:F1}%)");
-        System.Console.WriteLine($"Free Space: {DriveBender.SizeFormatter.Format(pool.BytesFree)}");
+        System.Console.WriteLine($"Total Capacity: {DivisonM.DriveBender.SizeFormatter.Format(pool.BytesTotal)}");
+        System.Console.WriteLine($"Used Space: {DivisonM.DriveBender.SizeFormatter.Format(pool.BytesUsed)} ({pool.BytesUsed * 100.0 / pool.BytesTotal:F1}%)");
+        System.Console.WriteLine($"Free Space: {DivisonM.DriveBender.SizeFormatter.Format(pool.BytesFree)}");
         System.Console.WriteLine();
         
         System.Console.WriteLine($"Volumes ({pool.Volumes.Count()}):");
         foreach (var volume in pool.Volumes.OrderBy(v => v.Name)) {
           System.Console.WriteLine($"  {volume.Name} ({volume.Label}):");
-          System.Console.WriteLine($"    Total: {DriveBender.SizeFormatter.Format(volume.BytesTotal)}");
-          System.Console.WriteLine($"    Used: {DriveBender.SizeFormatter.Format(volume.BytesUsed)} ({volume.BytesUsed * 100.0 / volume.BytesTotal:F1}%)");
-          System.Console.WriteLine($"    Free: {DriveBender.SizeFormatter.Format(volume.BytesFree)}");
+          System.Console.WriteLine($"    Total: {DivisonM.DriveBender.SizeFormatter.Format(volume.BytesTotal)}");
+          System.Console.WriteLine($"    Used: {DivisonM.DriveBender.SizeFormatter.Format(volume.BytesUsed)} ({volume.BytesUsed * 100.0 / volume.BytesTotal:F1}%)");
+          System.Console.WriteLine($"    Free: {DivisonM.DriveBender.SizeFormatter.Format(volume.BytesFree)}");
           System.Console.WriteLine();
         }
         
@@ -269,8 +269,8 @@ namespace DriveBender.Console {
       }
     }
     
-    private static DriveBender.IMountPoint GetPool(string poolName) {
-      var pools = DriveBender.DetectedMountPoints;
+    private static IMountPoint GetPool(string poolName) {
+      var pools = DivisonM.DriveBender.DetectedMountPoints;
       var pool = pools.FirstOrDefault(p => string.Equals(p.Name, poolName, StringComparison.OrdinalIgnoreCase));
       
       if (pool == null) {

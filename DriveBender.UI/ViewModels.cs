@@ -7,9 +7,9 @@ using IVolume = DivisonM.DriveBender.IVolume;
 namespace DriveBender.UI {
   
   public class PoolViewModel : INotifyPropertyChanged {
-    public DriveBender.IMountPoint MountPoint { get; }
+    public IMountPoint MountPoint { get; }
     
-    public PoolViewModel(DriveBender.IMountPoint mountPoint) {
+    public PoolViewModel(IMountPoint mountPoint) {
       MountPoint = mountPoint;
     }
     
@@ -21,9 +21,9 @@ namespace DriveBender.UI {
     public ulong UsedSize => MountPoint.BytesUsed;
     public ulong FreeSize => MountPoint.BytesFree;
     
-    public string TotalSizeFormatted => DriveBender.SizeFormatter.Format(TotalSize);
-    public string UsedSizeFormatted => DriveBender.SizeFormatter.Format(UsedSize);
-    public string FreeSizeFormatted => DriveBender.SizeFormatter.Format(FreeSize);
+    public string TotalSizeFormatted => DivisonM.DriveBender.SizeFormatter.Format(TotalSize);
+    public string UsedSizeFormatted => DivisonM.DriveBender.SizeFormatter.Format(UsedSize);
+    public string FreeSizeFormatted => DivisonM.DriveBender.SizeFormatter.Format(FreeSize);
     
     public int VolumeCount => MountPoint.Volumes.Count();
     public string UsagePercentage => TotalSize > 0 ? $"{UsedSize * 100.0 / TotalSize:F1}%" : "0%";
@@ -36,9 +36,9 @@ namespace DriveBender.UI {
   }
   
   public class VolumeViewModel : INotifyPropertyChanged {
-    public DriveBender.IVolume Volume { get; }
+    public IVolume Volume { get; }
     
-    public VolumeViewModel(DriveBender.IVolume volume) {
+    public VolumeViewModel(IVolume volume) {
       Volume = volume;
     }
     
@@ -50,9 +50,9 @@ namespace DriveBender.UI {
     public ulong UsedSize => Volume.BytesUsed;
     public ulong FreeSize => Volume.BytesFree;
     
-    public string TotalSizeFormatted => DriveBender.SizeFormatter.Format(TotalSize);
-    public string UsedSizeFormatted => DriveBender.SizeFormatter.Format(UsedSize);
-    public string FreeSizeFormatted => DriveBender.SizeFormatter.Format(FreeSize);
+    public string TotalSizeFormatted => DivisonM.DriveBender.SizeFormatter.Format(TotalSize);
+    public string UsedSizeFormatted => DivisonM.DriveBender.SizeFormatter.Format(UsedSize);
+    public string FreeSizeFormatted => DivisonM.DriveBender.SizeFormatter.Format(FreeSize);
     
     public string UsagePercentage => TotalSize > 0 ? $"{UsedSize * 100.0 / TotalSize:F1}%" : "0%";
     

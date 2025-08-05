@@ -29,9 +29,9 @@ namespace DriveBender.UI {
   }
   
   public partial class DuplicationManagerDialog : Window {
-    private readonly DriveBender.IMountPoint _mountPoint;
+    private readonly IMountPoint _mountPoint;
     
-    public DuplicationManagerDialog(DriveBender.IMountPoint mountPoint) {
+    public DuplicationManagerDialog(IMountPoint mountPoint) {
       _mountPoint = mountPoint;
       // Placeholder - implement actual dialog
       var result = MessageBox.Show($"Manage duplication for pool '{mountPoint.Name}' - Feature coming soon!", "Duplication Manager", MessageBoxButton.OK, MessageBoxImage.Information);

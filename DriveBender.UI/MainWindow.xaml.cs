@@ -39,7 +39,7 @@ namespace DriveBender.UI {
         StatusTextBlock.Text = "Refreshing pools...";
         
         await Task.Run(() => {
-          var mountPoints = DriveBender.DetectedMountPoints;
+          var mountPoints = DivisonM.DriveBender.DetectedMountPoints;
           
           Dispatcher.Invoke(() => {
             Pools.Clear();
