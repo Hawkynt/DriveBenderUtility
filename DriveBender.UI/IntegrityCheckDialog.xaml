@@ -1,0 +1,51 @@
+<Window x:Class="DriveBender.UI.IntegrityCheckDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Pool Integrity Check" Height="500" Width="800"
+        WindowStartupLocation="CenterOwner">
+    
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        
+        <!-- Header -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,10">
+            <TextBlock Text="Pool Integrity Check" FontSize="16" FontWeight="Bold" VerticalAlignment="Center"/>
+            <CheckBox Name="DeepScanCheckBox" Content="Deep Scan (Hash Verification)" Margin="20,0,0,0" VerticalAlignment="Center"/>
+            <Button Name="StartCheckButton" Content="Start Check" Style="{StaticResource ButtonStyle}" 
+                    Click="StartCheckButton_Click" Margin="20,0,0,0"/>
+        </StackPanel>
+        
+        <!-- Issues List -->
+        <DataGrid Grid.Row="1" Name="IssuesDataGrid" Style="{StaticResource DataGridStyle}">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="File Path" Binding="{Binding FilePath}" Width="300"/>
+                <DataGridTextColumn Header="Issue Type" Binding="{Binding IssueType}" Width="120"/>
+                <DataGridTextColumn Header="Description" Binding="{Binding Description}" Width="250"/>
+                <DataGridTextColumn Header="Locations" Binding="{Binding LocationCount}" Width="80"/>
+            </DataGrid.Columns>
+        </DataGrid>
+        
+        <!-- Progress -->
+        <StackPanel Grid.Row="2" Margin="0,10,0,0">
+            <TextBlock Name="ProgressTextBlock" Text="Ready to start integrity check"/>
+            <ProgressBar Name="ProgressBar" Height="20" Margin="0,5,0,0" Visibility="Collapsed"/>
+        </StackPanel>
+        
+        <!-- Buttons -->
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button Name="RepairSelectedButton" Content="Repair Selected" Style="{StaticResource ButtonStyle}" 
+                    Click="RepairSelectedButton_Click" IsEnabled="False"/>
+            <Button Name="RepairAllButton" Content="Repair All" Style="{StaticResource ButtonStyle}" 
+                    Click="RepairAllButton_Click" IsEnabled="False"/>
+            <Button Name="ExportButton" Content="Export Report" Style="{StaticResource ButtonStyle}" 
+                    Click="ExportButton_Click" IsEnabled="False"/>
+            <Button Name="CloseButton" Content="Close" Style="{StaticResource ButtonStyle}" 
+                    Click="CloseButton_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

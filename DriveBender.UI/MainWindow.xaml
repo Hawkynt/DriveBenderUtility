@@ -1,0 +1,98 @@
+<Window x:Class="DriveBender.UI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Drive Bender Pool Manager" Height="600" Width="900"
+        WindowStartupLocation="CenterScreen">
+    
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        
+        <!-- Header -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,10">
+            <TextBlock Text="Drive Bender Pool Manager" Style="{StaticResource HeaderTextStyle}" FontSize="20"/>
+            <Button Name="RefreshButton" Content="Refresh" Style="{StaticResource ButtonStyle}" 
+                    Click="RefreshButton_Click" Margin="20,0,0,0"/>
+        </StackPanel>
+        
+        <!-- Pools Section -->
+        <Grid Grid.Row="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            
+            <TextBlock Grid.Row="0" Text="Pools" Style="{StaticResource HeaderTextStyle}"/>
+            
+            <DataGrid Grid.Row="1" Name="PoolsDataGrid" Style="{StaticResource DataGridStyle}"
+                      SelectionChanged="PoolsDataGrid_SelectionChanged">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="150"/>
+                    <DataGridTextColumn Header="Description" Binding="{Binding Description}" Width="200"/>
+                    <DataGridTextColumn Header="Total Size" Binding="{Binding TotalSizeFormatted}" Width="100"/>
+                    <DataGridTextColumn Header="Used" Binding="{Binding UsedSizeFormatted}" Width="100"/>
+                    <DataGridTextColumn Header="Free" Binding="{Binding FreeSizeFormatted}" Width="100"/>
+                    <DataGridTextColumn Header="Volumes" Binding="{Binding VolumeCount}" Width="80"/>
+                </DataGrid.Columns>
+            </DataGrid>
+            
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,5,0,0">
+                <Button Name="CreatePoolButton" Content="Create Pool" Style="{StaticResource ButtonStyle}" 
+                        Click="CreatePoolButton_Click"/>
+                <Button Name="DeletePoolButton" Content="Delete Pool" Style="{StaticResource ButtonStyle}" 
+                        Click="DeletePoolButton_Click" IsEnabled="False"/>
+                <Button Name="RebalanceButton" Content="Rebalance" Style="{StaticResource ButtonStyle}" 
+                        Click="RebalanceButton_Click" IsEnabled="False"/>
+                <Button Name="CheckIntegrityButton" Content="Check Integrity" Style="{StaticResource ButtonStyle}" 
+                        Click="CheckIntegrityButton_Click" IsEnabled="False"/>
+            </StackPanel>
+        </Grid>
+        
+        <GridSplitter Grid.Row="2" Height="5" HorizontalAlignment="Stretch" VerticalAlignment="Center" 
+                      Background="LightGray" Margin="0,5"/>
+        
+        <!-- Volumes Section -->
+        <Grid Grid.Row="3">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            
+            <TextBlock Grid.Row="0" Text="Volumes" Style="{StaticResource HeaderTextStyle}"/>
+            
+            <DataGrid Grid.Row="1" Name="VolumesDataGrid" Style="{StaticResource DataGridStyle}">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="150"/>
+                    <DataGridTextColumn Header="Label" Binding="{Binding Label}" Width="150"/>
+                    <DataGridTextColumn Header="Total Size" Binding="{Binding TotalSizeFormatted}" Width="100"/>
+                    <DataGridTextColumn Header="Used" Binding="{Binding UsedSizeFormatted}" Width="100"/>
+                    <DataGridTextColumn Header="Free" Binding="{Binding FreeSizeFormatted}" Width="100"/>
+                    <DataGridTextColumn Header="Usage %" Binding="{Binding UsagePercentage}" Width="80"/>
+                </DataGrid.Columns>
+            </DataGrid>
+            
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,5,0,0">
+                <Button Name="AddDriveButton" Content="Add Drive" Style="{StaticResource ButtonStyle}" 
+                        Click="AddDriveButton_Click" IsEnabled="False"/>
+                <Button Name="RemoveDriveButton" Content="Remove Drive" Style="{StaticResource ButtonStyle}" 
+                        Click="RemoveDriveButton_Click" IsEnabled="False"/>
+                <Button Name="DuplicationButton" Content="Manage Duplication" Style="{StaticResource ButtonStyle}" 
+                        Click="DuplicationButton_Click" IsEnabled="False"/>
+            </StackPanel>
+        </Grid>
+        
+        <!-- Status Bar -->
+        <StatusBar Grid.Row="4" Height="25">
+            <StatusBarItem>
+                <TextBlock Name="StatusTextBlock" Text="Ready"/>
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>

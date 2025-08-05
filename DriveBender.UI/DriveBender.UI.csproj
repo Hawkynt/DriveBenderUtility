@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net47</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyTitle>DriveBender UI</AssemblyTitle>
+    <Company>»SynthelicZ«</Company>
+    <Product>DriveBender User Interface</Product>
+    <Description>Graphical user interface for managing Drive Bender pools</Description>
+    <Copyright>Copyright © Hawkynt 2017-2024</Copyright>
+    <LangVersion>default</LangVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DriveBender.Core\DriveBender.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\app.manifest" Link="app.manifest" />
+    <Content Include="..\app.ico" Link="app.ico" />
+  </ItemGroup>
+</Project>

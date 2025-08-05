@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net47</TargetFramework>
+    <AssemblyTitle>DriveBender.Core</AssemblyTitle>
+    <Company>»SynthelicZ«</Company>
+    <Product>DriveBender Core Library</Product>
+    <Description>Core library for managing Drive Bender pools</Description>
+    <Copyright>Copyright © Hawkynt 2017-2024</Copyright>
+    <LangVersion>default</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Data.DataSetExtensions" />
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="FrameworkExtensions.Corlib" Version="1.0.2.398" />
+  </ItemGroup>
+</Project>
