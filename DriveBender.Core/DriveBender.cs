@@ -86,10 +86,9 @@ public static partial class DriveBender {
     ];
 
     public static string Format(ulong size) {
-      const double factor = 1.5;
       foreach (var (d, t) in SIZE_VALUES)
-        if (size / factor >= d)
-          return $"{(double)size / d:0.#}{t}";
+        if (size >= d)
+          return ((double)size / d).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + t;
 
       return $"{size}B";
     }

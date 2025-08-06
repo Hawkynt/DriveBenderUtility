@@ -121,7 +121,7 @@ namespace DriveBender.Tests.Integration.EdgeCase {
       var criticalFiles = mockFiles.Where(f => f.Size > ByteSize.FromMegabytes(50)).Take(5);
       foreach (var file in criticalFiles) {
         Assert.DoesNotThrow(() => 
-          DuplicationManager.CreateAdditionalShadowCopy(file, mockVolumes.Skip(1).First())
+          DuplicationManager.CreateAdditionalShadowCopy(file, mockVolumes.Skip(1).FirstOrDefault() ?? throw new InvalidOperationException("No available volumes for shadow copy creation"))
         );
       }
       

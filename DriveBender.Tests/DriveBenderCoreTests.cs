@@ -28,7 +28,7 @@ namespace DriveBender.Tests {
       DivisonM.DriveBender.SizeFormatter.Format(1024).Should().Be("1KiB");
       DivisonM.DriveBender.SizeFormatter.Format(2048).Should().Be("2KiB");
       DivisonM.DriveBender.SizeFormatter.Format(1536).Should().Be("1.5KiB");
-      
+
       // MiB
       DivisonM.DriveBender.SizeFormatter.Format(1024 * 1024).Should().Be("1MiB");
       DivisonM.DriveBender.SizeFormatter.Format(1024 * 1024 * 2).Should().Be("2MiB");

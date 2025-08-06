@@ -14,7 +14,7 @@ namespace DivisonM {
       if (mountPoint == null)
         throw new ArgumentNullException(nameof(mountPoint));
       
-      if (duplicationLevel.Value < 1 || duplicationLevel.Value > mountPoint.Volumes.Count() - 1)
+      if (duplicationLevel.Value < 1 || duplicationLevel.Value > mountPoint.Volumes.Count())
         throw new ArgumentException("Invalid duplication level", nameof(duplicationLevel));
       
       try {
@@ -103,6 +103,9 @@ namespace DivisonM {
     }
     
     public static int GetDuplicationLevel(DriveBender.IMountPoint mountPoint, string folderPath) {
+      if (string.IsNullOrWhiteSpace(folderPath))
+        return 0;
+        
       return GetDuplicationLevel(mountPoint, new FolderPath(folderPath)).Value;
     }
     

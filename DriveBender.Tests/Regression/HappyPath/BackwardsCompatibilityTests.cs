@@ -20,12 +20,15 @@ namespace DriveBender.Tests.Regression.HappyPath {
       
       // Arrange
       var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
-      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVolume1 = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVolume2 = new Mock<DivisonM.DriveBender.IVolume>();
       
       mockMountPoint.Setup(m => m.Name).Returns("LegacyPool");
-      mockVolume.Setup(v => v.Name).Returns("LegacyVolume");
-      mockVolume.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(100));
-      mockMountPoint.Setup(m => m.Volumes).Returns(new[] { mockVolume.Object });
+      mockVolume1.Setup(v => v.Name).Returns("LegacyVolume1");
+      mockVolume1.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(100));
+      mockVolume2.Setup(v => v.Name).Returns("LegacyVolume2");
+      mockVolume2.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(100));
+      mockMountPoint.Setup(m => m.Volumes).Returns(new[] { mockVolume1.Object, mockVolume2.Object });
       
       // Act & Assert - Old string-based calls
       var legacyPoolName = "LegacyTestPool";
@@ -111,11 +114,18 @@ namespace DriveBender.Tests.Regression.HappyPath {
       
       // Arrange
       var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
-      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVolume1 = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVolume2 = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVolume3 = new Mock<DivisonM.DriveBender.IVolume>();
       var mockFile = new Mock<DivisonM.DriveBender.IFile>();
       
-      mockVolume.Setup(v => v.Name).Returns("TestVolume");
-      mockFile.Setup(f => f.Primary).Returns(mockVolume.Object);
+      mockVolume1.Setup(v => v.Name).Returns("TestVolume1");
+      mockVolume2.Setup(v => v.Name).Returns("TestVolume2");
+      mockVolume3.Setup(v => v.Name).Returns("TestVolume3");
+      mockFile.Setup(f => f.Primary).Returns(mockVolume1.Object);
+      
+      // Set up volumes for the mount point to allow duplication levels up to 3
+      mockMountPoint.Setup(m => m.Volumes).Returns(new[] { mockVolume1.Object, mockVolume2.Object, mockVolume3.Object });
       
       // Act & Assert - Original methods should work with old int-based duplication
       Assert.DoesNotThrow(() => {
@@ -123,7 +133,7 @@ namespace DriveBender.Tests.Regression.HappyPath {
         DuplicationManager.EnableDuplicationOnFolder(mockMountPoint.Object, "TestFolder", 2);
         DuplicationManager.EnableDuplicationOnFolder(mockMountPoint.Object, "TestFolder", 3);
         
-        DuplicationManager.CreateAdditionalShadowCopy(mockFile.Object, mockVolume.Object);
+        DuplicationManager.CreateAdditionalShadowCopy(mockFile.Object, mockVolume1.Object);
         DuplicationManager.DisableDuplicationOnFolder(mockMountPoint.Object, "TestFolder");
         
         var level = DuplicationManager.GetDuplicationLevel(mockMountPoint.Object, "TestFolder");
@@ -196,11 +206,17 @@ namespace DriveBender.Tests.Regression.HappyPath {
       
       // Arrange
       var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
-      var mockVolume = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVolume1 = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVolume2 = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVolume3 = new Mock<DivisonM.DriveBender.IVolume>();
       
-      mockVolume.Setup(v => v.Name).Returns("MixedVolume");
-      mockVolume.Setup(v => v.BytesFree).Returns(2000000000UL); // Old format
-      mockMountPoint.Setup(m => m.Volumes).Returns(new[] { mockVolume.Object });
+      mockVolume1.Setup(v => v.Name).Returns("MixedVolume1");
+      mockVolume1.Setup(v => v.BytesFree).Returns(2000000000UL); // Old format
+      mockVolume2.Setup(v => v.Name).Returns("MixedVolume2");
+      mockVolume2.Setup(v => v.BytesFree).Returns(2000000000UL);
+      mockVolume3.Setup(v => v.Name).Returns("MixedVolume3");
+      mockVolume3.Setup(v => v.BytesFree).Returns(2000000000UL);
+      mockMountPoint.Setup(m => m.Volumes).Returns(new[] { mockVolume1.Object, mockVolume2.Object, mockVolume3.Object });
       
       // Act & Assert - Mix old strings with new semantic types
       var oldStylePath = "Documents/OldStyle";
@@ -221,8 +237,8 @@ namespace DriveBender.Tests.Regression.HappyPath {
       });
       
       // Verify volume free space works with both old and new patterns
-      ulong oldStyleFree = mockVolume.Object.BytesFree;
-      ByteSize newStyleFree = mockVolume.Object.BytesFree;
+      ulong oldStyleFree = mockVolume1.Object.BytesFree;
+      ByteSize newStyleFree = mockVolume1.Object.BytesFree;
       
       oldStyleFree.Should().Be(2000000000UL);
       newStyleFree.Bytes.Should().Be(2000000000UL);
@@ -251,6 +267,10 @@ namespace DriveBender.Tests.Regression.HappyPath {
       
       // Verify legacy duplication patterns
       var mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
+      var mockVol1 = new Mock<DivisonM.DriveBender.IVolume>();
+      var mockVol2 = new Mock<DivisonM.DriveBender.IVolume>();
+      mockMountPoint.Setup(m => m.Volumes).Returns(new[] { mockVol1.Object, mockVol2.Object });
+      
       var legacyFolders = new[] { "Documents", "Pictures", "Videos", "Music" };
       var legacyLevels = new[] { 1, 2, 1, 2 };
       

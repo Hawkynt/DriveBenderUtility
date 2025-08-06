@@ -87,8 +87,13 @@ namespace DivisonM {
       // Normalize path separators and remove leading/trailing separators
       var normalized = value.Replace('\\', '/').Trim('/');
       
-      if (normalized.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
-        throw new ArgumentException("Folder path contains invalid characters", nameof(value));
+      // For folder paths, we need to be more lenient with validation
+      // Allow colons for drive letters (C:) and basic path characters
+      var invalidChars = new[] { '<', '>', '"', '|', '?', '*', '\0' };
+      foreach (var c in invalidChars) {
+        if (normalized.Contains(c))
+          throw new ArgumentException("Folder path contains invalid characters", nameof(value));
+      }
       
       _value = normalized;
     }

@@ -7,7 +7,27 @@ namespace DivisonM {
   public static class PoolManager {
     
     public static bool CreatePool(string poolName, string mountPointPath, IEnumerable<string> drivePaths) {
-      return CreatePool(new PoolName(poolName), mountPointPath, drivePaths.Select(p => new DrivePath(p)));
+      try {
+        if (drivePaths == null)
+          throw new ArgumentNullException(nameof(drivePaths));
+        
+        var drivePathList = drivePaths.ToList();
+        if (drivePathList.Count == 0)
+          throw new ArgumentException("At least one drive path is required", nameof(drivePaths));
+        
+        var validatedDrives = drivePathList.Select(p => new DrivePath(p));
+        return CreatePool(new PoolName(poolName), mountPointPath, validatedDrives);
+      } catch (DirectoryNotFoundException) {
+        DriveBender.Logger?.Invoke($"Failed to create pool '{poolName}': One or more drive paths do not exist");
+        return false;
+      } catch (ArgumentNullException) {
+        throw;
+      } catch (ArgumentException) {
+        throw;
+      } catch (Exception ex) {
+        DriveBender.Logger?.Invoke($"Failed to create pool '{poolName}': {ex.Message}");
+        return false;
+      }
     }
     
     public static bool CreatePool(PoolName poolName, string mountPointPath, IEnumerable<DrivePath> drivePaths) {
@@ -63,7 +83,15 @@ namespace DivisonM {
     }
     
     public static bool AddDriveToPool(string poolName, string drivePath) {
-      return AddDriveToPool(new PoolName(poolName), new DrivePath(drivePath));
+      try {
+        return AddDriveToPool(new PoolName(poolName), new DrivePath(drivePath));
+      } catch (DirectoryNotFoundException) {
+        DriveBender.Logger?.Invoke($"Failed to add drive to pool '{poolName}': Drive path does not exist: {drivePath}");
+        return false;
+      } catch (Exception ex) {
+        DriveBender.Logger?.Invoke($"Failed to add drive to pool '{poolName}': {ex.Message}");
+        return false;
+      }
     }
     
     public static bool AddDriveToPool(PoolName poolName, DrivePath drivePath) {
@@ -91,12 +119,20 @@ namespace DivisonM {
     }
     
     public static bool RemoveDriveFromPool(string poolName, string drivePath, bool moveData = true) {
-      return RemoveDriveFromPool(new PoolName(poolName), new DrivePath(drivePath), new DriveOperationOptions { 
-        DryRun = false, 
+      try {
+        return RemoveDriveFromPool(new PoolName(poolName), new DrivePath(drivePath), new DriveOperationOptions { 
+          DryRun = false, 
         CreateBackup = true, 
         PromptUser = false,
         AutoBalance = moveData 
       }).Success;
+      } catch (DirectoryNotFoundException) {
+        DriveBender.Logger?.Invoke($"Failed to remove drive from pool '{poolName}': Drive path does not exist: {drivePath}");
+        return false;
+      } catch (Exception ex) {
+        DriveBender.Logger?.Invoke($"Failed to remove drive from pool '{poolName}': {ex.Message}");
+        return false;
+      }
     }
     
     public static DriveOperationResult RemoveDriveFromPool(PoolName poolName, DrivePath drivePath, DriveOperationOptions options) {

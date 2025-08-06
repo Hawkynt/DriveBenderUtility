@@ -40,7 +40,9 @@ namespace DivisonM {
       DriveBender.Logger?.Invoke($"Starting integrity check for pool '{mountPoint.Name}' (Deep scan: {deepScan}, Dry run: {dryRun})");
       
       var issues = new List<IntegrityIssue>();
-      var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>();
+      
+      try {
+        var files = mountPoint.GetItems(SearchOption.AllDirectories).OfType<DriveBender.IFile>();
       
       foreach (var file in files) {
         try {
@@ -55,6 +57,15 @@ namespace DivisonM {
           });
         }
       }
+      } catch (Exception ex) {
+        DriveBender.Logger?.Invoke($"Error during pool integrity check: {ex.Message}");
+        issues.Add(new IntegrityIssue {
+          FilePath = "Pool Structure",
+          IssueType = IntegrityIssueType.AccessDenied,
+          Description = $"Cannot access pool structure: {ex.Message}",
+          SuggestedAction = "Check pool mount point and accessibility"
+        });
+      }
       
       DriveBender.Logger?.Invoke($"Integrity check completed. Found {issues.Count} issues.");
       return issues;
@@ -62,6 +73,11 @@ namespace DivisonM {
     
     public static IEnumerable<IntegrityIssue> CheckFileIntegrity(DriveBender.IFile file, bool deepScan = false) {
       var issues = new List<IntegrityIssue>();
+      
+      if (file == null) {
+        return issues; // Return empty list for null file
+      }
+      
       var locations = GetAllFileLocations(file).ToArray();
       
       if (locations.Length == 0) {
@@ -125,9 +141,26 @@ namespace DivisonM {
     }
     
     public static bool RepairIntegrityIssue(IntegrityIssue issue, bool dryRun = true, bool createBackup = true) {
+      if (issue == null) {
+        DriveBender.Logger?.Invoke("Cannot repair null integrity issue");
+        return false;
+      }
+      
       if (dryRun) {
-        DriveBender.Logger?.Invoke($"[DRY RUN] Would repair {issue.IssueType} for '{issue.FilePath}'");
-        return true;
+        switch (issue.IssueType) {
+          case IntegrityIssueType.MissingPrimary:
+          case IntegrityIssueType.MissingShadowCopy:
+          case IntegrityIssueType.DuplicatePrimary:
+          case IntegrityIssueType.DuplicateShadowCopy:
+          case IntegrityIssueType.HashMismatch:
+          case IntegrityIssueType.CorruptedFile:
+          case IntegrityIssueType.OrphanedShadowCopy:
+            DriveBender.Logger?.Invoke($"[DRY RUN] Would repair {issue.IssueType} for '{issue.FilePath}'");
+            return true;
+          default:
+            DriveBender.Logger?.Invoke($"[DRY RUN] Cannot repair issue type: {issue.IssueType}");
+            return false;
+        }
       }
       
       try {

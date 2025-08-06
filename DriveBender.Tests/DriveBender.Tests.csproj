@@ -8,6 +8,7 @@
     <Description>Unit and integration tests for Drive Bender utilities</Description>
     <Copyright>Copyright © Hawkynt 2017-2024</Copyright>
     <LangVersion>default</LangVersion>
+    <NoWarn>MSB3277</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\DriveBender.Core\DriveBender.Core.csproj" />

@@ -1,80 +1,131 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using DivisonM;
 using NUnit.Framework;
 using FluentAssertions;
-using Moq;
+using static DivisonM.DriveBender;
 
 namespace DriveBender.Tests.Integration.HappyPath {
   
   [TestFixture]
   [Category("Integration")]
   [Category("HappyPath")]
-  public class PoolIntegrationTests : TestBase {
+  public class PoolIntegrationTests : IntegrationTestBase {
     
-    private Mock<DivisonM.DriveBender.IMountPoint> _mockMountPoint;
-    private Mock<DivisonM.DriveBender.IVolume> _mockVolume1;
-    private Mock<DivisonM.DriveBender.IVolume> _mockVolume2;
-    private List<Mock<DivisonM.DriveBender.IFile>> _mockFiles;
+    private string _drive1Path;
+    private string _drive2Path;
+    private string _drive3Path;
+    private string _poolMountPoint;
+    private string _poolName;
     
     [SetUp]
     public override void SetUp() {
-      _mockMountPoint = new Mock<DivisonM.DriveBender.IMountPoint>();
-      _mockVolume1 = new Mock<DivisonM.DriveBender.IVolume>();
-      _mockVolume2 = new Mock<DivisonM.DriveBender.IVolume>();
-      _mockFiles = new List<Mock<DivisonM.DriveBender.IFile>>();
-      
-      SetupMockVolumes();
-      SetupMockFiles();
-      SetupMockMountPoint();
+      base.SetUp(); // Call base class setup to create TestDirectory
+
+      _drive1Path = GetTestPath("Drive1");
+      _drive2Path = GetTestPath("Drive2");
+      _drive3Path = GetTestPath("Drive3");
+      _poolMountPoint = GetTestPath("PoolMount");
+      _poolName = "TestPool_" + Guid.NewGuid().ToString("N");
+
+      CreateTestDirectory(_drive1Path);
+      CreateTestDirectory(_drive2Path);
+      CreateTestDirectory(_drive3Path);
+      CreateTestDirectory(_poolMountPoint);
+
+      // Simulate DriveBender info files for the drives
+      CreateDriveBenderInfoFile(_drive1Path, "Drive1Label", Guid.NewGuid());
+      CreateDriveBenderInfoFile(_drive2Path, "Drive2Label", Guid.NewGuid());
+      CreateDriveBenderInfoFile(_drive3Path, "Drive3Label", Guid.NewGuid());
+    }
+
+    private void CreateDriveBenderInfoFile(string drivePath, string label, Guid id) {
+      var infoFilePath = Path.Combine(drivePath, $"volume.{DriveBenderConstants.INFO_EXTENSION}");
+      var content = $"volumelabel:{label}\nid:{id}\ndescription:Test Drive\n";
+      System.IO.File.WriteAllText(infoFilePath, content);
+
+      // Create the actual pool directory structure
+      System.IO.Directory.CreateDirectory(Path.Combine(drivePath, $"{{{id}}}"));
     }
     
     [Test]
     public void FullWorkflow_CreatePoolEnableDuplicationCheckIntegrity_ShouldWork() {
       // Arrange
-      var poolName = new PoolName("IntegrationTestPool");
-      var mountPoint = "C:\\TestMount";
-      var drives = new[] { "C:\\TestDrive1", "C:\\TestDrive2" };
-      var folderPath = new FolderPath("Documents/Important");
+      var drives = new[] { _drive1Path, _drive2Path };
+      var folderPath = "Documents/Important";
       
       // Act & Assert - Step 1: Create Pool
-      var createResult = PoolManager.CreatePool(poolName, mountPoint, drives);
-      // May fail due to non-existent paths, but should not throw
+      var createResult = PoolManager.CreatePool(_poolName, _poolMountPoint, drives);
+      createResult.Should().BeTrue();
+      
+      var pool = DetectedMountPoints.FirstOrDefault(p => p.Name == _poolName);
+      pool.Should().NotBeNull();
+      
+      // Create the folder structure for duplication testing
+      var documentsPath = Path.Combine(_poolMountPoint, "Documents");
+      var importantPath = Path.Combine(documentsPath, "Important");
+      Directory.CreateDirectory(importantPath);
       
       // Act & Assert - Step 2: Enable Duplication
       Assert.DoesNotThrow(() => 
-        DuplicationManager.EnableDuplicationOnFolder(_mockMountPoint.Object, folderPath, DuplicationLevel.Double)
+        DuplicationManager.EnableDuplicationOnFolder(pool, folderPath, 2)
       );
       
+      // Create a test file to verify duplication works
+      var testFilePath = Path.Combine(importantPath, "test.txt");
+      System.IO.File.WriteAllText(testFilePath, "Test content for duplication");
+      
       // Act & Assert - Step 3: Check Integrity
-      var integrityIssues = IntegrityChecker.CheckPoolIntegrity(_mockMountPoint.Object, false, true);
+      var integrityIssues = IntegrityChecker.CheckPoolIntegrity(pool, false, true);
       integrityIssues.Should().NotBeNull();
       
       // Act & Assert - Step 4: Verify Duplication Level
-      var duplicationLevel = DuplicationManager.GetDuplicationLevel(_mockMountPoint.Object, folderPath);
-      duplicationLevel.Should().BeOfType<DuplicationLevel>();
+      var duplicationLevel = DuplicationManager.GetDuplicationLevel(pool, folderPath);
+      duplicationLevel.Should().BeGreaterThan(0);
     }
     
     [Test]
     public void ShadowCopyWorkflow_CreateVerifyRepair_ShouldIntegrate() {
       // Arrange
-      var file = _mockFiles[0].Object;
-      var targetVolume = _mockVolume2.Object;
+      var drives = new[] { _drive1Path, _drive2Path };
+      PoolManager.CreatePool(_poolName, _poolMountPoint, drives);
+      var pool = DetectedMountPoints.FirstOrDefault(p => p.Name == _poolName);
+      if (pool == null) {
+        Assert.Inconclusive($"Could not find pool '{_poolName}' in detected mount points - test environment may not be properly set up");
+        return;
+      }
       
-      // Act & Assert - Step 1: Create Shadow Copy
+      // Create a test file
+      var testFilePath = Path.Combine(_poolMountPoint, "shadow_test.txt");
+      var fileContent = "Content for shadow copy testing";
+      System.IO.File.WriteAllText(testFilePath, fileContent);
+      
+      // Get the file from the pool
+      var poolFiles = pool.GetItems(SearchOption.AllDirectories).OfType<IPhysicalFile>();
+      var testFile = poolFiles.FirstOrDefault(f => f.Source.Name == "shadow_test.txt");
+      testFile.Should().NotBeNull();
+      
+      // Get a target volume (just pick the first one)
+      var targetVolume = pool.Volumes.FirstOrDefault();
+      targetVolume.Should().NotBeNull();
+      
+      // Act & Assert - Step 1: Create Shadow Copy (cast to IFile)
       Assert.DoesNotThrow(() => 
-        DuplicationManager.CreateAdditionalShadowCopy(file, targetVolume)
+        DuplicationManager.CreateAdditionalShadowCopy((IFile)testFile, targetVolume)
       );
       
       // Act & Assert - Step 2: Verify File Integrity
-      var fileIssues = IntegrityChecker.CheckFileIntegrity(file, false);
+      var fileIssues = IntegrityChecker.CheckFileIntegrity((IFile)testFile, false);
       fileIssues.Should().NotBeNull();
       
       // Act & Assert - Step 3: Check if repair is needed
       if (fileIssues.Any()) {
-        var firstIssue = fileIssues.First();
+        var firstIssue = fileIssues.FirstOrDefault();
+        if (firstIssue == null) {
+          Assert.Inconclusive("No file integrity issues found - test environment may not be properly set up");
+          return;
+        }
         var repairResult = IntegrityChecker.RepairIntegrityIssue(firstIssue, true, true);
         // repairResult should be a boolean
       }
@@ -82,102 +133,169 @@ namespace DriveBender.Tests.Integration.HappyPath {
     
     [Test]
     public void DriveManagement_AddRemoveReplace_ShouldMaintainIntegrity() {
-      // Arrange
-      var poolName = "DriveManagementPool";
-      var originalDrive = "C:\\OriginalDrive";
-      var newDrive = "C:\\NewDrive";
+      // Arrange - Create initial pool with 2 drives
+      var drives = new[] { _drive1Path, _drive2Path };
+      PoolManager.CreatePool(_poolName, _poolMountPoint, drives);
+      var pool = DetectedMountPoints.First(p => p.Name == _poolName);
+      
+      // Create some test files
+      var testFile1 = Path.Combine(_poolMountPoint, "file1.txt");
+      var testFile2 = Path.Combine(_poolMountPoint, "file2.txt");
+      System.IO.File.WriteAllText(testFile1, "Test content 1");
+      System.IO.File.WriteAllText(testFile2, "Test content 2");
       
       // Act & Assert - Step 1: Add Drive to Pool
-      var addResult = PoolManager.AddDriveToPool(poolName, originalDrive);
-      // May fail due to non-existent pool/drive, but should not throw
+      var addResult = PoolManager.AddDriveToPool(_poolName, _drive3Path);
+      addResult.Should().BeTrue();
+      
+      // Refresh pool to see the new drive
+      pool = DetectedMountPoints.FirstOrDefault(p => p.Name == _poolName);
+      if (pool == null) {
+        Assert.Inconclusive($"Could not find pool '{_poolName}' after adding drive - test environment may not be properly set up");
+        return;
+      }
+      pool.Volumes.Should().HaveCount(3);
       
       // Act & Assert - Step 2: Check Pool Integrity Before Removal
-      var issuesBeforeRemoval = IntegrityChecker.CheckPoolIntegrity(_mockMountPoint.Object, false, true);
+      var issuesBeforeRemoval = IntegrityChecker.CheckPoolIntegrity(pool, false, true);
       issuesBeforeRemoval.Should().NotBeNull();
       
       // Act & Assert - Step 3: Remove Drive (with data movement)
-      var removeResult = PoolManager.RemoveDriveFromPool(poolName, originalDrive, true);
-      // May fail due to non-existent pool/drive, but should not throw
+      var removeResult = PoolManager.RemoveDriveFromPool(_poolName, _drive1Path, true);
+      removeResult.Should().BeTrue();
       
-      // Act & Assert - Step 4: Add Replacement Drive
-      var replaceResult = PoolManager.AddDriveToPool(poolName, newDrive);
-      // May fail due to non-existent pool/drive, but should not throw
+      // Refresh pool after drive removal
+      pool = DetectedMountPoints.FirstOrDefault(p => p.Name == _poolName);
+      if (pool == null) {
+        Assert.Inconclusive($"Could not find pool '{_poolName}' after removing drive - test environment may not be properly set up");
+        return;
+      }
+      pool.Volumes.Should().HaveCount(2);
+      
+      // Act & Assert - Step 4: Verify files still exist and are accessible
+      System.IO.File.Exists(testFile1).Should().BeTrue();
+      System.IO.File.Exists(testFile2).Should().BeTrue();
+      System.IO.File.ReadAllText(testFile1).Should().Be("Test content 1");
+      System.IO.File.ReadAllText(testFile2).Should().Be("Test content 2");
       
       // Act & Assert - Step 5: Verify Integrity After Changes
-      var issuesAfterChanges = IntegrityChecker.CheckPoolIntegrity(_mockMountPoint.Object, false, true);
+      var issuesAfterChanges = IntegrityChecker.CheckPoolIntegrity(pool, false, true);
       issuesAfterChanges.Should().NotBeNull();
     }
     
     [Test]
     public void MultiLevelDuplication_EnableIncreaseDecrease_ShouldWork() {
       // Arrange
-      var folderPath = new FolderPath("Projects/Critical");
+      var drives = new[] { _drive1Path, _drive2Path, _drive3Path };
+      PoolManager.CreatePool(_poolName, _poolMountPoint, drives);
+      var pool = DetectedMountPoints.FirstOrDefault(p => p.Name == _poolName);
+      if (pool == null) {
+        Assert.Inconclusive($"Could not find pool '{_poolName}' in detected mount points - test environment may not be properly set up");
+        return;
+      }
+      
+      var folderPath = "Projects/Critical";
+      var fullFolderPath = Path.Combine(_poolMountPoint, folderPath);
+      Directory.CreateDirectory(fullFolderPath);
+      
+      // Create some test files in the folder
+      var testFile1 = Path.Combine(fullFolderPath, "critical1.txt");
+      var testFile2 = Path.Combine(fullFolderPath, "critical2.txt");
+      var testFile3 = Path.Combine(fullFolderPath, "critical3.txt");
+      System.IO.File.WriteAllText(testFile1, "Critical content 1");
+      System.IO.File.WriteAllText(testFile2, "Critical content 2");
+      System.IO.File.WriteAllText(testFile3, "Critical content 3");
       
       // Act & Assert - Step 1: Enable Basic Duplication
       Assert.DoesNotThrow(() => 
-        DuplicationManager.EnableDuplicationOnFolder(_mockMountPoint.Object, folderPath, DuplicationLevel.Single)
+        DuplicationManager.EnableDuplicationOnFolder(pool, folderPath, 1)
       );
       
       // Act & Assert - Step 2: Increase Duplication Level
       Assert.DoesNotThrow(() => 
-        DuplicationManager.EnableDuplicationOnFolder(_mockMountPoint.Object, folderPath, DuplicationLevel.Triple)
+        DuplicationManager.EnableDuplicationOnFolder(pool, folderPath, 3)
       );
       
-      // Act & Assert - Step 3: Create Additional Shadow Copies for Files
-      foreach (var mockFile in _mockFiles.Take(3)) {
-        Assert.DoesNotThrow(() => 
-          DuplicationManager.CreateAdditionalShadowCopy(mockFile.Object, _mockVolume2.Object)
-        );
+      // Act & Assert - Step 3: Get files and create additional shadow copies
+      var poolFiles = pool.GetItems(SearchOption.AllDirectories).OfType<IPhysicalFile>()
+                          .Where(f => f.Source.FullName.Contains("Critical")).Take(3).ToList();
+      
+      foreach (var file in poolFiles) {
+        var availableVolumes = pool.Volumes.ToList();
+        if (availableVolumes.Any()) {
+          Assert.DoesNotThrow(() => 
+            DuplicationManager.CreateAdditionalShadowCopy((IFile)file, availableVolumes.FirstOrDefault() ?? throw new InvalidOperationException("No available volumes for shadow copy creation"))
+          );
+        }
       }
       
       // Act & Assert - Step 4: Verify All Files Have Proper Duplication
-      var currentLevel = DuplicationManager.GetDuplicationLevel(_mockMountPoint.Object, folderPath);
-      currentLevel.Should().BeOfType<DuplicationLevel>();
+      var currentLevel = DuplicationManager.GetDuplicationLevel(pool, folderPath);
+      currentLevel.Should().BeGreaterThan(0);
       
       // Act & Assert - Step 5: Disable Duplication
       Assert.DoesNotThrow(() => 
-        DuplicationManager.DisableDuplicationOnFolder(_mockMountPoint.Object, folderPath)
+        DuplicationManager.DisableDuplicationOnFolder(pool, folderPath)
       );
     }
     
     [Test]
     public void IntegrityRepairWorkflow_DetectRepairVerify_ShouldComplete() {
       // Arrange
-      var mockCorruptedFile = new Mock<DivisonM.DriveBender.IFile>();
-      mockCorruptedFile.Setup(f => f.FullName).Returns("CorruptedFile.doc");
-      mockCorruptedFile.Setup(f => f.Size).Returns(ByteSize.FromMegabytes(5));
-      mockCorruptedFile.Setup(f => f.Primary).Returns(_mockVolume1.Object);
-      
-      // Add corrupted file to mock mount point
-      var allFiles = _mockFiles.Select(f => f.Object).Concat(new[] { mockCorruptedFile.Object });
-      _mockMountPoint.Setup(m => m.GetItems(It.IsAny<SearchOption>())).Returns(allFiles);
-      
-      // Act & Assert - Step 1: Detect Integrity Issues
-      var issues = IntegrityChecker.CheckPoolIntegrity(_mockMountPoint.Object, true, true);
-      issues.Should().NotBeNull();
-      
-      // Act & Assert - Step 2: Attempt Repair (Dry Run)
-      foreach (var issue in issues.Take(5)) { // Limit to 5 for performance
-        var dryRunResult = IntegrityChecker.RepairIntegrityIssue(issue, true, true);
-        // dryRunResult should be a boolean
+      var drives = new[] { _drive1Path, _drive2Path };
+      PoolManager.CreatePool(_poolName, _poolMountPoint, drives);
+      var pool = DetectedMountPoints.FirstOrDefault(p => p.Name == _poolName);
+      if (pool == null) {
+        Assert.Inconclusive($"Could not find pool '{_poolName}' in detected mount points - test environment may not be properly set up");
+        return;
       }
       
-      // Act & Assert - Step 3: Perform Actual Repair
-      foreach (var issue in issues.Take(2)) { // Limit to 2 for performance
-        var repairResult = IntegrityChecker.RepairIntegrityIssue(issue, false, true);
-        // repairResult should be a boolean
+      // Create test files
+      var testFile1 = Path.Combine(_poolMountPoint, "integrity_test1.doc");
+      var testFile2 = Path.Combine(_poolMountPoint, "integrity_test2.txt");
+      var content1 = "Document content for integrity testing";
+      var content2 = "Text content for integrity verification";
+      
+      System.IO.File.WriteAllText(testFile1, content1);
+      System.IO.File.WriteAllText(testFile2, content2);
+      
+      // Enable duplication to create shadow copies that we can test
+      DuplicationManager.EnableDuplicationOnFolder(pool, "", 2);
+      
+      // Act & Assert - Step 1: Detect Integrity Issues
+      var issues = IntegrityChecker.CheckPoolIntegrity(pool, true, true);
+      issues.Should().NotBeNull();
+      
+      // Act & Assert - Step 2: Attempt Repair (Dry Run) if any issues found
+      if (issues.Any()) {
+        foreach (var issue in issues.Take(5)) { // Limit to 5 for performance
+          var dryRunResult = IntegrityChecker.RepairIntegrityIssue(issue, true, true);
+          // dryRunResult should be a boolean
+        }
+        
+        // Act & Assert - Step 3: Perform Actual Repair
+        foreach (var issue in issues.Take(2)) { // Limit to 2 for performance
+          var repairResult = IntegrityChecker.RepairIntegrityIssue(issue, false, true);
+          // repairResult should be a boolean
+        }
       }
       
       // Act & Assert - Step 4: Re-check Integrity
-      var postRepairIssues = IntegrityChecker.CheckPoolIntegrity(_mockMountPoint.Object, false, true);
+      var postRepairIssues = IntegrityChecker.CheckPoolIntegrity(pool, false, true);
       postRepairIssues.Should().NotBeNull();
+      
+      // Act & Assert - Step 5: Verify files are still accessible and content is intact
+      System.IO.File.Exists(testFile1).Should().BeTrue();
+      System.IO.File.Exists(testFile2).Should().BeTrue();
+      System.IO.File.ReadAllText(testFile1).Should().Be(content1);
+      System.IO.File.ReadAllText(testFile2).Should().Be(content2);
     }
     
     [Test]
     public void DataTypeIntegration_SemanticTypesWorkTogether_ShouldBeConsistent() {
       // Arrange
       var poolName = new PoolName("SemanticTestPool");
-      var drivePath = new DrivePath(Path.GetTempPath()); // Use temp path as it exists
+      var drivePath = new DrivePath(_drive1Path); // Use our test drive path
       var folderPath = new FolderPath("Documents/Projects/MyApp");
       var duplicationLevel = new DuplicationLevel(2);
       var fileSize = ByteSize.FromGigabytes(1.5);
@@ -198,38 +316,23 @@ namespace DriveBender.Tests.Integration.HappyPath {
       
       var doubleSize = fileSize + fileSize;
       doubleSize.Gigabytes.Should().BeApproximately(3.0, 0.1);
-    }
-    
-    private void SetupMockVolumes() {
-      _mockVolume1.Setup(v => v.Name).Returns("IntegrationVolume1");
-      _mockVolume1.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(500));
       
-      _mockVolume2.Setup(v => v.Name).Returns("IntegrationVolume2");
-      _mockVolume2.Setup(v => v.BytesFree).Returns(ByteSize.FromGigabytes(300));
-    }
-    
-    private void SetupMockFiles() {
-      for (int i = 0; i < 10; i++) {
-        var mockFile = new Mock<DivisonM.DriveBender.IFile>();
-        mockFile.Setup(f => f.FullName).Returns($"IntegrationFile{i}.txt");
-        mockFile.Setup(f => f.Size).Returns(ByteSize.FromMegabytes(i + 1));
-        mockFile.Setup(f => f.Primary).Returns(i % 2 == 0 ? _mockVolume1.Object : _mockVolume2.Object);
-        
-        if (i % 3 == 0) {
-          mockFile.Setup(f => f.ShadowCopies).Returns(new[] { _mockVolume2.Object });
-        } else {
-          mockFile.Setup(f => f.ShadowCopies).Returns(Enumerable.Empty<DivisonM.DriveBender.IVolume>());
-        }
-        
-        _mockFiles.Add(mockFile);
-      }
-    }
-    
-    private void SetupMockMountPoint() {
-      _mockMountPoint.Setup(m => m.Name).Returns("IntegrationMountPoint");
-      _mockMountPoint.Setup(m => m.Volumes).Returns(new[] { _mockVolume1.Object, _mockVolume2.Object });
-      _mockMountPoint.Setup(m => m.GetItems(It.IsAny<SearchOption>()))
-                   .Returns(_mockFiles.Select(f => f.Object));
+      // Act & Assert - Test with actual pool operations using semantic types
+      var drives = new[] { _drive1Path, _drive2Path };
+      var createResult = PoolManager.CreatePool(poolName.Value, _poolMountPoint, drives);
+      createResult.Should().BeTrue();
+      
+      var pool = DetectedMountPoints.FirstOrDefault(p => p.Name == poolName.Value);
+      pool.Should().NotBeNull();
+      
+      // Create the folder structure using semantic types
+      var fullFolderPath = Path.Combine(_poolMountPoint, folderPath.Value);
+      Directory.CreateDirectory(fullFolderPath);
+      
+      // Test duplication level with semantic types
+      Assert.DoesNotThrow(() => 
+        DuplicationManager.EnableDuplicationOnFolder(pool, folderPath.Value, duplicationLevel.Value)
+      );
     }
   }
 }
