@@ -30,15 +30,16 @@ jobs:
       - name: Build
         run: dotnet build DriveBender.sln --configuration Release --no-restore
 
-      # Skip test tiers that need a real DriveBender install or a mountable
-      # filesystem (Integration, EndToEnd, Performance) plus a handful of
-      # individually-failing tests that depend on real drive-letter state.
-      # Heavy tiers still run but are allow-fail below.
+      # Filter out every test that needs a real DriveBender install or a
+       # mountable filesystem. Some fixtures are missing their `[Category]`
+       # attribute (e.g. PoolManagementIntegrationTests), so we also match on
+       # the namespace segments `Integration`, `EndToEnd`, `Performance`,
+       # `Regression` plus a few individually-failing unit-named tests.
       - name: Test (isolated unit tests)
         run: >
           dotnet test DriveBender.Tests/DriveBender.Tests.csproj
           --configuration Release --no-build
-          --filter "(TestCategory!=Integration&TestCategory!=EndToEnd&TestCategory!=Performance)&(FullyQualifiedName!~CreatePool_WithNonExistentDrive&FullyQualifiedName!~Bug002_InfiniteLoopInDuplicationEnabling&FullyQualifiedName!~PoolManager_WithAccessDeniedToDirectory)"
+          --filter "(TestCategory!=Integration&TestCategory!=EndToEnd&TestCategory!=Performance)&(FullyQualifiedName!~.Integration.&FullyQualifiedName!~.EndToEnd.&FullyQualifiedName!~.Performance.&FullyQualifiedName!~.Regression.)&(FullyQualifiedName!~CreatePool_WithNonExistentDrive&FullyQualifiedName!~Bug002_InfiniteLoopInDuplicationEnabling&FullyQualifiedName!~PoolManager_WithAccessDeniedToDirectory)"
           --logger "trx;LogFileName=unit-tests.trx"
 
       - name: Test (integration + e2e + perf + known-flaky, allow-fail)
@@ -46,7 +47,7 @@ jobs:
         run: >
           dotnet test DriveBender.Tests/DriveBender.Tests.csproj
           --configuration Release --no-build
-          --filter "TestCategory=Integration|TestCategory=EndToEnd|TestCategory=Performance|FullyQualifiedName~CreatePool_WithNonExistentDrive|FullyQualifiedName~Bug002_InfiniteLoopInDuplicationEnabling|FullyQualifiedName~PoolManager_WithAccessDeniedToDirectory"
+          --filter "TestCategory=Integration|TestCategory=EndToEnd|TestCategory=Performance|FullyQualifiedName~.Integration.|FullyQualifiedName~.EndToEnd.|FullyQualifiedName~.Performance.|FullyQualifiedName~.Regression.|FullyQualifiedName~CreatePool_WithNonExistentDrive|FullyQualifiedName~Bug002_InfiniteLoopInDuplicationEnabling|FullyQualifiedName~PoolManager_WithAccessDeniedToDirectory"
           --logger "trx;LogFileName=extra-tests.trx"
 
       - uses: actions/upload-artifact@v4
