@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_call: {}
+
+jobs:
+  test:
+    # All projects target net47 (.NET Framework) -- Windows runner only.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'            # SDK only; actual target is net47
+
+      - name: Stamp versions
+        shell: bash
+        run: perl .github/workflows/scripts/version.pl --stamp
+
+      - name: Restore
+        run: dotnet restore DriveBender.sln
+
+      - name: Build
+        run: dotnet build DriveBender.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test DriveBender.Tests/DriveBender.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=tests.trx"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: '**/TestResults/*.trx'

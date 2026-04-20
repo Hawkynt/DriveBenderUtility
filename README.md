@@ -1,10 +1,12 @@
 # 🗂️ DriveBenderUtility
 
+[![CI](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/ci.yml)
+[![Release](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/release.yml/badge.svg)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/Hawkynt/DriveBenderUtility?label=release&sort=semver)](https://github.com/Hawkynt/DriveBenderUtility/releases/latest)
+[![Latest nightly](https://img.shields.io/github/v/release/Hawkynt/DriveBenderUtility?include_prereleases&label=nightly&sort=date)](https://github.com/Hawkynt/DriveBenderUtility/releases?q=prerelease%3Atrue)
 ![License](https://img.shields.io/github/license/Hawkynt/DriveBenderUtility)
 ![Language](https://img.shields.io/github/languages/top/Hawkynt/DriveBenderUtility?color=purple)
 [![Last Commit](https://img.shields.io/github/last-commit/Hawkynt/DriveBenderUtility?branch=master)![Activity](https://img.shields.io/github/commit-activity/y/Hawkynt/DriveBenderUtility?branch=master)](https://github.com/Hawkynt/DriveBenderUtility/commits/master)
-[![Tests](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/tests.yml/badge.svg)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/tests.yml)
-[![Build](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/Build.yml/badge.svg)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/Build.yml)
 
 > The #1 Spot for dealing with [DriveBender](https://en.wikipedia.org/wiki/Non-standard_RAID_levels#Drive_Extender) pools outside [DriveBender](https://www.division-m.com/drivebender/).
 

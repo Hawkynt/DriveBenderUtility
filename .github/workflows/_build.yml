@@ -1,0 +1,74 @@
+name: Build artifacts
+
+# Produces two zips (net47 is Windows-only):
+#   * DriveBender-Console-win-<version>.zip
+#   * DriveBender-UI-win-<version>.zip
+#
+# .NET Framework builds don't support --self-contained / --runtime like modern
+# .NET; we publish the framework-dependent output which needs .NET Framework 4.7
+# Runtime on the target machine.
+on:
+  workflow_call:
+    inputs:
+      version: { required: true, type: string }
+      release-kind: { required: true, type: string }
+      changelog-flag: { required: true, type: string }
+      ref: { required: false, type: string, default: "" }
+    outputs:
+      console-artifact:
+        value: ${{ jobs.build.outputs.console-artifact }}
+      ui-artifact:
+        value: ${{ jobs.build.outputs.ui-artifact }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      console-artifact: DriveBender-Console-win-${{ inputs.version }}
+      ui-artifact:      DriveBender-UI-win-${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '8.x' }
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - name: Update CHANGELOG
+        shell: bash
+        run: node .github/workflows/scripts/update-changelog.mjs ${{ inputs.changelog-flag }}
+
+      - name: Stamp versions
+        shell: bash
+        run: perl .github/workflows/scripts/version.pl --stamp
+
+      - name: Publish Console (net47, framework-dependent)
+        run: dotnet publish DriveBender.Console/DriveBender.Console.csproj -c Release --output publish/console
+
+      - name: Publish UI (net47, framework-dependent)
+        run: dotnet publish DriveBender.UI/DriveBender.UI.csproj -c Release --output publish/ui
+
+      - name: Package Console zip
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}"
+          Compress-Archive -Path publish/console/* -DestinationPath "DriveBender-Console-win-$v.zip"
+
+      - name: Package UI zip
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}"
+          Compress-Archive -Path publish/ui/* -DestinationPath "DriveBender-UI-win-$v.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DriveBender-Console-win-${{ inputs.version }}
+          path: DriveBender-Console-win-${{ inputs.version }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DriveBender-UI-win-${{ inputs.version }}
+          path: DriveBender-UI-win-${{ inputs.version }}.zip
