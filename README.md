@@ -1,12 +1,21 @@
 # 🗂️ DriveBenderUtility
 
+[![License](https://img.shields.io/github/license/Hawkynt/DriveBenderUtility)](https://github.com/Hawkynt/DriveBenderUtility/blob/master/LICENSE)
+[![Language](https://img.shields.io/github/languages/top/Hawkynt/DriveBenderUtility?color=8957D5)](https://github.com/Hawkynt/DriveBenderUtility)
+
 [![CI](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/ci.yml)
-[![Release](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/release.yml/badge.svg)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/release.yml)
-[![Latest release](https://img.shields.io/github/v/release/Hawkynt/DriveBenderUtility?label=release&sort=semver)](https://github.com/Hawkynt/DriveBenderUtility/releases/latest)
-[![Latest nightly](https://img.shields.io/github/v/release/Hawkynt/DriveBenderUtility?include_prereleases&label=nightly&sort=date)](https://github.com/Hawkynt/DriveBenderUtility/releases?q=prerelease%3Atrue)
-![License](https://img.shields.io/github/license/Hawkynt/DriveBenderUtility)
-![Language](https://img.shields.io/github/languages/top/Hawkynt/DriveBenderUtility?color=purple)
-[![Last Commit](https://img.shields.io/github/last-commit/Hawkynt/DriveBenderUtility?branch=master)![Activity](https://img.shields.io/github/commit-activity/y/Hawkynt/DriveBenderUtility?branch=master)](https://github.com/Hawkynt/DriveBenderUtility/commits/master)
+![Last Commit](https://img.shields.io/github/last-commit/Hawkynt/DriveBenderUtility?branch=master)
+![Activity](https://img.shields.io/github/commit-activity/m/Hawkynt/DriveBenderUtility)
+
+[![Stars](https://img.shields.io/github/stars/Hawkynt/DriveBenderUtility?color=FFD700)](https://github.com/Hawkynt/DriveBenderUtility/stargazers)
+[![Forks](https://img.shields.io/github/forks/Hawkynt/DriveBenderUtility?color=008080)](https://github.com/Hawkynt/DriveBenderUtility/network/members)
+[![Issues](https://img.shields.io/github/issues/Hawkynt/DriveBenderUtility)](https://github.com/Hawkynt/DriveBenderUtility/issues)
+![Code Size](https://img.shields.io/github/languages/code-size/Hawkynt/DriveBenderUtility?color=4CAF50)
+![Repo Size](https://img.shields.io/github/repo-size/Hawkynt/DriveBenderUtility?color=FF9800)
+
+[![Release](https://img.shields.io/github/v/release/Hawkynt/DriveBenderUtility?sort=semver)](https://github.com/Hawkynt/DriveBenderUtility/releases/latest)
+[![Nightly](https://img.shields.io/github/v/release/Hawkynt/DriveBenderUtility?include_prereleases=true&sort=date&label=nightly&color=FF9800)](https://github.com/Hawkynt/DriveBenderUtility/releases)
+[![Downloads](https://img.shields.io/github/downloads/Hawkynt/DriveBenderUtility/total)](https://github.com/Hawkynt/DriveBenderUtility/releases)
 
 > The #1 Spot for dealing with [DriveBender](https://en.wikipedia.org/wiki/Non-standard_RAID_levels#Drive_Extender) pools outside [DriveBender](https://www.division-m.com/drivebender/).
 
@@ -27,7 +36,7 @@ Core library containing all Drive Bender functionality:
 - **Semantic Data Types**: Type-safe wrappers for paths, sizes, and configuration
 
 ### 💻 DriveBender.Console  
-Command-line interface with 12+ commands:
+Command-line interface covering the full pool lifecycle:
 - Pool creation and deletion
 - Drive management operations
 - Duplication control
@@ -43,7 +52,7 @@ WPF-based graphical user interface featuring:
 - Pool creation wizards
 
 ### 🧪 DriveBender.Tests
-Comprehensive test suite with 100+ tests categorized as:
+Comprehensive test suite categorized as:
 - **Unit Tests**: Core functionality testing (HappyPath, EdgeCase, Exception)
 - **Integration Tests**: Cross-component testing
 - **End-to-End Tests**: Complete workflow validation
