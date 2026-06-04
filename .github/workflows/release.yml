@@ -1,12 +1,15 @@
 name: Release
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# Force JavaScript-based actions to run on Node 24 instead of the deprecated Node 20 ahead of
+# the 2026-06-16 hard cutover, until we bump each action to a Node-24-native major version.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   test:
@@ -29,28 +32,38 @@ jobs:
     with:
       version: ${{ needs.version.outputs.version }}
       release-kind: release
-      changelog-flag: --release ${{ github.ref_name }}
+      changelog-flag: --release v${{ needs.version.outputs.version }}
 
   publish:
     needs: [version, build]
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: actions/download-artifact@v4
         with: { name: "${{ needs.build.outputs.console-artifact }}", path: dist }
       - uses: actions/download-artifact@v4
         with: { name: "${{ needs.build.outputs.ui-artifact }}",      path: dist }
 
-      - uses: softprops/action-gh-release@v2
+      # Notes = a short curated header + the commit-prefix changelog (+ - * # !),
+      # NOT GitHub's PR-based "What's Changed".
+      - name: Compose release notes
+        env:
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          node .github/workflows/scripts/update-changelog.mjs --release "v$V" --notes CHANGES.md
+          echo "## DriveBenderUtility v$V" > RELEASE_NOTES.md
+          echo >> RELEASE_NOTES.md
+          cat CHANGES.md >> RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
-          body: |
-            ## DriveBenderUtility v${{ needs.version.outputs.version }}
-
-            - **Console** — CLI for managing Drive Bender pools.
-            - **UI** — WPF graphical interface.
-
-            Requires .NET Framework 4.7 Runtime on the target machine.
           files: dist/*.zip
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
