@@ -1,10 +1,10 @@
 # 🗂️ DriveBenderUtility
 
-[![License](https://img.shields.io/github/license/Hawkynt/DriveBenderUtility)](https://github.com/Hawkynt/DriveBenderUtility/blob/master/LICENSE)
+[![License](https://img.shields.io/github/license/Hawkynt/DriveBenderUtility)](https://github.com/Hawkynt/DriveBenderUtility/blob/main/LICENSE)
 [![Language](https://img.shields.io/github/languages/top/Hawkynt/DriveBenderUtility?color=8957D5)](https://github.com/Hawkynt/DriveBenderUtility)
 
-[![CI](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/ci.yml)
-![Last Commit](https://img.shields.io/github/last-commit/Hawkynt/DriveBenderUtility?branch=master)
+[![CI](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Hawkynt/DriveBenderUtility/actions/workflows/ci.yml)
+![Last Commit](https://img.shields.io/github/last-commit/Hawkynt/DriveBenderUtility?branch=main)
 ![Activity](https://img.shields.io/github/commit-activity/m/Hawkynt/DriveBenderUtility)
 
 [![Stars](https://img.shields.io/github/stars/Hawkynt/DriveBenderUtility?color=FFD700)](https://github.com/Hawkynt/DriveBenderUtility/stargazers)
@@ -18,8 +18,6 @@
 [![Downloads](https://img.shields.io/github/downloads/Hawkynt/DriveBenderUtility/total)](https://github.com/Hawkynt/DriveBenderUtility/releases)
 
 > The #1 Spot for dealing with [DriveBender](https://en.wikipedia.org/wiki/Non-standard_RAID_levels#Drive_Extender) pools outside [DriveBender](https://www.division-m.com/drivebender/).
-
-## 📖 Overview
 
 **DriveBenderUtility** is a comprehensive C# solution for managing Drive Bender storage pools with advanced features including pool management, drive operations, duplication control, and file integrity checking. The solution provides both command-line and WPF GUI interfaces for complete pool lifecycle management.
 
@@ -103,7 +101,7 @@ Comprehensive test suite categorized as:
 - ✅ Input validation and sanitization
 - ✅ Compile-time safety for critical operations
 
-## 🚀 Getting Started
+## 📦 Getting Started
 
 ### Prerequisites
 
@@ -408,13 +406,7 @@ nunit3-console DriveBender.Tests/bin/Debug/DriveBender.Tests.dll
 - **Validation**: Input validation prevents path traversal attacks
 - **Logging**: Comprehensive audit trail of all operations
 
-## 📄 License
-
-This project is licensed under the LGPL3 License. See the [LICENSE](LICENSE) file for more details.
-
-## 📞 Support & Contact
-
-### Getting Help
+## 🆘 Getting Help
 - **Documentation**: This README and inline code documentation
 - **Issues**: [GitHub Issues](https://github.com/Hawkynt/DriveBenderUtility/issues) for bugs and feature requests
 - **Discussions**: [GitHub Discussions](https://github.com/Hawkynt/DriveBenderUtility/discussions) for questions and help
@@ -434,3 +426,14 @@ We welcome feature requests! Please:
 - Describe the use case
 - Provide implementation suggestions if possible
 - Consider contributing the feature yourself
+
+## ❤️ Support
+
+If this project saves you time or money, consider supporting its development:
+
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub-Sponsor-EA4AAA?logo=githubsponsors)](https://github.com/sponsors/Hawkynt)
+[![PayPal](https://img.shields.io/badge/PayPal-Donate-00457C?logo=paypal)](https://www.paypal.me/hawkynt)
+
+## 📜 License
+
+Licensed under LGPL-3.0-or-later — see [LICENSE](LICENSE).
