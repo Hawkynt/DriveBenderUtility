@@ -14,7 +14,7 @@
 ![Repo Size](https://img.shields.io/github/repo-size/Hawkynt/DriveBenderUtility?color=FF9800)
 
 [![Release](https://img.shields.io/github/v/release/Hawkynt/DriveBenderUtility?sort=semver)](https://github.com/Hawkynt/DriveBenderUtility/releases/latest)
-[![Nightly](https://img.shields.io/github/v/release/Hawkynt/DriveBenderUtility?include_prereleases=true&sort=date&label=nightly&color=FF9800)](https://github.com/Hawkynt/DriveBenderUtility/releases)
+[![Nightly](https://img.shields.io/github/v/release/Hawkynt/DriveBenderUtility?include_prereleases&sort=date&label=nightly&color=FF9800)](https://github.com/Hawkynt/DriveBenderUtility/releases)
 [![Downloads](https://img.shields.io/github/downloads/Hawkynt/DriveBenderUtility/total)](https://github.com/Hawkynt/DriveBenderUtility/releases)
 
 > The #1 Spot for dealing with [DriveBender](https://en.wikipedia.org/wiki/Non-standard_RAID_levels#Drive_Extender) pools outside [DriveBender](https://www.division-m.com/drivebender/).
