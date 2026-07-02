@@ -181,6 +181,9 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
 
   public void AtomicReplace(string tempRelative, string finalRelative, bool shadow) {
     this._Check(VolumeOp.AtomicReplace);
+    if ((this.Caps & BackendCaps.AtomicRename) == 0)
+      throw new PoolFsException(PoolFsError.NotSupported, $"Backend '{this.DisplayName}' has no atomic rename (capability profile)");
+
     var tempPhysical = PoolPaths.ToPhysical(tempRelative, shadow);
     var finalPhysical = PoolPaths.ToPhysical(finalRelative, shadow);
     var staged = this._files.GetValueOrDefault(tempPhysical)
@@ -311,7 +314,11 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
 
     public override void Flush() {
       owner._Check(VolumeOp.Flush);
-      file.Persisted = (byte[])file.Current.Clone();
+
+      // a backend without DurableFlush acknowledges the flush but does not actually
+      // persist — exactly the FTP/WebDAV behaviour the engine must never trust
+      if ((owner.Caps & BackendCaps.DurableFlush) != 0)
+        file.Persisted = (byte[])file.Current.Clone();
     }
 
     public override long Seek(long offset, SeekOrigin origin) => this._position = origin switch {

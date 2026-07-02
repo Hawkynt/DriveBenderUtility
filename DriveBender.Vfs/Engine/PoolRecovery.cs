@@ -122,14 +122,8 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
       if (this._ContentEquals(member, path, shadow, content))
         continue;
 
-      // publish via temp + atomic rename — never a torn overwrite (SAFE-ATOMIC)
-      var temp = path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
-      using (var stream = member.OpenWrite(temp, shadow, true)) {
-        stream.Write(content, 0, content.Length);
-        stream.Flush();
-      }
-
-      member.AtomicReplace(temp, path, shadow);
+      // temp + atomic rename where supported, put-and-verify emulation otherwise (SAFE-ATOMIC, FR-CAP-ADAPT)
+      WholeFilePublisher.Publish(member, path, shadow, content);
       changed = true;
     }
 

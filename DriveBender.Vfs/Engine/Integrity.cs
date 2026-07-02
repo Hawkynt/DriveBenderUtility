@@ -355,14 +355,7 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     }
   }
 
-  private void _Publish(IVolumeIO member, string path, bool shadow, byte[] content) {
-    var temp = path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
-    using (var stream = member.OpenWrite(temp, shadow, true)) {
-      stream.Write(content, 0, content.Length);
-      stream.Flush();
-    }
-
-    member.AtomicReplace(temp, path, shadow);
-  }
+  private void _Publish(IVolumeIO member, string path, bool shadow, byte[] content)
+    => WholeFilePublisher.Publish(member, path, shadow, content);
 
 }

@@ -607,7 +607,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     open.File.Lock.EnterWriteLock();
     try {
       var path = open.File.Path;
-      var copies = this._placement.ResolveCopies(path);
+      IReadOnlyList<PhysicalCopy> copies = this._placement.ResolveCopies(path);
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
@@ -626,11 +626,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         return bytes.Length;
       }
 
-      var requiredCopies = policy == WritePolicy.WriteThrough
-        ? copies.Count
-        : Math.Min(copies.Count, ConfigValidator.EffectiveMinCopiesBeforeAck(effective.Write, effective.Duplication));
+      // copies on members without a durable flush can never satisfy the ack quorum and
+      // are always completed asynchronously (SAFE-REMOTE); order them behind the rest
+      var orderedCopies = copies.OrderByDescending(c => WholeFilePublisher.CanSatisfyAckQuorum(c.Volume)).ToArray();
+      var eligibleCount = orderedCopies.Count(c => WholeFilePublisher.CanSatisfyAckQuorum(c.Volume));
+      copies = orderedCopies;
 
-      this._RequireAckQuorum(path, copies.Count);
+      var requiredCopies = policy == WritePolicy.WriteThrough
+        ? eligibleCount
+        : Math.Min(eligibleCount, ConfigValidator.EffectiveMinCopiesBeforeAck(effective.Write, effective.Duplication));
+
+      this._RequireAckQuorum(path, eligibleCount);
 
       // intent → mutate the ack set durably → (write-through: complete now; write-back /
       // deferred: the intent stays open until the owed copies are applied, so a crash
@@ -646,6 +652,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       if (requiredCopies >= copies.Count)
         this._journal.Complete(sequence, JournalOp.Write);
+      else if (policy == WritePolicy.WriteThrough) {
+        // write-through with weak-flush members: apply their copies now (best effort), the
+        // intent stays open so recovery reconciles them if they were lost (SAFE-REMOTE)
+        for (var i = requiredCopies; i < copies.Count; ++i) {
+          var copy = copies[i];
+          using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
+          stream.Seek(offset, SeekOrigin.Begin);
+          stream.Write(bytes, 0, bytes.Length);
+          stream.Flush();
+        }
+
+        this._journal.Complete(sequence, JournalOp.Write);
+      }
       else if (!this._writeBuffer.StageWrite(path, offset, bytes, sequence, requiredCopies)) {
         // write-buffer backpressure: degrade to write-through instead of growing RAM (FR-BACKP)
         for (var i = requiredCopies; i < copies.Count; ++i) {
@@ -791,13 +810,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         if (parent.Length > 0)
           target.EnsureFolder(parent, false);
 
-        var temp = path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
-        using (var stream = target.OpenWrite(temp, false, true)) {
-          stream.Write(content, 0, content.Length);
-          stream.Flush();
-        }
-
-        target.AtomicReplace(temp, path, false);
+        WholeFilePublisher.Publish(target, path, false, content);
         landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
         this._journal.Complete(sequence, JournalOp.Drain);
         this._integrity.InvalidateFile(path);
