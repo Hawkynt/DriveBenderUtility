@@ -308,10 +308,14 @@ dbmount serve --open      # animated live dashboard at http://127.0.0.1:9723 (to
 ```
 
 The page shows every pool with live capacity donuts, cache-hit/dirty meters, a
-RAM→fast→capacity tier diagram with animated data flows, per-member health, and
-health/fix/restore buttons — updated once a second while pools are mounted. The
-**desktop app** (`DriveBender.App`) is the same page in a native window: it
-launches the daemon for you, so web and desktop are identical.
+RAM→fast→capacity tier diagram with animated data flows, and per-member health —
+updated once a second while pools are mounted. From the same page you can run the
+**entire lifecycle**: create a pool (with typed local/remote members and a
+credential), mount / unmount, add or remove members, remove- and replace-media,
+run health / fix / restore, and delete (keep data) or purge (wipe data, guarded
+by a name-confirmation). The **desktop app** (`DriveBender.App`) is the same page
+in a native window — it launches the daemon for you, so web and desktop are
+identical.
 
 ### 5. Health & media maintenance
 
