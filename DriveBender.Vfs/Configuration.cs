@@ -145,6 +145,16 @@ public enum ExternalEditPolicy {
   [JsonStringEnumMemberName("read-only-until-reconciled")] ReadOnlyUntilReconciled,
 }
 
+/// <summary>What the mounted view does when a member drops out live (§10 SAFE-DEGRADE).</summary>
+[JsonConverter(typeof(JsonStringEnumConverter<MemberLossPolicy>))]
+public enum MemberLossPolicy {
+  /// <summary>Keep serving complete metadata from the in-memory shadow namespace; reads of vanished data fail cleanly.</summary>
+  [JsonStringEnumMemberName("retain-metadata")] RetainMetadata,
+
+  /// <summary>Immediately drop files/folders with no surviving copy from the mounted namespace.</summary>
+  [JsonStringEnumMemberName("discard-inaccessible")] DiscardInaccessible,
+}
+
 public sealed record WriteConfig {
   [JsonPropertyName("policy")] public WritePolicy? Policy { get; init; }
   [JsonPropertyName("minCopiesBeforeAck")] public int? MinCopiesBeforeAck { get; init; }
@@ -232,6 +242,16 @@ public sealed record SafetyConfig {
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
 }
 
+public sealed record ResilienceConfig {
+  /// <summary>Behaviour when a mounted pool loses a member live (§10 SAFE-DEGRADE); default retain-metadata.</summary>
+  [JsonPropertyName("onMemberLoss")] public MemberLossPolicy? OnMemberLoss { get; init; }
+
+  /// <summary>How often the member watcher polls member reachability while mounted.</summary>
+  [JsonPropertyName("memberPollSeconds")] public double? MemberPollSeconds { get; init; }
+
+  [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+}
+
 public sealed record IntegrityConfig {
   [JsonPropertyName("checksumDb")] public bool? ChecksumDb { get; init; }
   [JsonPropertyName("fastHash")] public string? FastHash { get; init; }
@@ -274,6 +294,7 @@ public sealed record PoolConfig {
   [JsonPropertyName("memberOverrides")] public Dictionary<string, JsonElement>? MemberOverrides { get; init; }
   [JsonPropertyName("background")] public BackgroundConfig? Background { get; init; }
   [JsonPropertyName("safety")] public SafetyConfig? Safety { get; init; }
+  [JsonPropertyName("resilience")] public ResilienceConfig? Resilience { get; init; }
   [JsonPropertyName("integrity")] public IntegrityConfig? Integrity { get; init; }
   [JsonPropertyName("trash")] public TrashConfig? Trash { get; init; }
   [JsonPropertyName("locale")] public string? Locale { get; init; }
@@ -332,6 +353,7 @@ public static class ConfigResolver {
     },
     "background": { "maxThroughput": "50%", "balancerEnabled": true, "duplicatorEnabled": true },
     "safety": { "journalEnabled": true, "refuseMountOnUnrecoverable": true, "verifyDrainWithChecksum": true },
+    "resilience": { "onMemberLoss": "retain-metadata", "memberPollSeconds": 5 },
     "integrity": {
       "checksumDb": true,
       "fastHash": "xxh3",

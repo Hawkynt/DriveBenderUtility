@@ -87,3 +87,12 @@ public sealed class TrashMaintenanceJob(PoolFileSystem fs) : IBackgroundJob {
   public bool RunOnce() => fs.PurgeTrash() > 0;
 
 }
+
+/// <summary>Polls member reachability so drive loss/return is reacted to per policy (§10 SAFE-DEGRADE).</summary>
+public sealed class MemberWatchJob(PoolFileSystem fs) : IBackgroundJob {
+
+  public string Name => "member-watch";
+
+  public bool RunOnce() => fs.PollMembers();
+
+}

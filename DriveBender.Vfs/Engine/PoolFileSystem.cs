@@ -19,7 +19,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly Guid _poolId;
   private readonly IReadOnlyList<EngineMember> _members;
   private readonly CacheInstance _cache;
-  private readonly PoolConfig _config;
+  private PoolConfig _config;
   private readonly PlacementResolver _placement;
   private readonly HandleTable _handles = new();
   private readonly Journal _journal;
@@ -27,12 +27,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly PoolTrash _trash;
   private readonly IntegrityService _integrity;
   private readonly ActivityFeed _activity;
+  private readonly ShadowNamespace _shadow = new();
+  private readonly MemberWatcher _watcher;
   private readonly Func<DateTime> _clock;
-  private readonly long _readAheadMin;
-  private readonly long _readAheadMax;
-  private readonly bool _readAheadEnabled;
-  private readonly bool _readAheadAdaptive;
-  private readonly long _mirrorSplitThreshold;
+  private long _readAheadMin;
+  private long _readAheadMax;
+  private bool _readAheadEnabled;
+  private bool _readAheadAdaptive;
+  private long _mirrorSplitThreshold;
+  private MemberLossPolicy _memberLossPolicy;
   private MountOptions? _mountOptions;
 
   public PoolFileSystem(Guid poolId, IReadOnlyList<EngineMember> members, CacheInstance cache, PoolConfig effectiveConfig, Journal? journal = null, Func<DateTime>? clock = null) {
@@ -53,12 +56,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       effectiveConfig,
       members.ToDictionary(m => m.Io.MemberId, m => m.Role));
 
-    var readAhead = effectiveConfig.ReadAhead;
+    this._watcher = new([.. members.Select(m => m.Io)]);
+    this._watcher.MemberLost += this._OnMemberLost;
+    this._watcher.MemberReturned += this._OnMemberReturned;
+    this._ApplyRuntimeConfig(effectiveConfig);
+  }
+
+  private void _ApplyRuntimeConfig(PoolConfig config) {
+    var readAhead = config.ReadAhead;
     this._readAheadEnabled = readAhead?.Enabled ?? true;
     this._readAheadMin = SizeSpec.ParseBytes(readAhead?.MinWindow ?? "1MiB");
     this._readAheadMax = SizeSpec.ParseBytes(readAhead?.MaxWindow ?? "8MiB");
     this._readAheadAdaptive = readAhead?.Adaptive ?? true;
-    this._mirrorSplitThreshold = SizeSpec.ParseBytes(effectiveConfig.Io?.MirrorReadSplitThreshold ?? "8MiB");
+    this._mirrorSplitThreshold = SizeSpec.ParseBytes(config.Io?.MirrorReadSplitThreshold ?? "8MiB");
+    this._memberLossPolicy = config.Resilience?.OnMemberLoss ?? MemberLossPolicy.RetainMetadata;
   }
 
   public PlacementResolver Placement => this._placement;
@@ -67,6 +78,59 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public PoolTrash Trash => this._trash;
   public IntegrityService Integrity => this._integrity;
   public ActivityFeed Activity => this._activity;
+  public MemberWatcher Watcher => this._watcher;
+  public ShadowNamespace Shadow => this._shadow;
+  public MemberLossPolicy MemberLossPolicy => this._memberLossPolicy;
+
+  /// <summary>Polls member reachability and reacts per the drive-loss policy; the host/scheduler drives this (§10 SAFE-DEGRADE).</summary>
+  public bool PollMembers() => this._watcher.Poll();
+
+  /// <summary>
+  /// Applies non-structural config changes to a mounted pool without unmount (CFG.reload):
+  /// write policy, tiers, read-ahead, drive-loss policy, and cache sizing. Shrinking the
+  /// cache flushes dirty write-buffer data down to the new cap first, never dropping it
+  /// (SAFE-NOLOSS). Membership changes are not reload-able and are rejected.
+  /// </summary>
+  public void ReloadConfig(PoolConfig newConfig) {
+    ConfigValidator.Validate(newConfig, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+
+    // shrinking caches must not strand dirty data: flush everything owed first (SAFE-NOLOSS)
+    if (this._writeBuffer.DirtyPaths.Count > 0)
+      foreach (var path in this._writeBuffer.DirtyPaths)
+        this.FlushPath(path);
+
+    this._config = newConfig;
+    this._ApplyRuntimeConfig(newConfig);
+
+    // placement reads its tuning live from the config reference it was given; refresh caches so new policy takes effect
+    this._cache.Metadata.InvalidatePool(this._poolId);
+    this._placement.UpdateConfig(newConfig);
+    this._activity.Publish(ActivityKind.Recovery, "", reason: "config reloaded");
+    DriveBender.Logger("Configuration reloaded live");
+  }
+
+  private void _OnMemberLost(IVolumeIO member) {
+    this._activity.Publish(ActivityKind.Recovery, "", reason: $"member lost: {member.DisplayName}");
+    if (this._memberLossPolicy == MemberLossPolicy.DiscardInaccessible) {
+      // drop cached metadata so the next listing reflects only surviving copies…
+      this._cache.Metadata.InvalidatePool(this._poolId);
+      this._placement.InvalidateAll();
+
+      // …and prune the shadow namespace of paths with no accessible copy left
+      foreach (var path in this._shadow.AllPaths())
+        if (this._placement.ResolveCopies(path).Count == 0)
+          this._shadow.Remove(path);
+    }
+    // retain-metadata: keep every cache and the shadow namespace so metadata stays complete
+  }
+
+  private void _OnMemberReturned(IVolumeIO member) {
+    // a returned member may hold newer/owed data; drop caches and reconcile (SAFE-OFFLINE)
+    this._cache.Metadata.InvalidatePool(this._poolId);
+    this._placement.InvalidateAll();
+    if (this._config.Integrity?.ChecksumDb != false)
+      this._integrity.QuickScan(this._Invalidate);
+  }
 
   /// <summary>Dashboard counters for this pool (OPS-METRICS).</summary>
   public PoolMetrics GetMetrics()
@@ -88,7 +152,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       ? DurationSpec.Parse(write?.DeferWindow ?? "5s")
       : TimeSpan.Zero;
     var maxDefer = TimeSpan.FromSeconds(write?.MaxDeferSeconds ?? 30);
-    var jobs = new List<IBackgroundJob> { new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this) };
+    var jobs = new List<IBackgroundJob> { new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this), new MemberWatchJob(this) };
     if (this._config.Trash?.Enabled == true)
       jobs.Add(new TrashMaintenanceJob(this));
 
@@ -186,11 +250,18 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._cache.Metadata.TryGet<FileMeta>(key, out var cached))
       return this._OverlayMeta(normalized, cached);
 
-    var meta = this._StatUncached(normalized)
-               ?? throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {path}");
+    var meta = this._StatUncached(normalized);
+    if (meta == null) {
+      // retain-metadata: a path whose only copy vanished is still visible from the shadow namespace (§10 SAFE-DEGRADE)
+      if (this._memberLossPolicy == MemberLossPolicy.RetainMetadata && this._shadow.Get(normalized) is { } remembered)
+        return new(remembered.Length, DateTime.MinValue, remembered.LastWriteTimeUtc, remembered.Kind == NodeKind.Directory ? FileAttributes.Directory : FileAttributes.Normal);
 
-    this._cache.Metadata.Put(key, meta);
-    return this._OverlayMeta(normalized, meta);
+      throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {path}");
+    }
+
+    this._cache.Metadata.Put(key, meta.Value);
+    this._shadow.Record(normalized, new(meta.Value.IsDirectory ? NodeKind.Directory : NodeKind.File, meta.Value.Length, meta.Value.LastWriteTimeUtc));
+    return this._OverlayMeta(normalized, meta.Value);
   }
 
   private FileMeta _OverlayMeta(string normalized, FileMeta meta) {
@@ -271,11 +342,25 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       }
     }
 
+    // retain-metadata: complete the listing with remembered entries whose members have dropped out (§10 SAFE-DEGRADE)
+    if (this._memberLossPolicy == MemberLossPolicy.RetainMetadata && (folderSeen || this._shadow.Get(normalized)?.Kind == NodeKind.Directory))
+      foreach (var remembered in this._shadow.Children(normalized))
+        if (!entries.ContainsKey(remembered.Name)) {
+          entries[remembered.Name] = remembered;
+          folderSeen = true;
+        }
+
     if (!folderSeen)
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {path}");
 
     IReadOnlyList<DirEntry> result = [.. entries.Values.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase)];
     this._cache.Metadata.Put(key, result);
+
+    // remember the live namespace so it survives a later member loss
+    this._shadow.Record(normalized, new(NodeKind.Directory, 0, DateTime.MinValue));
+    foreach (var entry in result)
+      this._shadow.Record(normalized.Length == 0 ? entry.Name : $"{normalized}/{entry.Name}", new(entry.Kind, entry.Length, entry.LastWriteTimeUtc));
+
     return result;
   }
 
@@ -326,6 +411,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._EnsureShadows(normalized, [], content: []);
     this._journal.Complete(sequence, JournalOp.Create);
     this._Invalidate(normalized);
+    this._shadow.Record(normalized, new(NodeKind.File, 0, this._clock()));
     return this._handles.Open(normalized, AccessMode.ReadWrite).Handle;
   }
 
@@ -396,6 +482,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._journal.Complete(sequence, JournalOp.Rename);
     this._integrity.RenameFile(fromNormalized, toNormalized);
     this._handles.RenamePath(fromNormalized, toNormalized);
+    this._shadow.Rename(fromNormalized, toNormalized);
     this._Invalidate(fromNormalized);
     this._Invalidate(toNormalized);
   }
@@ -420,6 +507,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           this._journal.Complete(staleSequence, JournalOp.Write);
 
       this._Invalidate(normalized);
+      this._shadow.Remove(normalized);
       return;
     }
 
@@ -438,6 +526,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._journal.Complete(staleSequence, JournalOp.Write);
 
     this._Invalidate(normalized);
+    this._shadow.Remove(normalized);
   }
 
   public void MakeDir(string path) {
@@ -462,6 +551,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._journal.Complete(sequence, JournalOp.MakeDir);
     this._Invalidate(normalized);
+    this._shadow.Record(normalized, new(NodeKind.Directory, 0, this._clock()));
   }
 
   public void RemoveDir(string path) {
@@ -483,6 +573,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._journal.Complete(sequence, JournalOp.RemoveDir);
     this._Invalidate(normalized);
+    this._shadow.Remove(normalized);
   }
 
   private void _Invalidate(string normalized) {

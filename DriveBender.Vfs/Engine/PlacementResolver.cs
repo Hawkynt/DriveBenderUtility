@@ -15,6 +15,9 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
 
   private int _roundRobinCounter;
 
+  /// <summary>Swaps the tuning config live (CFG.reload); placement decisions use the new values immediately.</summary>
+  public void UpdateConfig(PoolConfig newConfig) => config = newConfig;
+
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
   /// <summary>All physical copies of a path, primaries before shadows (FR-RESOLVE); cached in the metadata cache.</summary>
@@ -22,7 +25,8 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
     var normalized = PoolPaths.Normalize(path);
     var key = new MetadataKey(poolId, normalized, MetadataKind.Placement);
     if (metadata.TryGet<IReadOnlyList<PhysicalCopy>>(key, out var cached))
-      return cached;
+      // a cached list can outlive a member going offline; only ever hand back reachable copies (§10 SAFE-DEGRADE)
+      return [.. cached.Where(c => c.Volume.IsOnline)];
 
     var copies = new List<PhysicalCopy>();
     foreach (var member in this._Online)
@@ -39,6 +43,9 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
   }
 
   public void Invalidate(string path) => metadata.InvalidatePath(poolId, path);
+
+  /// <summary>Drops every cached placement (used on member online/offline transitions).</summary>
+  public void InvalidateAll() => metadata.InvalidatePool(poolId);
 
   /// <summary>Duplication level D (total copies) effective for a path's folder (§6.3).</summary>
   public int DuplicationLevelFor(string folderPath) {
