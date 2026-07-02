@@ -76,29 +76,42 @@ internal static class MountCommand {
 
   private static int _MountPlatform(PoolFileSystem fs, string target, string label, MountOptions options) {
 #if WINDOWS
-    if (!Windows.WinFspMountHost.IsWinFspAvailable()) {
-      Console.Error.WriteLine("WinFsp is not installed — get it from https://winfsp.dev and retry.");
+    // WinFsp preferred (richer semantics); Dokan (LGPL) as the no-extra-install fallback (§4.1)
+    IDisposable mountHost;
+    Action unmountAction;
+    if (Windows.WinFspMountHost.IsWinFspAvailable()) {
+      var winFsp = new Windows.WinFspMountHost();
+      winFsp.Mount(fs, target, label, options.ReadOnly);
+      mountHost = winFsp;
+      unmountAction = winFsp.Unmount;
+    } else if (Windows.DokanMountHost.IsDokanAvailable()) {
+      var dokan = new Windows.DokanMountHost();
+      dokan.Mount(fs, target, label, options.ReadOnly);
+      mountHost = dokan;
+      unmountAction = dokan.Unmount;
+    } else {
+      Console.Error.WriteLine("No filesystem driver found — install WinFsp (https://winfsp.dev) or Dokan (https://dokan-dev.github.io) and retry.");
       return 3;
     }
 
-    using var mountHost = new Windows.WinFspMountHost();
-    mountHost.Mount(fs, target, label, options.ReadOnly);
+    using (mountHost) {
+      var scheduler = fs.CreateScheduler();
+      using var pump = new Timer(_ => scheduler.Pump(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
 
-    var scheduler = fs.CreateScheduler();
-    using var pump = new Timer(_ => scheduler.Pump(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+      Console.WriteLine($"Pool mounted at '{target}'. Press Ctrl+C to unmount.");
+      using var stop = new ManualResetEventSlim();
+      Console.CancelKeyPress += (_, e) => {
+        e.Cancel = true;
+        stop.Set();
+      };
+      stop.Wait();
 
-    Console.WriteLine($"Pool mounted at '{target}'. Press Ctrl+C to unmount.");
-    using var stop = new ManualResetEventSlim();
-    Console.CancelKeyPress += (_, e) => {
-      e.Cancel = true;
-      stop.Set();
-    };
-    stop.Wait();
+      Console.WriteLine("Unmounting (flushing dirty state)…");
+      unmountAction();
+      scheduler.Quiesce();
+      fs.Unmount(); // clean unmount flushes everything (FR-CLEAN-UNMOUNT)
+    }
 
-    Console.WriteLine("Unmounting (flushing dirty state)…");
-    mountHost.Unmount();
-    scheduler.Quiesce();
-    fs.Unmount(); // clean unmount flushes everything (FR-CLEAN-UNMOUNT)
     return 0;
 #else
     if (!OperatingSystem.IsLinux()) {

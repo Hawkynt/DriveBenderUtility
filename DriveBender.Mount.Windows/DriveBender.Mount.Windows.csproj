@@ -16,5 +16,6 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="winfsp.net" Version="2.2.26112" />
+    <PackageReference Include="DokanNet" Version="2.3.0.3" />
   </ItemGroup>
 </Project>
