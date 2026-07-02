@@ -82,7 +82,7 @@ namespace DriveBender.UI {
     }
     
     private void CreatePoolButton_Click(object sender, RoutedEventArgs e) {
-      var dialog = new CreatePoolDialog();
+      var dialog = new CreatePoolDialog { Owner = this };
       if (dialog.ShowDialog() == true) {
         RefreshPools();
       }
