@@ -55,9 +55,23 @@ public sealed class RealHostEnvironment : IHostEnvironment {
     public static extern bool GetDiskFreeSpaceEx(string lpDirectoryName, out ulong lpFreeBytesAvailable, out ulong lpTotalNumberOfBytes, out ulong lpTotalNumberOfFreeBytes);
   }
 
-  public string ConfigRoot => OperatingSystem.IsWindows()
-    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DriveBenderUtility")
-    : "/etc/drivebenderutility";
+  public string ConfigRoot {
+    get {
+      if (OperatingSystem.IsWindows())
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DriveBenderUtility");
+
+      // machine-wide when root (or already provisioned writable); per-user XDG fallback otherwise
+      const string machineRoot = "/etc/drivebenderutility";
+      if (Directory.Exists(machineRoot) || Environment.IsPrivilegedProcess)
+        return machineRoot;
+
+      var xdg = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME");
+      var baseDir = string.IsNullOrEmpty(xdg)
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config")
+        : xdg;
+      return Path.Combine(baseDir, "drivebenderutility");
+    }
+  }
 
   public IEnumerable<string> EnumerateVolumeRoots() {
     foreach (var drive in DriveInfo.GetDrives()) {

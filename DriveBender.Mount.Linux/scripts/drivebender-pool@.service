@@ -1,0 +1,20 @@
+# systemd template unit: mount a Drive Bender pool at boot (§6.12)
+#
+#   systemctl enable --now drivebender-pool@media.service
+#
+# mounts /etc/drivebenderutility/pools/media.json at its manifest mount.target.
+# Copy to /etc/systemd/system/drivebender-pool@.service.
+
+[Unit]
+Description=Drive Bender pool %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/drivebenderutility/dbmount mount --manifest /etc/drivebenderutility/pools/%i.json
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

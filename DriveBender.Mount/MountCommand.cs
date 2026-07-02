@@ -101,8 +101,17 @@ internal static class MountCommand {
     fs.Unmount(); // clean unmount flushes everything (FR-CLEAN-UNMOUNT)
     return 0;
 #else
-    Console.Error.WriteLine("Mounting on this platform requires the FUSE adapter (pending milestone); Windows builds use WinFsp.");
-    return 3;
+    if (!OperatingSystem.IsLinux()) {
+      Console.Error.WriteLine("Mounting is supported on Windows (WinFsp build) and Linux (FUSE); this platform has no adapter.");
+      return 3;
+    }
+
+    if (!Linux.LinuxFuseMountHost.IsFuseAvailable()) {
+      Console.Error.WriteLine("FUSE is not available (/dev/fuse missing) — install fuse3 and retry.");
+      return 3;
+    }
+
+    return Linux.LinuxFuseMountHost.Run(fs, target, options.ReadOnly);
 #endif
   }
 

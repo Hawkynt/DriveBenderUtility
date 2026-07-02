@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Version>1.0.0</Version>
+    <AssemblyTitle>DriveBender.Mount.Linux</AssemblyTitle>
+    <Company>»SynthelicZ«</Company>
+    <Product>DriveBender FUSE Adapter</Product>
+    <Description>FUSE adapter hosting a Drive Bender pool as a Linux filesystem</Description>
+    <Copyright>Copyright © Hawkynt 2017-2026</Copyright>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DriveBender.Vfs\DriveBender.Vfs.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="LTRData.FuseDotNet" Version="1.0.0.14" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="scripts\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

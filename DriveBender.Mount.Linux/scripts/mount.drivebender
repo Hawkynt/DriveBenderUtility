@@ -1,0 +1,51 @@
+#!/bin/sh
+# mount.drivebender — fstab/mount helper for Drive Bender pools (FR-MOUNT-FSTAB)
+#
+# Usage (mount(8) calls this as):
+#   mount.drivebender <manifest.json|poolId|poolName> <mountpoint> [-o options]
+#
+# fstab example:
+#   /etc/drivebenderutility/pools/media.json  /mnt/media  fuse.drivebender  defaults,_netdev,allow_other  0 0
+#
+# Options handled here: ro (read-only); everything else passes through to dbmount/FUSE.
+# Install: copy to /sbin/mount.drivebender (and symlink /sbin/mount.fuse.drivebender), chmod 0755.
+
+set -e
+
+MANIFEST="$1"
+TARGET="$2"
+shift 2 || true
+
+READONLY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o)
+      case ",$2," in
+        *,ro,*) READONLY="--read-only" ;;
+      esac
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+DBMOUNT="${DBMOUNT:-dbmount}"
+command -v "$DBMOUNT" >/dev/null 2>&1 || DBMOUNT=/opt/drivebenderutility/dbmount
+
+# mount(8) expects the helper to return once the filesystem is up: run detached,
+# dbmount itself stays attached to the FUSE session and flushes on unmount.
+"$DBMOUNT" mount --manifest "$MANIFEST" --target "$TARGET" $READONLY &
+
+# wait until the mountpoint is live (or the mounter died)
+for _ in $(seq 1 50); do
+  if grep -q " $TARGET fuse.drivebender" /proc/mounts 2>/dev/null || mountpoint -q "$TARGET" 2>/dev/null; then
+    exit 0
+  fi
+  kill -0 $! 2>/dev/null || exit 1
+  sleep 0.2
+done
+
+echo "mount.drivebender: timeout waiting for '$TARGET' to come up" >&2
+exit 1
