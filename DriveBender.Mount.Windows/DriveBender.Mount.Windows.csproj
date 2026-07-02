@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Version>1.0.0</Version>
+    <AssemblyTitle>DriveBender.Mount.Windows</AssemblyTitle>
+    <Company>»SynthelicZ«</Company>
+    <Product>DriveBender WinFsp Adapter</Product>
+    <Description>WinFsp adapter hosting a Drive Bender pool as a Windows filesystem</Description>
+    <Copyright>Copyright © Hawkynt 2017-2026</Copyright>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DriveBender.Vfs\DriveBender.Vfs.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="winfsp.net" Version="2.2.26112" />
+  </ItemGroup>
+</Project>

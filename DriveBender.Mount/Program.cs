@@ -42,7 +42,7 @@ internal static class Program {
       (PoolRemoveMemberOptions o) => _Guard(() => _PoolRemoveMember(provider, lifecycle, o)),
       (PoolAdoptOptions o) => _Guard(() => _PoolAdopt(provider, lifecycle, o)),
       (PoolRepairManifestOptions o) => _Guard(() => _PoolRepairManifest(provider, store, o)),
-      (MountOptions o) => _NotImplemented("mount"),
+      (MountOptions o) => _Guard(() => MountCommand.Run(host, store, provider, o)),
       (UnmountOptions o) => _NotImplemented("unmount"),
       (StatusOptions o) => _NotImplemented("status"),
       (ListOptions o) => _Guard(() => _PoolList(provider, o.Json)),
