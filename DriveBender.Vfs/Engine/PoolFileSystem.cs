@@ -8,11 +8,11 @@ public sealed record EngineMember(IVolumeIO Io, MemberRole Role = MemberRole.Cap
 /// <summary>
 /// The VFS engine (CMP-VFS) over a set of pool members: presents the merged logical
 /// namespace (FR-DIR), hides on-disk sidecars (FR-HIDE), serves block-aligned cached
-/// reads with read-ahead (FR-RA) and mirror block routing (FR-MIRROR), and reports
-/// duplication-aware pool statistics (FR-STAT).
-///
-/// Milestone M1: the read side. Mutating operations arrive with the journalled write
-/// path (M2) and until then fail with <see cref="PoolFsError.NotSupported"/>.
+/// reads with read-ahead (FR-RA) and mirror block routing (FR-MIRROR), reports
+/// duplication-aware pool statistics (FR-STAT), and executes journalled, crash-safe
+/// mutations (SAFE-WAL/SAFE-ORDER): every write is durable on all reachable copies
+/// before it is acknowledged (M2 semantics — the tiered write-back cascade of M3
+/// relaxes latency, never durability).
 /// </summary>
 public sealed class PoolFileSystem : IPoolFileSystem {
 
@@ -22,6 +22,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly PoolConfig _config;
   private readonly PlacementResolver _placement;
   private readonly HandleTable _handles = new();
+  private readonly Journal _journal;
   private readonly long _readAheadMin;
   private readonly long _readAheadMax;
   private readonly bool _readAheadEnabled;
@@ -29,11 +30,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly long _mirrorSplitThreshold;
   private MountOptions? _mountOptions;
 
-  public PoolFileSystem(Guid poolId, IReadOnlyList<EngineMember> members, CacheInstance cache, PoolConfig effectiveConfig) {
+  public PoolFileSystem(Guid poolId, IReadOnlyList<EngineMember> members, CacheInstance cache, PoolConfig effectiveConfig, Journal? journal = null) {
     this._poolId = poolId;
     this._members = members;
     this._cache = cache;
     this._config = effectiveConfig;
+    this._journal = journal ?? new(new MemberJournalStore([.. members.Select(m => m.Io)]));
     this._placement = new(
       poolId,
       [.. members.Select(m => m.Io)],
@@ -50,6 +52,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   public PlacementResolver Placement => this._placement;
+  public Journal Journal => this._journal;
   public bool IsMounted => this._mountOptions != null;
   public bool IsReadOnly => this._mountOptions?.ReadOnly ?? false;
 
@@ -61,6 +64,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     if (!this._Online.Any())
       throw new PoolFsException(PoolFsError.Offline, "No pool member is online — refusing to mount");
+
+    // recovery before serving: roll forward, reconcile, clean temps (FR-RECOVER)
+    var report = new PoolRecovery([.. this._Online], this._journal).Run();
+    if (report.AnythingDone)
+      DriveBender.Logger($"Recovery: {report.RolledForward} rolled forward, {report.Reconciled} reconciled, {report.TempsRemoved} staging files removed");
 
     this._mountOptions = options;
   }
@@ -74,10 +82,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       throw new PoolFsException(PoolFsError.InvalidArgument, "Pool is not mounted");
   }
 
-  private PoolFsException _WriteNotSupportedYet()
-    => this.IsReadOnly
-      ? new(PoolFsError.AccessDenied, "Pool is mounted read-only")
-      : new PoolFsException(PoolFsError.NotSupported, "The journalled write path lands with milestone M2");
+  private void _RequireWritable() {
+    this._RequireMounted();
+    if (this.IsReadOnly)
+      throw new PoolFsException(PoolFsError.AccessDenied, "Pool is mounted read-only");
+  }
 
   #region metadata
 
@@ -112,8 +121,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   public void SetAttributes(string path, FileMetaPatch patch) {
-    this._RequireMounted();
-    throw this._WriteNotSupportedYet();
+    this._RequireWritable();
+    var normalized = PoolPaths.Normalize(path);
+    var copies = this._placement.ResolveCopies(normalized);
+    if (copies.Count == 0)
+      throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {path}");
+
+    foreach (var copy in copies)
+      copy.Volume.SetTimestamps(normalized, copy.Shadow, patch.CreationTimeUtc, patch.LastWriteTimeUtc);
+
+    this._cache.Metadata.InvalidatePath(this._poolId, normalized);
   }
 
   public IReadOnlyList<DirEntry> ReadDirectory(string path) {
@@ -168,31 +185,187 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   #endregion
 
-  #region namespace (M2)
+  #region namespace
+
+  private bool _ParentExists(string normalized) {
+    var parent = PoolPaths.GetParent(normalized);
+    return parent.Length == 0 || this._Online.Any(m => m.FolderExists(parent, false));
+  }
 
   public NodeHandle Create(string path, NodeKind kind, CreateFlags flags) {
-    this._RequireMounted();
-    throw this._WriteNotSupportedYet();
+    this._RequireWritable();
+    var normalized = PoolPaths.Normalize(path);
+    if (kind == NodeKind.Directory) {
+      this.MakeDir(normalized);
+      return NodeHandle.Invalid;
+    }
+
+    if (!this._ParentExists(normalized))
+      throw new PoolFsException(PoolFsError.NotFound, $"Parent folder not found: {path}");
+
+    var existing = this._placement.ResolveCopies(normalized);
+    if (existing.Count > 0) {
+      if ((flags & CreateFlags.Exclusive) != 0)
+        throw new PoolFsException(PoolFsError.Exists, $"File already exists: {path}");
+
+      var handleForExisting = this._handles.Open(normalized, AccessMode.ReadWrite).Handle;
+      if ((flags & CreateFlags.Truncate) != 0)
+        this.SetLength(handleForExisting, 0);
+
+      return handleForExisting;
+    }
+
+    var target = this._placement.ChoosePrimaryTarget(0)
+                 ?? throw new PoolFsException(PoolFsError.NoSpace, "No pool member can take the new file");
+
+    var sequence = this._journal.LogIntent(JournalOp.Create, normalized, memberId: target.MemberId);
+    var parent = PoolPaths.GetParent(normalized);
+    if (parent.Length > 0)
+      target.EnsureFolder(parent, false);
+
+    using (var stream = target.OpenWrite(normalized, false, true))
+      stream.Flush();
+
+    this._EnsureShadows(normalized, [], content: []);
+    this._journal.Complete(sequence, JournalOp.Create);
+    this._Invalidate(normalized);
+    return this._handles.Open(normalized, AccessMode.ReadWrite).Handle;
+  }
+
+  /// <summary>Brings a file up to its folder's duplication level D by creating missing shadow copies (SAFE-DUP).</summary>
+  private void _EnsureShadows(string normalized, IReadOnlyList<PhysicalCopy> knownCopies, byte[] content) {
+    var duplication = this._placement.DuplicationLevelFor(PoolPaths.GetParent(normalized));
+    if (duplication < 2)
+      return;
+
+    var holders = knownCopies.Count > 0
+      ? knownCopies.Select(c => c.Volume).ToList()
+      : [.. this._Online.Where(m => m.FileExists(normalized, false) || m.FileExists(normalized, true))];
+
+    while (holders.Count < duplication) {
+      var target = this._placement.ChooseShadowTarget(content.LongLength, holders);
+      if (target == null) {
+        DriveBender.Logger($"[Warning]Duplication level {duplication} for '{normalized}' not placeable — no independent failure domain left; owed copies deferred (SAFE-PHYS)");
+        return;
+      }
+
+      var parent = PoolPaths.GetParent(normalized);
+      target.EnsureFolder(parent, true);
+      using (var stream = target.OpenWrite(normalized, true, true)) {
+        if (content.Length > 0)
+          stream.Write(content, 0, content.Length);
+        stream.Flush();
+      }
+
+      holders.Add(target);
+    }
   }
 
   public void Rename(string from, string to, RenameFlags flags) {
-    this._RequireMounted();
-    throw this._WriteNotSupportedYet();
+    this._RequireWritable();
+    var fromNormalized = PoolPaths.Normalize(from);
+    var toNormalized = PoolPaths.Normalize(to);
+    var copies = this._placement.ResolveCopies(fromNormalized);
+    if (copies.Count == 0)
+      throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {from}");
+
+    if (!this._ParentExists(toNormalized))
+      throw new PoolFsException(PoolFsError.NotFound, $"Target parent folder not found: {to}");
+
+    var targetCopies = this._placement.ResolveCopies(toNormalized);
+    if (targetCopies.Count > 0 && (flags & RenameFlags.ReplaceExisting) == 0)
+      throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {to}");
+
+    var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
+
+    // overwrite-on-rename removes every copy of the old target first (no orphans)
+    foreach (var stale in targetCopies)
+      stale.Volume.Delete(toNormalized, stale.Shadow);
+
+    // namespace-atomic per member: the name flips via rename on every member holding a copy (FR-RENAME)
+    foreach (var copy in copies) {
+      var parent = PoolPaths.GetParent(toNormalized);
+      if (parent.Length > 0)
+        copy.Volume.EnsureFolder(parent, false);
+      if (copy.Shadow)
+        copy.Volume.EnsureFolder(parent, true);
+
+      copy.Volume.AtomicReplace(fromNormalized, toNormalized, copy.Shadow);
+    }
+
+    this._journal.Complete(sequence, JournalOp.Rename);
+    this._handles.RenamePath(fromNormalized, toNormalized);
+    this._Invalidate(fromNormalized);
+    this._Invalidate(toNormalized);
   }
 
   public void Unlink(string path) {
-    this._RequireMounted();
-    throw this._WriteNotSupportedYet();
+    this._RequireWritable();
+    var normalized = PoolPaths.Normalize(path);
+    var copies = this._placement.ResolveCopies(normalized);
+    if (copies.Count == 0)
+      throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
+
+    var sequence = this._journal.LogIntent(JournalOp.Delete, normalized);
+
+    // every primary and shadow copy goes — no orphans remain (FR-DELETE)
+    foreach (var member in this._Online)
+    foreach (var shadow in new[] { false, true })
+      if (member.FileExists(normalized, shadow))
+        member.Delete(normalized, shadow);
+
+    this._journal.Complete(sequence, JournalOp.Delete);
+    this._Invalidate(normalized);
   }
 
   public void MakeDir(string path) {
-    this._RequireMounted();
-    throw this._WriteNotSupportedYet();
+    this._RequireWritable();
+    var normalized = PoolPaths.Normalize(path);
+    if (normalized.Length == 0)
+      throw new PoolFsException(PoolFsError.Exists, "The pool root always exists");
+
+    if (!this._ParentExists(normalized))
+      throw new PoolFsException(PoolFsError.NotFound, $"Parent folder not found: {path}");
+
+    if (this._Online.Any(m => m.FolderExists(normalized, false)) || this._placement.ResolveCopies(normalized).Count > 0)
+      throw new PoolFsException(PoolFsError.Exists, $"Path already exists: {path}");
+
+    var target = this._placement.ChoosePrimaryTarget(0)
+                 ?? throw new PoolFsException(PoolFsError.NoSpace, "No pool member can take the new folder");
+
+    var sequence = this._journal.LogIntent(JournalOp.MakeDir, normalized, memberId: target.MemberId);
+    target.EnsureFolder(normalized, false);
+    if (this._placement.DuplicationLevelFor(normalized) >= 2)
+      target.EnsureFolder(normalized, true); // enable the duplication container
+
+    this._journal.Complete(sequence, JournalOp.MakeDir);
+    this._Invalidate(normalized);
   }
 
   public void RemoveDir(string path) {
-    this._RequireMounted();
-    throw this._WriteNotSupportedYet();
+    this._RequireWritable();
+    var normalized = PoolPaths.Normalize(path);
+    if (normalized.Length == 0)
+      throw new PoolFsException(PoolFsError.AccessDenied, "The pool root cannot be removed");
+
+    if (this.ReadDirectory(normalized).Count > 0)
+      throw new PoolFsException(PoolFsError.NotEmpty, $"Folder is not empty: {path}");
+
+    var sequence = this._journal.LogIntent(JournalOp.RemoveDir, normalized);
+    foreach (var member in this._Online) {
+      if (member.FolderExists(normalized, true))
+        member.DeleteFolder(normalized, true);
+      if (member.FolderExists(normalized, false))
+        member.DeleteFolder(normalized, false);
+    }
+
+    this._journal.Complete(sequence, JournalOp.RemoveDir);
+    this._Invalidate(normalized);
+  }
+
+  private void _Invalidate(string normalized) {
+    this._placement.Invalidate(normalized);
+    this._cache.InvalidatePath(this._poolId, normalized);
   }
 
   #endregion
@@ -202,7 +375,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public NodeHandle Open(string path, AccessMode mode, ShareMode share) {
     this._RequireMounted();
     if ((mode & AccessMode.Write) != 0)
-      throw this._WriteNotSupportedYet();
+      this._RequireWritable();
 
     var normalized = PoolPaths.Normalize(path);
     if (this._placement.ResolveCopies(normalized).Count == 0)
@@ -316,20 +489,85 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   public int Write(NodeHandle handle, ReadOnlySpan<byte> data, long offset, WriteMode mode) {
-    this._RequireMounted();
-    this._handles.Get(handle);
-    throw this._WriteNotSupportedYet();
+    this._RequireWritable();
+    var open = this._handles.Get(handle);
+    if ((open.Access & AccessMode.Write) == 0)
+      throw new PoolFsException(PoolFsError.AccessDenied, "Handle is not open for writing");
+    if (offset < 0)
+      throw new PoolFsException(PoolFsError.InvalidArgument, "Negative offset");
+
+    var bytes = data.ToArray();
+    open.File.Lock.EnterWriteLock();
+    try {
+      var path = open.File.Path;
+      var copies = this._placement.ResolveCopies(path);
+      if (copies.Count == 0)
+        throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
+
+      if (mode == WriteMode.Append)
+        offset = copies[0].Volume.Stat(path, copies[0].Shadow)?.Length ?? 0;
+
+      this._RequireAckQuorum(path, copies.Count);
+
+      // intent → mutate every copy → complete (SAFE-ORDER); the ack only happens after
+      // the data is durable on all reachable copies (M2 write-through semantics, FR-WT)
+      var sequence = this._journal.LogIntent(JournalOp.Write, path, offset: offset, length: bytes.Length);
+      foreach (var copy in copies) {
+        using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
+        stream.Seek(offset, SeekOrigin.Begin);
+        stream.Write(bytes, 0, bytes.Length);
+        stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+      }
+
+      this._journal.Complete(sequence, JournalOp.Write);
+
+      // coherency: a read after this write must return the new bytes (SAFE-COHERE)
+      this._cache.Pages.InvalidatePath(this._poolId, path);
+      this._cache.Metadata.InvalidatePath(this._poolId, path);
+      return bytes.Length;
+    } finally {
+      open.File.Lock.ExitWriteLock();
+    }
+  }
+
+  /// <summary>Refuses an ack when fewer copies are reachable than the folder's effective minCopiesBeforeAck (SAFE-LZ).</summary>
+  private void _RequireAckQuorum(string path, int reachableCopies) {
+    var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(path));
+    var required = ConfigValidator.EffectiveMinCopiesBeforeAck(effective.Write, effective.Duplication);
+    if (reachableCopies < required)
+      throw new PoolFsException(PoolFsError.Offline, $"Only {reachableCopies} of the required {required} copies of '{path}' are reachable — refusing to acknowledge (minCopiesBeforeAck)");
   }
 
   public void SetLength(NodeHandle handle, long length) {
-    this._RequireMounted();
-    this._handles.Get(handle);
-    throw this._WriteNotSupportedYet();
+    this._RequireWritable();
+    var open = this._handles.Get(handle);
+    if ((open.Access & AccessMode.Write) == 0)
+      throw new PoolFsException(PoolFsError.AccessDenied, "Handle is not open for writing");
+    if (length < 0)
+      throw new PoolFsException(PoolFsError.InvalidArgument, "Negative length");
+
+    open.File.Lock.EnterWriteLock();
+    try {
+      var path = open.File.Path;
+      var copies = this._placement.ResolveCopies(path);
+      if (copies.Count == 0)
+        throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
+
+      var sequence = this._journal.LogIntent(JournalOp.Truncate, path, length: length);
+      foreach (var copy in copies)
+        copy.Volume.Truncate(path, copy.Shadow, length); // grows zero-filled or shrinks on all copies (FR-TRUNC)
+
+      this._journal.Complete(sequence, JournalOp.Truncate);
+      this._cache.Pages.InvalidatePath(this._poolId, path);
+      this._cache.Metadata.InvalidatePath(this._poolId, path);
+    } finally {
+      open.File.Lock.ExitWriteLock();
+    }
   }
 
   public void Flush(NodeHandle handle) {
     this._RequireMounted();
-    this._handles.Get(handle); // no dirty state exists before M2 — flush is a no-op
+    this._handles.Get(handle); // M2 write-through: acknowledged data is already durable (SAFE-FSYNC)
   }
 
   public void Close(NodeHandle handle) => this._handles.Close(handle);

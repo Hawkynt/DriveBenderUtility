@@ -197,13 +197,11 @@ public class PoolFileSystemTests {
 
   [Test]
   [Category("Exception")]
-  public void WriteOps_GivenM1Engine_WhenCalled_ThenNotSupportedYet() {
+  public void WriteOps_GivenReadHandle_WhenWriting_ThenAccessDenied() {
     this._volume1.Seed("f.bin", false, [1]);
     var handle = this._fs.Open("f.bin", AccessMode.Read, ShareMode.Read);
 
-    ((Action)(() => this._fs.Create("new.bin", NodeKind.File, CreateFlags.None))).Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.NotSupported);
-    ((Action)(() => this._fs.Unlink("f.bin"))).Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.NotSupported);
-    ((Action)(() => this._fs.Write(handle, new byte[1], 0, WriteMode.Normal))).Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.NotSupported);
+    ((Action)(() => this._fs.Write(handle, new byte[1], 0, WriteMode.Normal))).Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.AccessDenied);
     this._fs.Close(handle);
   }
 
