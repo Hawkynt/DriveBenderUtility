@@ -9,12 +9,14 @@
 <body>
   <header>
     <h1>🗂️ Drive Bender Pool Manager</h1>
+    <button id="new-pool" class="primary">＋ New pool</button>
     <div class="live"><span id="live-dot" class="dot"></span><span id="live-text">connecting…</span></div>
   </header>
   <main>
     <div id="pools" class="grid"></div>
-    <div id="empty" class="empty" hidden>No pools discovered. Create one with <code>dbmount pool create</code>.</div>
+    <div id="empty" class="empty" hidden>No pools yet — click <b>New pool</b> to create one.</div>
   </main>
+  <div id="modal-root"></div>
   <script src="app.js"></script>
 </body>
 </html>

@@ -125,6 +125,35 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     return store.Save(manifest with { Members = [.. manifest.Members.Where(m => m.MemberId != memberId)] });
   }
 
+  /// <summary>
+  /// Removes a pool from the registry and its member sidecars. Data is preserved unless
+  /// <paramref name="purgeData"/> is set, in which case each member's pool content is
+  /// wiped too (destructive; the caller must confirm). Members' foreign data outside the
+  /// pool layout is never touched.
+  /// </summary>
+  public void Delete(PoolManifest manifest, bool purgeData) {
+    foreach (var member in manifest.Members) {
+      if (!host.DirectoryExists(member.Path))
+        continue;
+
+      if (purgeData) {
+        // wipe the pool's on-disk content under this member (files + shadow/duplication folders)
+        foreach (var file in host.EnumerateFiles(member.Path, "*"))
+          host.DeleteFile(file);
+        foreach (var dir in host.EnumerateDirectories(member.Path))
+          if (!PoolPaths.IsHiddenName(Path.GetFileName(dir)!))
+            host.DeleteDirectory(dir, recursive: true);
+      }
+
+      store.RemoveMemberSidecars(member.Path);
+      if (host.DirectoryExists(Path.Combine(member.Path, PoolPaths.UtilityFolderName)))
+        host.DeleteDirectory(Path.Combine(member.Path, PoolPaths.UtilityFolderName), recursive: true);
+    }
+
+    store.DeleteRegistryEntry(manifest.PoolId);
+    DriveBender.Logger($"{(purgeData ? "Purged" : "Deleted")} pool '{manifest.Name}' ({manifest.PoolId}){(purgeData ? " — data wiped" : " — data preserved")}");
+  }
+
   public string Export(PoolManifest manifest) => ManifestSerializer.Write(manifest);
 
   /// <summary>

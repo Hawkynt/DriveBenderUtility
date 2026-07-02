@@ -132,6 +132,15 @@ public sealed class FakeHostEnvironment : IHostEnvironment {
 
   public void DeleteFile(string path) => this._files.Remove(_Normalize(path));
 
+  public void DeleteDirectory(string path, bool recursive) {
+    var normalized = _Normalize(path);
+    var prefix = normalized.EndsWith('\\') ? normalized : normalized + '\\';
+    foreach (var file in this._files.Keys.Where(f => f.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToArray())
+      this._files.Remove(file);
+    foreach (var dir in this._directories.Where(d => d.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || d.Equals(normalized, StringComparison.OrdinalIgnoreCase)).ToArray())
+      this._directories.Remove(dir);
+  }
+
   public IEnumerable<string> EnumerateFiles(string directory, string pattern) {
     var normalized = _Normalize(directory);
     if (!this._IsReachable(normalized) || !this._directories.Contains(normalized))

@@ -101,3 +101,25 @@ button.primary { background: var(--accent); color: #06121f; border-color: var(--
 .activity div { padding: 2px 0; border-top: 1px solid var(--line); animation: fadein .4s ease; }
 @keyframes fadein { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; } }
 .empty { color: var(--muted); text-align: center; padding: 40px; }
+
+button.danger { border-color: var(--bad); color: var(--bad); }
+button.danger:hover { background: rgba(248,81,73,.12); }
+button.small { padding: 3px 8px; font-size: 12px; }
+.member button.small { margin-left: 6px; }
+
+/* modal */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; animation: fadein .15s ease; }
+.modal { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
+  width: min(560px, 92vw); max-height: 88vh; overflow: auto; padding: 20px; }
+.modal h2 { margin: 0 0 14px; font-size: 17px; }
+.modal label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
+.modal input, .modal select { width: 100%; padding: 7px 9px; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+.modal .row { display: flex; gap: 8px; }
+.modal .row > * { flex: 1; }
+.modal .memberlist { margin: 8px 0; display: flex; flex-direction: column; gap: 5px; }
+.modal .memberlist .m { display: flex; align-items: center; gap: 8px; font-size: 12px; background: var(--panel-2); padding: 5px 8px; border-radius: 8px; }
+.modal .memberlist .m .role { color: var(--muted); }
+.modal .memberlist .m button { margin-left: auto; }
+.modal .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.modal .err { color: var(--bad); font-size: 12px; margin-top: 8px; min-height: 16px; }

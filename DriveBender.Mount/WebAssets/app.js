@@ -56,10 +56,25 @@ function topology(pool) {
   </svg>`;
 }
 
-function memberRow(m) {
-  return `<div class="member"><span class="status ${m.online ? "" : "off"}"></span>
+const KINDS = [
+  ["file", "Local folder / drive"], ["unc", "UNC share"], ["ftp", "FTP"], ["ftps", "FTPS"],
+  ["sftp", "SFTP"], ["webdav", "WebDAV"], ["webdavs", "WebDAV (HTTPS)"], ["s3", "Amazon S3"],
+  ["azblob", "Azure Blob"], ["azfile", "Azure File"], ["dropbox", "Dropbox"], ["onedrive", "OneDrive"],
+  ["gdrive", "Google Drive"], ["gcs", "Google Cloud Storage"]
+];
+const ROLES = ["capacity", "landing", "readonly"];
+
+function memberRow(pool, m) {
+  const row = el("div", "member");
+  row.innerHTML = `<span class="status ${m.online ? "" : "off"}"></span>
     <span>${m.label || m.path}</span>${m.network ? '<span class="badge info">remote</span>' : ""}
-    <span class="role">${m.role}</span></div>`;
+    <span class="role">${m.role}</span>`;
+  const scatter = el("button", "small danger", "remove");
+  scatter.title = "Scatter this member's data to the others, then remove it";
+  scatter.onclick = () => confirm(`Remove member "${m.label || m.path}"? Its data is scattered to the other members first.`)
+    && op(`/api/pool/remove-member?pool=${pool.id}&member=${encodeURIComponent(m.id)}`);
+  row.appendChild(scatter);
+  return row;
 }
 
 function card(pool) {
@@ -89,28 +104,39 @@ function card(pool) {
     <div class="meter"><div class="label"><span>Cache hit rate</span><span>read ${fmtBytes(m.readBytes)} · wrote ${fmtBytes(m.writtenBytes)}</span></div>
       ${sparkline(hist)}</div>` : ""}
     ${topology(pool)}
-    <div class="members">${pool.members.map(memberRow).join("")}</div>
+    <div class="members"></div>
     ${pool.warnings && pool.warnings.length ? `<div class="warnings">${pool.warnings.map(w => "<div>⚠ " + w + "</div>").join("")}</div>` : ""}
     ${m && m.activity && m.activity.length ? `<div class="activity">${m.activity.slice(0,8).map(a =>
       `<div>${a.kind} ${a.path||""} ${a.bytes?fmtBytes(a.bytes):""} ${a.reason||""}</div>`).join("")}</div>` : ""}
-    <div class="actions">
-      <button data-act="health">Health check</button>
-      <button data-act="fix" class="primary">Check &amp; fix</button>
-      <button data-act="restore">Restore</button>
-    </div>`;
+    <div class="actions"></div>`;
 
-  c.querySelector('[data-act="health"]').onclick = () => op("/api/health?pool=" + pool.id);
-  c.querySelector('[data-act="fix"]').onclick = () => op("/api/health?fix=true&pool=" + pool.id);
-  c.querySelector('[data-act="restore"]').onclick = () => op("/api/restore?pool=" + pool.id);
+  const memberBox = c.querySelector(".members");
+  pool.members.forEach(mem => memberBox.appendChild(memberRow(pool, mem)));
+
+  const actions = c.querySelector(".actions");
+  const add = (label, cls, fn) => { const b = el("button", cls, label); b.onclick = fn; actions.appendChild(b); };
+  if (pool.mounted)
+    add("Unmount", "", () => op("/api/pool/unmount?pool=" + pool.id));
+  else
+    add("Mount", "primary", () => op("/api/pool/mount?pool=" + pool.id));
+  add("Health", "", () => op("/api/health?pool=" + pool.id));
+  add("Fix", "", () => op("/api/health?fix=true&pool=" + pool.id));
+  add("Restore", "", () => op("/api/restore?pool=" + pool.id));
+  add("Add member", "", () => addMemberDialog(pool));
+  add("Delete", "danger", () => confirm(`Delete pool "${pool.name}"? The manifest is removed; your files are kept on disk.`) && op("/api/pool/delete?pool=" + pool.id));
+  add("Purge", "danger", () => prompt(`PURGE wipes all data in "${pool.name}". Type the pool name to confirm:`) === pool.name && op("/api/pool/purge?pool=" + pool.id));
   return c;
 }
 
-async function op(url) {
+async function op(url, body) {
   try {
-    const r = await fetch(url, { method: "POST", ...auth });
-    const j = await r.json();
-    alert(j.ok ? "Done: " + JSON.stringify(j.result) : "Failed: " + j.error);
-  } catch (e) { alert("Request failed: " + e); }
+    const opts = { method: "POST", headers: { ...auth.headers } };
+    if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    const r = await fetch(url, opts);
+    const j = await r.json().catch(() => ({ ok: r.ok }));
+    if (!j.ok) alert("Failed: " + (j.error || r.status));
+    return j.ok;
+  } catch (e) { alert("Request failed: " + e); return false; }
 }
 
 function render(data) {
@@ -128,6 +154,94 @@ function render(data) {
   }
   container.querySelectorAll(".card").forEach(c => { if (!seen.has(c.dataset.id)) c.remove(); });
 }
+
+// ---- modals: create pool & add member -------------------------------------
+function closeModal() { document.getElementById("modal-root").innerHTML = ""; }
+
+function memberEditor() {
+  // returns { node, getMembers() } — a kind/location/role/credential row + running list
+  const members = [];
+  const wrap = el("div");
+  wrap.innerHTML = `
+    <label>Add member</label>
+    <div class="row">
+      <select class="k">${KINDS.map(k => `<option value="${k[0]}">${k[1]}</option>`).join("")}</select>
+      <select class="r">${ROLES.map(r => `<option value="${r}">${r}</option>`).join("")}</select>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <input class="loc" placeholder="path or URI (e.g. D:\\ , \\\\server\\share, sftp://user@host/path)">
+      <button type="button" class="addm" style="flex:0 0 auto">Add</button>
+    </div>
+    <input class="cred" style="margin-top:6px" placeholder="credential reference (remote members, optional)">
+    <div class="memberlist"></div>`;
+  const list = wrap.querySelector(".memberlist");
+  const redraw = () => {
+    list.innerHTML = "";
+    members.forEach((m, i) => {
+      const row = el("div", "m", `<span>${m.location}</span><span class="role">${m.role}</span>`);
+      const rm = el("button", "small danger", "×"); rm.onclick = () => { members.splice(i, 1); redraw(); };
+      row.appendChild(rm); list.appendChild(row);
+    });
+  };
+  wrap.querySelector(".addm").onclick = () => {
+    const loc = wrap.querySelector(".loc").value.trim(); if (!loc) return;
+    members.push({ location: loc, role: wrap.querySelector(".r").value, credential: wrap.querySelector(".cred").value.trim() || null });
+    wrap.querySelector(".loc").value = ""; wrap.querySelector(".cred").value = ""; redraw();
+  };
+  return { node: wrap, getMembers: () => members };
+}
+
+function showModal(title, bodyNode, onOk, okLabel) {
+  const root = document.getElementById("modal-root");
+  const err = el("div", "err");
+  const overlay = el("div", "overlay");
+  const modal = el("div", "modal");
+  modal.appendChild(el("h2", null, title));
+  modal.appendChild(bodyNode);
+  modal.appendChild(err);
+  const actions = el("div", "modal-actions");
+  const cancel = el("button", null, "Cancel"); cancel.onclick = closeModal;
+  const ok = el("button", "primary", okLabel || "OK");
+  ok.onclick = async () => { const msg = await onOk(); if (msg) err.textContent = msg; else closeModal(); };
+  actions.append(cancel, ok);
+  modal.appendChild(actions);
+  overlay.appendChild(modal);
+  overlay.onclick = e => { if (e.target === overlay) closeModal(); };
+  root.innerHTML = ""; root.appendChild(overlay);
+}
+
+function createPoolDialog() {
+  const form = el("div");
+  form.innerHTML = `<label>Pool name</label><input class="name" placeholder="MyPool">
+    <label>Mount target (optional)</label><input class="mt" placeholder="X:\\ or /mnt/mypool">`;
+  const editor = memberEditor();
+  form.appendChild(editor.node);
+  showModal("Create pool", form, async () => {
+    const name = form.querySelector(".name").value.trim();
+    const members = editor.getMembers();
+    if (!name) return "Enter a pool name.";
+    if (!members.length) return "Add at least one member.";
+    const ok = await op("/api/pool/create", { name, mountTarget: form.querySelector(".mt").value.trim(), members });
+    return ok ? null : "Create failed.";
+  }, "Create");
+}
+
+function addMemberDialog(pool) {
+  const form = el("div");
+  form.innerHTML = `<div class="row"><select class="k">${KINDS.map(k=>`<option value="${k[0]}">${k[1]}</option>`).join("")}</select>
+    <select class="r">${ROLES.map(r=>`<option value="${r}">${r}</option>`).join("")}</select></div>
+    <label>Location</label><input class="loc" placeholder="path or URI">
+    <label>Credential reference (remote, optional)</label><input class="cred">`;
+  showModal(`Add member to ${pool.name}`, form, async () => {
+    const loc = form.querySelector(".loc").value.trim();
+    if (!loc) return "Enter a location.";
+    const ok = await op("/api/pool/add-member?pool=" + pool.id, {
+      location: loc, role: form.querySelector(".r").value, credential: form.querySelector(".cred").value.trim() || null });
+    return ok ? null : "Add failed.";
+  }, "Add");
+}
+
+document.getElementById("new-pool").onclick = createPoolDialog;
 
 function connect() {
   const es = new EventSource("/api/stream?token=" + encodeURIComponent(token));

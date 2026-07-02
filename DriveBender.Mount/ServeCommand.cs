@@ -96,6 +96,36 @@ internal sealed class ServeCommand(
         case "/api/restore" when request.HttpMethod == "POST":
           this._WriteJson(context, this._RunRestore(request));
           break;
+        case "/api/pool/create" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._Create(request));
+          break;
+        case "/api/pool/mount" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._Mount(request));
+          break;
+        case "/api/pool/unmount" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._Unmount(request));
+          break;
+        case "/api/pool/add-member" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._AddMember(request));
+          break;
+        case "/api/pool/remove-member" when request.HttpMethod == "POST":
+          this._WriteJson(context, _Guard(() => { PoolOpsCommand.RemoveMedia(host, store, provider, lifecycle, remoteResolver, new() { Pool = this._RequirePool(request), Member = request.QueryString["member"] }); return "ok"; }));
+          break;
+        case "/api/pool/replace-media" when request.HttpMethod == "POST":
+          this._WriteJson(context, _Guard(() => { PoolOpsCommand.ReplaceMedia(host, store, provider, lifecycle, remoteResolver, new() { Pool = this._RequirePool(request), Old = request.QueryString["old"] ?? "", New = request.QueryString["new"] ?? "" }); return "ok"; }));
+          break;
+        case "/api/pool/delete" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._Delete(request, purge: false));
+          break;
+        case "/api/pool/purge" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._Delete(request, purge: true));
+          break;
+        case "/api/credential/set" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._CredentialSet(request));
+          break;
+        case "/api/credential/remove" when request.HttpMethod == "POST":
+          this._WriteJson(context, _Guard(() => { credentials.Remove(request.QueryString["name"] ?? ""); return "ok"; }));
+          break;
         default:
           context.Response.StatusCode = 404;
           context.Response.Close();
@@ -180,6 +210,113 @@ internal sealed class ServeCommand(
   private object _RunRestore(HttpListenerRequest request) {
     var poolRef = this._RequirePool(request);
     return _Guard(() => { PoolOpsCommand.Restore(host, provider, remoteResolver, new() { Pool = poolRef }); return "ok"; });
+  }
+
+  private sealed record CreateBody(string? Name, string? MountTarget, MemberBody[]? Members);
+  private sealed record MemberBody(string Location, string? Role, string? Credential);
+
+  private object _Create(HttpListenerRequest request) => _Guard(() => {
+    var body = _ReadBody<CreateBody>(request);
+    if (body?.Name == null || body.Members == null || body.Members.Length == 0)
+      throw new ManifestException("create needs a name and at least one member");
+
+    var specs = body.Members.Select(m => new PoolLifecycle.MemberSpec(
+      m.Location,
+      _ParseRole(m.Role),
+      Credential: string.IsNullOrWhiteSpace(m.Credential) ? null : "cred-ref:" + CredentialStore.NormalizeReference(m.Credential!),
+      Network: MemberSchemes.IsRemote(MemberSchemes.SchemeOf(null, m.Location))));
+
+    var manifest = lifecycle.Create(body.Name, specs, string.IsNullOrWhiteSpace(body.MountTarget) ? null : body.MountTarget);
+    return new { manifest.PoolId, manifest.Name };
+  });
+
+  private object _AddMember(HttpListenerRequest request) => _Guard(() => {
+    var body = _ReadBody<MemberBody>(request);
+    var pool = this._Discover(this._RequirePool(request));
+    if (body == null)
+      throw new ManifestException("add-member needs a member body");
+
+    var credential = string.IsNullOrWhiteSpace(body.Credential) ? null : "cred-ref:" + CredentialStore.NormalizeReference(body.Credential!);
+    lifecycle.AddMember(pool.Manifest, new(body.Location, _ParseRole(body.Role), Credential: credential));
+    return "ok";
+  });
+
+  private object _Mount(HttpListenerRequest request) => _Guard(() => {
+    var pool = this._Discover(this._RequirePool(request));
+    if (mountRegistry.Find(pool.PoolId.ToString()) != null)
+      return "already mounted";
+
+    var target = request.QueryString["target"];
+    _LaunchMount(pool.PoolId, target);
+    return "mounting";
+  });
+
+  private object _Unmount(HttpListenerRequest request) => _Guard(() => {
+    var entry = mountRegistry.Find(this._RequirePool(request)) ?? throw new ManifestException("pool is not mounted");
+    mountRegistry.RequestStop(entry.PoolId); // the mount process flushes and detaches cleanly
+    return "unmounting";
+  });
+
+  private object _Delete(HttpListenerRequest request, bool purge) => _Guard(() => {
+    var pool = this._Discover(this._RequirePool(request));
+    if (mountRegistry.Find(pool.PoolId.ToString()) != null)
+      throw new ManifestException("unmount the pool before deleting it");
+
+    lifecycle.Delete(pool.Manifest, purgeData: purge);
+    return purge ? "purged" : "deleted";
+  });
+
+  private object _CredentialSet(HttpListenerRequest request) => _Guard(() => {
+    var body = _ReadBody<CredentialBody>(request);
+    if (body?.Name == null || string.IsNullOrEmpty(body.Secret))
+      throw new ManifestException("credential set needs a name and secret");
+
+    credentials.Store(body.Name, body.User ?? "", body.Secret);
+    return "ok";
+  });
+
+  private sealed record CredentialBody(string? Name, string? User, string? Secret);
+
+  private static MemberRole _ParseRole(string? role) => role?.ToLowerInvariant() switch {
+    "landing" => MemberRole.Landing,
+    "readonly" => MemberRole.ReadOnly,
+    _ => MemberRole.Capacity,
+  };
+
+  private PoolRef _Discover(string nameOrId) {
+    var pools = provider.Discover();
+    var pool = Guid.TryParse(nameOrId, out var id)
+      ? pools.FirstOrDefault(p => p.PoolId == id)
+      : pools.FirstOrDefault(p => p.Name.Equals(nameOrId, StringComparison.OrdinalIgnoreCase));
+    return pool ?? throw new ManifestException($"no pool '{nameOrId}'");
+  }
+
+  /// <summary>Launches a detached <c>dbmount mount</c> child so the daemon never holds the mount itself.</summary>
+  private static void _LaunchMount(Guid poolId, string? target) {
+    var entryDll = Assembly.GetEntryAssembly()!.Location;
+    var exe = Environment.ProcessPath ?? "dotnet";
+    var start = new System.Diagnostics.ProcessStartInfo { UseShellExecute = false, CreateNoWindow = true };
+    if (exe.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase) || exe.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase)) {
+      start.FileName = exe;
+      start.ArgumentList.Add(entryDll);
+    } else
+      start.FileName = exe; // published single-file dbmount
+
+    start.ArgumentList.Add("mount");
+    start.ArgumentList.Add("--manifest");
+    start.ArgumentList.Add(poolId.ToString());
+    if (!string.IsNullOrWhiteSpace(target)) {
+      start.ArgumentList.Add("--target");
+      start.ArgumentList.Add(target);
+    }
+
+    System.Diagnostics.Process.Start(start);
+  }
+
+  private static T? _ReadBody<T>(HttpListenerRequest request) {
+    using var reader = new StreamReader(request.InputStream, request.ContentEncoding);
+    var json = reader.ReadToEnd();
+    return string.IsNullOrWhiteSpace(json) ? default : JsonSerializer.Deserialize<T>(json, _Json);
   }
 
   private string _RequirePool(HttpListenerRequest request)

@@ -31,6 +31,10 @@ public interface IHostEnvironment {
 
   void CreateDirectory(string path);
   void DeleteFile(string path);
+
+  /// <summary>Deletes a directory; recursive removes its contents too. No-op when absent.</summary>
+  void DeleteDirectory(string path, bool recursive);
+
   IEnumerable<string> EnumerateFiles(string directory, string pattern);
   IEnumerable<string> EnumerateDirectories(string directory);
 
@@ -104,6 +108,11 @@ public sealed class RealHostEnvironment : IHostEnvironment {
 
   public void CreateDirectory(string path) => Directory.CreateDirectory(path);
   public void DeleteFile(string path) => File.Delete(path);
+
+  public void DeleteDirectory(string path, bool recursive) {
+    if (Directory.Exists(path))
+      Directory.Delete(path, recursive);
+  }
 
   public IEnumerable<string> EnumerateFiles(string directory, string pattern)
     => Directory.Exists(directory) ? Directory.EnumerateFiles(directory, pattern) : [];
