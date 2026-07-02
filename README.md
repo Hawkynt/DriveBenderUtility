@@ -81,9 +81,19 @@ Platform-agnostic VFS/I/O engine towards live pool mounting
 ### 🚀 DriveBender.Mount *(net10.0, `dbmount`)*
 CLI/daemon entry point for manifest pools:
 - `dbmount pool create|import|export|list|add-member|remove-member|adopt|repair-manifest`
-- `dbmount mount|unmount|status` (mount engine lands with milestone M1)
+- `dbmount mount --manifest <file|poolId|name> [--target X:\] [--read-only]` —
+  mounts the pool as a live Windows filesystem via **WinFsp**
+  (install from <https://winfsp.dev>): crash recovery replays the journal before
+  serving, health warnings surface up front, background workers (owed-copy sync,
+  landing-zone drain, trash maintenance) pump while mounted, and Ctrl+C
+  unmounts cleanly after flushing all dirty state
 - Non-destructive by contract: pre-existing folder content is never absorbed
   without `--force`, and folders owned by another pool are always refused
+
+### 🪟 DriveBender.Mount.Windows *(net10.0-windows)*
+The WinFsp platform adapter — a thin callback translation over the engine's
+`IPoolFileSystem` contract; no pool logic lives in the adapter, so adding the
+Linux FUSE backend requires zero engine changes.
 
 ### 🧪 DriveBender.Vfs.Tests *(net10.0)*
 Headless engine suite: the whole VFS engine runs against in-memory fakes
