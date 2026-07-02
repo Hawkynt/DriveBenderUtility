@@ -134,9 +134,47 @@ async function op(url, body) {
     if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
     const r = await fetch(url, opts);
     const j = await r.json().catch(() => ({ ok: r.ok }));
-    if (!j.ok) alert("Failed: " + (j.error || r.status));
+    if (!j.ok) {
+      if (j.needsPrereq && j.installable && confirm(`${j.error}\n\nInstall ${j.driver} now?`)) {
+        await installDriver();
+      } else {
+        alert("Failed: " + (j.error || r.status));
+      }
+    }
     return j.ok;
   } catch (e) { alert("Request failed: " + e); return false; }
+}
+
+async function installDriver() {
+  const banner = document.getElementById("prereq");
+  if (banner) banner.textContent = "Installing driver… (accept any prompt that appears)";
+  try {
+    const r = await fetch("/api/prereqs/install", { method: "POST", headers: { ...auth.headers } });
+    const j = await r.json().catch(() => ({ ok: r.ok }));
+    alert(j.ok ? (j.result || "Installed.") : "Install failed: " + (j.error || r.status));
+  } catch (e) { alert("Install failed: " + e); }
+  checkPrereqs();
+}
+
+async function checkPrereqs() {
+  const banner = document.getElementById("prereq");
+  if (!banner) return;
+  try {
+    const s = await fetch("/api/prereqs", auth).then(r => r.json());
+    if (s.ok && !s.needsElevation) { banner.hidden = true; return; }
+    banner.hidden = false;
+    banner.innerHTML = "";
+    const msg = el("span", null, s.ok
+      ? "⚠ Mounting needs administrator rights — accepting the prompt when you click Mount is enough."
+      : "⚠ " + s.detail + " Mounting won't work until it's installed.");
+    banner.appendChild(msg);
+    if (!s.ok && s.installable) {
+      const b = el("button", "primary small", "Install " + s.driver);
+      b.style.marginLeft = "12px";
+      b.onclick = installDriver;
+      banner.appendChild(b);
+    }
+  } catch (_) { banner.hidden = true; }
 }
 
 function render(data) {
@@ -242,6 +280,8 @@ function addMemberDialog(pool) {
 }
 
 document.getElementById("new-pool").onclick = createPoolDialog;
+checkPrereqs();
+setInterval(checkPrereqs, 15000);
 
 function connect() {
   const es = new EventSource("/api/stream?token=" + encodeURIComponent(token));

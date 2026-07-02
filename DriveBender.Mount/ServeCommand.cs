@@ -7,6 +7,11 @@ using DivisonM.Vfs;
 
 namespace DivisonM.Mount;
 
+/// <summary>A mount was requested but the filesystem driver prerequisite is missing.</summary>
+internal sealed class PrereqException(PrereqStatus status) : Exception(status.Detail) {
+  public PrereqStatus Status { get; } = status;
+}
+
 /// <summary>
 /// The local management daemon (§6.13): a loopback-bound HTTP API + Server-Sent-Events
 /// metrics stream serving the animation-rich web UI. Bound to 127.0.0.1 and gated by a
@@ -98,6 +103,18 @@ internal sealed class ServeCommand(
           break;
         case "/api/pool/create" when request.HttpMethod == "POST":
           this._WriteJson(context, this._Create(request));
+          break;
+        case "/api/prereqs":
+          this._WriteJson(context, _PrereqPayload(Prerequisites.Check()));
+          break;
+        case "/api/prereqs/install" when request.HttpMethod == "POST":
+          this._WriteJson(context, _Guard(() => {
+            var (ok, message) = Prerequisites.Install();
+            if (!ok)
+              throw new ManifestException(message);
+
+            return message;
+          }));
           break;
         case "/api/pool/mount" when request.HttpMethod == "POST":
           this._WriteJson(context, this._Mount(request));
@@ -246,9 +263,32 @@ internal sealed class ServeCommand(
     if (mountRegistry.Find(pool.PoolId.ToString()) != null)
       return "already mounted";
 
+    // don't launch a doomed child — check the driver first and tell the UI what to do
+    var prereq = Prerequisites.Check();
+    if (!prereq.Ok)
+      throw new PrereqException(prereq);
+
     var target = request.QueryString["target"];
-    _LaunchMount(pool.PoolId, target);
-    return "mounting";
+    var (process, needsElevation) = _LaunchMount(pool.PoolId, target);
+
+    // wait for the mount to actually appear (or the child to fail) so "Mount" reports the truth
+    for (var i = 0; i < 40; ++i) {
+      if (mountRegistry.Find(pool.PoolId.ToString()) != null)
+        return "mounted";
+
+      if (process is { HasExited: true }) {
+        var error = process.StartInfo.RedirectStandardError ? process.StandardError.ReadToEnd().Trim() : "";
+        throw new ManifestException(error.Length > 0
+          ? error
+          : needsElevation
+            ? "Mounting was cancelled or denied — it needs administrator rights (accept the UAC prompt)."
+            : "The mount process exited before the pool came up. Check that a filesystem driver is installed.");
+      }
+
+      Thread.Sleep(250);
+    }
+
+    return "mounting"; // still coming up (large pools / remote members can take a moment)
   });
 
   private object _Unmount(HttpListenerRequest request) => _Guard(() => {
@@ -291,26 +331,48 @@ internal sealed class ServeCommand(
     return pool ?? throw new ManifestException($"no pool '{nameOrId}'");
   }
 
-  /// <summary>Launches a detached <c>dbmount mount</c> child so the daemon never holds the mount itself.</summary>
-  private static void _LaunchMount(Guid poolId, string? target) {
+  /// <summary>
+  /// Launches a detached <c>dbmount mount</c> child so the daemon never holds the mount
+  /// itself. On Windows, mounting needs elevation: if the daemon isn't already privileged
+  /// the child is launched via ShellExecute "runas" so the OS prompts for it (UAC).
+  /// </summary>
+  private static (System.Diagnostics.Process? process, bool needsElevation) _LaunchMount(Guid poolId, string? target) {
     var entryDll = Assembly.GetEntryAssembly()!.Location;
     var exe = Environment.ProcessPath ?? "dotnet";
-    var start = new System.Diagnostics.ProcessStartInfo { UseShellExecute = false, CreateNoWindow = true };
-    if (exe.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase) || exe.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase)) {
-      start.FileName = exe;
-      start.ArgumentList.Add(entryDll);
-    } else
-      start.FileName = exe; // published single-file dbmount
+    var viaDotnet = exe.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase) || exe.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase);
 
-    start.ArgumentList.Add("mount");
-    start.ArgumentList.Add("--manifest");
-    start.ArgumentList.Add(poolId.ToString());
+    var args = new List<string>();
+    if (viaDotnet)
+      args.Add(entryDll);
+    args.Add("mount");
+    args.Add("--manifest");
+    args.Add(poolId.ToString());
     if (!string.IsNullOrWhiteSpace(target)) {
-      start.ArgumentList.Add("--target");
-      start.ArgumentList.Add(target);
+      args.Add("--target");
+      args.Add(target);
     }
 
-    System.Diagnostics.Process.Start(start);
+    var needsElevation = OperatingSystem.IsWindows() && !Prerequisites.IsElevated;
+    var start = new System.Diagnostics.ProcessStartInfo { FileName = viaDotnet ? exe : exe };
+    if (needsElevation) {
+      // ShellExecute + runas triggers UAC; output can't be redirected in this mode
+      start.UseShellExecute = true;
+      start.Verb = "runas";
+      start.Arguments = string.Join(' ', args.Select(a => a.Contains(' ') ? $"\"{a}\"" : a));
+    } else {
+      start.UseShellExecute = false;
+      start.CreateNoWindow = true;
+      start.RedirectStandardError = true;
+      foreach (var a in args)
+        start.ArgumentList.Add(a);
+    }
+
+    try {
+      return (System.Diagnostics.Process.Start(start), needsElevation);
+    } catch (System.ComponentModel.Win32Exception e) when (needsElevation) {
+      // user declined the UAC prompt
+      throw new ManifestException("Mounting needs administrator rights and the elevation prompt was declined.");
+    }
   }
 
   private static T? _ReadBody<T>(HttpListenerRequest request) {
@@ -325,6 +387,8 @@ internal sealed class ServeCommand(
   private static object _Guard(Func<object> action) {
     try {
       return new { ok = true, result = action() };
+    } catch (PrereqException e) {
+      return new { ok = false, error = e.Message, needsPrereq = true, driver = e.Status.Driver, installable = e.Status.Installable };
     } catch (Exception e) {
       return new { ok = false, error = e.Message };
     }
@@ -361,6 +425,9 @@ internal sealed class ServeCommand(
     using var reader = new StreamReader(stream);
     return reader.ReadToEnd();
   }
+
+  private static object _PrereqPayload(PrereqStatus status)
+    => new { status.Ok, status.Driver, status.Detail, status.Installable, status.NeedsElevation };
 
   private static string _NewToken() => Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
 
