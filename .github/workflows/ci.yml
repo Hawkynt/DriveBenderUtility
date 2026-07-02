@@ -14,7 +14,8 @@ env:
 
 jobs:
   test:
-    # All projects target net47 (.NET Framework) -- Windows runner only.
+    # Legacy projects target net47 (.NET Framework) -- Windows runner only.
+    # The VFS engine tier (net10.0) is platform-agnostic and runs here too.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +24,9 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.x'            # SDK only; actual target is net47
+          dotnet-version: |
+            8.x
+            10.x                           # net10.0 for DriveBender.Vfs / Mount; 8.x kept for the net47 tier
 
       - name: Stamp versions
         shell: bash
@@ -46,6 +49,14 @@ jobs:
           --configuration Release --no-build
           --filter "(TestCategory!=Integration&TestCategory!=EndToEnd&TestCategory!=Performance)&(FullyQualifiedName!~.Integration.&FullyQualifiedName!~.EndToEnd.&FullyQualifiedName!~.Performance.&FullyQualifiedName!~.Regression.)&(FullyQualifiedName!~CreatePool_WithNonExistentDrive&FullyQualifiedName!~Bug002_InfiniteLoopInDuplicationEnabling&FullyQualifiedName!~PoolManager_WithAccessDeniedToDirectory)"
           --logger "trx;LogFileName=unit-tests.trx"
+
+      # The VFS engine tier is pure-unit by design (in-memory fakes, TST-FAKE):
+      # it must stay green everywhere, headless, no real pool required.
+      - name: Test (VFS engine, headless)
+        run: >
+          dotnet test DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj
+          --configuration Release --no-build
+          --logger "trx;LogFileName=vfs-tests.trx"
 
       - name: Test (integration + e2e + known-flaky, allow-fail)
         continue-on-error: true

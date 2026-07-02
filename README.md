@@ -23,7 +23,7 @@
 
 ## 🏗️ Project Structure
 
-The solution is organized into four main projects:
+The solution is organized into the following projects:
 
 ### 📚 DriveBender.Core
 Core library containing all Drive Bender functionality:
@@ -56,6 +56,40 @@ Comprehensive test suite categorized as:
 - **End-to-End Tests**: Complete workflow validation
 - **Performance Tests**: Scalability and speed verification
 - **Regression Tests**: Backwards compatibility and bug prevention
+
+### ⚙️ DriveBender.Vfs *(net10.0)*
+Platform-agnostic VFS/I/O engine towards live pool mounting
+(see `docs/PRD-PoolMount-Driver.md`):
+- **Pool manifests**: pools defined over arbitrary member paths — drive roots,
+  subfolders, UNC shares — in a portable, versioned JSON manifest stored
+  redundantly (machine registry + a mirror on every member)
+- **Member self-identification**: members carry a `.drivebenderutility/member.json`
+  marker and are resolved by marker content, so drive-letter changes are harmless
+- **Native pool adapter**: the classic drive scan synthesizes a *virtual manifest*,
+  so native pools flow through the identical code path and can be *adopted*
+  into editable manifests in place
+- **Physical failure domains**: placement identity is the underlying volume
+  (subfolder members on one disk are one domain), with de-duplicated free-space
+  accounting and `reserveBytes`
+- **Byte-range I/O abstraction** (`IVolumeIO`) with local backend and atomic
+  temp-and-rename publication, ready for remote capacity backends
+- **Hierarchical configuration** (built-in defaults → global → pool → folder
+  globs) with strict validation: duplication-aware ack floors, journal and fsync
+  safety switches that cannot be disabled, and a never-over-committed RAM ceiling
+  for cache instances
+
+### 🚀 DriveBender.Mount *(net10.0, `dbmount`)*
+CLI/daemon entry point for manifest pools:
+- `dbmount pool create|import|export|list|add-member|remove-member|adopt|repair-manifest`
+- `dbmount mount|unmount|status` (mount engine lands with milestone M1)
+- Non-destructive by contract: pre-existing folder content is never absorbed
+  without `--force`, and folders owned by another pool are always refused
+
+### 🧪 DriveBender.Vfs.Tests *(net10.0)*
+Headless engine suite: the whole VFS engine runs against in-memory fakes
+(`FakeVolumeIO`, `FakeHostEnvironment`) including fault injection — power loss,
+no-space, torn writes, offline members — so every safety invariant is testable
+without a real pool.
 
 ## ✨ Features
 
@@ -107,10 +141,10 @@ Comprehensive test suite categorized as:
 
 To build and run the DriveBenderUtility, you'll need:
 
-- [.NET Framework 4.7](https://dotnet.microsoft.com/download/dotnet-framework/net47) or higher
+- [.NET SDK 10](https://dotnet.microsoft.com/download) (builds every project; the
+  legacy projects still *target* .NET Framework 4.7)
 - Administrator permissions for managing drives and pools
-- Drive Bender software installed on your system
-- Visual Studio 2019+ or MSBuild tools
+- Drive Bender software installed on your system (for native pools)
 
 ### 🔨 Building the Project
 
