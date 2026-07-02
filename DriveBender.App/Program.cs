@@ -95,14 +95,26 @@ internal static class Program {
       if (!Directory.Exists(mountBin))
         continue;
 
-      foreach (var name in new[] { "dbmount.dll", "dbmount.exe" }) {
-        var hit = Directory.GetFiles(mountBin, name, SearchOption.AllDirectories).FirstOrDefault();
-        if (hit != null)
-          return hit;
-      }
+      var candidates = names.SelectMany(name => _SafeFind(mountBin, name)).ToArray();
+      if (candidates.Length == 0)
+        continue;
+
+      // pick the build matching this OS: dbmount is per-TFM (net10.0-windows carries the
+      // WinFsp/Dokan code, net10.0 the FUSE code). Launching the wrong one is why an
+      // install can report "no package manager found" on Windows.
+      var wantsWindows = OperatingSystem.IsWindows();
+      return candidates.OrderByDescending(p => p.Contains("windows", StringComparison.OrdinalIgnoreCase) == wantsWindows).First();
     }
 
     return null;
+  }
+
+  private static IEnumerable<string> _SafeFind(string root, string pattern) {
+    try {
+      return Directory.GetFiles(root, pattern, SearchOption.AllDirectories);
+    } catch {
+      return [];
+    }
   }
 
   private static int _FreeLoopbackPort() {
