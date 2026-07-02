@@ -25,36 +25,37 @@ internal static class Program {
     var lifecycle = new PoolLifecycle(host, store);
     var mountRegistry = new MountRegistry(host);
 
-    return Parser.Default.ParseArguments<
-      PoolCreateOptions,
-      PoolImportOptions,
-      PoolExportOptions,
-      PoolListOptions,
-      PoolAddMemberOptions,
-      PoolRemoveMemberOptions,
-      PoolAdoptOptions,
-      PoolRepairManifestOptions,
-      CredentialSetOptions,
-      CredentialRemoveOptions,
-      MountOptions,
-      UnmountOptions,
-      StatusOptions,
-      ListOptions
-    >(_TranslateVerbs(args)).MapResult(
-      (PoolCreateOptions o) => _Guard(() => _PoolCreate(lifecycle, o)),
-      (PoolImportOptions o) => _Guard(() => _PoolImport(lifecycle, o)),
-      (PoolExportOptions o) => _Guard(() => _PoolExport(provider, lifecycle, o)),
-      (PoolListOptions o) => _Guard(() => _PoolList(provider, o.Json)),
-      (PoolAddMemberOptions o) => _Guard(() => _PoolAddMember(provider, lifecycle, o)),
-      (PoolRemoveMemberOptions o) => _Guard(() => _PoolRemoveMember(provider, lifecycle, o)),
-      (PoolAdoptOptions o) => _Guard(() => _PoolAdopt(provider, lifecycle, o)),
-      (PoolRepairManifestOptions o) => _Guard(() => _PoolRepairManifest(provider, store, o)),
-      (CredentialSetOptions o) => _Guard(() => _CredentialSet(credentialStore, o)),
-      (CredentialRemoveOptions o) => _Guard(() => _CredentialRemove(credentialStore, o)),
-      (MountOptions o) => _Guard(() => MountCommand.Run(host, store, provider, remoteResolver, mountRegistry, o)),
-      (UnmountOptions o) => _Guard(() => _Unmount(mountRegistry, o)),
-      (StatusOptions o) => _Guard(() => _Status(mountRegistry, o)),
-      (ListOptions o) => _Guard(() => _PoolList(provider, o.Json)),
+    // the object-based ParseArguments overload — the generic MapResult caps at 16 verbs, we have more
+    var verbTypes = new[] {
+      typeof(PoolCreateOptions), typeof(PoolImportOptions), typeof(PoolExportOptions), typeof(PoolListOptions),
+      typeof(PoolAddMemberOptions), typeof(PoolRemoveMemberOptions), typeof(PoolAdoptOptions), typeof(PoolRepairManifestOptions),
+      typeof(CredentialSetOptions), typeof(CredentialRemoveOptions),
+      typeof(InstallServiceOptions), typeof(UninstallServiceOptions), typeof(InstallSystemdOptions), typeof(RegisterShellOptions),
+      typeof(MountOptions), typeof(UnmountOptions), typeof(StatusOptions), typeof(ListOptions),
+    };
+
+    return Parser.Default.ParseArguments(_TranslateVerbs(args), verbTypes).MapResult(
+      parsed => _Guard(() => parsed switch {
+        PoolCreateOptions o => _PoolCreate(lifecycle, o),
+        PoolImportOptions o => _PoolImport(lifecycle, o),
+        PoolExportOptions o => _PoolExport(provider, lifecycle, o),
+        PoolListOptions o => _PoolList(provider, o.Json),
+        PoolAddMemberOptions o => _PoolAddMember(provider, lifecycle, o),
+        PoolRemoveMemberOptions o => _PoolRemoveMember(provider, lifecycle, o),
+        PoolAdoptOptions o => _PoolAdopt(provider, lifecycle, o),
+        PoolRepairManifestOptions o => _PoolRepairManifest(provider, store, o),
+        CredentialSetOptions o => _CredentialSet(credentialStore, o),
+        CredentialRemoveOptions o => _CredentialRemove(credentialStore, o),
+        InstallServiceOptions o => ServiceInstaller.InstallWindowsService(o.Manifest, o.Target),
+        UninstallServiceOptions o => ServiceInstaller.UninstallWindowsService(o.Manifest),
+        InstallSystemdOptions o => ServiceInstaller.InstallSystemd(o.Manifest, host),
+        RegisterShellOptions => ServiceInstaller.RegisterShellAssociation(),
+        MountOptions o => MountCommand.Run(host, store, provider, remoteResolver, mountRegistry, o),
+        UnmountOptions o => _Unmount(mountRegistry, o),
+        StatusOptions o => _Status(mountRegistry, o),
+        ListOptions o => _PoolList(provider, o.Json),
+        _ => ExitError,
+      }),
       _ => ExitError
     );
   }

@@ -122,6 +122,31 @@ public sealed class MountOptions {
   public bool Foreground { get; set; }
 }
 
+[Verb("install-service", HelpText = "Install a Windows service that mounts a manifest at boot (FR-MOUNT-WIN-CLI).")]
+public sealed class InstallServiceOptions {
+  [Option("manifest", Required = true, HelpText = "Manifest path or pool id/name.")]
+  public string Manifest { get; set; } = "";
+
+  [Option('t', "target", HelpText = "Mount target; defaults to the manifest's mount.target.")]
+  public string? Target { get; set; }
+}
+
+[Verb("uninstall-service", HelpText = "Remove the Windows service for a manifest.")]
+public sealed class UninstallServiceOptions {
+  [Option("manifest", Required = true, HelpText = "Manifest path or pool id/name.")]
+  public string Manifest { get; set; } = "";
+}
+
+[Verb("install-systemd", HelpText = "Install the systemd unit + mount.drivebender fstab helper on Linux (FR-MOUNT-FSTAB).")]
+public sealed class InstallSystemdOptions {
+  [Option("manifest", Required = true, HelpText = "Manifest path or pool id/name (for the enable hint).")]
+  public string Manifest { get; set; } = "";
+}
+
+[Verb("register-shell", HelpText = "Register the right-click \"mount\" action for *.dbpool.json manifests (Windows, FR-MOUNT-WIN-GUI).")]
+public sealed class RegisterShellOptions {
+}
+
 [Verb("unmount", HelpText = "Unmount a mounted pool.")]
 public sealed class UnmountOptions {
   [Value(0, Required = true, MetaName = "target", HelpText = "Mount target or pool id.")]
