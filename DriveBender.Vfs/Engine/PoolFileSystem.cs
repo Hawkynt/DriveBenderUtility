@@ -876,12 +876,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   #endregion
 
-  /// <summary>Aggregate statistics: shared physical volumes counted once, reserves subtracted (FR-STAT, FR-SPACE-SHARED).</summary>
+  /// <summary>
+  /// Aggregate statistics: shared physical volumes counted once, reserves subtracted
+  /// (FR-STAT, FR-SPACE-SHARED). Members whose backend cannot report capacity signal it
+  /// with BytesTotal == 0 and are excluded from the aggregate — never counted as zero or
+  /// infinite (documented FR-STAT convention).
+  /// </summary>
   public FsStatistics StatFs() {
     this._RequireMounted();
     long free = 0, total = 0;
     foreach (var group in this._members.Where(m => m.Io.IsOnline).GroupBy(m => m.Io.PhysicalVolumeId, StringComparer.OrdinalIgnoreCase)) {
       var io = group.First().Io;
+      if (io.BytesTotal == 0)
+        continue; // capacity unknown (remote service) — excluded from the aggregate
+
       var reserved = group.Sum(m => m.ReserveBytes);
       free += Math.Max(0, io.BytesFree - reserved);
       total += io.BytesTotal;

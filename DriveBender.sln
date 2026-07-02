@@ -19,6 +19,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DriveBender.Mount", "DriveB
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DriveBender.Mount.Windows", "DriveBender.Mount.Windows\DriveBender.Mount.Windows.csproj", "{4B566A6A-1020-44B8-B249-409B7D7E88F2}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DriveBender.Backends", "DriveBender.Backends\DriveBender.Backends.csproj", "{B7A999C2-B449-4461-BF5D-DFF67509DA52}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -113,6 +115,18 @@ Global
 		{4B566A6A-1020-44B8-B249-409B7D7E88F2}.Release|x64.Build.0 = Release|Any CPU
 		{4B566A6A-1020-44B8-B249-409B7D7E88F2}.Release|x86.ActiveCfg = Release|Any CPU
 		{4B566A6A-1020-44B8-B249-409B7D7E88F2}.Release|x86.Build.0 = Release|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Debug|x64.Build.0 = Debug|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Debug|x86.Build.0 = Debug|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Release|x64.ActiveCfg = Release|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Release|x64.Build.0 = Release|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Release|x86.ActiveCfg = Release|Any CPU
+		{B7A999C2-B449-4461-BF5D-DFF67509DA52}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
