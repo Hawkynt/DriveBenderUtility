@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drive Bender Pool Manager</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>🗂️ Drive Bender Pool Manager</h1>
+    <div class="live"><span id="live-dot" class="dot"></span><span id="live-text">connecting…</span></div>
+  </header>
+  <main>
+    <div id="pools" class="grid"></div>
+    <div id="empty" class="empty" hidden>No pools discovered. Create one with <code>dbmount pool create</code>.</div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

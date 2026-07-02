@@ -32,6 +32,7 @@ internal static class Program {
       typeof(PoolHealthOptions), typeof(PoolRestoreOptions), typeof(PoolRemoveMediaOptions), typeof(PoolReplaceMediaOptions),
       typeof(CredentialSetOptions), typeof(CredentialRemoveOptions),
       typeof(InstallServiceOptions), typeof(UninstallServiceOptions), typeof(InstallSystemdOptions), typeof(RegisterShellOptions),
+      typeof(ServeOptions),
       typeof(MountOptions), typeof(UnmountOptions), typeof(StatusOptions), typeof(ListOptions),
     };
 
@@ -55,6 +56,7 @@ internal static class Program {
         UninstallServiceOptions o => ServiceInstaller.UninstallWindowsService(o.Manifest),
         InstallSystemdOptions o => ServiceInstaller.InstallSystemd(o.Manifest, host),
         RegisterShellOptions => ServiceInstaller.RegisterShellAssociation(),
+        ServeOptions o => new ServeCommand(host, store, provider, lifecycle, remoteResolver, credentialStore, mountRegistry).Run(o),
         MountOptions o => MountCommand.Run(host, store, provider, remoteResolver, mountRegistry, o),
         UnmountOptions o => _Unmount(mountRegistry, o),
         StatusOptions o => _Status(mountRegistry, o),

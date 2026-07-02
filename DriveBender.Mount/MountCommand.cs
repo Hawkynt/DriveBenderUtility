@@ -71,10 +71,10 @@ internal static class MountCommand {
     var label = pool.Manifest.Mount?.VolumeLabel ?? pool.Name;
     var fs = new PoolFileSystem(pool.PoolId, members, cache, config);
 
-    return _MountPlatform(fs, pool, target, label, registry, options);
+    return _MountPlatform(host, fs, pool, target, label, registry, options);
   }
 
-  private static int _MountPlatform(PoolFileSystem fs, PoolRef pool, string target, string label, MountRegistry registry, MountOptions options) {
+  private static int _MountPlatform(IHostEnvironment host, PoolFileSystem fs, PoolRef pool, string target, string label, MountRegistry registry, MountOptions options) {
 #if WINDOWS
     // WinFsp preferred (richer semantics); Dokan (LGPL) as the no-extra-install fallback (§4.1)
     IDisposable mountHost;
@@ -95,12 +95,15 @@ internal static class MountCommand {
     }
 
     var backend = mountHost is Windows.WinFspMountHost ? "winfsp" : "dokan";
-    registry.Register(new() { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = backend, StartedUtc = DateTime.UtcNow.ToString("O") });
+    var entry = new MountEntry { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = backend, StartedUtc = DateTime.UtcNow.ToString("O") };
+    registry.Register(entry);
+    var metrics = new MetricsPublisher(host);
     using (mountHost) {
       var scheduler = fs.CreateScheduler();
       using var stop = new ManualResetEventSlim();
       using var pump = new Timer(_ => {
         scheduler.Pump();
+        metrics.Publish(fs, entry); // live snapshot for the serve daemon (§6.13)
         if (registry.StopRequested(pool.PoolId)) // another dbmount asked for a clean unmount
           stop.Set();
       }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
@@ -117,6 +120,7 @@ internal static class MountCommand {
       scheduler.Quiesce();
       fs.Unmount(); // clean unmount flushes everything (FR-CLEAN-UNMOUNT)
       registry.Unregister(pool.PoolId);
+      metrics.Remove(pool.PoolId);
     }
 
     return 0;
@@ -131,10 +135,13 @@ internal static class MountCommand {
       return 3;
     }
 
+    var fuseEntry = new MountEntry { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = "fuse", StartedUtc = DateTime.UtcNow.ToString("O") };
+    var fuseMetrics = new MetricsPublisher(host);
     return Linux.LinuxFuseMountHost.Run(fs, target, options.ReadOnly,
-      onMounted: () => registry.Register(new() { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = "fuse", StartedUtc = DateTime.UtcNow.ToString("O") }),
+      onMounted: () => registry.Register(fuseEntry),
       stopRequested: () => registry.StopRequested(pool.PoolId),
-      onUnmounted: () => registry.Unregister(pool.PoolId));
+      onUnmounted: () => { registry.Unregister(pool.PoolId); fuseMetrics.Remove(pool.PoolId); },
+      onTick: () => fuseMetrics.Publish(fs, fuseEntry));
 #endif
   }
 

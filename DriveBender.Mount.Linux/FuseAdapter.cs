@@ -313,7 +313,7 @@ public static class LinuxFuseMountHost {
   public static bool IsFuseAvailable() => OperatingSystem.IsLinux() && File.Exists("/dev/fuse");
 
   /// <summary>Mounts and blocks until the filesystem is unmounted (umount/fusermount3, Ctrl+C, or a registry stop request).</summary>
-  public static int Run(PoolFileSystem fs, string target, bool readOnly, Action? onMounted = null, Func<bool>? stopRequested = null, Action? onUnmounted = null) {
+  public static int Run(PoolFileSystem fs, string target, bool readOnly, Action? onMounted = null, Func<bool>? stopRequested = null, Action? onUnmounted = null, Action? onTick = null) {
     FuseAdapter.NativeUid = _GetId("-u");
     FuseAdapter.NativeGid = _GetId("-g");
 
@@ -326,6 +326,9 @@ public static class LinuxFuseMountHost {
         registered = true;
         onMounted?.Invoke();
       }
+
+      if (registered)
+        onTick?.Invoke(); // periodic metrics snapshot for the serve daemon
 
       // another dbmount asked for a clean unmount → detach; libfuse returns from Mount()
       if (stopRequested?.Invoke() == true)

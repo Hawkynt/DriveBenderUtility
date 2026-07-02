@@ -183,6 +183,15 @@ public sealed class InstallSystemdOptions {
 public sealed class RegisterShellOptions {
 }
 
+[Verb("serve", HelpText = "Run the local management web UI + API (animated live dashboard) on 127.0.0.1.")]
+public sealed class ServeOptions {
+  [Option('p', "port", Default = 9723, HelpText = "Localhost port for the management UI.")]
+  public int Port { get; set; }
+
+  [Option("open", HelpText = "Open the UI in the default browser.")]
+  public bool OpenBrowser { get; set; }
+}
+
 [Verb("unmount", HelpText = "Unmount a mounted pool.")]
 public sealed class UnmountOptions {
   [Value(0, Required = true, MetaName = "target", HelpText = "Mount target or pool id.")]

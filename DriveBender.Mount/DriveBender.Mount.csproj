@@ -26,4 +26,9 @@
   <ItemGroup>
     <PackageReference Include="CommandLineParser" Version="2.9.1" />
   </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="WebAssets\index.html" LogicalName="DriveBender.Mount.WebAssets.index.html" />
+    <EmbeddedResource Include="WebAssets\app.js" LogicalName="DriveBender.Mount.WebAssets.app.js" />
+    <EmbeddedResource Include="WebAssets\styles.css" LogicalName="DriveBender.Mount.WebAssets.styles.css" />
+  </ItemGroup>
 </Project>
