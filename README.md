@@ -72,28 +72,71 @@ Platform-agnostic VFS/I/O engine towards live pool mounting
   (subfolder members on one disk are one domain), with de-duplicated free-space
   accounting and `reserveBytes`
 - **Byte-range I/O abstraction** (`IVolumeIO`) with local backend and atomic
-  temp-and-rename publication, ready for remote capacity backends
+  temp-and-rename publication, plus whole-file remote backends
 - **Hierarchical configuration** (built-in defaults → global → pool → folder
   globs) with strict validation: duplication-aware ack floors, journal and fsync
   safety switches that cannot be disabled, and a never-over-committed RAM ceiling
   for cache instances
 
-### 🚀 DriveBender.Mount *(net10.0, `dbmount`)*
+### 🌐 DriveBender.Backends *(net10.0)*
+Members can be far more than local drives — any of these joins a pool as a
+whole-file capacity tier, over the **official first-party SDKs** (no wrapper
+libraries):
+
+| Scheme | Backend | SDK |
+|---|---|---|
+| `file` / `unc` | local drive, subfolder, UNC share | .NET |
+| `ftp` / `ftps` | FTP / FTPS | FluentFTP |
+| `sftp` | SFTP (password or private key) | SSH.NET |
+| `webdav` / `webdavs` | WebDAV | WebDav.Client |
+| `s3` | Amazon S3 & S3-compatible (MinIO…) | AWSSDK.S3 |
+| `azblob` / `azfile` | Azure Blob / Azure Files | Azure.Storage.* |
+| `dropbox` | Dropbox | Dropbox.Api |
+| `onedrive` | Microsoft OneDrive | Microsoft.Graph |
+| `gdrive` / `gcs` | Google Drive / Cloud Storage | Google.Apis.* |
+
+Remote members are capability-honest: no atomic rename and no durable flush, so
+the engine journals around the gaps and never counts a remote copy toward
+`minCopiesBeforeAck` (`SAFE-REMOTE`). Secrets live only in the OS credential
+store (Windows Credential Manager, or an owner-only file fallback) and are
+referenced from the manifest by `cred-ref:<name>` handle (`SEC-CRED`).
+
+### 🚀 DriveBender.Mount *(net10.0 / net10.0-windows, `dbmount`)*
 CLI/daemon entry point for manifest pools:
 - `dbmount pool create|import|export|list|add-member|remove-member|adopt|repair-manifest`
-- `dbmount mount --manifest <file|poolId|name> [--target X:\] [--read-only]` —
-  mounts the pool as a live Windows filesystem via **WinFsp**
-  (install from <https://winfsp.dev>): crash recovery replays the journal before
-  serving, health warnings surface up front, background workers (owed-copy sync,
-  landing-zone drain, trash maintenance) pump while mounted, and Ctrl+C
-  unmounts cleanly after flushing all dirty state
+  — members may be drive roots, subfolders, UNC shares, or any remote URI above
+- `dbmount credential set <name>` / `remove` — store remote secrets (read from a
+  hidden prompt or stdin, never shell history)
+- `dbmount mount --manifest <file|poolId|name> [--target X:\|/mnt/pool] [--read-only]`
+  — mounts the pool as a live filesystem: **WinFsp** or **Dokan** on Windows,
+  **FUSE** on Linux. Crash recovery replays the journal before serving, health
+  warnings surface up front, background workers (owed-copy sync, landing-zone
+  drain, trash maintenance) pump while mounted, and unmount flushes all dirty
+  state
 - Non-destructive by contract: pre-existing folder content is never absorbed
   without `--force`, and folders owned by another pool are always refused
 
 ### 🪟 DriveBender.Mount.Windows *(net10.0-windows)*
-The WinFsp platform adapter — a thin callback translation over the engine's
-`IPoolFileSystem` contract; no pool logic lives in the adapter, so adding the
-Linux FUSE backend requires zero engine changes.
+The Windows platform adapters — thin callback translations over the engine's
+`IPoolFileSystem` contract (no pool logic in the adapter, `NFR-PORT`):
+- **WinFsp** (`winfsp.net`) — preferred, richer semantics
+- **Dokan** (`dokan-dotnet`, LGPL) — automatic fallback so no specific driver
+  install is forced; `dbmount` picks whichever is present
+
+### 🐧 DriveBender.Mount.Linux *(net10.0)*
+The **FUSE** platform adapter (`LTRData.FuseDotNet`, LGPL) plus a
+`mount.drivebender` fstab helper and a `drivebender-pool@.service` systemd
+template, so a manifest mounts natively at boot:
+
+```fstab
+/etc/drivebenderutility/pools/media.json  /mnt/media  fuse.drivebender  defaults,_netdev  0 0
+```
+
+### 🧪 DriveBender.Vfs.Tests *(net10.0)*
+Headless engine suite: the whole VFS engine runs against in-memory fakes
+(`FakeVolumeIO`, `FakeHostEnvironment`) including fault injection — power loss,
+no-space, torn writes, offline members — so every safety invariant is testable
+without a real pool.
 
 ### 🧪 DriveBender.Vfs.Tests *(net10.0)*
 Headless engine suite: the whole VFS engine runs against in-memory fakes
