@@ -26,6 +26,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly WriteBufferManager _writeBuffer;
   private readonly PoolTrash _trash;
   private readonly IntegrityService _integrity;
+  private readonly ActivityFeed _activity;
   private readonly Func<DateTime> _clock;
   private readonly long _readAheadMin;
   private readonly long _readAheadMax;
@@ -44,6 +45,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._writeBuffer = new(cache, this._clock);
     this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock);
     this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest);
+    this._activity = new(clock: this._clock);
     this._placement = new(
       poolId,
       [.. members.Select(m => m.Io)],
@@ -64,9 +66,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public WriteBufferManager WriteBuffer => this._writeBuffer;
   public PoolTrash Trash => this._trash;
   public IntegrityService Integrity => this._integrity;
+  public ActivityFeed Activity => this._activity;
+
+  /// <summary>Dashboard counters for this pool (OPS-METRICS).</summary>
+  public PoolMetrics GetMetrics()
+    => this._activity.Snapshot(this._cache.Pages.GetStatistics(this._poolId), this._writeBuffer.DirtyPaths.Count);
 
   /// <summary>Full checksum scrub: bit-rot repair and out-of-band reconciliation (FR-SCRUB, SAFE-OOB).</summary>
-  public IReadOnlyList<IntegrityIssue> RunScrub() => this._integrity.ScrubAll(this._Invalidate);
+  public IReadOnlyList<IntegrityIssue> RunScrub() {
+    var issues = this._integrity.ScrubAll(this._Invalidate);
+    foreach (var issue in issues)
+      this._activity.Publish(ActivityKind.Scrub, issue.Path, reason: $"{issue.Kind}: {issue.Message}");
+
+    return issues;
+  }
 
   /// <summary>Builds the background workers for this pool (CMP-BG): owed-copy sync (with the deferred window) and the landing-zone drainer.</summary>
   public BackgroundScheduler CreateScheduler() {
@@ -124,8 +137,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     // recovery before serving: roll forward, reconcile, clean temps (FR-RECOVER)
     var report = new PoolRecovery([.. this._Online], this._journal).Run();
-    if (report.AnythingDone)
+    if (report.AnythingDone) {
       DriveBender.Logger($"Recovery: {report.RolledForward} rolled forward, {report.Reconciled} reconciled, {report.TempsRemoved} staging files removed");
+      this._activity.Publish(ActivityKind.Recovery, "", report.RolledForward + report.Reconciled, reason: "journal replay on mount");
+    }
 
     // externally-modified members are caught before serving stale data (FR-OOB-MOUNT)
     if (this._config.Integrity?.ChecksumDb != false) {
@@ -510,6 +525,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       var count = (int)Math.Min(buffer.Length, length - offset);
       this._ReadRange(path, copies, buffer[..count], offset, count >= this._mirrorSplitThreshold);
+      this._activity.Publish(ActivityKind.Read, path, count, fromMember: copies[0].Volume.DisplayName, reason: "user I/O");
 
       if (this._readAheadEnabled) {
         ReadAheadState? state;
@@ -678,6 +694,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._journal.Complete(sequence, JournalOp.Write);
       }
 
+      this._activity.Publish(ActivityKind.Write, path, bytes.Length, toMember: copies.Count > 0 ? copies[0].Volume.DisplayName : null, reason: policy.ToString());
+
       // coherency: a read after this write must return the new bytes (SAFE-COHERE)
       this._integrity.InvalidateFile(path);
       this._cache.Pages.InvalidatePath(this._poolId, path);
@@ -815,6 +833,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._journal.Complete(sequence, JournalOp.Drain);
         this._integrity.InvalidateFile(path);
         this._integrity.RecordWholeFile(target, path, false, content);
+        this._activity.Publish(ActivityKind.Drain, path, content.Length, landing.DisplayName, target.DisplayName, "landing-zone drain");
 
         this._Invalidate(path);
         this._EnsureShadows(path, this._placement.ResolveCopies(path), content);
