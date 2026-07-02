@@ -13,7 +13,7 @@ namespace DivisonM.Mount;
 /// </summary>
 internal static class MountCommand {
 
-  public static int Run(IHostEnvironment host, ManifestStore store, IPoolProvider provider, BackendMemberResolver remoteResolver, MountOptions options) {
+  public static int Run(IHostEnvironment host, ManifestStore store, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, MountOptions options) {
     // resolve the manifest argument: a *.json file path, a pool id, or a pool name
     PoolRef? pool;
     if (File.Exists(options.Manifest)) {
@@ -71,10 +71,10 @@ internal static class MountCommand {
     var label = pool.Manifest.Mount?.VolumeLabel ?? pool.Name;
     var fs = new PoolFileSystem(pool.PoolId, members, cache, config);
 
-    return _MountPlatform(fs, target, label, options);
+    return _MountPlatform(fs, pool, target, label, registry, options);
   }
 
-  private static int _MountPlatform(PoolFileSystem fs, string target, string label, MountOptions options) {
+  private static int _MountPlatform(PoolFileSystem fs, PoolRef pool, string target, string label, MountRegistry registry, MountOptions options) {
 #if WINDOWS
     // WinFsp preferred (richer semantics); Dokan (LGPL) as the no-extra-install fallback (§4.1)
     IDisposable mountHost;
@@ -94,12 +94,18 @@ internal static class MountCommand {
       return 3;
     }
 
+    var backend = mountHost is Windows.WinFspMountHost ? "winfsp" : "dokan";
+    registry.Register(new() { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = backend, StartedUtc = DateTime.UtcNow.ToString("O") });
     using (mountHost) {
       var scheduler = fs.CreateScheduler();
-      using var pump = new Timer(_ => scheduler.Pump(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
-
-      Console.WriteLine($"Pool mounted at '{target}'. Press Ctrl+C to unmount.");
       using var stop = new ManualResetEventSlim();
+      using var pump = new Timer(_ => {
+        scheduler.Pump();
+        if (registry.StopRequested(pool.PoolId)) // another dbmount asked for a clean unmount
+          stop.Set();
+      }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+
+      Console.WriteLine($"Pool mounted at '{target}'. Press Ctrl+C or run 'dbmount unmount {target}' to unmount.");
       Console.CancelKeyPress += (_, e) => {
         e.Cancel = true;
         stop.Set();
@@ -110,6 +116,7 @@ internal static class MountCommand {
       unmountAction();
       scheduler.Quiesce();
       fs.Unmount(); // clean unmount flushes everything (FR-CLEAN-UNMOUNT)
+      registry.Unregister(pool.PoolId);
     }
 
     return 0;
@@ -124,7 +131,10 @@ internal static class MountCommand {
       return 3;
     }
 
-    return Linux.LinuxFuseMountHost.Run(fs, target, options.ReadOnly);
+    return Linux.LinuxFuseMountHost.Run(fs, target, options.ReadOnly,
+      onMounted: () => registry.Register(new() { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = "fuse", StartedUtc = DateTime.UtcNow.ToString("O") }),
+      stopRequested: () => registry.StopRequested(pool.PoolId),
+      onUnmounted: () => registry.Unregister(pool.PoolId));
 #endif
   }
 

@@ -23,6 +23,7 @@ internal static class Program {
     using var remoteResolver = new BackendMemberResolver(registry, credentialStore);
     var provider = new PoolProvider(host, store, [new JsonManifestSource(store), new NativeScanSource(host)], remoteResolver: remoteResolver);
     var lifecycle = new PoolLifecycle(host, store);
+    var mountRegistry = new MountRegistry(host);
 
     return Parser.Default.ParseArguments<
       PoolCreateOptions,
@@ -50,9 +51,9 @@ internal static class Program {
       (PoolRepairManifestOptions o) => _Guard(() => _PoolRepairManifest(provider, store, o)),
       (CredentialSetOptions o) => _Guard(() => _CredentialSet(credentialStore, o)),
       (CredentialRemoveOptions o) => _Guard(() => _CredentialRemove(credentialStore, o)),
-      (MountOptions o) => _Guard(() => MountCommand.Run(host, store, provider, remoteResolver, o)),
-      (UnmountOptions o) => _NotImplemented("unmount"),
-      (StatusOptions o) => _NotImplemented("status"),
+      (MountOptions o) => _Guard(() => MountCommand.Run(host, store, provider, remoteResolver, mountRegistry, o)),
+      (UnmountOptions o) => _Guard(() => _Unmount(mountRegistry, o)),
+      (StatusOptions o) => _Guard(() => _Status(mountRegistry, o)),
       (ListOptions o) => _Guard(() => _PoolList(provider, o.Json)),
       _ => ExitError
     );
@@ -281,6 +282,48 @@ internal static class Program {
 
     var manifest = lifecycle.Adopt(pool);
     Console.WriteLine($"Adopted native pool '{manifest.Name}' ({manifest.PoolId}) into an explicit manifest — no data was moved.");
+    return ExitOk;
+  }
+
+  private static int _Unmount(MountRegistry registry, UnmountOptions options) {
+    var entry = registry.Find(options.Target);
+    if (entry == null) {
+      Console.Error.WriteLine($"No mounted pool matches '{options.Target}'.");
+      return ExitNotFound;
+    }
+
+    Console.WriteLine($"Requesting clean unmount of '{entry.Name}' at '{entry.Target}'…");
+    registry.RequestStop(entry.PoolId);
+
+    // wait for the mounting process to flush and deregister
+    for (var i = 0; i < 100; ++i) {
+      if (registry.Find(options.Target) == null) {
+        Console.WriteLine("Unmounted.");
+        return ExitOk;
+      }
+
+      Thread.Sleep(200);
+    }
+
+    Console.Error.WriteLine("Unmount request sent, but the mount is still active — the mounting process may be busy.");
+    return ExitError;
+  }
+
+  private static int _Status(MountRegistry registry, StatusOptions options) {
+    var entries = registry.List();
+    if (options.Json) {
+      Console.WriteLine(JsonSerializer.Serialize(entries, new JsonSerializerOptions { WriteIndented = true }));
+      return ExitOk;
+    }
+
+    if (entries.Count == 0) {
+      Console.WriteLine("No pools are currently mounted.");
+      return ExitOk;
+    }
+
+    foreach (var entry in entries)
+      Console.WriteLine($"{entry.Name}  ->  {entry.Target}  [{entry.Backend}, pid {entry.ProcessId}, since {entry.StartedUtc}]");
+
     return ExitOk;
   }
 

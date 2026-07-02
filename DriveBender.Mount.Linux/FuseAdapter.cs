@@ -312,14 +312,25 @@ public static class LinuxFuseMountHost {
 
   public static bool IsFuseAvailable() => OperatingSystem.IsLinux() && File.Exists("/dev/fuse");
 
-  /// <summary>Mounts and blocks until the filesystem is unmounted (umount/fusermount3 or Ctrl+C).</summary>
-  public static int Run(PoolFileSystem fs, string target, bool readOnly) {
+  /// <summary>Mounts and blocks until the filesystem is unmounted (umount/fusermount3, Ctrl+C, or a registry stop request).</summary>
+  public static int Run(PoolFileSystem fs, string target, bool readOnly, Action? onMounted = null, Func<bool>? stopRequested = null, Action? onUnmounted = null) {
     FuseAdapter.NativeUid = _GetId("-u");
     FuseAdapter.NativeGid = _GetId("-g");
 
     fs.Mount(new(target, readOnly));
     var scheduler = fs.CreateScheduler();
-    using var pump = new Timer(_ => scheduler.Pump(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+    var registered = false;
+    using var pump = new Timer(_ => {
+      scheduler.Pump();
+      if (!registered && (System.IO.Directory.Exists(target) && _IsMounted(target))) {
+        registered = true;
+        onMounted?.Invoke();
+      }
+
+      // another dbmount asked for a clean unmount → detach; libfuse returns from Mount()
+      if (stopRequested?.Invoke() == true)
+        Unmount(target);
+    }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
 
     Console.CancelKeyPress += (_, e) => {
       e.Cancel = true;
@@ -328,7 +339,7 @@ public static class LinuxFuseMountHost {
 
     var options = "fsname=drivebender,subtype=drivebender,default_permissions" + (readOnly ? ",ro" : "");
     var adapter = new FuseAdapter(fs);
-    DriveBender.Logger($"Mounting pool at '{target}' via FUSE (unmount with: umount {target})");
+    DriveBender.Logger($"Mounting pool at '{target}' via FUSE (unmount with: umount {target} or dbmount unmount {target})");
     var args = new List<string> { "dbmount", target, "-f", "-o", options };
     if (Environment.GetEnvironmentVariable("DBMOUNT_FUSE_DEBUG") == "1")
       args.Add("-d");
@@ -339,9 +350,23 @@ public static class LinuxFuseMountHost {
     } finally {
       scheduler.Quiesce();
       fs.Unmount(); // clean unmount flushes everything (FR-CLEAN-UNMOUNT)
+      onUnmounted?.Invoke();
     }
 
     return 0;
+  }
+
+  private static bool _IsMounted(string target) {
+    try {
+      foreach (var line in File.ReadLines("/proc/mounts")) {
+        var parts = line.Split(' ');
+        if (parts.Length >= 2 && parts[1] == target)
+          return true;
+      }
+    } catch (IOException) {
+    }
+
+    return false;
   }
 
   public static void Unmount(string target) {
