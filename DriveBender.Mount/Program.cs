@@ -29,6 +29,7 @@ internal static class Program {
     var verbTypes = new[] {
       typeof(PoolCreateOptions), typeof(PoolImportOptions), typeof(PoolExportOptions), typeof(PoolListOptions),
       typeof(PoolAddMemberOptions), typeof(PoolRemoveMemberOptions), typeof(PoolAdoptOptions), typeof(PoolRepairManifestOptions),
+      typeof(PoolHealthOptions), typeof(PoolRestoreOptions), typeof(PoolRemoveMediaOptions), typeof(PoolReplaceMediaOptions),
       typeof(CredentialSetOptions), typeof(CredentialRemoveOptions),
       typeof(InstallServiceOptions), typeof(UninstallServiceOptions), typeof(InstallSystemdOptions), typeof(RegisterShellOptions),
       typeof(MountOptions), typeof(UnmountOptions), typeof(StatusOptions), typeof(ListOptions),
@@ -44,6 +45,10 @@ internal static class Program {
         PoolRemoveMemberOptions o => _PoolRemoveMember(provider, lifecycle, o),
         PoolAdoptOptions o => _PoolAdopt(provider, lifecycle, o),
         PoolRepairManifestOptions o => _PoolRepairManifest(provider, store, o),
+        PoolHealthOptions o => PoolOpsCommand.Health(host, provider, remoteResolver, o),
+        PoolRestoreOptions o => PoolOpsCommand.Restore(host, provider, remoteResolver, o),
+        PoolRemoveMediaOptions o => PoolOpsCommand.RemoveMedia(host, store, provider, lifecycle, remoteResolver, o),
+        PoolReplaceMediaOptions o => PoolOpsCommand.ReplaceMedia(host, store, provider, lifecycle, remoteResolver, o),
         CredentialSetOptions o => _CredentialSet(credentialStore, o),
         CredentialRemoveOptions o => _CredentialRemove(credentialStore, o),
         InstallServiceOptions o => ServiceInstaller.InstallWindowsService(o.Manifest, o.Target),

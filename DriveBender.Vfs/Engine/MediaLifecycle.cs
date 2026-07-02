@@ -17,6 +17,18 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
 
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
+  /// <summary>Files that are below their duplication level or missing a primary (read-only audit for health checks).</summary>
+  public int CountUnderDuplicated() {
+    var count = 0;
+    foreach (var (_, copies) in this._EnumerateLogicalFiles()) {
+      var domains = copies.Select(c => c.Member.PhysicalVolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+      if (domains < duplicationLevel || !copies.Any(c => !c.Shadow))
+        ++count;
+    }
+
+    return count;
+  }
+
   /// <summary>All logical files and where their copies live (primary + shadow), across every online member.</summary>
   private Dictionary<string, List<Copy>> _EnumerateLogicalFiles() {
     var map = new Dictionary<string, List<Copy>>(StringComparer.OrdinalIgnoreCase);

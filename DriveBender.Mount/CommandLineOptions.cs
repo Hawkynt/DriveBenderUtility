@@ -89,6 +89,42 @@ public sealed class PoolRepairManifestOptions {
   public string Pool { get; set; } = "";
 }
 
+[Verb("pool-health", HelpText = "Check pool health (SMART, temperature, bit-rot, missing copies); --fix corrects what it can.")]
+public sealed class PoolHealthOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+
+  [Option("fix", HelpText = "Repair bit-rot from good copies, resolve conflicts, and restore missing shadows/primaries.")]
+  public bool Fix { get; set; }
+}
+
+[Verb("pool-restore", HelpText = "Restore the pool to its duplication level (recreate missing shadows, promote surviving shadows).")]
+public sealed class PoolRestoreOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+}
+
+[Verb("pool-remove-media", HelpText = "Scatter a member's data over the remaining members, then remove it from the pool.")]
+public sealed class PoolRemoveMediaOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+
+  [Option('m', "member", Required = true, HelpText = "Member path or id to remove.")]
+  public string? Member { get; set; }
+}
+
+[Verb("pool-replace-media", HelpText = "Migrate a member's data onto a replacement folder, then swap it in the manifest.")]
+public sealed class PoolReplaceMediaOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+
+  [Option("old", Required = true, HelpText = "Member path or id to replace.")]
+  public string Old { get; set; } = "";
+
+  [Option("new", Required = true, HelpText = "Replacement member folder.")]
+  public string New { get; set; } = "";
+}
+
 [Verb("credential-set", HelpText = "Store a secret in the OS credential store; reference it from members as cred-ref:<name>.")]
 public sealed class CredentialSetOptions {
   [Value(0, Required = true, MetaName = "name", HelpText = "Reference name (e.g. MyPool-server).")]
