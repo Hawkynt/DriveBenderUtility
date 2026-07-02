@@ -1,0 +1,134 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:DivisonM.App.ViewModels"
+        x:Class="DivisonM.App.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="{Binding Title}" Width="900" Height="620"
+        MinWidth="640" MinHeight="460">
+
+  <TabControl Margin="8">
+
+    <!-- Dashboard -->
+    <TabItem Header="{Binding L[tab.dashboard]}">
+      <Grid RowDefinitions="Auto,*" DataContext="{Binding Dashboard}">
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,8" Spacing="8">
+          <Button Content="{Binding $parent[Window].DataContext.L[dashboard.refresh]}" Command="{Binding RefreshCommand}"/>
+          <TextBlock Text="{Binding StatusMessage}" VerticalAlignment="Center"/>
+        </StackPanel>
+        <DataGrid Grid.Row="1" ItemsSource="{Binding Pools}" SelectedItem="{Binding SelectedPool}"
+                  IsReadOnly="True" AutoGenerateColumns="False" GridLinesVisibility="Horizontal">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="200"/>
+            <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="120"/>
+            <DataGridTextColumn Header="Health" Binding="{Binding Health}" Width="120"/>
+            <DataGridTextColumn Header="Members" Binding="{Binding OnlineMembers}" Width="90"/>
+            <DataGridTextColumn Header="Free" Binding="{Binding BytesFree}" Width="120"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </Grid>
+    </TabItem>
+
+    <!-- Create Pool -->
+    <TabItem Header="{Binding L[tab.create]}">
+      <ScrollViewer>
+        <StackPanel Margin="4" Spacing="8" DataContext="{Binding CreatePool}">
+          <TextBlock Text="{Binding $parent[Window].DataContext.L[create.name]}"/>
+          <TextBox Text="{Binding PoolName}"/>
+          <TextBlock Text="{Binding $parent[Window].DataContext.L[create.mountTarget]}"/>
+          <TextBox Text="{Binding MountTarget}"/>
+
+          <Border BorderBrush="Gray" BorderThickness="1" CornerRadius="4" Padding="8">
+            <StackPanel Spacing="6">
+              <TextBlock Text="{Binding $parent[Window].DataContext.L[create.addMember]}" FontWeight="Bold"/>
+              <Grid ColumnDefinitions="Auto,*,Auto" RowDefinitions="Auto,Auto">
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="{Binding $parent[Window].DataContext.L[create.kind]}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{x:Static vm:CreatePoolViewModel.Kinds}" SelectedItem="{Binding SelectedKind}" HorizontalAlignment="Stretch">
+                  <ComboBox.ItemTemplate><DataTemplate x:DataType="vm:MemberKind"><TextBlock Text="{Binding Display}"/></DataTemplate></ComboBox.ItemTemplate>
+                </ComboBox>
+                <ComboBox Grid.Row="0" Grid.Column="2" ItemsSource="{x:Static vm:CreatePoolViewModel.Roles}" SelectedItem="{Binding SelectedRole}" Margin="8,0,0,0"/>
+                <TextBlock Grid.Row="1" Grid.Column="0" Text="{Binding $parent[Window].DataContext.L[create.location]}" VerticalAlignment="Center" Margin="0,6,8,0"/>
+                <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding MemberLocation}" Margin="0,6,0,0"/>
+                <Button Grid.Row="1" Grid.Column="2" Content="{Binding $parent[Window].DataContext.L[create.addMember]}" Command="{Binding AddMemberCommand}" Margin="8,6,0,0"/>
+              </Grid>
+              <TextBox Text="{Binding CredentialReference}" Watermark="{Binding $parent[Window].DataContext.L[create.credential]}"/>
+              <TextBlock Text="{Binding $parent[Window].DataContext.L[create.credentialHint]}" Foreground="Gray" TextWrapping="Wrap"/>
+            </StackPanel>
+          </Border>
+
+          <TextBlock Text="{Binding $parent[Window].DataContext.L[create.members]}" FontWeight="Bold"/>
+          <DataGrid ItemsSource="{Binding Members}" SelectedItem="{Binding SelectedMember}" Height="150"
+                    IsReadOnly="True" AutoGenerateColumns="False">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="Location" Binding="{Binding Location}" Width="*"/>
+              <DataGridTextColumn Header="Role" Binding="{Binding Role}" Width="120"/>
+            </DataGrid.Columns>
+          </DataGrid>
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <Button Content="{Binding $parent[Window].DataContext.L[create.removeMember]}" Command="{Binding RemoveMemberCommand}"/>
+            <Button Content="{Binding $parent[Window].DataContext.L[create.create]}" Command="{Binding CreateCommand}"/>
+            <TextBlock Text="{Binding StatusMessage}" VerticalAlignment="Center"/>
+          </StackPanel>
+        </StackPanel>
+      </ScrollViewer>
+    </TabItem>
+
+    <!-- Tuning -->
+    <TabItem Header="{Binding L[tab.tuning]}">
+      <StackPanel Margin="4" Spacing="8" DataContext="{Binding Tuning}">
+        <TextBlock Text="{Binding $parent[Window].DataContext.L[tuning.writePolicy]}"/>
+        <ComboBox ItemsSource="{x:Static vm:TuningViewModel.Policies}" SelectedItem="{Binding WritePolicy}"/>
+        <TextBlock Text="{Binding $parent[Window].DataContext.L[tuning.duplication]}"/>
+        <NumericUpDown Value="{Binding Duplication}" Minimum="1" Maximum="10" Increment="1"/>
+        <TextBlock Text="{Binding $parent[Window].DataContext.L[tuning.minCopies]}"/>
+        <NumericUpDown Value="{Binding MinCopiesBeforeAck}" Minimum="1" Maximum="10" Increment="1"/>
+        <CheckBox Content="{Binding $parent[Window].DataContext.L[tuning.acceptVolatileAck]}" IsChecked="{Binding AcceptVolatileAck}"/>
+        <TextBlock Text="{Binding VolatileWarning}" Foreground="OrangeRed" TextWrapping="Wrap" IsVisible="{Binding ShowVolatileWarning}"/>
+        <TextBlock Text="{Binding $parent[Window].DataContext.L[tuning.cacheSize]}"/>
+        <TextBox Text="{Binding CacheSize}"/>
+        <TextBlock Text="{Binding $parent[Window].DataContext.L[tuning.readEviction]}"/>
+        <ComboBox ItemsSource="{x:Static vm:TuningViewModel.EvictionPolicies}" SelectedItem="{Binding ReadEviction}"/>
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <Button Content="{Binding $parent[Window].DataContext.L[tuning.apply]}" Command="{Binding ApplyCommand}"/>
+          <TextBlock Text="{Binding ValidationMessage}" VerticalAlignment="Center"/>
+        </StackPanel>
+      </StackPanel>
+    </TabItem>
+
+    <!-- Credentials -->
+    <TabItem Header="{Binding L[tab.credentials]}">
+      <StackPanel Margin="4" Spacing="8" DataContext="{Binding Credentials}">
+        <TextBlock Text="{Binding $parent[Window].DataContext.L[credentials.name]}"/>
+        <TextBox Text="{Binding Name}"/>
+        <TextBlock Text="{Binding $parent[Window].DataContext.L[credentials.user]}"/>
+        <TextBox Text="{Binding User}"/>
+        <TextBlock Text="{Binding $parent[Window].DataContext.L[credentials.secret]}"/>
+        <TextBox Text="{Binding Secret}" PasswordChar="•"/>
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <Button Content="{Binding $parent[Window].DataContext.L[credentials.store]}" Command="{Binding StoreCommand}"/>
+          <Button Content="{Binding $parent[Window].DataContext.L[credentials.remove]}" Command="{Binding RemoveCommand}"/>
+          <TextBlock Text="{Binding StatusMessage}" VerticalAlignment="Center"/>
+        </StackPanel>
+      </StackPanel>
+    </TabItem>
+
+    <!-- Activity -->
+    <TabItem Header="{Binding L[tab.activity]}">
+      <Grid RowDefinitions="Auto,*" Margin="4" DataContext="{Binding Activity}">
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,0,0,8">
+          <Button Content="{Binding $parent[Window].DataContext.L[activity.pause]}" Command="{Binding PauseCommand}"/>
+          <Button Content="{Binding $parent[Window].DataContext.L[activity.clear]}" Command="{Binding ClearCommand}"/>
+          <TextBlock Text="{Binding DroppedSamples, StringFormat='dropped: {0}'}" VerticalAlignment="Center" Foreground="Gray"/>
+        </StackPanel>
+        <DataGrid Grid.Row="1" ItemsSource="{Binding Events}" IsReadOnly="True" AutoGenerateColumns="False">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Op" Binding="{Binding Kind}" Width="120"/>
+            <DataGridTextColumn Header="Path" Binding="{Binding Path}" Width="*"/>
+            <DataGridTextColumn Header="Bytes" Binding="{Binding Bytes}" Width="100"/>
+            <DataGridTextColumn Header="Reason" Binding="{Binding Reason}" Width="180"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </Grid>
+    </TabItem>
+
+  </TabControl>
+</Window>
