@@ -24,6 +24,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly HandleTable _handles = new();
   private readonly Journal _journal;
   private readonly WriteBufferManager _writeBuffer;
+  private readonly PoolTrash _trash;
+  private readonly Func<DateTime> _clock;
   private readonly long _readAheadMin;
   private readonly long _readAheadMax;
   private readonly bool _readAheadEnabled;
@@ -37,7 +39,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._cache = cache;
     this._config = effectiveConfig;
     this._journal = journal ?? new(new MemberJournalStore([.. members.Select(m => m.Io)]));
-    this._writeBuffer = new(cache, clock);
+    this._clock = clock ?? (static () => DateTime.UtcNow);
+    this._writeBuffer = new(cache, this._clock);
+    this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock);
     this._placement = new(
       poolId,
       [.. members.Select(m => m.Io)],
@@ -56,6 +60,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public PlacementResolver Placement => this._placement;
   public Journal Journal => this._journal;
   public WriteBufferManager WriteBuffer => this._writeBuffer;
+  public PoolTrash Trash => this._trash;
 
   /// <summary>Builds the background workers for this pool (CMP-BG): owed-copy sync (with the deferred window) and the landing-zone drainer.</summary>
   public BackgroundScheduler CreateScheduler() {
@@ -64,7 +69,40 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       ? DurationSpec.Parse(write?.DeferWindow ?? "5s")
       : TimeSpan.Zero;
     var maxDefer = TimeSpan.FromSeconds(write?.MaxDeferSeconds ?? 30);
-    return new([new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this)]);
+    var jobs = new List<IBackgroundJob> { new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this) };
+    if (this._config.Trash?.Enabled == true)
+      jobs.Add(new TrashMaintenanceJob(this));
+
+    return new(jobs);
+  }
+
+  /// <summary>Applies the configured trash retention and size cap, purging oldest first (§6.14).</summary>
+  public int PurgeTrash() {
+    var trashConfig = this._config.Trash;
+    var retention = DurationSpec.Parse(trashConfig?.Retention ?? "7d");
+    var maxSizeSpec = SizeSpec.Parse(trashConfig?.MaxSize ?? "5%");
+    var maxSize = maxSizeSpec.ResolveBytes(this.StatFs().BytesTotal);
+    return this._trash.Purge(retention, maxSize);
+  }
+
+  /// <summary>Restores a trashed item to its original path and re-establishes its duplication level (FR-TRASH).</summary>
+  public void RestoreFromTrash(string originalPath) {
+    this._RequireWritable();
+    var normalized = PoolPaths.Normalize(originalPath);
+    var restored = this._trash.Restore(normalized)
+                   ?? throw new PoolFsException(PoolFsError.NotFound, $"No trash entry for '{originalPath}'");
+
+    byte[] content;
+    using (var source = restored.member.OpenRead(normalized, false)) {
+      using var buffer = new MemoryStream();
+      source.CopyTo(buffer);
+      content = buffer.ToArray();
+    }
+
+    this._Invalidate(normalized);
+    this._EnsureShadows(normalized, this._placement.ResolveCopies(normalized), content);
+    this._Invalidate(normalized);
+    DriveBender.Logger($" - Restored '{normalized}' from trash");
   }
   public bool IsMounted => this._mountOptions != null;
   public bool IsReadOnly => this._mountOptions?.ReadOnly ?? false;
@@ -339,6 +377,18 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     // pending buffered mutations are moot once the file dies; their intents complete with the delete
     var discarded = this._writeBuffer.Drain(normalized);
+
+    var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(normalized));
+    if (effective.Trash?.Enabled == true) {
+      // recoverable delete: all copies move to the hidden pool trash instead of dying (FR-TRASH)
+      this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true);
+      if (discarded != null)
+        foreach (var staleSequence in discarded.Value.journalSequences)
+          this._journal.Complete(staleSequence, JournalOp.Write);
+
+      this._Invalidate(normalized);
+      return;
+    }
 
     var sequence = this._journal.LogIntent(JournalOp.Delete, normalized);
 

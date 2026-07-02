@@ -78,3 +78,12 @@ public sealed class DrainJob(PoolFileSystem fs) : IBackgroundJob {
   public bool RunOnce() => fs.DrainOneLandingFile();
 
 }
+
+/// <summary>Applies the trash retention/size policy, purging oldest first (§6.14).</summary>
+public sealed class TrashMaintenanceJob(PoolFileSystem fs) : IBackgroundJob {
+
+  public string Name => "trash-maintenance";
+
+  public bool RunOnce() => fs.PurgeTrash() > 0;
+
+}

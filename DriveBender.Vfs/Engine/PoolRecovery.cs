@@ -26,7 +26,7 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
           rolledForward += this._DeleteAllCopies(intent.Path) ? 1 : 0;
           break;
 
-        case JournalOp.Rename when intent is { Path: not null, TargetPath: not null }:
+        case JournalOp.Rename or JournalOp.TrashMove when intent is { Path: not null, TargetPath: not null }:
           rolledForward += this._RollForwardRename(intent.Path, intent.TargetPath) ? 1 : 0;
           break;
 
