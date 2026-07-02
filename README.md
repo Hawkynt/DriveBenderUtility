@@ -19,7 +19,15 @@
 
 > The #1 Spot for dealing with [DriveBender](https://en.wikipedia.org/wiki/Non-standard_RAID_levels#Drive_Extender) pools outside [DriveBender](https://www.division-m.com/drivebender/).
 
-**DriveBenderUtility** is a comprehensive C# solution for managing Drive Bender storage pools with advanced features including pool management, drive operations, duplication control, and file integrity checking. The solution provides both command-line and WPF GUI interfaces for complete pool lifecycle management.
+**DriveBenderUtility** is a comprehensive C# solution for managing Drive Bender
+storage pools — and mounting them as a live, read/write filesystem on Windows
+(WinFsp/Dokan) and Linux (FUSE). Pools are defined by a portable JSON manifest
+over arbitrary members: local drives, subfolders, UNC shares, and remote/cloud
+endpoints (FTP/SFTP/WebDAV/S3/Azure/Dropbox/OneDrive/Google). It adds a tiered
+RAM→SSD→capacity write cascade, configurable duplication and write policies,
+crash-safe journaling, bit-rot/SMART health checks with correction, and both a
+CLI (`dbmount`) and an animated live web/desktop dashboard. Jump to
+[**Quick Start**](#-quick-start) to create and mount your first pool.
 
 ## 🏗️ Project Structure
 
@@ -192,204 +200,167 @@ without a real pool.
 
 ### Prerequisites
 
-To build and run the DriveBenderUtility, you'll need:
+- **Build:** [.NET SDK 10](https://dotnet.microsoft.com/download). The engine,
+  backends, `dbmount` and the app are `net10.0`; `DriveBender.Core` also targets
+  `net47`/`netstandard2.0`. (Nothing needs Drive Bender installed — native pools
+  are auto-discovered if present.)
+- **To mount on Windows:** [**WinFsp**](https://winfsp.dev) *or*
+  [**Dokan**](https://dokan-dev.github.io) — `dbmount` uses whichever is present
+  (WinFsp preferred, Dokan is the no-extra-install fallback). Mounting needs an
+  elevated shell.
+- **To mount on Linux:** `fuse3` (`/dev/fuse`) — e.g. `sudo apt install fuse3`.
+- **Remote/cloud members** need nothing extra; the SDKs are bundled.
 
-- [.NET SDK 10](https://dotnet.microsoft.com/download) (builds every project; the
-  legacy projects still *target* .NET Framework 4.7)
-- Administrator permissions for managing drives and pools
-- Drive Bender software installed on your system (for native pools)
+### 🔨 Build
 
-### 🔨 Building the Project
-
-#### Build All Projects
 ```bash
-msbuild DriveBenderUtility.sln /p:Configuration=Release
-```
-
-#### Build Individual Projects
-```bash
-# everything (Core multi-targets net47/netstandard2.0; engine, backends, mount, app are net10)
 dotnet build DriveBender.sln -c Release
-
-# the mount CLI/daemon and the desktop shell
-dotnet build DriveBender.Mount/DriveBender.Mount.csproj -c Release
-dotnet build DriveBender.App/DriveBender.App.csproj -c Release
 ```
 
-### 🧪 Running Tests
+That produces `dbmount` (the CLI/daemon, `DriveBender.Mount/bin/Release/...`) and
+`DriveBender.App` (the desktop shell). To run `dbmount` directly during
+development, use `dotnet <path>/dbmount.dll <args>`; a published build gives a
+plain `dbmount` executable. The examples below write `dbmount`.
 
-Run the comprehensive test suite:
-```bash
-# Run all tests
-nunit3-console DriveBender.Tests/bin/Release/DriveBender.Tests.dll
-
-# Run specific categories
-nunit3-console DriveBender.Tests/bin/Release/DriveBender.Tests.dll --where "cat==Unit && cat==HappyPath"
-nunit3-console DriveBender.Tests/bin/Release/DriveBender.Tests.dll --where "cat==Integration"
-nunit3-console DriveBender.Tests/bin/Release/DriveBender.Tests.dll --where "cat==Performance"
-```
-
-### 💻 Using the Console Interface
+### 🧪 Tests
 
 ```bash
-# Display help
-DriveBender.Console.exe --help
-
-# Create a new pool
-DriveBender.Console.exe create-pool --name "MyPool" --mount "C:\MyPool" --drives "D:\" "E:\"
-
-# Check pool integrity
-DriveBender.Console.exe check-integrity --pool "MyPool" --deep-scan
-
-# Enable duplication on a folder
-DriveBender.Console.exe enable-duplication --pool "MyPool" --folder "Documents/Important" --level 3
-
-# Remove a drive from pool
-DriveBender.Console.exe remove-drive --pool "MyPool" --drive "D:\" --move-data
-
-# Repair integrity issues
-DriveBender.Console.exe repair --pool "MyPool" --create-backup --dry-run=false
+dotnet test DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj   # the VFS engine (headless)
+dotnet test DriveBender.Tests/DriveBender.Tests.csproj           # legacy Core suite
+dotnet test DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj --filter "TestCategory=Unit"
 ```
 
-### 🖥️ Using the WPF Interface
+## 🚀 Quick Start
 
-Launch the GUI application:
+A **pool** is defined by a portable JSON *manifest* — a set of member folders
+(local drives/subfolders, UNC shares, or remote endpoints) plus tuning. You
+create it once, then mount it as a live drive.
+
+### 1. Create a pool
+
 ```bash
-DriveBender.UI.exe
+# two local members, duplicated data mounted at X:\ (Windows) …
+dbmount pool create --name MyPool --member "D:\" --member "E:\" --mount "X:\"
+
+# … or on Linux, mounted at a directory
+dbmount pool create --name MyPool --member /mnt/disk1 --member /mnt/disk2 --mount /mnt/mypool
+
+# an SSD landing zone (fast tier) plus capacity drives
+dbmount pool create --name Media --landing "F:\ssd" --member "G:\" --member "H:\" --mount "M:\"
+
+dbmount pool list          # what's discovered (manifest pools + native scan)
+dbmount pool export MyPool # print the manifest JSON
 ```
 
-Features:
-- **Pool Overview**: Visual representation of all pools and their health
-- **Integrity Dashboard**: Real-time integrity status with repair options
-- **Drive Management**: Add/remove drives with space validation
-- **Duplication Control**: Configure folder-level duplication settings
+Creating a pool never destroys existing folder contents without `--force`, and a
+folder already owned by another pool is always refused.
 
-### 📚 API Usage Examples
+### 2. Mount it
 
-#### Basic Pool Operations
-```csharp
-using DivisonM;
-
-// Create a new pool
-var poolName = new PoolName("MyDataPool");
-var mountPoint = @"C:\MyDataPool";
-var drives = new[] { @"D:\", @"E:\" };
-
-bool success = PoolManager.CreatePool(poolName, mountPoint, drives);
-
-// Add duplication to critical folders
-var importantFolder = new FolderPath("Documents/Critical");
-DuplicationManager.EnableDuplicationOnFolder(mountPoint, importantFolder, DuplicationLevel.Triple);
-```
-
-#### Integrity Checking and Repair
-```csharp
-// Check pool integrity
-var issues = IntegrityChecker.CheckPoolIntegrity(mountPoint, deepScan: true, dryRun: true);
-
-// Repair issues with backup
-foreach (var issue in issues.Take(10)) {
-    bool repaired = IntegrityChecker.RepairIntegrityIssue(issue, dryRun: false, createBackup: true);
-    Console.WriteLine($"Issue {issue.Type}: {(repaired ? "Repaired" : "Failed")}");
-}
-```
-
-#### Advanced Drive Management
-```csharp
-// Check space before removing drive
-var spaceCheck = PoolManager.CheckSpaceForDriveRemoval(poolName, drivePath);
-if (!spaceCheck.HasSufficientSpace) {
-    Console.WriteLine($"Insufficient space: {spaceCheck.ShortfallSpace.ToHumanReadable()} needed");
-    Console.WriteLine($"Recommended action: {spaceCheck.RecommendedAction}");
-}
-
-// Remove drive with options
-var options = new DriveOperationOptions {
-    DryRun = false,
-    CreateBackup = true,
-    PromptUser = true,
-    AutoBalance = true
-};
-
-var result = PoolManager.RemoveDriveFromPool(poolName, drivePath, options);
-```
-
-#### Using Semantic Data Types
-```csharp
-// Type-safe operations
-var poolName = new PoolName("ProductionPool");
-var drivePath = new DrivePath(@"C:\Data");
-var folderPath = new FolderPath("Users/Documents");
-var fileSize = ByteSize.FromGigabytes(2.5);
-var duplicationLevel = new DuplicationLevel(3);
-
-// Automatic validation
-Console.WriteLine($"Pool: {poolName}");
-Console.WriteLine($"Drive exists: {drivePath.Exists}");
-Console.WriteLine($"Folder segments: {string.Join("/", folderPath.Segments)}");
-Console.WriteLine($"Size: {fileSize.ToHumanReadable()}");
-Console.WriteLine($"Duplication: {duplicationLevel}");
-```
-
-## 🔧 Advanced Configuration
-
-### Command Line Options
-
-#### Global Options
-- `--dry-run`: Preview operations without making changes (default: true)
-- `--verbose`: Enable detailed logging
-- `--no-backup`: Skip backup creation during repairs
-- `--timeout <minutes>`: Set operation timeout (default: 30)
-
-#### Pool Management Commands
 ```bash
-# List all pools
-DriveBender.Console.exe list-pools
+# Windows (run elevated; WinFsp or Dokan must be installed)
+dbmount mount --manifest MyPool            # mounts at the manifest's target, or pass --target Y:\
+dbmount status                             # what's mounted right now
+dbmount unmount X:\                        # clean unmount (flushes dirty data); or Ctrl+C the mount
 
-# Show pool details  
-DriveBender.Console.exe pool-info --name "MyPool"
-
-# Delete pool (with confirmation)
-DriveBender.Console.exe delete-pool --name "MyPool" --preserve-data
+# Linux
+dbmount mount --manifest MyPool --target /mnt/mypool
+fusermount3 -u /mnt/mypool                 # or: dbmount unmount /mnt/mypool
 ```
 
-#### Drive Operations
+Now use `X:\` (or `/mnt/mypool`) from Explorer / any app — reads, writes,
+rename, delete all work, with duplication, tiering and balancing handled
+underneath.
+
+**Mount automatically at boot / login:**
+
 ```bash
-# Add drive to existing pool
-DriveBender.Console.exe add-drive --pool "MyPool" --drive "F:\" 
+# Windows service (mounts before login)
+dbmount install-service --manifest MyPool --target X:\
+# Windows Explorer: register a right-click "mount" for *.dbpool.json manifests
+dbmount register-shell
 
-# Replace drive (remove old, add new)
-DriveBender.Console.exe replace-drive --pool "MyPool" --old-drive "D:\" --new-drive "G:\"
-
-# Balance pool data
-DriveBender.Console.exe balance --pool "MyPool"
+# Linux: install the systemd unit + mount.drivebender fstab helper (run with sudo)
+dbmount install-systemd --manifest MyPool
+systemctl enable --now drivebender-pool@MyPool.service
+#   …or add to /etc/fstab:
+#   /etc/drivebenderutility/pools/MyPool.json  /mnt/mypool  fuse.drivebender  defaults,_netdev  0 0
 ```
 
-### Configuration Files
+### 3. Remote & cloud members
 
-#### Pool Configuration (JSON)
-```json
+Store the secret once (it goes to the OS credential store, never the manifest),
+then reference it by handle:
+
+```bash
+dbmount credential set MyPool-nas --user backup      # prompts for the secret (hidden)
+dbmount pool add-member MyPool --member "sftp://backup@nas.local/pool" --credential MyPool-nas
+```
+
+Supported schemes: `file`/`unc`, `ftp`/`ftps`, `sftp`, `webdav`/`webdavs`, `s3`,
+`azblob`, `azfile`, `dropbox`, `onedrive`, `gdrive`, `gcs` (see the backend table
+above for the secret format each expects).
+
+### 4. The GUI — web dashboard & desktop app
+
+```bash
+dbmount serve --open      # animated live dashboard at http://127.0.0.1:9723 (token-gated)
+```
+
+The page shows every pool with live capacity donuts, cache-hit/dirty meters, a
+RAM→fast→capacity tier diagram with animated data flows, per-member health, and
+health/fix/restore buttons — updated once a second while pools are mounted. The
+**desktop app** (`DriveBender.App`) is the same page in a native window: it
+launches the daemon for you, so web and desktop are identical.
+
+### 5. Health & media maintenance
+
+```bash
+dbmount pool health MyPool               # SMART, temperature, bit-rot, missing copies
+dbmount pool health MyPool --fix         # repair bit-rot, resolve conflicts, restore duplication
+dbmount pool restore MyPool              # bring every file back to its duplication level
+
+dbmount pool remove-media MyPool --member "E:\"                 # scatter its data, then drop it
+dbmount pool replace-media MyPool --old "D:\" --new "K:\newdisk"  # migrate to a replacement disk
+```
+
+Run `dbmount --help` (or `dbmount <verb> --help`) for the full option list.
+
+## 🔧 Configuration
+
+Tuning lives in the manifest's `defaults` block (per pool) or a machine-wide
+`config.json` under the config root (`%ProgramData%\DriveBenderUtility` on
+Windows, `/etc/drivebenderutility` or `~/.config/drivebenderutility` on Linux).
+Values resolve built-in defaults → global file → pool → per-folder glob. A few
+common knobs:
+
+```jsonc
 {
-  "pools": [
-    {
-      "name": "MediaPool",
-      "mountPoint": "C:\\Media",
-      "drives": ["D:\\", "E:\\", "F:\\"],
-      "duplicationSettings": {
-        "Videos": { "level": 2, "enabled": true },
-        "Photos": { "level": 3, "enabled": true },
-        "Documents": { "level": 2, "enabled": true }
-      }
-    }
-  ],
-  "globalSettings": {
-    "defaultDuplicationLevel": 2,
-    "autoRepair": true,
-    "createBackups": true,
-    "deepScanInterval": "weekly"
+  "duplication": 2,                       // total copies kept of each file
+  "write": {
+    "policy": "write-back",               // write-through | write-back | deferred | performance
+    "minCopiesBeforeAck": 2               // durable copies required before a write is acknowledged
+  },
+  "resilience": {
+    "onMemberLoss": "retain-metadata"     // keep showing metadata when a drive is pulled,
+                                          //   or "discard-inaccessible" to drop unreachable entries
+  },
+  "trash": { "enabled": true, "retention": "7d" },   // recoverable deletes
+  "folders": {
+    "Documents/**": { "write": { "policy": "write-through" }, "duplication": 3 }
   }
 }
 ```
+
+Config is validated on load and can be reloaded live without unmounting. See
+`docs/PRD-PoolMount-Driver.md` §8 for the complete schema.
+
+> **Legacy native pools:** the older `DriveBender.Console` still manages
+> Division-M-format native pools directly (`create`, `add-drive`,
+> `enable-duplication`, `check`, `repair`, `rebalance` — see
+> `DriveBender.Console/CommandLineOptions.cs`). New work should prefer manifest
+> pools via `dbmount`, which can also *adopt* a discovered native pool
+> (`dbmount pool adopt <name>`) into an editable manifest without moving data.
 
 ## 📊 Architecture & Design
 
@@ -428,10 +399,11 @@ git clone https://github.com/Hawkynt/DriveBenderUtility.git
 cd DriveBenderUtility
 
 # Build the solution
-msbuild DriveBenderUtility.sln /p:Configuration=Debug
+dotnet build DriveBender.sln -c Release
 
 # Run tests to ensure everything works
-nunit3-console DriveBender.Tests/bin/Debug/DriveBender.Tests.dll
+dotnet test DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj
+dotnet test DriveBender.Tests/DriveBender.Tests.csproj
 ```
 
 ### Contribution Guidelines
