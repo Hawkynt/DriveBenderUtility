@@ -23,6 +23,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly PlacementResolver _placement;
   private readonly HandleTable _handles = new();
   private readonly Journal _journal;
+  private readonly WriteBufferManager _writeBuffer;
   private readonly long _readAheadMin;
   private readonly long _readAheadMax;
   private readonly bool _readAheadEnabled;
@@ -30,12 +31,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly long _mirrorSplitThreshold;
   private MountOptions? _mountOptions;
 
-  public PoolFileSystem(Guid poolId, IReadOnlyList<EngineMember> members, CacheInstance cache, PoolConfig effectiveConfig, Journal? journal = null) {
+  public PoolFileSystem(Guid poolId, IReadOnlyList<EngineMember> members, CacheInstance cache, PoolConfig effectiveConfig, Journal? journal = null, Func<DateTime>? clock = null) {
     this._poolId = poolId;
     this._members = members;
     this._cache = cache;
     this._config = effectiveConfig;
     this._journal = journal ?? new(new MemberJournalStore([.. members.Select(m => m.Io)]));
+    this._writeBuffer = new(cache, clock);
     this._placement = new(
       poolId,
       [.. members.Select(m => m.Io)],
@@ -53,6 +55,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public PlacementResolver Placement => this._placement;
   public Journal Journal => this._journal;
+  public WriteBufferManager WriteBuffer => this._writeBuffer;
+
+  /// <summary>Builds the background workers for this pool (CMP-BG): owed-copy sync (with the deferred window) and the landing-zone drainer.</summary>
+  public BackgroundScheduler CreateScheduler() {
+    var write = this._config.Write;
+    var deferWindow = (write?.Policy ?? WritePolicy.WriteBack) == WritePolicy.Deferred
+      ? DurationSpec.Parse(write?.DeferWindow ?? "5s")
+      : TimeSpan.Zero;
+    var maxDefer = TimeSpan.FromSeconds(write?.MaxDeferSeconds ?? 30);
+    return new([new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this)]);
+  }
   public bool IsMounted => this._mountOptions != null;
   public bool IsReadOnly => this._mountOptions?.ReadOnly ?? false;
 
@@ -73,7 +86,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._mountOptions = options;
   }
 
-  public void Unmount() => this._mountOptions = null;
+  public void Unmount() {
+    if (this._mountOptions == null)
+      return;
+
+    // clean unmount: every owed copy is applied before the mount releases (FR-CLEAN-UNMOUNT)
+    foreach (var path in this._writeBuffer.DirtyPaths)
+      this.FlushPath(path);
+
+    this._mountOptions = null;
+  }
 
   public void Dispose() => this.Unmount();
 
@@ -95,13 +117,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var normalized = PoolPaths.Normalize(path);
     var key = new MetadataKey(this._poolId, normalized, MetadataKind.Stat);
     if (this._cache.Metadata.TryGet<FileMeta>(key, out var cached))
-      return cached;
+      return this._OverlayMeta(normalized, cached);
 
     var meta = this._StatUncached(normalized)
                ?? throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {path}");
 
     this._cache.Metadata.Put(key, meta);
-    return meta;
+    return this._OverlayMeta(normalized, meta);
+  }
+
+  private FileMeta _OverlayMeta(string normalized, FileMeta meta) {
+    if (meta.IsDirectory || !this._writeBuffer.IsDirty(normalized))
+      return meta;
+
+    return meta with { Length = this._writeBuffer.OverlayLength(normalized, meta.Length) };
   }
 
   private FileMeta? _StatUncached(string normalized) {
@@ -276,6 +305,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (targetCopies.Count > 0 && (flags & RenameFlags.ReplaceExisting) == 0)
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {to}");
 
+    this.FlushPath(fromNormalized); // pending mutations land under the old name first
+
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
 
     // overwrite-on-rename removes every copy of the old target first (no orphans)
@@ -306,6 +337,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (copies.Count == 0)
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
 
+    // pending buffered mutations are moot once the file dies; their intents complete with the delete
+    var discarded = this._writeBuffer.Drain(normalized);
+
     var sequence = this._journal.LogIntent(JournalOp.Delete, normalized);
 
     // every primary and shadow copy goes — no orphans remain (FR-DELETE)
@@ -315,6 +349,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         member.Delete(normalized, shadow);
 
     this._journal.Complete(sequence, JournalOp.Delete);
+    if (discarded != null)
+      foreach (var staleSequence in discarded.Value.journalSequences)
+        this._journal.Complete(staleSequence, JournalOp.Write);
+
     this._Invalidate(normalized);
   }
 
@@ -397,7 +435,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
-      var length = copies[0].Volume.Stat(path, copies[0].Shadow)?.Length ?? 0;
+      var length = this._writeBuffer.OverlayLength(path, copies[0].Volume.Stat(path, copies[0].Shadow)?.Length ?? 0);
       if (offset >= length)
         return 0; // reads past EOF return 0 bytes (FR-READ)
 
@@ -432,7 +470,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var absolute = offset + written;
       var blockIndex = absolute / blockSize;
       var blockOffset = (int)(absolute % blockSize);
-      var block = this._LoadBlock(path, copies, blockIndex, mirrorSplit);
+      var block = this._writeBuffer.OverlayBlock(path, blockIndex, blockSize, this._LoadBlock(path, copies, blockIndex, mirrorSplit));
       var available = Math.Min(buffer.Length - written, block.Length - blockOffset);
       if (available <= 0)
         throw new PoolFsException(PoolFsError.IoError, $"Short read at block {blockIndex} of '{path}'");
@@ -505,21 +543,52 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
       if (mode == WriteMode.Append)
-        offset = copies[0].Volume.Stat(path, copies[0].Shadow)?.Length ?? 0;
+        offset = this._writeBuffer.OverlayLength(path, copies[0].Volume.Stat(path, copies[0].Shadow)?.Length ?? 0);
+
+      var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(path));
+      var policy = effective.Write?.Policy ?? WritePolicy.WriteBack;
+      var volatileAck = policy == WritePolicy.Performance && (effective.Write?.AcceptVolatileAck ?? false);
+
+      // performance + acceptVolatileAck: the ack may come from RAM alone — an explicit,
+      // per-folder opt-in (SAFE-RAM); fsync still forces durability (SAFE-FSYNC)
+      if (volatileAck && this._writeBuffer.StageWrite(path, offset, bytes, 0, 0)) {
+        this._cache.Pages.InvalidatePath(this._poolId, path);
+        this._cache.Metadata.InvalidatePath(this._poolId, path);
+        return bytes.Length;
+      }
+
+      var requiredCopies = policy == WritePolicy.WriteThrough
+        ? copies.Count
+        : Math.Min(copies.Count, ConfigValidator.EffectiveMinCopiesBeforeAck(effective.Write, effective.Duplication));
 
       this._RequireAckQuorum(path, copies.Count);
 
-      // intent → mutate every copy → complete (SAFE-ORDER); the ack only happens after
-      // the data is durable on all reachable copies (M2 write-through semantics, FR-WT)
+      // intent → mutate the ack set durably → (write-through: complete now; write-back /
+      // deferred: the intent stays open until the owed copies are applied, so a crash
+      // in the gap reconciles from the durable primary) (SAFE-ORDER, FR-WT, FR-WB)
       var sequence = this._journal.LogIntent(JournalOp.Write, path, offset: offset, length: bytes.Length);
-      foreach (var copy in copies) {
+      for (var i = 0; i < requiredCopies; ++i) {
+        var copy = copies[i];
         using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
         stream.Seek(offset, SeekOrigin.Begin);
         stream.Write(bytes, 0, bytes.Length);
         stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
       }
 
-      this._journal.Complete(sequence, JournalOp.Write);
+      if (requiredCopies >= copies.Count)
+        this._journal.Complete(sequence, JournalOp.Write);
+      else if (!this._writeBuffer.StageWrite(path, offset, bytes, sequence, requiredCopies)) {
+        // write-buffer backpressure: degrade to write-through instead of growing RAM (FR-BACKP)
+        for (var i = requiredCopies; i < copies.Count; ++i) {
+          var copy = copies[i];
+          using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
+          stream.Seek(offset, SeekOrigin.Begin);
+          stream.Write(bytes, 0, bytes.Length);
+          stream.Flush();
+        }
+
+        this._journal.Complete(sequence, JournalOp.Write);
+      }
 
       // coherency: a read after this write must return the new bytes (SAFE-COHERE)
       this._cache.Pages.InvalidatePath(this._poolId, path);
@@ -549,6 +618,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     open.File.Lock.EnterWriteLock();
     try {
       var path = open.File.Path;
+      this.FlushPath(path); // pending buffered writes apply before the truncate so ordering stays linear
       var copies = this._placement.ResolveCopies(path);
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
@@ -567,7 +637,133 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public void Flush(NodeHandle handle) {
     this._RequireMounted();
-    this._handles.Get(handle); // M2 write-through: acknowledged data is already durable (SAFE-FSYNC)
+    var open = this._handles.Get(handle);
+    this.FlushPath(open.File.Path); // fsync is an absolute durability barrier in every mode (SAFE-FSYNC)
+  }
+
+  /// <summary>
+  /// Applies every buffered mutation of a path durably to all its copies and completes
+  /// the open journal intents. Idempotent; no-op for clean files.
+  /// </summary>
+  public void FlushPath(string path) {
+    var normalized = PoolPaths.Normalize(path);
+    var drained = this._writeBuffer.Drain(normalized);
+    if (drained == null)
+      return;
+
+    var (ops, journalSequences, _) = drained.Value;
+    if (ops.Count > 0) {
+      var copies = this._placement.ResolveCopies(normalized);
+      var volatileSequence = journalSequences.Count == 0 && copies.Count > 0
+        ? this._journal.LogIntent(JournalOp.Write, normalized)
+        : 0;
+
+      foreach (var copy in copies) {
+        using var stream = copy.Volume.OpenWrite(normalized, copy.Shadow, false);
+        foreach (var op in ops) {
+          if (op.TruncateLength is { } truncateLength) {
+            stream.SetLength(truncateLength);
+            continue;
+          }
+
+          stream.Seek(op.Offset, SeekOrigin.Begin);
+          stream.Write(op.Data!, 0, op.Data!.Length);
+        }
+
+        stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+      }
+
+      if (volatileSequence != 0)
+        this._journal.Complete(volatileSequence, JournalOp.Write);
+    }
+
+    foreach (var sequence in journalSequences)
+      this._journal.Complete(sequence, JournalOp.Write);
+
+    this._cache.Pages.InvalidatePath(this._poolId, normalized);
+    this._cache.Metadata.InvalidatePath(this._poolId, normalized);
+  }
+
+  /// <summary>
+  /// Drains one clean, closed file from a fast-tier member down to capacity (FR-LZ-DRAIN):
+  /// whole-file copy via temp + atomic rename under a journalled Drain intent, duplication
+  /// re-established, then the fast-tier original is freed. Returns false when nothing is
+  /// drainable right now.
+  /// </summary>
+  public bool DrainOneLandingFile() {
+    if (this._mountOptions == null)
+      return false;
+
+    foreach (var landing in this._members.Where(m => m is { Role: MemberRole.Landing, Io.IsOnline: true }).Select(m => m.Io)) {
+      foreach (var path in this._WalkFiles(landing)) {
+        if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
+          continue; // only clean, closed files move (the balancer rule of §6.10 applies here too)
+
+        var copies = this._placement.ResolveCopies(path);
+        var holders = copies.Select(c => c.Volume).ToArray();
+        var size = landing.Stat(path, false)?.Length ?? 0;
+        var target = this._placement.ChooseDrainTarget(size, holders.Where(h => h.MemberId != landing.MemberId));
+        if (target == null)
+          continue;
+
+        var sequence = this._journal.LogIntent(JournalOp.Drain, path, memberId: target.MemberId);
+
+        byte[] content;
+        using (var source = landing.OpenRead(path, false)) {
+          using var buffer = new MemoryStream();
+          source.CopyTo(buffer);
+          content = buffer.ToArray();
+        }
+
+        var parent = PoolPaths.GetParent(path);
+        if (parent.Length > 0)
+          target.EnsureFolder(parent, false);
+
+        var temp = path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+        using (var stream = target.OpenWrite(temp, false, true)) {
+          stream.Write(content, 0, content.Length);
+          stream.Flush();
+        }
+
+        target.AtomicReplace(temp, path, false);
+        landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
+        this._journal.Complete(sequence, JournalOp.Drain);
+
+        this._Invalidate(path);
+        this._EnsureShadows(path, this._placement.ResolveCopies(path), content);
+        this._Invalidate(path);
+        DriveBender.Logger($" - Drained '{path}' from '{landing.DisplayName}' to '{target.DisplayName}' ({content.Length} bytes)");
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /// <summary>All primary files on one member, walked raw (shadow containers and sidecars skipped).</summary>
+  private IEnumerable<string> _WalkFiles(IVolumeIO member) {
+    var stack = new Stack<string>();
+    stack.Push("");
+    while (stack.Count > 0) {
+      var folder = stack.Pop();
+      VolumeEntry[] entries;
+      try {
+        entries = [.. member.List(folder, false)];
+      } catch (PoolFsException) {
+        continue;
+      }
+
+      foreach (var entry in entries) {
+        if (PoolPaths.IsHiddenName(entry.Name))
+          continue;
+
+        var childPath = folder.Length == 0 ? entry.Name : $"{folder}/{entry.Name}";
+        if (entry.IsDirectory)
+          stack.Push(childPath);
+        else
+          yield return childPath;
+      }
+    }
   }
 
   public void Close(NodeHandle handle) => this._handles.Close(handle);

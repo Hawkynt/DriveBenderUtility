@@ -93,6 +93,22 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
       .FirstOrDefault();
   }
 
+  /// <summary>
+  /// Picks the capacity member a landing-zone file drains to (FR-LZ-DRAIN): capacity
+  /// role, below its low watermark, and never a failure domain already holding a copy.
+  /// </summary>
+  public IVolumeIO? ChooseDrainTarget(long size, IEnumerable<IVolumeIO> existingCopyHolders) {
+    var occupiedDomains = new HashSet<string>(existingCopyHolders.Select(m => m.PhysicalVolumeId), StringComparer.OrdinalIgnoreCase);
+    var candidates = this._CandidatesRespectingWatermark(size, MemberRole.Capacity, this._LowWatermarkFraction("capacity"))
+      .Where(m => !occupiedDomains.Contains(m.PhysicalVolumeId))
+      .ToArray();
+
+    if (candidates.Length == 0)
+      candidates = [.. this._Online.Where(m => this._IsEligible(m, size, MemberRole.Capacity) && !occupiedDomains.Contains(m.PhysicalVolumeId))];
+
+    return this._PickByStrategy(candidates);
+  }
+
   private double _LowWatermarkFraction(string tier) {
     var text = config.Tiers?.GetValueOrDefault(tier)?.LowWatermark;
     return text == null ? 1.0 : (SizeSpec.Parse(text).Percent ?? 100) / 100.0;
