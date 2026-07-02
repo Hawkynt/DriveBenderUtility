@@ -59,13 +59,6 @@ jobs:
           --configuration Release --no-build
           --logger "trx;LogFileName=vfs-tests.trx"
 
-      # GUI ViewModels are unit-tested headless (MVVM, no window) — CFG-VALIDATE parity,
-      # i18n completeness, activity binding (TST-UI); green-gating like the engine tier.
-      - name: Test (GUI ViewModels, headless)
-        run: >
-          dotnet test DriveBender.App.Tests/DriveBender.App.Tests.csproj
-          --configuration Release --no-build
-          --logger "trx;LogFileName=app-tests.trx"
 
       - name: Test (integration + e2e + known-flaky, allow-fail)
         continue-on-error: true

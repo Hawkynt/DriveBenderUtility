@@ -30,7 +30,7 @@ jobs:
     runs-on: windows-latest
     outputs:
       console-artifact: DriveBender-Console-win-${{ inputs.version }}
-      ui-artifact:      DriveBender-UI-win-${{ inputs.version }}
+      ui-artifact:      DriveBender-App-win-${{ inputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,7 +38,10 @@ jobs:
           fetch-depth: 0
 
       - uses: actions/setup-dotnet@v4
-        with: { dotnet-version: '8.x' }
+        with:
+          dotnet-version: |
+            8.x
+            10.x
 
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
@@ -54,8 +57,11 @@ jobs:
       - name: Publish Console (net47, framework-dependent)
         run: dotnet publish DriveBender.Console/DriveBender.Console.csproj -c Release --output publish/console
 
-      - name: Publish UI (net47, framework-dependent)
-        run: dotnet publish DriveBender.UI/DriveBender.UI.csproj -c Release --output publish/ui
+      # the desktop app (WebView shell) ships alongside dbmount, which it launches to serve the UI
+      - name: Publish App + dbmount (net10, framework-dependent)
+        run: |
+          dotnet publish DriveBender.Mount/DriveBender.Mount.csproj -c Release -f net10.0-windows --output publish/app
+          dotnet publish DriveBender.App/DriveBender.App.csproj   -c Release --output publish/app
 
       - name: Package Console zip
         shell: pwsh
@@ -63,11 +69,11 @@ jobs:
           $v = "${{ inputs.version }}"
           Compress-Archive -Path publish/console/* -DestinationPath "DriveBender-Console-win-$v.zip"
 
-      - name: Package UI zip
+      - name: Package App zip
         shell: pwsh
         run: |
           $v = "${{ inputs.version }}"
-          Compress-Archive -Path publish/ui/* -DestinationPath "DriveBender-UI-win-$v.zip"
+          Compress-Archive -Path publish/app/* -DestinationPath "DriveBender-App-win-$v.zip"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -75,5 +81,5 @@ jobs:
           path: DriveBender-Console-win-${{ inputs.version }}.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: DriveBender-UI-win-${{ inputs.version }}
-          path: DriveBender-UI-win-${{ inputs.version }}.zip
+          name: DriveBender-App-win-${{ inputs.version }}
+          path: DriveBender-App-win-${{ inputs.version }}.zip

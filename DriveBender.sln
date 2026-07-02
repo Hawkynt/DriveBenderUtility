@@ -7,8 +7,6 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "DriveBender.Core", "DriveBe
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "DriveBender.Console", "DriveBender.Console\DriveBender.Console.csproj", "{75458F29-5B26-3F03-2D3C-02B32E30FAAD}"
 EndProject
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "DriveBender.UI", "DriveBender.UI\DriveBender.UI.csproj", "{7FA5BD4F-7ECC-029B-F901-FC41AEF97EF0}"
-EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "DriveBender.Tests", "DriveBender.Tests\DriveBender.Tests.csproj", "{3774961B-A63E-463A-ABF9-9D8FAF243571}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DriveBender.Vfs", "DriveBender.Vfs\DriveBender.Vfs.csproj", "{0673D856-92EE-4FE9-8655-F2E387EFBEE0}"
@@ -24,8 +22,6 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DriveBender.Mount.Linux", "DriveBender.Mount.Linux\DriveBender.Mount.Linux.csproj", "{BB97A17F-22CE-42FA-87B8-27F3D8804ECE}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DriveBender.App", "DriveBender.App\DriveBender.App.csproj", "{74305650-BE76-464F-BB3A-6A1D945F4CF8}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DriveBender.App.Tests", "DriveBender.App.Tests\DriveBender.App.Tests.csproj", "{C14E9F5A-DFB4-4B52-AE38-499345E283F3}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -57,14 +53,6 @@ Global
 		{75458F29-5B26-3F03-2D3C-02B32E30FAAD}.Release|x64.Build.0 = Release|Any CPU
 		{75458F29-5B26-3F03-2D3C-02B32E30FAAD}.Release|x86.ActiveCfg = Release|Any CPU
 		{75458F29-5B26-3F03-2D3C-02B32E30FAAD}.Release|x86.Build.0 = Release|Any CPU
-		{7FA5BD4F-7ECC-029B-F901-FC41AEF97EF0}.Debug|x64.ActiveCfg = Debug|Any CPU
-		{7FA5BD4F-7ECC-029B-F901-FC41AEF97EF0}.Debug|x64.Build.0 = Debug|Any CPU
-		{7FA5BD4F-7ECC-029B-F901-FC41AEF97EF0}.Debug|x86.ActiveCfg = Debug|Any CPU
-		{7FA5BD4F-7ECC-029B-F901-FC41AEF97EF0}.Debug|x86.Build.0 = Debug|Any CPU
-		{7FA5BD4F-7ECC-029B-F901-FC41AEF97EF0}.Release|x64.ActiveCfg = Release|Any CPU
-		{7FA5BD4F-7ECC-029B-F901-FC41AEF97EF0}.Release|x64.Build.0 = Release|Any CPU
-		{7FA5BD4F-7ECC-029B-F901-FC41AEF97EF0}.Release|x86.ActiveCfg = Release|Any CPU
-		{7FA5BD4F-7ECC-029B-F901-FC41AEF97EF0}.Release|x86.Build.0 = Release|Any CPU
 		{3774961B-A63E-463A-ABF9-9D8FAF243571}.Debug|x64.ActiveCfg = Debug|Any CPU
 		{3774961B-A63E-463A-ABF9-9D8FAF243571}.Debug|x64.Build.0 = Debug|Any CPU
 		{3774961B-A63E-463A-ABF9-9D8FAF243571}.Debug|x86.ActiveCfg = Debug|Any CPU
@@ -157,18 +145,6 @@ Global
 		{74305650-BE76-464F-BB3A-6A1D945F4CF8}.Release|x64.Build.0 = Release|Any CPU
 		{74305650-BE76-464F-BB3A-6A1D945F4CF8}.Release|x86.ActiveCfg = Release|Any CPU
 		{74305650-BE76-464F-BB3A-6A1D945F4CF8}.Release|x86.Build.0 = Release|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Debug|x64.ActiveCfg = Debug|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Debug|x64.Build.0 = Debug|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Debug|x86.ActiveCfg = Debug|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Debug|x86.Build.0 = Debug|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Release|Any CPU.Build.0 = Release|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Release|x64.ActiveCfg = Release|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Release|x64.Build.0 = Release|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Release|x86.ActiveCfg = Release|Any CPU
-		{C14E9F5A-DFB4-4B52-AE38-499345E283F3}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

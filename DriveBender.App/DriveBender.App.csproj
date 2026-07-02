@@ -6,27 +6,14 @@
     <AssemblyTitle>DriveBender.App</AssemblyTitle>
     <Company>»SynthelicZ«</Company>
     <Product>DriveBender Pool Manager</Product>
-    <Description>Cross-platform GUI for managing Drive Bender pools</Description>
+    <Description>Cross-platform desktop shell hosting the Drive Bender management web UI</Description>
     <Copyright>Copyright © Hawkynt 2017-2026</Copyright>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\DriveBender.Vfs\DriveBender.Vfs.csproj" />
-    <ProjectReference Include="..\DriveBender.Backends\DriveBender.Backends.csproj" />
-  </ItemGroup>
-  <ItemGroup>
-    <PackageReference Include="Avalonia" Version="12.0.5" />
-    <PackageReference Include="Avalonia.Desktop" Version="12.0.5" />
-    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.0.5" />
-    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.0.5" />
-    <PackageReference Include="Avalonia.Controls.DataGrid" Version="12.0.1" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Update="Localization\strings.en.json" CopyToOutputDirectory="PreserveNewest" />
-    <None Update="Localization\strings.de.json" CopyToOutputDirectory="PreserveNewest" />
+    <PackageReference Include="Photino.NET" Version="4.0.16" />
   </ItemGroup>
 </Project>

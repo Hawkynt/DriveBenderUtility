@@ -41,13 +41,11 @@ Command-line interface covering the full pool lifecycle:
 - Integrity checking and repair
 - Dry-run mode for safe operations
 
-### 🖥️ DriveBender.UI
-WPF-based graphical user interface featuring:
-- Pool overview and management
-- Visual integrity checking
-- Drive space monitoring
-- Interactive repair workflows
-- Pool creation wizards
+### 🖥️ DriveBender.App *(net10.0)*
+The desktop GUI is a thin cross-platform **WebView shell** (Photino → WebView2 on
+Windows, WebKitGTK on Linux) that launches `dbmount serve` and hosts the same web
+UI the daemon serves — so the desktop app and a browser are the *same* animated,
+live dashboard. (The legacy WPF `DriveBender.UI` has been retired.)
 
 ### 🧪 DriveBender.Tests
 Comprehensive test suite categorized as:
@@ -132,11 +130,13 @@ template, so a manifest mounts natively at boot:
 /etc/drivebenderutility/pools/media.json  /mnt/media  fuse.drivebender  defaults,_netdev  0 0
 ```
 
-### 🧪 DriveBender.Vfs.Tests *(net10.0)*
-Headless engine suite: the whole VFS engine runs against in-memory fakes
-(`FakeVolumeIO`, `FakeHostEnvironment`) including fault injection — power loss,
-no-space, torn writes, offline members — so every safety invariant is testable
-without a real pool.
+### 🖥️ DriveBender.App *(net10.0)* & the web UI
+The management daemon `dbmount serve` hosts a **dependency-free animated web
+dashboard** (127.0.0.1, per-session token): live capacity donuts, cache-hit and
+dirty meters, a hit-rate sparkline, a RAM→fast→capacity **tier topology with
+animated flow lines**, per-member health tiles, and health/fix/restore actions,
+fed at 1 Hz over Server-Sent Events. `DriveBender.App` is the cross-platform
+desktop shell that hosts that same page in a native WebView.
 
 ### 🧪 DriveBender.Vfs.Tests *(net10.0)*
 Headless engine suite: the whole VFS engine runs against in-memory fakes
@@ -208,17 +208,12 @@ msbuild DriveBenderUtility.sln /p:Configuration=Release
 
 #### Build Individual Projects
 ```bash
-# Core library
-msbuild DriveBender.Core/DriveBender.Core.csproj
+# everything (Core multi-targets net47/netstandard2.0; engine, backends, mount, app are net10)
+dotnet build DriveBender.sln -c Release
 
-# Console application
-msbuild DriveBender.Console/DriveBender.Console.csproj
-
-# WPF UI application  
-msbuild DriveBender.UI/DriveBender.UI.csproj
-
-# Test suite
-msbuild DriveBender.Tests/DriveBender.Tests.csproj
+# the mount CLI/daemon and the desktop shell
+dotnet build DriveBender.Mount/DriveBender.Mount.csproj -c Release
+dotnet build DriveBender.App/DriveBender.App.csproj -c Release
 ```
 
 ### 🧪 Running Tests
