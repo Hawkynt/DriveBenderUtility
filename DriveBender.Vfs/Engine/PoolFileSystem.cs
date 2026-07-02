@@ -25,6 +25,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly Journal _journal;
   private readonly WriteBufferManager _writeBuffer;
   private readonly PoolTrash _trash;
+  private readonly IntegrityService _integrity;
   private readonly Func<DateTime> _clock;
   private readonly long _readAheadMin;
   private readonly long _readAheadMax;
@@ -42,6 +43,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._clock = clock ?? (static () => DateTime.UtcNow);
     this._writeBuffer = new(cache, this._clock);
     this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock);
+    this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest);
     this._placement = new(
       poolId,
       [.. members.Select(m => m.Io)],
@@ -61,6 +63,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public Journal Journal => this._journal;
   public WriteBufferManager WriteBuffer => this._writeBuffer;
   public PoolTrash Trash => this._trash;
+  public IntegrityService Integrity => this._integrity;
+
+  /// <summary>Full checksum scrub: bit-rot repair and out-of-band reconciliation (FR-SCRUB, SAFE-OOB).</summary>
+  public IReadOnlyList<IntegrityIssue> RunScrub() => this._integrity.ScrubAll(this._Invalidate);
 
   /// <summary>Builds the background workers for this pool (CMP-BG): owed-copy sync (with the deferred window) and the landing-zone drainer.</summary>
   public BackgroundScheduler CreateScheduler() {
@@ -121,6 +127,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (report.AnythingDone)
       DriveBender.Logger($"Recovery: {report.RolledForward} rolled forward, {report.Reconciled} reconciled, {report.TempsRemoved} staging files removed");
 
+    // externally-modified members are caught before serving stale data (FR-OOB-MOUNT)
+    if (this._config.Integrity?.ChecksumDb != false) {
+      var oob = this._integrity.QuickScan(this._Invalidate);
+      foreach (var issue in oob)
+        DriveBender.Logger($"[Integrity]{issue.Kind}: {issue.Path} — {issue.Message}");
+    }
+
     this._mountOptions = options;
   }
 
@@ -132,6 +145,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     foreach (var path in this._writeBuffer.DirtyPaths)
       this.FlushPath(path);
 
+    this._integrity.SaveAll();
     this._mountOptions = null;
   }
 
@@ -293,6 +307,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using (var stream = target.OpenWrite(normalized, false, true))
       stream.Flush();
 
+    this._integrity.RecordWholeFile(target, normalized, false, []);
     this._EnsureShadows(normalized, [], content: []);
     this._journal.Complete(sequence, JournalOp.Create);
     this._Invalidate(normalized);
@@ -324,6 +339,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         stream.Flush();
       }
 
+      this._integrity.RecordWholeFile(target, normalized, true, content);
       holders.Add(target);
     }
   }
@@ -363,6 +379,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     this._journal.Complete(sequence, JournalOp.Rename);
+    this._integrity.RenameFile(fromNormalized, toNormalized);
     this._handles.RenamePath(fromNormalized, toNormalized);
     this._Invalidate(fromNormalized);
     this._Invalidate(toNormalized);
@@ -382,6 +399,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (effective.Trash?.Enabled == true) {
       // recoverable delete: all copies move to the hidden pool trash instead of dying (FR-TRASH)
       this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true);
+      this._integrity.InvalidateFile(normalized);
       if (discarded != null)
         foreach (var staleSequence in discarded.Value.journalSequences)
           this._journal.Complete(staleSequence, JournalOp.Write);
@@ -399,6 +417,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         member.Delete(normalized, shadow);
 
     this._journal.Complete(sequence, JournalOp.Delete);
+    this._integrity.InvalidateFile(normalized);
     if (discarded != null)
       foreach (var staleSequence in discarded.Value.journalSequences)
         this._journal.Complete(staleSequence, JournalOp.Write);
@@ -641,6 +660,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       }
 
       // coherency: a read after this write must return the new bytes (SAFE-COHERE)
+      this._integrity.InvalidateFile(path);
       this._cache.Pages.InvalidatePath(this._poolId, path);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
       return bytes.Length;
@@ -678,6 +698,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         copy.Volume.Truncate(path, copy.Shadow, length); // grows zero-filled or shrinks on all copies (FR-TRUNC)
 
       this._journal.Complete(sequence, JournalOp.Truncate);
+      this._integrity.InvalidateFile(path);
       this._cache.Pages.InvalidatePath(this._poolId, path);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
     } finally {
@@ -730,6 +751,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     foreach (var sequence in journalSequences)
       this._journal.Complete(sequence, JournalOp.Write);
 
+    this._integrity.InvalidateFile(normalized);
     this._cache.Pages.InvalidatePath(this._poolId, normalized);
     this._cache.Metadata.InvalidatePath(this._poolId, normalized);
   }
@@ -778,6 +800,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         target.AtomicReplace(temp, path, false);
         landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
         this._journal.Complete(sequence, JournalOp.Drain);
+        this._integrity.InvalidateFile(path);
+        this._integrity.RecordWholeFile(target, path, false, content);
 
         this._Invalidate(path);
         this._EnsureShadows(path, this._placement.ResolveCopies(path), content);
