@@ -51,6 +51,9 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
   private string _Resolve(string relativePath, bool shadow)
     => System.IO.Path.Combine(this._rootPath, PoolPaths.ToPhysical(relativePath, shadow).Replace('/', System.IO.Path.DirectorySeparatorChar));
 
+  private string _ResolveFolder(string relativeFolder, bool shadow)
+    => System.IO.Path.Combine(this._rootPath, PoolPaths.ToPhysicalFolder(relativeFolder, shadow).Replace('/', System.IO.Path.DirectorySeparatorChar));
+
   private PoolFsException _Offline() => new(PoolFsError.Offline, $"Member '{this.DisplayName}' ({this._rootPath}) is offline");
 
   private T _Guard<T>(Func<T> operation) {
@@ -109,11 +112,11 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
   });
 
   public void EnsureFolder(string relativeFolder, bool shadow) => this._Guard(() => {
-    Directory.CreateDirectory(this._Resolve(relativeFolder, shadow));
+    Directory.CreateDirectory(this._ResolveFolder(relativeFolder, shadow));
   });
 
   public void DeleteFolder(string relativeFolder, bool shadow) => this._Guard(() => {
-    var path = this._Resolve(relativeFolder, shadow);
+    var path = this._ResolveFolder(relativeFolder, shadow);
     if (!Directory.Exists(path))
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {relativeFolder}");
 
@@ -147,10 +150,10 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
   });
 
   public bool FileExists(string relativePath, bool shadow) => File.Exists(this._Resolve(relativePath, shadow));
-  public bool FolderExists(string relativeFolder, bool shadow) => Directory.Exists(this._Resolve(relativeFolder, shadow));
+  public bool FolderExists(string relativeFolder, bool shadow) => Directory.Exists(this._ResolveFolder(relativeFolder, shadow));
 
   public IEnumerable<VolumeEntry> List(string relativeFolder, bool shadow) {
-    var path = this._Resolve(relativeFolder, shadow);
+    var path = this._ResolveFolder(relativeFolder, shadow);
     var directory = new DirectoryInfo(path);
     if (!directory.Exists)
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {relativeFolder}");

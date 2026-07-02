@@ -161,14 +161,14 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
 
   public void EnsureFolder(string relativeFolder, bool shadow) {
     this._Check(VolumeOp.EnsureFolder);
-    var physical = PoolPaths.ToPhysical(relativeFolder, shadow);
+    var physical = PoolPaths.ToPhysicalFolder(relativeFolder, shadow);
     this._EnsureParents(physical + "/x");
     this._folders.Add(physical);
   }
 
   public void DeleteFolder(string relativeFolder, bool shadow) {
     this._Check(VolumeOp.DeleteFolder);
-    var physical = PoolPaths.ToPhysical(relativeFolder, shadow);
+    var physical = PoolPaths.ToPhysicalFolder(relativeFolder, shadow);
     if (!this._folders.Contains(physical))
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {relativeFolder}");
 
@@ -206,11 +206,11 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public bool FileExists(string relativePath, bool shadow) => this.IsOnline && this._files.ContainsKey(PoolPaths.ToPhysical(relativePath, shadow));
-  public bool FolderExists(string relativeFolder, bool shadow) => this.IsOnline && this._folders.Contains(PoolPaths.ToPhysical(relativeFolder, shadow));
+  public bool FolderExists(string relativeFolder, bool shadow) => this.IsOnline && this._folders.Contains(PoolPaths.ToPhysicalFolder(relativeFolder, shadow));
 
   public IEnumerable<VolumeEntry> List(string relativeFolder, bool shadow) {
     this._Check(VolumeOp.List);
-    var physical = PoolPaths.ToPhysical(relativeFolder, shadow);
+    var physical = PoolPaths.ToPhysicalFolder(relativeFolder, shadow);
     if (!this._folders.Contains(physical))
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {relativeFolder}");
 

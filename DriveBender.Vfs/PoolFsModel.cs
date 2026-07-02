@@ -75,6 +75,21 @@ public static class PoolPaths {
       : $"{normalized[..lastSlash]}/{DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME}/{normalized[(lastSlash + 1)..]}";
   }
 
+  /// <summary>
+  /// Physical location of a folder: its shadow side is the folder's own
+  /// FOLDER.DUPLICATE.$DRIVEBENDER container (the marker that enables duplication and
+  /// holds its files' shadow copies) — unlike files, whose shadow lives in the parent.
+  /// </summary>
+  public static string ToPhysicalFolder(string relativeFolder, bool shadow) {
+    var normalized = Normalize(relativeFolder);
+    if (!shadow)
+      return normalized;
+
+    return normalized.Length == 0
+      ? DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME
+      : $"{normalized}/{DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME}";
+  }
+
   /// <summary>Names that never appear in the mounted namespace (FR-HIDE).</summary>
   public static bool IsHiddenName(string name)
     => name.Equals(DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase)
