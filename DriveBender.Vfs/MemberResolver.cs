@@ -26,9 +26,13 @@ public sealed record PoolMember(
 /// (poolId, memberId). Resolution is by marker content, not path — A:\ today and E:\
 /// tomorrow resolve to the same member.
 /// </summary>
-public sealed class MemberResolver(IHostEnvironment host, ManifestStore store, IReadOnlyList<string>? searchPaths = null) {
+public sealed class MemberResolver(IHostEnvironment host, ManifestStore store, IReadOnlyList<string>? searchPaths = null, IRemoteMemberResolver? remoteResolver = null) {
 
   public PoolMember Resolve(PoolManifest manifest, PoolMemberDefinition definition) {
+    // remote endpoints resolve by reachability through their backend, not by marker scan
+    if (remoteResolver != null && remoteResolver.CanResolve(definition))
+      return remoteResolver.Resolve(manifest, definition);
+
     // 1. the last-known path hint, verified by marker content
     if (host.DirectoryExists(definition.Path)) {
       var marker = store.TryLoadMarker(definition.Path);

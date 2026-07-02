@@ -37,19 +37,9 @@ public sealed class BackendRegistry {
   }
 
   /// <summary>The scheme of a member: its explicit manifest value, else parsed from the path, else local.</summary>
-  public static string SchemeOf(string? explicitScheme, string path) {
-    if (!string.IsNullOrWhiteSpace(explicitScheme))
-      return explicitScheme;
+  public static string SchemeOf(string? explicitScheme, string path) => MemberSchemes.SchemeOf(explicitScheme, path);
 
-    if (path.StartsWith(@"\\", StringComparison.Ordinal))
-      return "unc";
-
-    var separator = path.IndexOf("://", StringComparison.Ordinal);
-    return separator > 0 ? path[..separator] : "file";
-  }
-
-  public static bool IsRemoteScheme(string scheme)
-    => scheme is not ("file" or "local" or "unc");
+  public static bool IsRemoteScheme(string scheme) => MemberSchemes.IsRemote(scheme);
 
   public IVolumeIO Open(Guid memberId, string displayName, string path, string? explicitScheme, string? credentialReference, ICredentialResolver? credentials) {
     var scheme = SchemeOf(explicitScheme, path);

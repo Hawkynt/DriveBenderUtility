@@ -42,7 +42,7 @@ public interface IPoolProvider {
 }
 
 /// <summary>Default provider over any set of manifest sources (JSON registry + native scan).</summary>
-public sealed class PoolProvider(IHostEnvironment host, ManifestStore store, IEnumerable<IManifestSource> sources, IReadOnlyList<string>? searchPaths = null) : IPoolProvider {
+public sealed class PoolProvider(IHostEnvironment host, ManifestStore store, IEnumerable<IManifestSource> sources, IReadOnlyList<string>? searchPaths = null, IRemoteMemberResolver? remoteResolver = null) : IPoolProvider {
 
   private readonly IManifestSource[] _sources = [.. sources];
 
@@ -62,13 +62,13 @@ public sealed class PoolProvider(IHostEnvironment host, ManifestStore store, IEn
   }
 
   public PoolHealth Inspect(PoolRef pool) {
-    var resolver = new MemberResolver(host, store, searchPaths);
+    var resolver = new MemberResolver(host, store, searchPaths, remoteResolver);
     var members = resolver.ResolveAll(pool.Manifest);
     return this._ComputeHealth(pool, members);
   }
 
   public DriveBender.IMountPoint Open(PoolRef pool, out PoolHealth health) {
-    var resolver = new MemberResolver(host, store, searchPaths);
+    var resolver = new MemberResolver(host, store, searchPaths, remoteResolver);
     var members = resolver.ResolveAll(pool.Manifest);
     health = this._ComputeHealth(pool, members);
 
@@ -87,12 +87,14 @@ public sealed class PoolProvider(IHostEnvironment host, ManifestStore store, IEn
       store.Save(updated, members.Where(m => m.Online).ToDictionary(m => m.MemberId, m => m.ResolvedPath));
     }
 
-    var drives = online.Select(m => new DriveBender.PoolDriveWithoutPool(
-      pool.Name,
-      m.Label ?? m.ResolvedPath,
-      pool.PoolId,
-      new DirectoryInfo(m.ResolvedPath)
-    ));
+    var drives = online
+      .Where(m => !m.Network || !m.ResolvedPath.Contains("://")) // Core's offline tooling only walks host paths
+      .Select(m => new DriveBender.PoolDriveWithoutPool(
+        pool.Name,
+        m.Label ?? m.ResolvedPath,
+        pool.PoolId,
+        new DirectoryInfo(m.ResolvedPath)
+      ));
 
     return new DriveBender.MountPoint(drives);
   }

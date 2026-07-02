@@ -1,6 +1,7 @@
 using System.Text.Json;
 using CommandLine;
 using DivisonM;
+using DivisonM.Backends;
 using DivisonM.Vfs;
 
 namespace DivisonM.Mount;
@@ -17,7 +18,10 @@ internal static class Program {
 
     var host = new RealHostEnvironment();
     var store = new ManifestStore(host);
-    var provider = new PoolProvider(host, store, [new JsonManifestSource(store), new NativeScanSource(host)]);
+    var credentialStore = new CredentialStore(host);
+    var registry = BackendRegistry.CreateDefault(host);
+    using var remoteResolver = new BackendMemberResolver(registry, credentialStore);
+    var provider = new PoolProvider(host, store, [new JsonManifestSource(store), new NativeScanSource(host)], remoteResolver: remoteResolver);
     var lifecycle = new PoolLifecycle(host, store);
 
     return Parser.Default.ParseArguments<
@@ -29,6 +33,8 @@ internal static class Program {
       PoolRemoveMemberOptions,
       PoolAdoptOptions,
       PoolRepairManifestOptions,
+      CredentialSetOptions,
+      CredentialRemoveOptions,
       MountOptions,
       UnmountOptions,
       StatusOptions,
@@ -42,7 +48,9 @@ internal static class Program {
       (PoolRemoveMemberOptions o) => _Guard(() => _PoolRemoveMember(provider, lifecycle, o)),
       (PoolAdoptOptions o) => _Guard(() => _PoolAdopt(provider, lifecycle, o)),
       (PoolRepairManifestOptions o) => _Guard(() => _PoolRepairManifest(provider, store, o)),
-      (MountOptions o) => _Guard(() => MountCommand.Run(host, store, provider, o)),
+      (CredentialSetOptions o) => _Guard(() => _CredentialSet(credentialStore, o)),
+      (CredentialRemoveOptions o) => _Guard(() => _CredentialRemove(credentialStore, o)),
+      (MountOptions o) => _Guard(() => MountCommand.Run(host, store, provider, remoteResolver, o)),
       (UnmountOptions o) => _NotImplemented("unmount"),
       (StatusOptions o) => _NotImplemented("status"),
       (ListOptions o) => _Guard(() => _PoolList(provider, o.Json)),
@@ -54,6 +62,8 @@ internal static class Program {
   private static string[] _TranslateVerbs(string[] args) {
     if (args.Length >= 2 && args[0].Equals("pool", StringComparison.OrdinalIgnoreCase) && !args[1].StartsWith('-'))
       args = ["pool-" + args[1], .. args.Skip(2)];
+    else if (args.Length >= 2 && args[0].Equals("credential", StringComparison.OrdinalIgnoreCase) && !args[1].StartsWith('-'))
+      args = ["credential-" + args[1], .. args.Skip(2)];
 
     return _GroupRepeatedOptions(args, new() {
       ["--member"] = "--member",
@@ -233,7 +243,10 @@ internal static class Program {
     };
 
     var reserve = options.Reserve == null ? 0 : SizeSpec.ParseBytes(options.Reserve);
-    var manifest = lifecycle.AddMember(pool.Manifest, new(options.Member, role, ReserveBytes: reserve), options.Force);
+    var credentialReference = options.Credential == null
+      ? null
+      : "cred-ref:" + CredentialStore.NormalizeReference(options.Credential);
+    var manifest = lifecycle.AddMember(pool.Manifest, new(options.Member, role, ReserveBytes: reserve, Credential: credentialReference), options.Force);
     Console.WriteLine($"Added '{options.Member}' to pool '{manifest.Name}' ({manifest.Members.Count} members).");
     return ExitOk;
   }
@@ -268,6 +281,52 @@ internal static class Program {
 
     var manifest = lifecycle.Adopt(pool);
     Console.WriteLine($"Adopted native pool '{manifest.Name}' ({manifest.PoolId}) into an explicit manifest — no data was moved.");
+    return ExitOk;
+  }
+
+  private static int _CredentialSet(CredentialStore credentials, CredentialSetOptions options) {
+    var secret = options.Secret;
+    if (secret == null) {
+      Console.Error.Write("Secret (input hidden): ");
+      secret = _ReadSecretFromConsole();
+    }
+
+    if (string.IsNullOrEmpty(secret)) {
+      Console.Error.WriteLine("Empty secret — nothing stored.");
+      return ExitError;
+    }
+
+    credentials.Store(options.Name, options.User, secret);
+    Console.WriteLine($"Stored credential '{CredentialStore.NormalizeReference(options.Name)}'; reference it from members as cred-ref:{CredentialStore.NormalizeReference(options.Name)}");
+    return ExitOk;
+  }
+
+  private static string _ReadSecretFromConsole() {
+    if (Console.IsInputRedirected)
+      return Console.In.ReadToEnd().Trim();
+
+    var buffer = new System.Text.StringBuilder();
+    while (true) {
+      var key = Console.ReadKey(intercept: true);
+      if (key.Key == ConsoleKey.Enter) {
+        Console.Error.WriteLine();
+        return buffer.ToString();
+      }
+
+      if (key.Key == ConsoleKey.Backspace) {
+        if (buffer.Length > 0)
+          buffer.Length -= 1;
+        continue;
+      }
+
+      if (key.KeyChar != '\0')
+        buffer.Append(key.KeyChar);
+    }
+  }
+
+  private static int _CredentialRemove(CredentialStore credentials, CredentialRemoveOptions options) {
+    credentials.Remove(options.Name);
+    Console.WriteLine($"Removed credential '{CredentialStore.NormalizeReference(options.Name)}' (if it existed).");
     return ExitOk;
   }
 

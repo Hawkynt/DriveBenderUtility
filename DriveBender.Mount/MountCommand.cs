@@ -1,3 +1,4 @@
+using DivisonM.Backends;
 using DivisonM.Vfs;
 using DivisonM.Vfs.Caching;
 using DivisonM.Vfs.Engine;
@@ -12,7 +13,7 @@ namespace DivisonM.Mount;
 /// </summary>
 internal static class MountCommand {
 
-  public static int Run(IHostEnvironment host, ManifestStore store, IPoolProvider provider, MountOptions options) {
+  public static int Run(IHostEnvironment host, ManifestStore store, IPoolProvider provider, BackendMemberResolver remoteResolver, MountOptions options) {
     // resolve the manifest argument: a *.json file path, a pool id, or a pool name
     PoolRef? pool;
     if (File.Exists(options.Manifest)) {
@@ -42,11 +43,11 @@ internal static class MountCommand {
       Console.WriteLine($"! {warning}");
 
     var members = health.OnlineMembers.Select(m => {
-      var definition = pool.Manifest.FindMember(m.MemberId);
-      return new EngineMember(
-        new LocalVolumeIO(m.MemberId, m.Label ?? m.ResolvedPath, m.ResolvedPath, m.PhysicalVolumeId),
-        m.Role,
-        m.ReserveBytes);
+      var definition = pool.Manifest.FindMember(m.MemberId)!;
+      IVolumeIO io = MemberSchemes.IsRemoteMember(definition)
+        ? remoteResolver.OpenVolume(definition)
+        : new LocalVolumeIO(m.MemberId, m.Label ?? m.ResolvedPath, m.ResolvedPath, m.PhysicalVolumeId);
+      return new EngineMember(io, m.Role, m.ReserveBytes);
     }).ToArray();
 
     if (members.Length == 0) {

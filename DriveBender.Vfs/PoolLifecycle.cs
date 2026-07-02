@@ -24,20 +24,25 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     var poolId = Guid.NewGuid();
     var definitions = new List<PoolMemberDefinition>();
     foreach (var spec in memberSpecs) {
-      this._EnsureMemberFolderUsable(spec.Path, poolId, force);
+      var scheme = MemberSchemes.SchemeOf(null, spec.Path);
+      var remote = MemberSchemes.IsRemote(scheme);
+      if (!remote)
+        this._EnsureMemberFolderUsable(spec.Path, poolId, force);
+
       definitions.Add(new() {
         MemberId = Guid.NewGuid(),
         Path = spec.Path,
         Role = spec.Role,
         Label = spec.Label,
         ReserveBytes = spec.ReserveBytes,
-        Network = spec.Network,
+        Network = spec.Network || remote,
         Credential = spec.Credential,
+        Scheme = remote ? scheme : null,
       });
     }
 
     foreach (var definition in definitions)
-      if (!host.DirectoryExists(definition.Path))
+      if (definition.Scheme == null && !host.DirectoryExists(definition.Path))
         host.CreateDirectory(definition.Path);
 
     var manifest = new PoolManifest {
@@ -80,9 +85,13 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     if (manifest.Members.Any(m => m.Path.Equals(spec.Path, StringComparison.OrdinalIgnoreCase)))
       throw new ManifestException($"'{spec.Path}' is already a member of pool '{manifest.Name}'");
 
-    this._EnsureMemberFolderUsable(spec.Path, manifest.PoolId, force);
-    if (!host.DirectoryExists(spec.Path))
-      host.CreateDirectory(spec.Path);
+    var scheme = MemberSchemes.SchemeOf(null, spec.Path);
+    var remote = MemberSchemes.IsRemote(scheme);
+    if (!remote) {
+      this._EnsureMemberFolderUsable(spec.Path, manifest.PoolId, force);
+      if (!host.DirectoryExists(spec.Path))
+        host.CreateDirectory(spec.Path);
+    }
 
     var updated = manifest with {
       Members = [.. manifest.Members, new PoolMemberDefinition {
@@ -91,8 +100,9 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
         Role = spec.Role,
         Label = spec.Label,
         ReserveBytes = spec.ReserveBytes,
-        Network = spec.Network,
+        Network = spec.Network || remote,
         Credential = spec.Credential,
+        Scheme = remote ? scheme : null,
       }],
     };
 

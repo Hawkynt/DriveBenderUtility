@@ -61,6 +61,9 @@ public sealed class PoolAddMemberOptions {
   [Option("reserve", HelpText = "Bytes the pool must not consume on the member's volume (e.g. 20GiB).")]
   public string? Reserve { get; set; }
 
+  [Option("credential", HelpText = "Credential reference for remote members (cred-ref:<name> or just <name>).")]
+  public string? Credential { get; set; }
+
   [Option("force", HelpText = "Consent to absorbing pre-existing content of a non-empty folder.")]
   public bool Force { get; set; }
 }
@@ -84,6 +87,24 @@ public sealed class PoolAdoptOptions {
 public sealed class PoolRepairManifestOptions {
   [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
   public string Pool { get; set; } = "";
+}
+
+[Verb("credential-set", HelpText = "Store a secret in the OS credential store; reference it from members as cred-ref:<name>.")]
+public sealed class CredentialSetOptions {
+  [Value(0, Required = true, MetaName = "name", HelpText = "Reference name (e.g. MyPool-server).")]
+  public string Name { get; set; } = "";
+
+  [Option('u', "user", Default = "", HelpText = "User name part of the credential.")]
+  public string User { get; set; } = "";
+
+  [Option("secret", HelpText = "The secret; omit to read it from stdin (recommended - keeps it out of shell history).")]
+  public string? Secret { get; set; }
+}
+
+[Verb("credential-remove", HelpText = "Remove a stored secret.")]
+public sealed class CredentialRemoveOptions {
+  [Value(0, Required = true, MetaName = "name", HelpText = "Reference name.")]
+  public string Name { get; set; } = "";
 }
 
 [Verb("mount", HelpText = "Mount a pool manifest at a target (drive letter, directory, or Linux mountpoint).")]
