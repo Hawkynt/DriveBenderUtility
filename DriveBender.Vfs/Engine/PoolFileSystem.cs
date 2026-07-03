@@ -996,22 +996,32 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // in the gap reconciles from the durable primary) (SAFE-ORDER, FR-WT, FR-WB)
       var sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
       var mirroredNow = requiredCopies > 1;
-      _WriteCopiesParallel(copies, 0, requiredCopies, dataPath, bytes, offset);
 
-      if (requiredCopies >= copies.Count)
+      // ack quorum with mid-write failover (SAFE-NOLOSS): a storage vanishing DURING the write
+      // does not fail the driver — the block redirects to the next ready storage, and the failed
+      // member's copy stays owed, served later from the write-back cache, never re-read from the
+      // broken storage
+      var appliedFlags = new bool[copies.Count];
+      this._WriteAckQuorum(copies, requiredCopies, dataPath, bytes, offset, appliedFlags);
+      var appliedCount = appliedFlags.Count(f => f);
+
+      if (appliedCount >= copies.Count)
         this._journal.Complete(sequence, JournalOp.Write);
       else if (policy == WritePolicy.WriteThrough) {
-        // write-through with weak-flush members: apply their copies now (best effort), the
-        // intent stays open so recovery reconciles them if they were lost (SAFE-REMOTE)
-        _WriteCopiesParallel(copies, requiredCopies, copies.Count, dataPath, bytes, offset);
+        // write-through: apply the remaining copies now (best effort); a copy that fails stays
+        // owed under the open intent so recovery reconciles it (SAFE-REMOTE)
         mirroredNow = true;
-        this._journal.Complete(sequence, JournalOp.Write);
+        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset))
+          this._journal.Complete(sequence, JournalOp.Write);
+        else
+          this._StageWithThrottle(path, offset, bytes, sequence, appliedCount); // hold the block for the lagging copy
       }
-      else if (!this._writeBuffer.StageWrite(path, offset, bytes, sequence, requiredCopies)) {
-        // write-buffer backpressure: degrade to write-through instead of growing RAM (FR-BACKP)
-        _WriteCopiesParallel(copies, requiredCopies, copies.Count, dataPath, bytes, offset);
+      else if (!this._StageWithThrottle(path, offset, bytes, sequence, appliedCount)) {
+        // buffer full even after throttling: degrade to synchronous catch-up (FR-BACKP)
         mirroredNow = true;
-        this._journal.Complete(sequence, JournalOp.Write);
+        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset))
+          this._journal.Complete(sequence, JournalOp.Write);
+        // else: the intent stays open — recovery reconciles the copies that never took the block
       }
 
       this._activity.Publish(ActivityKind.Write, path, bytes.Length, toMember: copies.Count > 0 ? copies[0].Volume.DisplayName : null, reason: policy.ToString());
@@ -1029,35 +1039,96 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
-  /// <summary>
-  /// Applies one write to a span of copies CONCURRENTLY — independent disks take their mirror
-  /// leg in parallel instead of doubling the latency (NFR-THROUGHPUT). All copies must land
-  /// (each with its own durability barrier) before this returns; the first failure surfaces.
-  /// </summary>
-  private void _WriteCopiesParallel(IReadOnlyList<PhysicalCopy> copies, int fromInclusive, int toExclusive, string path, byte[] bytes, long offset) {
-    void WriteOne(PhysicalCopy copy) {
-      this._BeginIo(copy.Volume.MemberId); // visible to the readiness selector while queued
-      try {
-        using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
-        stream.Seek(offset, SeekOrigin.Begin);
-        stream.Write(bytes, 0, bytes.Length);
-        stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
-      } finally {
-        this._EndIo(copy.Volume.MemberId);
-      }
-    }
-
-    if (toExclusive - fromInclusive <= 1) {
-      if (toExclusive > fromInclusive)
-        WriteOne(copies[fromInclusive]);
-      return;
-    }
-
+  private void _WriteOneCopy(PhysicalCopy copy, string path, byte[] bytes, long offset) {
+    this._BeginIo(copy.Volume.MemberId); // visible to the readiness selector while queued
     try {
-      Parallel.For(fromInclusive, toExclusive, i => WriteOne(copies[i]));
-    } catch (AggregateException e) when (e.InnerExceptions.OfType<PoolFsException>().FirstOrDefault() is { } inner) {
-      throw inner;
+      using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
+      stream.Seek(offset, SeekOrigin.Begin);
+      stream.Write(bytes, 0, bytes.Length);
+      stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+    } finally {
+      this._EndIo(copy.Volume.MemberId);
     }
+  }
+
+  /// <summary>
+  /// Lands the block on enough storages to satisfy the ack quorum: the preferred (ready-first)
+  /// set writes in parallel; a member failing mid-write is substituted by the next copy holder
+  /// so the driver's write still succeeds — its owed copy converges from the write cache later.
+  /// Throws only when the quorum itself is unreachable.
+  /// </summary>
+  private void _WriteAckQuorum(IReadOnlyList<PhysicalCopy> copies, int requiredCopies, string path, byte[] bytes, long offset, bool[] appliedFlags) {
+    var target = Math.Min(requiredCopies, copies.Count);
+    var errors = new Exception?[copies.Count];
+    Parallel.For(0, target, i => {
+      try {
+        this._WriteOneCopy(copies[i], path, bytes, offset);
+        appliedFlags[i] = true;
+      } catch (Exception e) {
+        errors[i] = e;
+      }
+    });
+
+    PoolFsException? lastError = null;
+    foreach (var error in errors.Where(e => e != null))
+      if (error is PoolFsException poolError)
+        lastError = poolError;
+      else
+        throw error!;
+
+    var succeeded = appliedFlags.Count(f => f);
+    for (var i = target; i < copies.Count && succeeded < target; ++i)
+      try {
+        this._WriteOneCopy(copies[i], path, bytes, offset);
+        appliedFlags[i] = true;
+        ++succeeded;
+        this._activity.Publish(ActivityKind.Recovery, path, bytes.Length, toMember: copies[i].Volume.DisplayName,
+          reason: "block redirected — a storage failed mid-write; its copy stays owed from the write cache");
+      } catch (PoolFsException e) {
+        lastError = e;
+      }
+
+    if (succeeded < target)
+      throw lastError ?? new PoolFsException(PoolFsError.IoError, $"No storage accepted the block of '{path}'");
+  }
+
+  /// <summary>Best-effort application to every copy not yet holding the block; true = all copies have it now.</summary>
+  private bool _TryWriteRemaining(IReadOnlyList<PhysicalCopy> copies, bool[] appliedFlags, string path, byte[] bytes, long offset) {
+    Parallel.For(0, copies.Count, i => {
+      if (appliedFlags[i])
+        return;
+
+      try {
+        this._WriteOneCopy(copies[i], path, bytes, offset);
+        appliedFlags[i] = true;
+      } catch (Exception) {
+        // stays owed — the open journal intent covers it
+      }
+    });
+
+    return appliedFlags.All(f => f);
+  }
+
+  /// <summary>
+  /// FR-BACKP as a THROTTLE: the write cache must never drop a block that has not reached all
+  /// available storages. When the budget is exhausted, THIS writer blocks while the oldest dirty
+  /// files flush down to their storages, then retries — new blocks are only accepted once the
+  /// evicted ones are safely written.
+  /// </summary>
+  private bool _StageWithThrottle(string path, long offset, byte[] bytes, long sequence, int durableCopies) {
+    if (this._writeBuffer.StageWrite(path, offset, bytes, sequence, durableCopies))
+      return true;
+
+    foreach (var dirty in this._writeBuffer.DirtyPaths) {
+      if (string.Equals(dirty, path, StringComparison.OrdinalIgnoreCase))
+        continue;
+
+      this.FlushPath(dirty); // blocking the writer IS the throttle
+      if (this._writeBuffer.StageWrite(path, offset, bytes, sequence, durableCopies))
+        return true;
+    }
+
+    return this._writeBuffer.StageWrite(path, offset, bytes, sequence, durableCopies);
   }
 
   /// <summary>Refuses an ack when fewer copies are reachable than the folder's effective minCopiesBeforeAck (SAFE-LZ).</summary>
