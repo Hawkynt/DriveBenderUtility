@@ -313,8 +313,13 @@ dbmount serve --open      # animated live dashboard at http://127.0.0.1:9723 (to
 The page shows every pool with live capacity donuts, cache-hit/dirty meters, a
 RAM→fast→capacity tier diagram with animated data flows, and per-member health —
 updated once a second while pools are mounted. From the same page you can run the
-**entire lifecycle**: create a pool (with typed local/remote members and a
-credential), mount / unmount, add or remove members, remove- and replace-media,
+**entire lifecycle**: create a pool (pick local folders with a built-in **folder
+browser**, or add remote members whose **credentials are collected by a
+scheme-aware dialog** — user/password for FTP·WebDAV, password *or* private key
+for SFTP, access/secret keys for S3, account key for Azure, token for
+Dropbox·OneDrive, service-account JSON for Google — stored under a reference the
+manifest never inlines), mount / unmount, add or remove members, remove- and
+replace-media,
 run health / fix / restore, **forget** a pool (drop it from this machine's list
 while leaving its data and on-disk markers intact, so it can be re-imported or
 recovered later), and delete (keep data) or purge (wipe data, guarded by a

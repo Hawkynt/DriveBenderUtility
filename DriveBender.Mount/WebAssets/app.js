@@ -64,6 +64,49 @@ const KINDS = [
 ];
 const ROLES = ["capacity", "landing", "readonly"];
 
+// local kinds are picked with the folder browser and need no credentials; every other kind is
+// a remote service with a scheme-specific credential form (mapped to the daemon's user/secret).
+const LOCAL_KINDS = new Set(["file", "unc"]);
+const needsCred = k => !LOCAL_KINDS.has(k);
+const CRED_SPECS = {
+  ftp:      [["user", "Username", "text"], ["pass", "Password", "password"]],
+  ftps:     [["user", "Username", "text"], ["pass", "Password", "password"]],
+  webdav:   [["user", "Username", "text"], ["pass", "Password", "password"]],
+  webdavs:  [["user", "Username", "text"], ["pass", "Password", "password"]],
+  sftp:     "sftp", // special: password or private-key authentication
+  s3:       [["accessKey", "Access key ID", "text"], ["secretKey", "Secret access key", "password"],
+             ["region", "Region (optional)", "text"], ["serviceUrl", "Endpoint URL (optional, S3-compatible)", "text"]],
+  azblob:   [["accountKey", "Storage account key", "password"]],
+  azfile:   [["accountKey", "Storage account key", "password"]],
+  dropbox:  [["token", "Access token", "password"]],
+  onedrive: [["token", "Access token", "password"]],
+  gdrive:   [["json", "Service account JSON", "textarea"]],
+  gcs:      [["json", "Service account JSON", "textarea"]],
+};
+const kindLabel = k => (KINDS.find(x => x[0] === k) || [, k])[1];
+
+// collapse the scheme-specific fields into the daemon's { user, secret } shape (multi-field
+// secrets are stored as a JSON object the matching backend knows how to read — see CredentialPayload)
+function credPayload(kind, v) {
+  switch (kind) {
+    case "ftp": case "ftps": case "webdav": case "webdavs":
+      return { user: v.user || "", secret: v.pass || "" };
+    case "sftp":
+      return v.mode === "key"
+        ? { user: v.user || "", secret: JSON.stringify({ privateKey: v.privateKey || "", passphrase: v.passphrase || "" }) }
+        : { user: v.user || "", secret: v.pass || "" };
+    case "s3": {
+      const o = { accessKey: v.accessKey || "", secretKey: v.secretKey || "" };
+      if (v.serviceUrl) o.serviceUrl = v.serviceUrl; else if (v.region) o.region = v.region;
+      return { user: "", secret: JSON.stringify(o) };
+    }
+    case "azblob": case "azfile": return { user: "", secret: v.accountKey || "" };
+    case "dropbox": case "onedrive": return { user: "", secret: v.token || "" };
+    case "gdrive": case "gcs": return { user: "", secret: v.json || "" };
+    default: return { user: "", secret: "" };
+  }
+}
+
 function memberRow(pool, m) {
   const row = el("div", "member");
   row.innerHTML = `<span class="status ${m.online ? "" : "off"}"></span>
@@ -235,44 +278,14 @@ function render(data) {
   container.querySelectorAll(".card").forEach(c => { if (!seen.has(c.dataset.id)) c.remove(); });
 }
 
-// ---- modals: create pool & add member -------------------------------------
-function closeModal() { document.getElementById("modal-root").innerHTML = ""; }
-
-function memberEditor() {
-  // returns { node, getMembers() } — a kind/location/role/credential row + running list
-  const members = [];
-  const wrap = el("div");
-  wrap.innerHTML = `
-    <label>Add member</label>
-    <div class="row">
-      <select class="k">${KINDS.map(k => `<option value="${k[0]}">${k[1]}</option>`).join("")}</select>
-      <select class="r">${ROLES.map(r => `<option value="${r}">${r}</option>`).join("")}</select>
-    </div>
-    <div class="row" style="margin-top:6px">
-      <input class="loc" placeholder="path or URI (e.g. D:\\ , \\\\server\\share, sftp://user@host/path)">
-      <button type="button" class="addm" style="flex:0 0 auto">Add</button>
-    </div>
-    <input class="cred" style="margin-top:6px" placeholder="credential reference (remote members, optional)">
-    <div class="memberlist"></div>`;
-  const list = wrap.querySelector(".memberlist");
-  const redraw = () => {
-    list.innerHTML = "";
-    members.forEach((m, i) => {
-      const row = el("div", "m", `<span>${m.location}</span><span class="role">${m.role}</span>`);
-      const rm = el("button", "small danger", "×"); rm.onclick = () => { members.splice(i, 1); redraw(); };
-      row.appendChild(rm); list.appendChild(row);
-    });
-  };
-  wrap.querySelector(".addm").onclick = () => {
-    const loc = wrap.querySelector(".loc").value.trim(); if (!loc) return;
-    members.push({ location: loc, role: wrap.querySelector(".r").value, credential: wrap.querySelector(".cred").value.trim() || null });
-    wrap.querySelector(".loc").value = ""; wrap.querySelector(".cred").value = ""; redraw();
-  };
-  return { node: wrap, getMembers: () => members };
+// ---- modals: a stack so a folder picker / credential dialog can open on top of the -----------
+// create dialog without destroying it. closeModal pops just the topmost overlay.
+function closeModal() {
+  const root = document.getElementById("modal-root");
+  if (root.lastElementChild) root.removeChild(root.lastElementChild);
 }
 
 function showModal(title, bodyNode, onOk, okLabel) {
-  const root = document.getElementById("modal-root");
   const err = el("div", "err");
   const overlay = el("div", "overlay");
   const modal = el("div", "modal");
@@ -287,7 +300,67 @@ function showModal(title, bodyNode, onOk, okLabel) {
   modal.appendChild(actions);
   overlay.appendChild(modal);
   overlay.onclick = e => { if (e.target === overlay) closeModal(); };
-  root.innerHTML = ""; root.appendChild(overlay);
+  document.getElementById("modal-root").appendChild(overlay);
+}
+
+// a location input + a "Browse" button (local folders) + a scheme-aware "Set credentials" button.
+// Returns { node, getKind, getLocation, getCred, reset }.
+function locationControls(rowFor) {
+  let cred = null;
+  const wrap = el("div");
+  wrap.innerHTML = `
+    <div class="row">
+      <select class="k">${KINDS.map(k => `<option value="${k[0]}">${k[1]}</option>`).join("")}</select>
+      <select class="r">${ROLES.map(r => `<option value="${r}">${r}</option>`).join("")}</select>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <input class="loc" placeholder="path or URI (e.g. D:\\ , \\\\server\\share, sftp://user@host/path)">
+      <button type="button" class="browse" style="flex:0 0 auto">📁 Browse</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button type="button" class="setcred" style="flex:0 0 auto" hidden>🔑 Set credentials…</button>
+      <span class="credmark"></span>
+    </div>`;
+  const kSel = wrap.querySelector(".k"), loc = wrap.querySelector(".loc");
+  const browse = wrap.querySelector(".browse"), setcred = wrap.querySelector(".setcred"), credmark = wrap.querySelector(".credmark");
+  const sync = () => { browse.hidden = kSel.value !== "file"; setcred.hidden = !needsCred(kSel.value); cred = null; credmark.textContent = ""; };
+  kSel.onchange = sync; sync();
+  browse.onclick = () => folderPicker(p => { loc.value = p; });
+  setcred.onclick = () => credentialDialog(kSel.value, name => { cred = name; credmark.textContent = "🔑 " + name; });
+  return {
+    node: wrap,
+    getKind: () => kSel.value,
+    getLocation: () => loc.value.trim(),
+    getRole: () => wrap.querySelector(".r").value,
+    getCred: () => cred,
+    reset: () => { loc.value = ""; cred = null; credmark.textContent = ""; },
+  };
+}
+
+function memberEditor() {
+  // returns { node, getMembers() } — a location/credential row + a running member list
+  const members = [];
+  const wrap = el("div");
+  wrap.appendChild(el("label", null, "Add member"));
+  const ctl = locationControls();
+  wrap.appendChild(ctl.node);
+  const addBtn = el("button", null, "Add member"); addBtn.style.marginTop = "8px";
+  wrap.appendChild(addBtn);
+  const list = el("div", "memberlist"); wrap.appendChild(list);
+  const redraw = () => {
+    list.innerHTML = "";
+    members.forEach((m, i) => {
+      const row = el("div", "m", `<span>${m.location}</span><span class="role">${m.role}${m.credential ? " · 🔑" : ""}</span>`);
+      const rm = el("button", "small danger", "×"); rm.onclick = () => { members.splice(i, 1); redraw(); };
+      row.appendChild(rm); list.appendChild(row);
+    });
+  };
+  addBtn.onclick = () => {
+    const loc = ctl.getLocation(); if (!loc) return;
+    members.push({ location: loc, role: ctl.getRole(), credential: ctl.getCred() });
+    ctl.reset(); redraw();
+  };
+  return { node: wrap, getMembers: () => members };
 }
 
 function createPoolDialog() {
@@ -308,17 +381,86 @@ function createPoolDialog() {
 
 function addMemberDialog(pool) {
   const form = el("div");
-  form.innerHTML = `<div class="row"><select class="k">${KINDS.map(k=>`<option value="${k[0]}">${k[1]}</option>`).join("")}</select>
-    <select class="r">${ROLES.map(r=>`<option value="${r}">${r}</option>`).join("")}</select></div>
-    <label>Location</label><input class="loc" placeholder="path or URI">
-    <label>Credential reference (remote, optional)</label><input class="cred">`;
+  const ctl = locationControls();
+  form.appendChild(ctl.node);
   showModal(`Add member to ${pool.name}`, form, async () => {
-    const loc = form.querySelector(".loc").value.trim();
+    const loc = ctl.getLocation();
     if (!loc) return "Enter a location.";
-    const ok = await op("/api/pool/add-member?pool=" + pool.id, {
-      location: loc, role: form.querySelector(".r").value, credential: form.querySelector(".cred").value.trim() || null });
+    const ok = await op("/api/pool/add-member?pool=" + pool.id, { location: loc, role: ctl.getRole(), credential: ctl.getCred() });
     return ok ? null : "Add failed.";
   }, "Add");
+}
+
+// server-backed folder browser (a page can't open a native picker; the localhost daemon lists folders)
+function folderPicker(onPick) {
+  const body = el("div");
+  const crumb = el("div", "fp-path", "This PC");
+  const listBox = el("div", "fp-list");
+  const manual = el("div");
+  manual.innerHTML = `<label>Or type a folder path</label><input class="fp-manual" placeholder="D:\\Data\\Pool">`;
+  body.append(crumb, listBox, manual);
+  let cur = "";
+  async function load(path) {
+    const q = path ? "?path=" + encodeURIComponent(path) : "";
+    let d;
+    try { d = await fetch("/api/fs/list" + q, auth).then(r => r.json()); } catch (_) { d = { dirs: [] }; }
+    cur = d.path || "";
+    crumb.textContent = cur || "This PC";
+    body.querySelector(".fp-manual").value = cur;
+    listBox.innerHTML = "";
+    if (cur) { const up = el("div", "fp-item", "⬆ .."); up.onclick = () => load(d.parent || ""); listBox.appendChild(up); }
+    (d.dirs || []).forEach(x => { const it = el("div", "fp-item", "📁 " + x.name); it.onclick = () => load(x.path); listBox.appendChild(it); });
+    if (cur && !(d.dirs || []).length) listBox.appendChild(el("div", "fp-empty", "(no subfolders)"));
+  }
+  load("");
+  showModal("Select folder", body, async () => {
+    const chosen = body.querySelector(".fp-manual").value.trim() || cur;
+    if (!chosen) return "Navigate into a folder or type a path.";
+    onPick(chosen); return null;
+  }, "Select this folder");
+}
+
+// scheme-specific credential form → stored securely under a reference name (SEC-CRED)
+function credFields(kind) {
+  const wrap = el("div");
+  if (kind === "sftp") {
+    wrap.innerHTML = `
+      <label>Username</label><input data-f="user">
+      <label>Authentication</label>
+      <select data-f="mode"><option value="password">Password</option><option value="key">Private key</option></select>
+      <div class="pw"><label>Password</label><input type="password" data-f="pass"></div>
+      <div class="key" hidden><label>Private key (PEM)</label><textarea data-f="privateKey" rows="4"></textarea>
+        <label>Passphrase (optional)</label><input type="password" data-f="passphrase"></div>`;
+    const sel = wrap.querySelector('[data-f="mode"]'), pw = wrap.querySelector(".pw"), key = wrap.querySelector(".key");
+    sel.onchange = () => { const isKey = sel.value === "key"; pw.hidden = isKey; key.hidden = !isKey; };
+    return wrap;
+  }
+  wrap.innerHTML = (CRED_SPECS[kind] || []).map(([f, label, type]) =>
+    type === "textarea"
+      ? `<label>${label}</label><textarea data-f="${f}" rows="6" placeholder="paste the JSON key"></textarea>`
+      : `<label>${label}</label><input type="${type}" data-f="${f}">`).join("");
+  return wrap;
+}
+
+function credentialDialog(kind, onDone) {
+  const body = el("div");
+  const nameWrap = el("div");
+  nameWrap.innerHTML = `<label>Reference name (the manifest stores only this handle, never the secret)</label>
+    <input class="crn" placeholder="e.g. backup-nas">`;
+  const fields = credFields(kind);
+  body.append(nameWrap, fields);
+  showModal("Credentials — " + kindLabel(kind), body, async () => {
+    const name = body.querySelector(".crn").value.trim();
+    if (!name) return "Enter a reference name.";
+    const v = {};
+    fields.querySelectorAll("[data-f]").forEach(e => v[e.dataset.f] = e.tagName === "TEXTAREA" ? e.value : e.value.trim());
+    const { user, secret } = credPayload(kind, v);
+    if (!secret) return "Fill in the credential fields.";
+    const ok = await op("/api/credential/set", { name, user, secret });
+    if (!ok) return "Could not store the credential.";
+    onDone(name);
+    return null;
+  }, "Save credentials");
 }
 
 document.getElementById("new-pool").onclick = createPoolDialog;

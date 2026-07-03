@@ -92,6 +92,9 @@ internal sealed class ServeCommand(
         case "/api/pools":
           this._WriteJson(context, this._Pools());
           break;
+        case "/api/fs/list":
+          this._WriteJson(context, this._FsList(request));
+          break;
         case "/api/stream":
           this._Stream(context);
           break;
@@ -205,6 +208,36 @@ internal sealed class ServeCommand(
       }),
       stampUtc = DateTime.UtcNow.ToString("O"),
     };
+  }
+
+  /// <summary>
+  /// Read-only directory listing that backs the web folder picker — a browser can't open a
+  /// native dialog, so the localhost daemon enumerates folders for it. No path (or an
+  /// unreadable one) lists the machine's volume roots; only folder names are returned.
+  /// </summary>
+  private object _FsList(HttpListenerRequest request) {
+    var path = request.QueryString["path"];
+    if (string.IsNullOrWhiteSpace(path) || !host.DirectoryExists(path))
+      return new { path = (string?)null, parent = (string?)null, dirs = _DirEntries(host.EnumerateVolumeRoots()) };
+
+    var parent = Path.GetDirectoryName(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+    string[] children;
+    try {
+      children = host.EnumerateDirectories(path).ToArray();
+    } catch (Exception) {
+      children = []; // unreadable folder — show it empty rather than failing the picker
+    }
+
+    return new { path, parent = string.IsNullOrEmpty(parent) ? null : parent, dirs = _DirEntries(children) };
+  }
+
+  private static object[] _DirEntries(IEnumerable<string> paths)
+    => paths.Select(p => new { name = _LeafName(p), path = p }).OrderBy(d => d.name, StringComparer.OrdinalIgnoreCase).ToArray();
+
+  private static string _LeafName(string path) {
+    var trimmed = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    var leaf = Path.GetFileName(trimmed);
+    return leaf.Length > 0 ? leaf : path; // volume roots (e.g. "C:\") have no leaf — show the root itself
   }
 
   private void _Stream(HttpListenerContext context) {
