@@ -161,7 +161,7 @@ function card(pool) {
   if (pool.mounted)
     add("Unmount", "", () => op("/api/pool/unmount?pool=" + pool.id));
   else
-    add("Mount", "primary", () => op("/api/pool/mount?pool=" + pool.id));
+    add("Mount", "primary", () => mountPool(pool));
   add("Health", "", () => op("/api/health?pool=" + pool.id));
   add("Fix", "", () => op("/api/health?fix=true&pool=" + pool.id));
   add("Restore", "", () => op("/api/restore?pool=" + pool.id));
@@ -171,6 +171,16 @@ function card(pool) {
   add("Delete", "danger", () => confirm(`Delete pool "${pool.name}"? The manifest is removed; your files are kept on disk.`) && op("/api/pool/delete?pool=" + pool.id));
   add("Purge", "danger", () => prompt(`PURGE wipes all data in "${pool.name}". Type the pool name to confirm:`) === pool.name && op("/api/pool/purge?pool=" + pool.id));
   return c;
+}
+
+// Mount at the pool's configured target, or ask for a drive letter / folder when it has none.
+function mountPool(pool) {
+  let target = pool.configuredTarget;
+  if (!target) {
+    target = prompt("Mount at which location?\n\nWindows: a free drive letter like X: (or an empty folder)\nLinux: an empty directory like /mnt/pool", "");
+    if (!target) return;
+  }
+  op("/api/pool/mount?pool=" + pool.id + "&target=" + encodeURIComponent(target.trim()));
 }
 
 async function post(url, body) {

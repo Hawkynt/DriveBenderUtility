@@ -184,6 +184,7 @@ internal sealed class ServeCommand(
           source = pool.IsVirtual ? "native" : "manifest",
           degraded = health.IsDegraded,
           mounted = mounted.TryGetValue(pool.PoolId, out var entry) ? entry.Target : null,
+          configuredTarget = pool.Manifest.Mount?.Target,
           bytesFree = health.BytesFree,
           bytesTotal = health.BytesTotal,
           failureDomains = health.IndependentFailureDomains,
@@ -328,7 +329,11 @@ internal sealed class ServeCommand(
     if (!prereq.Ok)
       throw new PrereqException(prereq);
 
-    var target = request.QueryString["target"];
+    var target = request.QueryString["target"] ?? pool.Manifest.Mount?.Target;
+    if (string.IsNullOrWhiteSpace(target))
+      throw new ManifestException("No mount target — choose a drive letter (e.g. X:) or an empty folder to mount at.");
+
+    mountRegistry.TakeError(pool.PoolId); // discard any stale failure report from a previous attempt
     var (process, needsElevation) = _LaunchMount(pool.PoolId, target);
 
     // wait for the mount to actually appear (or the child to fail) so "Mount" reports the truth
@@ -337,12 +342,19 @@ internal sealed class ServeCommand(
         return "mounted";
 
       if (process is { HasExited: true }) {
+        // prefer the child's own reported reason — the only channel back from an elevated child
+        var reported = mountRegistry.TakeError(pool.PoolId);
+        if (reported == null) {
+          Thread.Sleep(250); // give a crashing child a moment to flush its report
+          reported = mountRegistry.TakeError(pool.PoolId);
+        }
+
         var error = process.StartInfo.RedirectStandardError ? process.StandardError.ReadToEnd().Trim() : "";
-        throw new ManifestException(error.Length > 0
-          ? error
-          : needsElevation
-            ? "Mounting was cancelled or denied — it needs administrator rights (accept the UAC prompt)."
-            : "The mount process exited before the pool came up. Check that a filesystem driver is installed.");
+        throw new ManifestException(
+          !string.IsNullOrEmpty(reported) ? reported
+          : error.Length > 0 ? error
+          : needsElevation ? "Mounting was cancelled or denied — it needs administrator rights (accept the UAC prompt)."
+          : "The mount process exited before the pool came up. Check that a filesystem driver is installed.");
       }
 
       Thread.Sleep(250);

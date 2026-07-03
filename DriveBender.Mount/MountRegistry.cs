@@ -24,13 +24,47 @@ public sealed class MountRegistry(IHostEnvironment host) {
   private string _Directory => Path.Combine(host.ConfigRoot, "mounts");
   private string _EntryPath(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.json");
   private string _StopPath(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.stop");
+  private string _ErrorPath(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.error");
 
   public void Register(MountEntry entry) {
     host.CreateDirectory(this._Directory);
     host.WriteAllTextAtomic(this._EntryPath(entry.PoolId), JsonSerializer.Serialize(entry, new JsonSerializerOptions { WriteIndented = true }));
-    var stop = this._StopPath(entry.PoolId);
-    if (host.FileExists(stop))
-      host.DeleteFile(stop);
+    // mount succeeded: clear any stop-request and stale failure report
+    foreach (var path in new[] { this._StopPath(entry.PoolId), this._ErrorPath(entry.PoolId) })
+      if (host.FileExists(path))
+        host.DeleteFile(path);
+  }
+
+  /// <summary>
+  /// A mount child records why it failed here so the launching daemon can report the real reason —
+  /// an elevated (ShellExecute) child can't have its stderr redirected, so this file is the only
+  /// channel back.
+  /// </summary>
+  public void ReportError(Guid poolId, string message) {
+    host.CreateDirectory(this._Directory);
+    host.WriteAllTextAtomic(this._ErrorPath(poolId), message);
+  }
+
+  /// <summary>Reads and removes a failure report left by a mount child, if any.</summary>
+  public string? TakeError(Guid poolId) {
+    var path = this._ErrorPath(poolId);
+    if (!host.FileExists(path))
+      return null;
+
+    string message;
+    try {
+      message = host.ReadAllText(path).Trim();
+    } catch (IOException) {
+      return null;
+    }
+
+    try {
+      host.DeleteFile(path);
+    } catch (IOException) {
+      // best-effort cleanup; the message is what matters
+    }
+
+    return message.Length > 0 ? message : null;
   }
 
   public void Unregister(Guid poolId) {

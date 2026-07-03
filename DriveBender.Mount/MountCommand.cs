@@ -14,64 +14,77 @@ namespace DivisonM.Mount;
 internal static class MountCommand {
 
   public static int Run(IHostEnvironment host, ManifestStore store, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, MountOptions options) {
-    // resolve the manifest argument: a *.json file path, a pool id, or a pool name
-    PoolRef? pool;
-    if (File.Exists(options.Manifest)) {
-      var manifest = ManifestSerializer.Parse(File.ReadAllText(options.Manifest));
-      pool = new(manifest.PoolId, manifest.Name, manifest.IsVirtual, manifest);
-    } else {
-      var pools = provider.Discover();
-      pool = Guid.TryParse(options.Manifest, out var id)
-        ? pools.FirstOrDefault(p => p.PoolId == id)
-        : pools.FirstOrDefault(p => p.Name.Equals(options.Manifest, StringComparison.OrdinalIgnoreCase));
+    // key any failure report by the requested pool id so the launching daemon can read the real
+    // reason even when this child was elevated (its stderr can't be captured across the UAC boundary)
+    Guid? errorKey = Guid.TryParse(options.Manifest, out var requestedId) ? requestedId : null;
+    try {
+      // resolve the manifest argument: a *.json file path, a pool id, or a pool name
+      PoolRef? pool;
+      if (File.Exists(options.Manifest)) {
+        var manifest = ManifestSerializer.Parse(File.ReadAllText(options.Manifest));
+        pool = new(manifest.PoolId, manifest.Name, manifest.IsVirtual, manifest);
+      } else {
+        var pools = provider.Discover();
+        pool = Guid.TryParse(options.Manifest, out var id)
+          ? pools.FirstOrDefault(p => p.PoolId == id)
+          : pools.FirstOrDefault(p => p.Name.Equals(options.Manifest, StringComparison.OrdinalIgnoreCase));
+      }
+
+      if (pool == null)
+        return _Fail(registry, errorKey, $"No pool or manifest '{options.Manifest}' found.", 2);
+
+      errorKey = pool.PoolId;
+
+      var target = options.Target ?? pool.Manifest.Mount?.Target;
+      if (string.IsNullOrWhiteSpace(target))
+        return _Fail(registry, errorKey, "No mount target — choose a drive letter (e.g. X:) or an empty folder to mount at.", 1);
+
+      // resolve members and surface health before serving (SAFE-OFFLINE, SAFE-PHYS)
+      var health = provider.Inspect(pool);
+      foreach (var warning in health.Warnings)
+        Console.WriteLine($"! {warning}");
+
+      var members = health.OnlineMembers.Select(m => {
+        var definition = pool.Manifest.FindMember(m.MemberId)!;
+        IVolumeIO io = MemberSchemes.IsRemoteMember(definition)
+          ? remoteResolver.OpenVolume(definition)
+          : new LocalVolumeIO(m.MemberId, m.Label ?? m.ResolvedPath, m.ResolvedPath, m.PhysicalVolumeId);
+        return new EngineMember(io, m.Role, m.ReserveBytes);
+      }).ToArray();
+
+      if (members.Length == 0)
+        return _Fail(registry, errorKey, $"Pool '{pool.Name}' has no online member — refusing to mount.", 2);
+
+      // effective config: built-in defaults ← global file ← the manifest's defaults block (§8)
+      var globalConfigPath = Path.Combine(host.ConfigRoot, "config.json");
+      var globalJson = host.FileExists(globalConfigPath) ? host.ReadAllText(globalConfigPath) : null;
+      var poolJson = pool.Manifest.Defaults?.GetRawText();
+      var config = ConfigResolver.ResolveEffective(globalJson, poolJson);
+      ConfigValidator.Validate(config, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+      ConfigValidator.ValidateTierAssignments(pool.Manifest, config);
+
+      var cacheConfig = config.Caches != null && config.Caches.TryGetValue(config.Cache?.Use ?? "global", out var found)
+        ? found
+        : new CacheInstanceConfig { Size = "4GiB" };
+      var cache = new CacheInstance(config.Cache?.Use ?? "global", cacheConfig);
+
+      var label = pool.Manifest.Mount?.VolumeLabel ?? pool.Name;
+      var fs = new PoolFileSystem(pool.PoolId, members, cache, config);
+
+      return _MountPlatform(host, fs, pool, target, label, registry, options);
+    } catch (Exception e) {
+      // record the reason before it bubbles to Program's stderr guard (invisible when elevated)
+      if (errorKey != null)
+        registry.ReportError(errorKey.Value, e.Message);
+      throw;
     }
+  }
 
-    if (pool == null) {
-      Console.Error.WriteLine($"No pool or manifest '{options.Manifest}' found.");
-      return 2;
-    }
-
-    var target = options.Target ?? pool.Manifest.Mount?.Target;
-    if (string.IsNullOrWhiteSpace(target)) {
-      Console.Error.WriteLine("No mount target: pass --target or set mount.target in the manifest.");
-      return 1;
-    }
-
-    // resolve members and surface health before serving (SAFE-OFFLINE, SAFE-PHYS)
-    var health = provider.Inspect(pool);
-    foreach (var warning in health.Warnings)
-      Console.WriteLine($"! {warning}");
-
-    var members = health.OnlineMembers.Select(m => {
-      var definition = pool.Manifest.FindMember(m.MemberId)!;
-      IVolumeIO io = MemberSchemes.IsRemoteMember(definition)
-        ? remoteResolver.OpenVolume(definition)
-        : new LocalVolumeIO(m.MemberId, m.Label ?? m.ResolvedPath, m.ResolvedPath, m.PhysicalVolumeId);
-      return new EngineMember(io, m.Role, m.ReserveBytes);
-    }).ToArray();
-
-    if (members.Length == 0) {
-      Console.Error.WriteLine($"Pool '{pool.Name}' has no online member — refusing to mount.");
-      return 2;
-    }
-
-    // effective config: built-in defaults ← global file ← the manifest's defaults block (§8)
-    var globalConfigPath = Path.Combine(host.ConfigRoot, "config.json");
-    var globalJson = host.FileExists(globalConfigPath) ? host.ReadAllText(globalConfigPath) : null;
-    var poolJson = pool.Manifest.Defaults?.GetRawText();
-    var config = ConfigResolver.ResolveEffective(globalJson, poolJson);
-    ConfigValidator.Validate(config, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
-    ConfigValidator.ValidateTierAssignments(pool.Manifest, config);
-
-    var cacheConfig = config.Caches != null && config.Caches.TryGetValue(config.Cache?.Use ?? "global", out var found)
-      ? found
-      : new CacheInstanceConfig { Size = "4GiB" };
-    var cache = new CacheInstance(config.Cache?.Use ?? "global", cacheConfig);
-
-    var label = pool.Manifest.Mount?.VolumeLabel ?? pool.Name;
-    var fs = new PoolFileSystem(pool.PoolId, members, cache, config);
-
-    return _MountPlatform(host, fs, pool, target, label, registry, options);
+  private static int _Fail(MountRegistry registry, Guid? errorKey, string message, int code) {
+    Console.Error.WriteLine(message);
+    if (errorKey != null)
+      registry.ReportError(errorKey.Value, message);
+    return code;
   }
 
   private static int _MountPlatform(IHostEnvironment host, PoolFileSystem fs, PoolRef pool, string target, string label, MountRegistry registry, MountOptions options) {
@@ -90,8 +103,7 @@ internal static class MountCommand {
       mountHost = dokan;
       unmountAction = dokan.Unmount;
     } else {
-      Console.Error.WriteLine("No filesystem driver found — install WinFsp (https://winfsp.dev) or Dokan (https://dokan-dev.github.io) and retry.");
-      return 3;
+      return _Fail(registry, pool.PoolId, "No filesystem driver found — install WinFsp (https://winfsp.dev) or Dokan (https://dokan-dev.github.io) and retry.", 3);
     }
 
     var backend = mountHost is Windows.WinFspMountHost ? "winfsp" : "dokan";
@@ -125,15 +137,11 @@ internal static class MountCommand {
 
     return 0;
 #else
-    if (!OperatingSystem.IsLinux()) {
-      Console.Error.WriteLine("Mounting is supported on Windows (WinFsp build) and Linux (FUSE); this platform has no adapter.");
-      return 3;
-    }
+    if (!OperatingSystem.IsLinux())
+      return _Fail(registry, pool.PoolId, "Mounting is supported on Windows (WinFsp build) and Linux (FUSE); this platform has no adapter.", 3);
 
-    if (!Linux.LinuxFuseMountHost.IsFuseAvailable()) {
-      Console.Error.WriteLine("FUSE is not available (/dev/fuse missing) — install fuse3 and retry.");
-      return 3;
-    }
+    if (!Linux.LinuxFuseMountHost.IsFuseAvailable())
+      return _Fail(registry, pool.PoolId, "FUSE is not available (/dev/fuse missing) — install fuse3 and retry.", 3);
 
     var fuseEntry = new MountEntry { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = "fuse", StartedUtc = DateTime.UtcNow.ToString("O") };
     var fuseMetrics = new MetricsPublisher(host);
