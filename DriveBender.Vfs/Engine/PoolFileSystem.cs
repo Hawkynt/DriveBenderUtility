@@ -39,6 +39,18 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   /// <summary>The physical name data ops must use: the staged temp while the file is being written, the real name after.</summary>
   private string _DataName(string normalized) => this._staging.ContainsKey(normalized) ? _StagedNameOf(normalized) : normalized;
+
+  // FR-STRIPE-READY: outstanding I/O per member — the stripe selector routes each block to the
+  // storage that is READY, so a fast/idle SSD naturally takes more blocks than a slow/busy HDD
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, int> _memberLoad = new();
+
+  private void _BeginIo(Guid memberId) => this._memberLoad.AddOrUpdate(memberId, 1, static (_, v) => v + 1);
+  private void _EndIo(Guid memberId) => this._memberLoad.AddOrUpdate(memberId, 0, static (_, v) => Math.Max(0, v - 1));
+
+  /// <summary>Readiness score: queued work dominates, measured latency breaks ties — lower is readier.</summary>
+  private double _LoadScore(IVolumeIO volume)
+    => (this._memberLoad.TryGetValue(volume.MemberId, out var inflight) ? inflight : 0) * 1000.0
+       + (volume is MeasuredVolumeIO { Samples: > 0 } measured ? measured.AverageLatencyMs : 0.0);
   private readonly ShadowNamespace _shadow = new();
   private readonly MemberWatcher _watcher;
   private readonly Func<DateTime> _clock;
@@ -828,22 +840,30 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._cache.Pages.TryGet(key, out var cached))
       return cached;
 
-    // mirror block routing (FR-MIRROR): large reads alternate blocks across copies; when the
-    // routed copy fails mid-read (dying disk, vanished member) every other copy is tried before
-    // the read is allowed to fail — a duplicated file survives losing a storage DURING the read
-    var preferred = mirrorSplit && copies.Count > 1 ? (int)(blockIndex % copies.Count) : 0;
+    // readiness block routing (FR-MIRROR, FR-STRIPE-READY): a split read sends each block to the
+    // copy that is READY — least outstanding I/O, then measured latency, plain alternation when
+    // idle — so a fast storage serves more blocks than a slow one; when the routed copy fails
+    // mid-read (dying disk, vanished member) every other copy is tried before the read may fail
+    var rotation = mirrorSplit && copies.Count > 1 ? (int)(blockIndex % copies.Count) : 0;
+    var order = Enumerable.Range(0, copies.Count)
+      .OrderBy(i => mirrorSplit && copies.Count > 1 ? this._LoadScore(copies[i].Volume) : 0)
+      .ThenBy(i => (i - rotation + copies.Count) % copies.Count)
+      .ToArray();
     PoolFsException? lastError = null;
-    for (var attempt = 0; attempt < copies.Count; ++attempt) {
-      var copy = copies[(preferred + attempt) % copies.Count];
+    foreach (var index in order) {
+      var copy = copies[index];
       byte[] block;
+      this._BeginIo(copy.Volume.MemberId);
       try {
         block = _ReadBlockFrom(copy, path, blockIndex, this._cache.Pages.BlockSize);
       } catch (PoolFsException e) {
         lastError = e;
         continue;
+      } finally {
+        this._EndIo(copy.Volume.MemberId);
       }
 
-      if (attempt > 0)
+      if (lastError != null)
         this._activity.Publish(ActivityKind.Recovery, path, block.Length, fromMember: copy.Volume.DisplayName,
           reason: "read failover — a copy failed mid-read, another one served the block");
 
@@ -889,16 +909,22 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _Prefetch(string path, IReadOnlyList<PhysicalCopy> copies, long fromOffset, long windowBytes, long fileLength) {
     var blockSize = this._cache.Pages.BlockSize;
     var lastByte = Math.Min(fileLength, fromOffset + windowBytes) - 1; // never past EOF (FR-RA)
-    for (var blockIndex = fromOffset / blockSize; blockIndex <= lastByte / blockSize; ++blockIndex) {
-      var key = new PageKey(this._poolId, path, blockIndex);
-      if (this._cache.Pages.TryGet(key, out _))
-        continue;
+    var missing = new List<long>();
+    for (var blockIndex = fromOffset / blockSize; blockIndex <= lastByte / blockSize; ++blockIndex)
+      if (!this._cache.Pages.TryGet(new(this._poolId, path, blockIndex), out _))
+        missing.Add(blockIndex);
 
-      try {
-        this._LoadBlock(path, copies, blockIndex, mirrorSplit: false);
-      } catch (PoolFsException) {
-        return; // prefetch is best-effort; the foreground read will surface real errors
-      }
+    if (missing.Count == 0)
+      return;
+
+    // the whole window loads CONCURRENTLY across the copies (readiness-routed): fast storages keep
+    // filling the cache while a slow one finishes its block, so once the slow block arrives a burst
+    // of already-ready blocks hands over at once
+    try {
+      Parallel.ForEach(missing, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, copies.Count) },
+        blockIndex => this._LoadBlock(path, copies, blockIndex, mirrorSplit: copies.Count > 1));
+    } catch (Exception) {
+      // prefetch is best-effort; the foreground read will surface real errors
     }
   }
 
@@ -946,16 +972,23 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       this._RequireAckQuorum(path, eligibleCount);
 
-      // FR-STRIPE: when the ack needs fewer copies than exist, consecutive blocks ROTATE which
-      // storage takes them synchronously — a sequential writer spreads its blocks across the
-      // storages (each carries ~1/N of the load) while the owed-sync job converges the rest in
-      // the background, gearing towards per-storage-throughput × storages
+      // FR-STRIPE-READY: when the ack needs fewer copies than exist, each block goes to the
+      // storage that is READY — least outstanding I/O first, measured latency as the tiebreak,
+      // plain rotation only when everything is idle and unmeasured. A fast SSD drains its queue
+      // quicker and naturally takes more blocks than a slow/busy HDD; the owed-sync job copies
+      // the missing blocks between storages in the background until all share the full file
       if (eligibleCount > 1 && requiredCopies < eligibleCount) {
-        var rotation = (int)(offset / Math.Max(1, this._cache.Pages.BlockSize) % eligibleCount);
-        if (rotation > 0) {
-          var eligible = orderedCopies.Take(eligibleCount).ToArray();
-          copies = [.. eligible.Skip(rotation), .. eligible.Take(rotation), .. orderedCopies.Skip(eligibleCount)];
-        }
+        var block = offset / Math.Max(1, this._cache.Pages.BlockSize);
+        var eligible = orderedCopies.Take(eligibleCount).ToArray();
+        var rotation = (int)(block % eligible.Length);
+        copies = [
+          .. eligible
+            .Select((copy, index) => (copy, index))
+            .OrderBy(t => this._LoadScore(t.copy.Volume))
+            .ThenBy(t => (t.index - rotation + eligible.Length) % eligible.Length)
+            .Select(t => t.copy),
+          .. orderedCopies.Skip(eligibleCount),
+        ];
       }
 
       // intent → mutate the ack set durably → (write-through: complete now; write-back /
@@ -1001,12 +1034,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// leg in parallel instead of doubling the latency (NFR-THROUGHPUT). All copies must land
   /// (each with its own durability barrier) before this returns; the first failure surfaces.
   /// </summary>
-  private static void _WriteCopiesParallel(IReadOnlyList<PhysicalCopy> copies, int fromInclusive, int toExclusive, string path, byte[] bytes, long offset) {
+  private void _WriteCopiesParallel(IReadOnlyList<PhysicalCopy> copies, int fromInclusive, int toExclusive, string path, byte[] bytes, long offset) {
     void WriteOne(PhysicalCopy copy) {
-      using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
-      stream.Seek(offset, SeekOrigin.Begin);
-      stream.Write(bytes, 0, bytes.Length);
-      stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+      this._BeginIo(copy.Volume.MemberId); // visible to the readiness selector while queued
+      try {
+        using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
+        stream.Seek(offset, SeekOrigin.Begin);
+        stream.Write(bytes, 0, bytes.Length);
+        stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+      } finally {
+        this._EndIo(copy.Volume.MemberId);
+      }
     }
 
     if (toExclusive - fromInclusive <= 1) {

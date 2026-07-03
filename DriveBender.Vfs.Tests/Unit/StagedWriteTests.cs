@@ -116,6 +116,40 @@ public class StagedWriteTests {
   }
 
   [Test]
+  [Category("HappyPath")]
+  public void Write_GivenFastAndSlowStorage_WhenStriping_ThenReadyFastStorageTakesTheSyncBlocks() {
+    // FR-STRIPE-READY: the selector routes to the storage that is ready — the measured-fast one —
+    // instead of blindly alternating onto a slow/busy disk
+    var fast = new MeasuredVolumeIO(this._v1);
+    var slow = new MeasuredVolumeIO(this._v2);
+    fast.RecordLatency(0.5);
+    slow.RecordLatency(80);
+
+    var cache = new CacheInstance("r" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
+    var fs = new PoolFileSystem(_pool, [new(fast), new(slow)], cache,
+      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "write": { "policy": "write-back", "minCopiesBeforeAck": 1 } }"""));
+    fs.Mount(new(@"X:\"));
+
+    var handle = fs.Create("vid.bin", NodeKind.File, CreateFlags.None);
+    for (var block = 0; block < 4; ++block)
+      fs.Write(handle, Enumerable.Repeat((byte)(block + 1), 16).ToArray(), block * 16, WriteMode.Normal);
+
+    // every sync block landed on the measured-fast member; the slow one only owes background copies
+    var staged = _Staged("vid.bin");
+    var fastBytes = (this._v1.GetContent(staged, false) ?? this._v1.GetContent(staged, true))!;
+    var slowBytes = this._v2.GetContent(staged, false) ?? this._v2.GetContent(staged, true);
+    fastBytes.Length.Should().Be(64, "the ready (fast) storage took every synchronous block");
+    (slowBytes == null || slowBytes.All(b => b == 0)).Should().BeTrue("the slow storage holds no synced data yet — it converges in the background");
+
+    fs.CreateScheduler().Quiesce();
+    fs.Close(handle);
+    var final1 = this._v1.GetContent("vid.bin", false) ?? this._v1.GetContent("vid.bin", true);
+    var final2 = this._v2.GetContent("vid.bin", false) ?? this._v2.GetContent("vid.bin", true);
+    final1.Should().Equal(final2, "both storages converge to the identical full file");
+    final1!.Length.Should().Be(64);
+  }
+
+  [Test]
   [Category("EdgeCase")]
   public void Unlink_GivenStagedFile_WhenDeletedBeforeClose_ThenTempsVanishAndIntentCompletes() {
     var fs = this._CreateFs("""{ "duplication": 2 }""");
