@@ -147,6 +147,32 @@ public class PlacementResolverTests {
 
   [Test]
   [Category("HappyPath")]
+  public void ChoosePrimaryTarget_GivenLowestLatencyStrategy_WhenPlacing_ThenMeasuredFastestWins() {
+    var slow = new MeasuredVolumeIO(this._hdd1);
+    var fast = new MeasuredVolumeIO(this._hdd2);
+    slow.RecordLatency(25);
+    fast.RecordLatency(1.5);
+    var config = ConfigResolver.ResolveEffective(null, """{"placement":{"strategy":"lowest-latency"}}""");
+    var resolver = new PlacementResolver(_pool, [slow, fast], this._metadata, config);
+
+    resolver.ChoosePrimaryTarget(100).Should().Be(fast,
+      "lowest-latency places new primaries on the member that currently measures fastest");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void ChoosePrimaryTarget_GivenRoundRobinStrategy_WhenPlacingTwice_ThenTargetsAlternate() {
+    var config = ConfigResolver.ResolveEffective(null, """{"placement":{"strategy":"round-robin"}}""");
+    var resolver = new PlacementResolver(_pool, [this._hdd1, this._hdd2], this._metadata, config);
+
+    var first = resolver.ChoosePrimaryTarget(100);
+    var second = resolver.ChoosePrimaryTarget(100);
+
+    second.Should().NotBe(first, "round-robin spreads consecutive new files across members for parallel throughput");
+  }
+
+  [Test]
+  [Category("HappyPath")]
   public void UpdateRoles_GivenCapacityPromotedToLanding_WhenPlacingPrimary_ThenNewLandingPreferred() {
     var resolver = this._Resolver(ssdIsLanding: false); // everything starts as capacity
 

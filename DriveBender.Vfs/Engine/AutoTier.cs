@@ -38,6 +38,9 @@ public sealed class MeasuredVolumeIO(IVolumeIO inner) : IVolumeIO {
     }
   }
 
+  /// <summary>Feeds an observed latency directly — for tests and simulations of slow/busy drives.</summary>
+  public void RecordLatency(double milliseconds) => this._Record(milliseconds);
+
   private T _Timed<T>(Func<T> operation) {
     var watch = Stopwatch.StartNew();
     try {

@@ -49,11 +49,21 @@ function pathBetween(a, b) {
   return `M ${ax} ${ay} C ${ax + 36} ${ay}, ${bx - 36} ${by}, ${bx} ${by}`;
 }
 
-function spawnParticle(svg, d, cls, dur) {
+function spawnParticle(svg, d, cls, dur, label) {
   const ns = "http://www.w3.org/2000/svg";
-  const p = document.createElementNS(ns, "circle");
-  p.setAttribute("r", "3.2");
-  p.setAttribute("class", "pkt " + cls);
+  const g = document.createElementNS(ns, "g");
+  g.setAttribute("class", "pkt " + cls);
+  const c = document.createElementNS(ns, "circle");
+  c.setAttribute("r", "3.2");
+  g.appendChild(c);
+  if (label) {
+    // the file's name travels with its data block, so distinct files are followable
+    const t = document.createElementNS(ns, "text");
+    t.setAttribute("y", "-5");
+    t.setAttribute("text-anchor", "middle");
+    t.textContent = label.length > 14 ? label.slice(0, 13) + "…" : label;
+    g.appendChild(t);
+  }
   const am = document.createElementNS(ns, "animateMotion");
   am.setAttribute("dur", (dur || 900) + "ms");
   am.setAttribute("path", d);
@@ -61,17 +71,17 @@ function spawnParticle(svg, d, cls, dur) {
   am.setAttribute("calcMode", "spline");
   am.setAttribute("keyTimes", "0;1");
   am.setAttribute("keySplines", "0.4 0 0.2 1");
-  p.appendChild(am);
-  svg.appendChild(p);
-  setTimeout(() => p.remove(), (dur || 900) + 200);
+  g.appendChild(am);
+  svg.appendChild(g);
+  setTimeout(() => g.remove(), (dur || 900) + 200);
 }
 
-function burst(st, fromId, toId, cls, n) {
+function burst(st, fromId, toId, cls, n, label) {
   const a = st.pos[fromId], b = st.pos[toId];
   if (!a || !b) return;
   const d = pathBetween(a, b);
   for (let i = 0; i < (n || 1); i++)
-    setTimeout(() => st.svg.isConnected && spawnParticle(st.svg, d, cls, 850), i * 140);
+    setTimeout(() => st.svg.isConnected && spawnParticle(st.svg, d, cls, 850, i === 0 ? label : null), i * 140);
 }
 
 function buildFlowmap(wrap, pool, fast, cap) {
@@ -144,33 +154,54 @@ function updateFlowmap(wrap, pool) {
   if (st.cacheSub) st.cacheSub.textContent = (m.dirtyFiles || 0) > 0 ? m.dirtyFiles + " dirty" : "cache";
   if (!pool.mounted) return;
 
-  // counter deltas → ambient flows (entry ↔ cache ↔ tiers); particle count scales with volume
+  // real activity rows first: distinct FILES flying between the exact nodes involved —
+  // reads leave the member that served them, writes land on the member that took them
+  const fresh = [];
+  for (const a of m.activity || []) {
+    if (st.lastStamp && a.stamp <= st.lastStamp) break;
+    fresh.push(a);
+  }
+  if ((m.activity || []).length) st.lastStamp = m.activity[0].stamp;
+
+  let labeled = 0;
+  for (const a of fresh.reverse()) { // oldest first so the motion reads causally
+    if (labeled >= 6) break; // keep the map readable under load
+    const name = leafName(a.path || "");
+    const from = memberNodeId(st, pool, a.from), to = memberNodeId(st, pool, a.to);
+    if (a.kind === "Read") {
+      const src = from || st.firstFast || st.firstCap;
+      if (src) { burst(st, src, "cache", "read", 1, name); setTimeout(() => burst(st, "cache", "entry", "read", 1, name), 420); ++labeled; }
+    } else if (a.kind === "Write") {
+      const dst = to || st.firstFast || st.firstCap;
+      burst(st, "entry", "cache", "write", 1, name);
+      if (dst) setTimeout(() => burst(st, "cache", dst, "write", 1, name), 420);
+      ++labeled;
+    } else if ((a.kind === "Drain" || a.kind === "Rebalance" || a.kind === "RemoteTransfer") && from && to) {
+      burst(st, from, to, "drain", 1, name); ++labeled;
+    } else if ((a.kind === "Duplicate" || a.kind === "ShadowCreate") && to) {
+      burst(st, from || st.firstFast || "cache", to, "dup", 1, name); ++labeled;
+    }
+  }
+
+  // ambient fallback: the activity feed is sampled/rate-limited, so when counters moved but no
+  // row arrived this tick, unlabeled blocks still show the traffic
   const nOf = b => Math.max(1, Math.min(4, Math.round(Math.log2(1 + b / 4096))));
   const rd = st.lastRead == null ? 0 : (m.readBytes || 0) - st.lastRead;
   const wr = st.lastWrite == null ? 0 : (m.writtenBytes || 0) - st.lastWrite;
   st.lastRead = m.readBytes || 0;
   st.lastWrite = m.writtenBytes || 0;
-  if (wr > 0) {
-    burst(st, "entry", "cache", "write", nOf(wr));
-    const tgt = st.firstFast || st.firstCap;
-    if (tgt) setTimeout(() => burst(st, "cache", tgt, "write", 1), 400);
+  if (!labeled) {
+    if (wr > 0) {
+      burst(st, "entry", "cache", "write", nOf(wr));
+      const tgt = st.firstFast || st.firstCap;
+      if (tgt) setTimeout(() => burst(st, "cache", tgt, "write", 1), 400);
+    }
+    if (rd > 0) {
+      const src = st.firstFast || st.firstCap;
+      if (src) burst(st, src, "cache", "read", nOf(rd));
+      setTimeout(() => burst(st, "cache", "entry", "read", 1), 400);
+    }
   }
-  if (rd > 0) {
-    const src = st.firstFast || st.firstCap;
-    if (src) burst(st, src, "cache", "read", nOf(rd));
-    setTimeout(() => burst(st, "cache", "entry", "read", 1), 400);
-  }
-
-  // real activity rows → member-to-member movements (drain, duplicate, rebalance, remote)
-  for (const a of m.activity || []) {
-    if (st.lastStamp && a.stamp <= st.lastStamp) break;
-    const from = memberNodeId(st, pool, a.from), to = memberNodeId(st, pool, a.to);
-    if ((a.kind === "Drain" || a.kind === "Rebalance" || a.kind === "RemoteTransfer") && from && to)
-      burst(st, from, to, "drain", 2);
-    else if ((a.kind === "Duplicate" || a.kind === "ShadowCreate") && to)
-      burst(st, from || st.firstFast || "cache", to, "dup", 2);
-  }
-  if ((m.activity || []).length) st.lastStamp = m.activity[0].stamp;
 }
 
 const KINDS = [
@@ -278,7 +309,7 @@ function patchCard(c, pool) {
 
   top.innerHTML = `
     <h2>${pool.name} ${health} ${mountBadge}</h2>
-    <div class="sub">${pool.source} · ${pool.failureDomains} failure domain(s)${pool.autoLandingZone ? ' · <span title="placement.autoLandingZone: the landing zone follows the measured-fastest drive automatically">🚀 auto-LZ</span>' : ""}</div>
+    <div class="sub">${pool.source} · ${pool.failureDomains} failure domain(s) · <span title="primary placement strategy — change it via the Duplication dialog">⚖ ${pool.placementStrategy || "most-free-space"}</span>${pool.autoLandingZone ? ' · <span title="placement.autoLandingZone: the landing zone follows the measured-fastest drive automatically">🚀 auto-LZ</span>' : ""}</div>
     <div class="capacity-row">
       ${donut(pool.bytesFree, pool.bytesTotal)}
       <div class="cap-legend">
@@ -454,10 +485,18 @@ async function settingsDialog(pool) {
   }, "Save settings");
 }
 
-// Configure how many copies of each file the pool keeps — pool-wide and optionally per folder/file.
+// Configure copies + where new primaries land — pool-wide and optionally per folder/file.
 function duplicationDialog(pool) {
+  const STRATEGIES = [
+    ["most-free-space", "Most free space — fill the emptiest drive first (balances usage)"],
+    ["round-robin", "Round-robin — spread consecutive files across drives (parallel throughput, lower latency)"],
+    ["least-used", "Least used — favour the drive holding the least data"],
+    ["lowest-latency", "Lowest latency — the drive that currently measures fastest (live EWMA)"],
+  ];
   const form = el("div");
   form.innerHTML = `
+    <label>Where do new files land (primary placement strategy)</label>
+    <select class="strategy">${STRATEGIES.map(([v, l]) => `<option value="${v}" ${v === (pool.placementStrategy || "most-free-space") ? "selected" : ""}>${l}</option>`).join("")}</select>
     <label>Copies of every file, pool-wide (1 = no duplication)</label>
     <input class="dup" type="number" min="1" max="10" value="${pool.duplication || 1}">
     <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
@@ -484,7 +523,8 @@ function duplicationDialog(pool) {
     const level = parseInt(form.querySelector(".dup").value, 10);
     if (!(level >= 1)) return "Enter a valid pool-wide copy count.";
     const allowSamePhysical = form.querySelector(".dupsame").checked;
-    return await op("/api/pool/duplication?pool=" + pool.id, { level, allowSamePhysical }) ? null : "Could not set duplication.";
+    const strategy = form.querySelector(".strategy").value;
+    return await op("/api/pool/duplication?pool=" + pool.id, { level, allowSamePhysical, strategy }) ? null : "Could not set duplication.";
   }, "Save");
 }
 

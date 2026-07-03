@@ -136,6 +136,9 @@ public enum PlacementStrategy {
   [JsonStringEnumMemberName("most-free-space")] MostFreeSpace,
   [JsonStringEnumMemberName("round-robin")] RoundRobin,
   [JsonStringEnumMemberName("least-used")] LeastUsed,
+
+  /// <summary>Places new primaries on the member with the lowest measured I/O latency (live EWMA).</summary>
+  [JsonStringEnumMemberName("lowest-latency")] LowestLatency,
 }
 
 [JsonConverter(typeof(JsonStringEnumConverter<ExternalEditPolicy>))]

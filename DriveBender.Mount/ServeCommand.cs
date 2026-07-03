@@ -214,6 +214,7 @@ internal sealed class ServeCommand(
           duplication = _DuplicationOf(pool.Manifest),
           allowSamePhysical = _AllowSamePhysicalOf(pool.Manifest),
           autoLandingZone = _PlacementFlagOf(pool.Manifest, "autoLandingZone"),
+          placementStrategy = _PlacementStringOf(pool.Manifest, "strategy") ?? "most-free-space",
           bytesFree = health.BytesFree,
           bytesTotal = health.BytesTotal,
           failureDomains = health.IndependentFailureDomains,
@@ -295,6 +296,14 @@ internal sealed class ServeCommand(
     => manifest.Defaults is { ValueKind: JsonValueKind.Object } defaults
        && defaults.TryGetProperty("placement", out var p) && p.ValueKind == JsonValueKind.Object
        && p.TryGetProperty(flag, out var f) && f.ValueKind == JsonValueKind.True;
+
+  /// <summary>A string value from the manifest's placement block (e.g. strategy).</summary>
+  private static string? _PlacementStringOf(PoolManifest manifest, string key)
+    => manifest.Defaults is { ValueKind: JsonValueKind.Object } defaults
+       && defaults.TryGetProperty("placement", out var p) && p.ValueKind == JsonValueKind.Object
+       && p.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String
+      ? v.GetString()
+      : null;
 
   private void _Stream(HttpListenerContext context) {
     context.Response.ContentType = "text/event-stream";
@@ -382,17 +391,17 @@ internal sealed class ServeCommand(
     return new { manifest.PoolId, manifest.Name };
   });
 
-  private sealed record DuplicationBody(int? Level, string? Folder, bool? AllowSamePhysical);
+  private sealed record DuplicationBody(int? Level, string? Folder, bool? AllowSamePhysical, string? Strategy);
   private sealed record ConfigBody(string? Json);
 
-  /// <summary>Sets pool-wide (or per-folder) duplication; takes effect on the next mount.</summary>
+  /// <summary>Sets pool-wide (or per-folder) duplication and the primary-placement strategy; applied live when mounted.</summary>
   private object _SetDuplication(HttpListenerRequest request) => _Guard(() => {
     var body = _ReadBody<DuplicationBody>(request);
     var pool = this._Discover(this._RequirePool(request));
     if (body?.Level == null)
       throw new ManifestException("duplication needs a level (1-10)");
 
-    lifecycle.SetDuplication(pool.Manifest, body.Level.Value, string.IsNullOrWhiteSpace(body.Folder) ? null : body.Folder, body.AllowSamePhysical);
+    lifecycle.SetDuplication(pool.Manifest, body.Level.Value, string.IsNullOrWhiteSpace(body.Folder) ? null : body.Folder, body.AllowSamePhysical, body.Strategy);
     return this._ApplyLive(pool);
   });
 

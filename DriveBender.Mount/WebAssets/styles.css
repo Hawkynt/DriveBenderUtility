@@ -155,7 +155,8 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .flowmap .fnode .lat { fill: var(--muted); font-size: 8.5px; font-weight: 400; font-family: ui-monospace, monospace; }
 .flowmap .guide { fill: none; stroke: var(--line); stroke-width: 1; opacity: .55; }
 .flowmap .collabel { fill: var(--muted); font-size: 8px; text-anchor: middle; }
-.pkt { filter: drop-shadow(0 0 3px currentColor); }
+.pkt circle { filter: drop-shadow(0 0 3px currentColor); }
+.pkt text { font-size: 7.5px; font-family: ui-monospace, monospace; filter: none; paint-order: stroke; stroke: var(--panel); stroke-width: 2px; }
 .pkt.read { fill: var(--accent); color: var(--accent); }
 .pkt.write { fill: var(--warn); color: var(--warn); }
 .pkt.drain { fill: #f0883e; color: #f0883e; }

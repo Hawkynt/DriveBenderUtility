@@ -154,8 +154,14 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
       return null;
 
     return (config.Placement?.Strategy ?? PlacementStrategy.MostFreeSpace) switch {
+      // spreads consecutive new files across members — parallel spindles, lower per-file latency, higher aggregate throughput
       PlacementStrategy.RoundRobin => candidates[Interlocked.Increment(ref this._roundRobinCounter) % candidates.Length],
       PlacementStrategy.LeastUsed => candidates.OrderBy(m => m.BytesTotal - m.BytesFree).First(),
+      // live measurements (EWMA over real I/O) — unmeasured members rank last, free space breaks ties
+      PlacementStrategy.LowestLatency => candidates
+        .OrderBy(m => m is MeasuredVolumeIO { Samples: > 0 } measured ? measured.AverageLatencyMs : double.MaxValue)
+        .ThenByDescending(m => m.BytesFree)
+        .First(),
       _ => candidates.OrderByDescending(m => m.BytesFree).First(),
     };
   }

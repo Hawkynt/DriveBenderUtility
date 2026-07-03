@@ -204,7 +204,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
   /// ever land on independent physical volumes (SAFE-PHYS), so D&gt;domains keeps owed duplication
   /// pending rather than co-locating copies.
   /// </summary>
-  public PoolManifest SetDuplication(PoolManifest manifest, int level, string? folderGlob = null, bool? allowSamePhysical = null) {
+  public PoolManifest SetDuplication(PoolManifest manifest, int level, string? folderGlob = null, bool? allowSamePhysical = null, string? strategy = null) {
     if (level is < 1 or > 10)
       throw new ManifestException("Duplication level must be between 1 and 10 (1 = a single copy, no duplication)");
     if (manifest.IsVirtual)
@@ -229,6 +229,15 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
       if (defaults["placement"] is not JsonObject placement)
         defaults["placement"] = placement = new JsonObject();
       placement["shadowNeverSamePhysical"] = !allowSamePhysical.Value;
+    }
+
+    if (!string.IsNullOrWhiteSpace(strategy)) {
+      if (strategy is not ("most-free-space" or "round-robin" or "least-used" or "lowest-latency"))
+        throw new ManifestException($"Unknown placement strategy '{strategy}' (most-free-space | round-robin | least-used | lowest-latency)");
+
+      if (defaults["placement"] is not JsonObject placement)
+        defaults["placement"] = placement = new JsonObject();
+      placement["strategy"] = strategy;
     }
 
     var updated = manifest with { Defaults = JsonSerializer.SerializeToElement(defaults) };
