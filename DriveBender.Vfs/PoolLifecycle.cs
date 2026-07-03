@@ -1,7 +1,24 @@
 namespace DivisonM.Vfs;
 
 /// <summary>An operation would touch pre-existing data without explicit consent (SAFE-NONDESTRUCTIVE).</summary>
-public sealed class NonDestructiveViolationException(string message) : ManifestException(message);
+public class NonDestructiveViolationException(string message) : ManifestException(message);
+
+/// <summary>
+/// A folder is already claimed by a different pool's member marker. Carries enough context for
+/// the caller to offer a real choice — recover the claiming pool (when its mirror is still there)
+/// or take the folder over for a new/other pool — instead of a dead-end error.
+/// </summary>
+public sealed class MemberClaimConflictException(string message, string path, Guid conflictPoolId, bool restorable, bool registered)
+  : NonDestructiveViolationException(message) {
+  public string Path { get; } = path;
+  public Guid ConflictPoolId { get; } = conflictPoolId;
+
+  /// <summary>The claiming pool can be rebuilt from a manifest mirror still present at this folder.</summary>
+  public bool Restorable { get; } = restorable;
+
+  /// <summary>The claiming pool already has a registry entry on this machine (it should be visible in the list).</summary>
+  public bool Registered { get; } = registered;
+}
 
 /// <summary>
 /// Manifest-pool lifecycle operations behind the pool CLI verbs (FR-POOL-CLI): create,
@@ -13,7 +30,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
 
   public sealed record MemberSpec(string Path, MemberRole Role = MemberRole.Capacity, string? Label = null, long ReserveBytes = 0, bool Network = false, string? Credential = null);
 
-  public PoolManifest Create(string name, IEnumerable<MemberSpec> members, string? mountTarget = null, bool force = false) {
+  public PoolManifest Create(string name, IEnumerable<MemberSpec> members, string? mountTarget = null, bool force = false, bool takeOver = false) {
     if (string.IsNullOrWhiteSpace(name))
       throw new ManifestException("Pool requires a non-empty name");
 
@@ -27,7 +44,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
       var scheme = MemberSchemes.SchemeOf(null, spec.Path);
       var remote = MemberSchemes.IsRemote(scheme);
       if (!remote)
-        this._EnsureMemberFolderUsable(spec.Path, poolId, force);
+        this._EnsureMemberFolderUsable(spec.Path, poolId, force, takeOver: takeOver);
 
       definitions.Add(new() {
         MemberId = Guid.NewGuid(),
@@ -79,7 +96,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     return store.Save(pool.Manifest);
   }
 
-  public PoolManifest AddMember(PoolManifest manifest, MemberSpec spec, bool force = false) {
+  public PoolManifest AddMember(PoolManifest manifest, MemberSpec spec, bool force = false, bool takeOver = false) {
     if (manifest.IsVirtual)
       throw new ManifestException("Adopt the native pool first (pool adopt) before editing its membership");
     if (manifest.Members.Any(m => m.Path.Equals(spec.Path, StringComparison.OrdinalIgnoreCase)))
@@ -88,7 +105,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     var scheme = MemberSchemes.SchemeOf(null, spec.Path);
     var remote = MemberSchemes.IsRemote(scheme);
     if (!remote) {
-      this._EnsureMemberFolderUsable(spec.Path, manifest.PoolId, force);
+      this._EnsureMemberFolderUsable(spec.Path, manifest.PoolId, force, takeOver: takeOver);
       if (!host.DirectoryExists(spec.Path))
         host.CreateDirectory(spec.Path);
     }
@@ -157,24 +174,65 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
   public string Export(PoolManifest manifest) => ManifestSerializer.Write(manifest);
 
   /// <summary>
-  /// SAFE-NONDESTRUCTIVE: a folder already claimed by another pool is always refused; a
-  /// non-empty unclaimed folder needs explicit force (its content becomes pool content).
+  /// Rebuilds a pool the registry has lost from a member folder's manifest mirror and
+  /// re-registers it (the "restore the old pool" choice for an orphaned member marker).
+  /// Reconciles across the folder so the newest surviving copy wins (SAFE-MANIFEST).
   /// </summary>
-  private void _EnsureMemberFolderUsable(string path, Guid poolId, bool force, Guid? memberId = null) {
+  public PoolManifest Recover(string memberPath) {
+    var mirror = store.TryLoadMemberMirror(memberPath)
+      ?? throw new ManifestException($"'{memberPath}' has no recoverable manifest (its mirror copy is gone) — there is no old pool to restore here");
+
+    var recovered = store.Reconcile(mirror.PoolId, [memberPath]) ?? mirror;
+    DriveBender.Logger($"Recovered pool '{recovered.Name}' ({recovered.PoolId}) into the registry from the mirror at '{memberPath}'");
+    return recovered;
+  }
+
+  /// <summary>
+  /// Drops a pool from this machine's registry only. On-media markers/mirrors and all data
+  /// are left intact, so the pool stays self-describing and can be re-imported or recovered
+  /// later — the "remove from my list without deleting it" choice.
+  /// </summary>
+  public void Forget(PoolManifest manifest) {
+    if (manifest.IsVirtual)
+      throw new ManifestException($"'{manifest.Name}' is a native pool discovered from its drives — it has no registry entry to forget; detach its drives or delete it instead");
+
+    store.DeleteRegistryEntry(manifest.PoolId);
+    DriveBender.Logger($"Forgot pool '{manifest.Name}' ({manifest.PoolId}) — removed from this machine's registry; on-media markers and data untouched");
+  }
+
+  /// <summary>
+  /// SAFE-NONDESTRUCTIVE: a folder already claimed by another pool is refused with an
+  /// actionable conflict (recover it, or take it over); a non-empty unclaimed folder needs
+  /// explicit force (its content becomes pool content). <paramref name="takeOver"/> is the
+  /// caller's explicit consent to seize a foreign-claimed folder — its old marker is cleared.
+  /// </summary>
+  private void _EnsureMemberFolderUsable(string path, Guid poolId, bool force, Guid? memberId = null, bool takeOver = false) {
     if (!host.DirectoryExists(path))
       return;
 
     var marker = store.TryLoadMarker(path);
     if (marker != null) {
-      if (marker.PoolId != poolId)
-        throw new NonDestructiveViolationException($"'{path}' already belongs to another pool ({marker.PoolId}) — refusing regardless of force");
+      if (marker.PoolId != poolId) {
+        if (!takeOver)
+          throw new MemberClaimConflictException(
+            $"'{path}' already belongs to another pool ({marker.PoolId}).",
+            path, marker.PoolId,
+            restorable: store.TryLoadMemberMirror(path) != null,
+            registered: store.TryLoadRegistry(marker.PoolId) != null);
+
+        // explicit take-over: drop the foreign claim, then treat the folder as consented content
+        DriveBender.Logger($"Taking over '{path}' from pool {marker.PoolId} at the user's request");
+        store.RemoveMemberSidecars(path);
+        return;
+      }
+
       if (memberId != null && marker.MemberId != memberId)
         throw new NonDestructiveViolationException($"'{path}' is already member {marker.MemberId} of this pool — refusing to re-initialise it as {memberId}");
 
       return;
     }
 
-    if (force)
+    if (force || takeOver)
       return;
 
     var hasContent = host.EnumerateFiles(path, "*").Any(f => !PoolPaths.IsHiddenName(Path.GetFileName(f)))

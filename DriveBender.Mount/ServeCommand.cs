@@ -104,6 +104,12 @@ internal sealed class ServeCommand(
         case "/api/pool/create" when request.HttpMethod == "POST":
           this._WriteJson(context, this._Create(request));
           break;
+        case "/api/pool/recover" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._Recover(request));
+          break;
+        case "/api/pool/forget" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._Forget(request));
+          break;
         case "/api/prereqs":
           this._WriteJson(context, _PrereqPayload(Prerequisites.Check()));
           break;
@@ -229,8 +235,9 @@ internal sealed class ServeCommand(
     return _Guard(() => { PoolOpsCommand.Restore(host, provider, remoteResolver, new() { Pool = poolRef }); return "ok"; });
   }
 
-  private sealed record CreateBody(string? Name, string? MountTarget, MemberBody[]? Members);
+  private sealed record CreateBody(string? Name, string? MountTarget, MemberBody[]? Members, bool TakeOver = false);
   private sealed record MemberBody(string Location, string? Role, string? Credential);
+  private sealed record PathBody(string? Path);
 
   private object _Create(HttpListenerRequest request) => _Guard(() => {
     var body = _ReadBody<CreateBody>(request);
@@ -243,7 +250,7 @@ internal sealed class ServeCommand(
       Credential: string.IsNullOrWhiteSpace(m.Credential) ? null : "cred-ref:" + CredentialStore.NormalizeReference(m.Credential!),
       Network: MemberSchemes.IsRemote(MemberSchemes.SchemeOf(null, m.Location))));
 
-    var manifest = lifecycle.Create(body.Name, specs, string.IsNullOrWhiteSpace(body.MountTarget) ? null : body.MountTarget);
+    var manifest = lifecycle.Create(body.Name, specs, string.IsNullOrWhiteSpace(body.MountTarget) ? null : body.MountTarget, takeOver: body.TakeOver);
     return new { manifest.PoolId, manifest.Name };
   });
 
@@ -254,8 +261,28 @@ internal sealed class ServeCommand(
       throw new ManifestException("add-member needs a member body");
 
     var credential = string.IsNullOrWhiteSpace(body.Credential) ? null : "cred-ref:" + CredentialStore.NormalizeReference(body.Credential!);
-    lifecycle.AddMember(pool.Manifest, new(body.Location, _ParseRole(body.Role), Credential: credential));
+    lifecycle.AddMember(pool.Manifest, new(body.Location, _ParseRole(body.Role), Credential: credential), takeOver: request.QueryString["takeover"] == "true");
     return "ok";
+  });
+
+  /// <summary>Rebuilds an orphaned pool from a member folder's manifest mirror and re-registers it.</summary>
+  private object _Recover(HttpListenerRequest request) => _Guard(() => {
+    var path = _ReadBody<PathBody>(request)?.Path ?? request.QueryString["path"];
+    if (string.IsNullOrWhiteSpace(path))
+      throw new ManifestException("recover needs a member folder path");
+
+    var manifest = lifecycle.Recover(path);
+    return new { manifest.PoolId, manifest.Name };
+  });
+
+  /// <summary>Removes a pool from this machine's registry only — data and on-media markers stay.</summary>
+  private object _Forget(HttpListenerRequest request) => _Guard(() => {
+    var pool = this._Discover(this._RequirePool(request));
+    if (mountRegistry.Find(pool.PoolId.ToString()) != null)
+      throw new ManifestException("unmount the pool before forgetting it");
+
+    lifecycle.Forget(pool.Manifest);
+    return "forgotten";
   });
 
   private object _Mount(HttpListenerRequest request) => _Guard(() => {
@@ -389,6 +416,8 @@ internal sealed class ServeCommand(
       return new { ok = true, result = action() };
     } catch (PrereqException e) {
       return new { ok = false, error = e.Message, needsPrereq = true, driver = e.Status.Driver, installable = e.Status.Installable };
+    } catch (MemberClaimConflictException e) {
+      return new { ok = false, error = e.Message, conflict = new { path = e.Path, poolId = e.ConflictPoolId, restorable = e.Restorable, registered = e.Registered } };
     } catch (Exception e) {
       return new { ok = false, error = e.Message };
     }

@@ -157,6 +157,9 @@ without a real pool.
 ### 🔧 Pool Management
 - ✅ Create new storage pools with multiple drives
 - ✅ Delete existing pools with data preservation options
+- ✅ Forget a pool (remove from this machine's list, keep data + on-disk markers)
+- ✅ Recover an orphaned pool from a member folder's manifest mirror
+- ✅ Take a foreign-claimed folder over for a new pool (explicit consent)
 - ✅ Add drives to existing pools with automatic balancing
 - ✅ Remove drives with intelligent data migration
 - ✅ Replace drives with seamless data transfer
@@ -312,10 +315,15 @@ RAM→fast→capacity tier diagram with animated data flows, and per-member heal
 updated once a second while pools are mounted. From the same page you can run the
 **entire lifecycle**: create a pool (with typed local/remote members and a
 credential), mount / unmount, add or remove members, remove- and replace-media,
-run health / fix / restore, and delete (keep data) or purge (wipe data, guarded
-by a name-confirmation). The **desktop app** (`DriveBender.App`) is the same page
-in a native window — it launches the daemon for you, so web and desktop are
-identical.
+run health / fix / restore, **forget** a pool (drop it from this machine's list
+while leaving its data and on-disk markers intact, so it can be re-imported or
+recovered later), and delete (keep data) or purge (wipe data, guarded by a
+name-confirmation). If a chosen member folder is still claimed by another —
+possibly forgotten or otherwise invisible — pool, the UI offers to **restore**
+that pool from the manifest copy left in the folder, or **take the folder over**
+for the new one, instead of failing outright. The **desktop app**
+(`DriveBender.App`) is the same page in a native window — it launches the daemon
+for you, so web and desktop are identical.
 
 ### 5. Health & media maintenance
 

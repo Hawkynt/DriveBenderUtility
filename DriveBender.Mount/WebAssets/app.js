@@ -123,26 +123,68 @@ function card(pool) {
   add("Fix", "", () => op("/api/health?fix=true&pool=" + pool.id));
   add("Restore", "", () => op("/api/restore?pool=" + pool.id));
   add("Add member", "", () => addMemberDialog(pool));
+  if (pool.source === "manifest")
+    add("Forget", "", () => confirm(`Remove "${pool.name}" from this machine's list? Data and on-disk markers are kept — the pool can be restored or re-imported later.`) && op("/api/pool/forget?pool=" + pool.id));
   add("Delete", "danger", () => confirm(`Delete pool "${pool.name}"? The manifest is removed; your files are kept on disk.`) && op("/api/pool/delete?pool=" + pool.id));
   add("Purge", "danger", () => prompt(`PURGE wipes all data in "${pool.name}". Type the pool name to confirm:`) === pool.name && op("/api/pool/purge?pool=" + pool.id));
   return c;
 }
 
-async function op(url, body) {
+async function post(url, body) {
   try {
     const opts = { method: "POST", headers: { ...auth.headers } };
     if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
     const r = await fetch(url, opts);
-    const j = await r.json().catch(() => ({ ok: r.ok }));
-    if (!j.ok) {
-      if (j.needsPrereq && j.installable && confirm(`${j.error}\n\nInstall ${j.driver} now?`)) {
-        await installDriver();
-      } else {
-        alert("Failed: " + (j.error || r.status));
-      }
-    }
-    return j.ok;
-  } catch (e) { alert("Request failed: " + e); return false; }
+    return await r.json().catch(() => ({ ok: r.ok }));
+  } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+async function op(url, body) {
+  const j = await post(url, body);
+  if (!j.ok) {
+    if (j.needsPrereq && j.installable && confirm(`${j.error}\n\nInstall ${j.driver} now?`))
+      await installDriver();
+    else if (j.conflict)
+      conflictDialog(j.conflict, url, body);
+    else
+      alert("Failed: " + (j.error || ""));
+  }
+  return j.ok;
+}
+
+// A member folder is claimed by another (often orphaned/invisible) pool — offer to restore that
+// pool from the copy it left behind, or take the folder over for the pool we were creating.
+function conflictDialog(conflict, retryUrl, retryBody) {
+  const body = el("div");
+  body.innerHTML = `<p>The folder <b>${conflict.path}</b> already belongs to another pool
+    (<code>${conflict.poolId}</code>).${conflict.registered ? " It's already in your pool list." : ""}</p>
+    <p>${conflict.restorable
+      ? "You can restore that pool from the manifest copy still in the folder, or take the folder over for this pool."
+      : "Its manifest copy is gone, so it can't be restored — you can take the folder over for this pool."}</p>`;
+  const err = el("div", "err");
+  const actions = el("div", "modal-actions");
+  const cancel = el("button", null, "Cancel"); cancel.onclick = closeModal;
+  actions.appendChild(cancel);
+  if (conflict.restorable && !conflict.registered) {
+    const rec = el("button", "primary", "Restore old pool");
+    rec.onclick = async () => { if (await op("/api/pool/recover", { path: conflict.path })) closeModal(); else err.textContent = "Restore failed."; };
+    actions.appendChild(rec);
+  }
+  const take = el("button", conflict.restorable ? "danger" : "primary", "Use this folder anyway");
+  take.onclick = async () => {
+    const ok = retryUrl.includes("/pool/create")
+      ? await op(retryUrl, { ...retryBody, takeOver: true })
+      : await op(retryUrl + (retryUrl.includes("?") ? "&" : "?") + "takeover=true", retryBody);
+    if (ok) closeModal(); else err.textContent = "Could not take over the folder.";
+  };
+  actions.appendChild(take);
+  const root = document.getElementById("modal-root");
+  const overlay = el("div", "overlay");
+  const modal = el("div", "modal");
+  modal.append(el("h2", null, "Folder already in use"), body, err, actions);
+  overlay.appendChild(modal);
+  overlay.onclick = e => { if (e.target === overlay) closeModal(); };
+  root.innerHTML = ""; root.appendChild(overlay);
 }
 
 async function installDriver() {

@@ -79,6 +79,81 @@ public class PoolLifecycleTests {
   }
 
   [Test]
+  [Category("EdgeCase")]
+  public void Create_GivenFolderOwnedByAnotherPool_WhenConflict_ThenExposesRecoveryContext() {
+    this._host.AddDirectory(@"B:\test");
+    var other = this._lifecycle.Create("Other", [new(@"B:\test")], force: true); // writes marker + mirror + registry
+
+    var act = () => this._lifecycle.Create("MyPool", [new(@"B:\test")]);
+
+    var ex = act.Should().Throw<MemberClaimConflictException>().Which;
+    ex.ConflictPoolId.Should().Be(other.PoolId);
+    ex.Path.Should().Be(@"B:\test");
+    ex.Restorable.Should().BeTrue("a manifest mirror is present in the folder");
+    ex.Registered.Should().BeTrue("the claiming pool has a registry entry");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Create_GivenForeignFolderWithTakeOver_WhenCreated_ThenFolderReclaimedForTheNewPool() {
+    this._host.AddDirectory(@"B:\test");
+    var other = this._lifecycle.Create("Other", [new(@"B:\test")], force: true);
+
+    var mine = this._lifecycle.Create("MyPool", [new(@"B:\test")], takeOver: true);
+
+    mine.PoolId.Should().NotBe(other.PoolId);
+    this._store.TryLoadMarker(@"B:\test")!.PoolId.Should().Be(mine.PoolId, "take-over rewrites the marker to the new pool");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Forget_GivenManifestPool_WhenForgotten_ThenRegistryDroppedButMarkerAndDataKept() {
+    this._host.AddDirectory(@"B:\test");
+    this._host.AddFile(@"B:\test\keep.txt", "precious");
+    var manifest = this._lifecycle.Create("MyPool", [new(@"B:\test")], force: true);
+
+    this._lifecycle.Forget(manifest);
+
+    this._host.FileExists(this._store.RegistryPathFor(manifest.PoolId)).Should().BeFalse("forget drops the registry entry");
+    this._host.FileExists(ManifestStore.MarkerPathFor(@"B:\test")).Should().BeTrue("the on-media marker stays for later recovery");
+    this._host.TryGetFileContent(@"B:\test\keep.txt").Should().Be("precious", "data is never touched");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Recover_GivenOrphanedMemberMirror_WhenRecovered_ThenPoolReturnsToRegistry() {
+    this._host.AddDirectory(@"B:\test");
+    var created = this._lifecycle.Create("MyPool", [new(@"B:\test")], force: true);
+    this._lifecycle.Forget(created); // registry gone, mirror + marker remain — an orphan the list can't show
+
+    var recovered = this._lifecycle.Recover(@"B:\test");
+
+    recovered.PoolId.Should().Be(created.PoolId);
+    recovered.Name.Should().Be("MyPool");
+    this._host.FileExists(this._store.RegistryPathFor(created.PoolId)).Should().BeTrue("recover re-registers the pool");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Recover_GivenFolderWithoutMirror_WhenRecovered_ThenRefused() {
+    this._host.AddDirectory(@"B:\test");
+
+    var act = () => this._lifecycle.Recover(@"B:\test");
+
+    act.Should().Throw<ManifestException>().WithMessage("*no recoverable manifest*");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Forget_GivenNativePool_WhenForgotten_ThenRefused() {
+    var virtualManifest = new PoolManifest { PoolId = Guid.NewGuid(), Name = "Native", Members = [], IsVirtual = true };
+
+    var act = () => this._lifecycle.Forget(virtualManifest);
+
+    act.Should().Throw<ManifestException>().WithMessage("*native pool*");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public void Adopt_GivenNativePool_WhenAdopted_ThenExplicitManifestPersistedInPlace() {
     var poolId = Guid.NewGuid();
