@@ -310,12 +310,40 @@ public sealed class WinFspMountHost : IDisposable {
   private FileSystemHost? _host;
 
   /// <summary>True when the WinFsp runtime is installed on this machine.</summary>
+  /// <remarks>
+  /// Prefers the authoritative managed probe, but falls back to the registry/DLL the installer
+  /// writes. winfsp.net resolves the native DLL in a static initializer, so a long-lived process
+  /// that probed <em>before</em> WinFsp was installed poisons that type for its whole lifetime —
+  /// the on-disk fallback lets the daemon see a just-installed driver without a restart, while a
+  /// freshly-spawned mount child still loads the DLL normally.
+  /// </remarks>
   public static bool IsWinFspAvailable() {
     try {
-      return FileSystemHost.Version() != null;
+      if (FileSystemHost.Version() != null)
+        return true;
     } catch (DllNotFoundException) {
-      return false;
+      // fall through to the on-disk probe
     } catch (TypeInitializationException) {
+      // fall through to the on-disk probe
+    }
+
+    return _IsWinFspInstalledOnDisk();
+  }
+
+  private static bool _IsWinFspInstalledOnDisk() {
+    try {
+      var dllName = Environment.Is64BitOperatingSystem ? "winfsp-x64.dll" : "winfsp-x86.dll";
+      foreach (var view in new[] { Microsoft.Win32.RegistryView.Registry32, Microsoft.Win32.RegistryView.Registry64 }) {
+        using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, view);
+        using var key = baseKey.OpenSubKey(@"SOFTWARE\WinFsp");
+        if (key?.GetValue("InstallDir") is string dir && dir.Length > 0 && File.Exists(Path.Combine(dir, "bin", dllName)))
+          return true;
+      }
+
+      // registry aside, the installer's default location is the reliable last resort
+      var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+      return programFilesX86.Length > 0 && File.Exists(Path.Combine(programFilesX86, "WinFsp", "bin", dllName));
+    } catch (Exception) {
       return false;
     }
   }
