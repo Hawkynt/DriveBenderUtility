@@ -105,8 +105,10 @@ function buildFlowmap(wrap, pool, fast, cap) {
     pos[mm.id] = { x, y, w: 86, h: 30 };
     const name = leafName(mm.label || mm.path);
     return `<g class="fnode ${mm.online ? "" : "off"}"><rect x="${x}" y="${y}" width="86" height="30" rx="7"/>
-      <text x="${x + 43}" y="${y + 13}" text-anchor="middle">${mm.online ? "" : "⚠"}${esc(name.length > 12 ? name.slice(0, 11) + "…" : name)}</text>
-      <text class="lat" data-lat="${mm.id}" x="${x + 43}" y="${y + 25}" text-anchor="middle"></text></g>`;
+      <text x="${x + 43}" y="${y + 12}" text-anchor="middle">${mm.online ? "" : "⚠"}${esc(name.length > 12 ? name.slice(0, 11) + "…" : name)}</text>
+      <text class="lat" data-lat="${mm.id}" x="${x + 43}" y="${y + 21}" text-anchor="middle"></text>
+      <rect class="filltrack" x="${x + 4}" y="${y + 24}" width="78" height="3" rx="1.5"/>
+      <rect class="nodefill" data-fill="${mm.id}" x="${x + 4}" y="${y + 24}" width="0" height="3" rx="1.5"/></g>`;
   };
   const fastBoxes = fast.map((mm, i) => memberBox(mm, 177, 8 + i * 38)).join("");
   const capBoxes = cap.map((mm, i) => memberBox(mm, 295, 8 + i * 38)).join("");
@@ -128,8 +130,10 @@ function buildFlowmap(wrap, pool, fast, cap) {
   const svgEl = wrap.querySelector("svg");
   const latEls = {};
   svgEl.querySelectorAll("[data-lat]").forEach(t => latEls[t.dataset.lat] = t);
+  const fillEls = {};
+  svgEl.querySelectorAll("[data-fill]").forEach(r => fillEls[r.dataset.fill] = r);
   return {
-    sig: null, svg: svgEl, pos, latEls,
+    sig: null, svg: svgEl, pos, latEls, fillEls,
     cacheSub: svgEl.querySelector("[data-cachesub]"),
     firstFast: fast.length ? fast[0].id : null,
     firstCap: cap.length ? cap[0].id : null,
@@ -161,6 +165,13 @@ function updateFlowmap(wrap, pool) {
   pool.members.forEach(mm => {
     const t = st.latEls[mm.id];
     if (t) t.textContent = !mm.online ? "offline" : lat[mm.id] != null ? lat[mm.id].toFixed(1) + " ms" : "";
+    // live fill level inside the node: used vs free of this storage's volume
+    const f = st.fillEls[mm.id];
+    if (f && mm.bytesTotal > 0) {
+      const frac = (mm.bytesTotal - mm.bytesFree) / mm.bytesTotal;
+      f.setAttribute("width", Math.max(0, Math.min(78, Math.round(frac * 78))));
+      f.style.fill = usageColor(frac);
+    }
   });
   if (st.cacheSub) st.cacheSub.textContent = (m.dirtyFiles || 0) > 0 ? m.dirtyFiles + " dirty" : "cache";
   if (!pool.mounted) return;
@@ -271,6 +282,8 @@ function credPayload(kind, v) {
   }
 }
 
+function usageColor(frac) { return frac > 0.9 ? "var(--bad)" : frac > 0.75 ? "var(--warn)" : "var(--ok)"; }
+
 function memberRow(pool, m) {
   const row = el("div", "member");
   row.innerHTML = `<span class="status ${m.online ? "" : "off"}"></span>
@@ -292,6 +305,15 @@ function memberRow(pool, m) {
   scatter.onclick = () => confirm(`Remove member "${m.label || m.path}"? Its data is scattered to the other members first.`)
     && op(`/api/pool/remove-member?pool=${pool.id}&member=${encodeURIComponent(m.id)}`);
   row.appendChild(scatter);
+
+  // fill level: how full this storage's volume is (used vs free)
+  if (m.bytesTotal > 0) {
+    const used = m.bytesTotal - m.bytesFree;
+    const frac = used / m.bytesTotal;
+    row.appendChild(el("div", "fillbar",
+      `<span style="width:${Math.min(100, Math.round(frac * 100))}%;background:${usageColor(frac)}"></span>
+       <i>${fmtBytes(used)} used · ${fmtBytes(m.bytesFree)} free</i>`));
+  }
   return row;
 }
 

@@ -71,6 +71,15 @@ main { padding: 22px; max-width: 1200px; margin: 0 auto; }
 .member .role { color: var(--muted); margin-left: auto; }
 .member .role-select { margin-left: auto; background: var(--panel); color: var(--muted); border: 1px solid var(--line);
   border-radius: 6px; font-size: 11px; padding: 2px 4px; }
+.member { flex-wrap: wrap; }
+.member .fillbar { flex-basis: 100%; height: 6px; background: var(--panel); border-radius: 999px; margin-top: 4px; position: relative; overflow: visible; }
+.member .fillbar > span { display: block; height: 100%; border-radius: 999px; transition: width .6s cubic-bezier(.4,0,.2,1); }
+.member .fillbar > i { position: absolute; right: 0; top: 7px; font-size: 9.5px; font-style: normal; color: var(--muted); }
+.member:has(.fillbar) { padding-bottom: 18px; }
+
+/* flow-map node fill level */
+.flowmap .filltrack { fill: var(--panel); }
+.flowmap .nodefill { fill: var(--ok); transition: width .6s; }
 .member .status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
 .member .status.off { background: var(--bad); }
 

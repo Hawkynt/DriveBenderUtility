@@ -81,10 +81,16 @@ internal sealed class ServeCommand(
       HttpListenerContext context;
       try {
         context = listener.GetContext();
-      } catch (Exception) {
-        if (stop.IsSet || !listener.IsListening)
-          return; // rebuild (or stop) handled by the caller
-        throw;    // unexpected — let Run rebuild the listener
+      } catch (Exception e) {
+        if (stop.IsSet)
+          return;
+        if (!listener.IsListening)
+          throw; // the listener itself broke — Run rebuilds it
+
+        // transient accept failure (client aborted mid-handshake etc.): keep THIS listener —
+        // rebuilding would tear down every live SSE stream and show "reconnecting…" in the UI
+        DriveBender.Logger($"[Warning]management accept failed: {e.Message}");
+        continue;
       }
 
       // the SSE stream blocks for the life of the connection; run it on a DEDICATED thread so it
@@ -242,13 +248,18 @@ internal sealed class ServeCommand(
           bytesTotal = health.BytesTotal,
           failureDomains = health.IndependentFailureDomains,
           warnings = health.Warnings,
-          members = health.Members.Select(m => new {
-            id = m.MemberId,
-            path = m.ResolvedPath,
-            label = m.Label,
-            role = m.Role.ToString().ToLowerInvariant(),
-            online = m.Online,
-            network = m.Network,
+          members = health.Members.Select(m => {
+            var (free, total) = _MemberSpace(m);
+            return new {
+              id = m.MemberId,
+              path = m.ResolvedPath,
+              label = m.Label,
+              role = m.Role.ToString().ToLowerInvariant(),
+              online = m.Online,
+              network = m.Network,
+              bytesFree = free,
+              bytesTotal = total,
+            };
           }),
           metrics = metrics == null ? null : new {
             metrics.ReadBytes,
@@ -297,6 +308,19 @@ internal sealed class ServeCommand(
     var trimmed = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     var leaf = Path.GetFileName(trimmed);
     return leaf.Length > 0 ? leaf : path; // volume roots (e.g. "C:\") have no leaf — show the root itself
+  }
+
+  /// <summary>Free/total bytes of the volume under a member (0/0 when offline, remote or unprobeable).</summary>
+  private (long free, long total) _MemberSpace(PoolMember member) {
+    if (!member.Online || member.Network)
+      return (0, 0);
+
+    try {
+      var identity = host.GetVolumeIdentity(member.ResolvedPath);
+      return (identity.BytesFree, identity.BytesTotal);
+    } catch (Exception) {
+      return (0, 0);
+    }
   }
 
   /// <summary>The pool-wide duplication level from the manifest defaults (1 when unset).</summary>
