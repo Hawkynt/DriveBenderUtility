@@ -121,9 +121,10 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
 /// durable intent before touching disk and a completion record after, so a crash at any
 /// instant is recoverable to a consistent state. Replay is idempotent (SAFE-IDEMP).
 /// </summary>
-public sealed class Journal(IJournalStore store) {
+public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
 
   private readonly Lock _lock = new();
+  private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
   private long _nextSequence;
   private bool _loaded;
 
@@ -131,7 +132,9 @@ public sealed class Journal(IJournalStore store) {
   // at rest it holds only open entries (completed history is redundant once its mutation is durable)
   private readonly HashSet<long> _open = [];
   private int _completedSinceCompact;
+  private DateTime _lastCompactUtc = DateTime.MinValue;
   private const int _COMPACT_THRESHOLD = 512; // bound growth under sustained load that never quiesces
+  private static readonly TimeSpan _COMPACT_MIN_INTERVAL = TimeSpan.FromSeconds(5); // amortized: a per-chunk quiesce during a large copy must not rewrite per write
 
   private static readonly JsonSerializerOptions _OPTIONS = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault };
 
@@ -173,16 +176,20 @@ public sealed class Journal(IJournalStore store) {
       this._open.Remove(sequence);
       ++this._completedSinceCompact;
 
-      // once every logged mutation has completed, the log carries no open work — clear it so it
-      // only ever accumulates genuinely-open entries; otherwise bound growth by periodic compaction
-      if (this._open.Count == 0) {
+      // compaction keeps the at-rest journal down to its open entries — but AMORTIZED: a large
+      // sequential copy quiesces after every chunk, and rewriting the journal on each of those
+      // starves the data path (the disk ends up writing journals instead of the file)
+      var now = this._clock();
+      if (this._open.Count == 0 && now - this._lastCompactUtc >= _COMPACT_MIN_INTERVAL) {
         store.Rewrite([]);
         this._completedSinceCompact = 0;
+        this._lastCompactUtc = now;
       } else if (this._completedSinceCompact >= _COMPACT_THRESHOLD) {
         store.Rewrite(this.ReadAll()
           .Where(r => !r.Completed && this._open.Contains(r.Sequence))
           .Select(r => JsonSerializer.Serialize(r, _OPTIONS)));
         this._completedSinceCompact = 0;
+        this._lastCompactUtc = now;
       }
     }
   }

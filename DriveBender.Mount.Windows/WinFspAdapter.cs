@@ -25,9 +25,13 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
 
   private static string _ToPoolPath(string fileName) => fileName.Replace('\\', '/').Trim('/');
 
+  private const int STATUS_DEVICE_NOT_READY = unchecked((int)0xC00000A3);
+
   private static int _Translate(PoolFsException e) => e.Error switch {
     PoolFsError.NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
     PoolFsError.AccessDenied => STATUS_ACCESS_DENIED,
+    // a member offline / ack quorum not met is a "device not ready", not an anonymous I/O error
+    PoolFsError.Offline => STATUS_DEVICE_NOT_READY,
     PoolFsError.Exists => STATUS_OBJECT_NAME_COLLISION,
     PoolFsError.NotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
     PoolFsError.NoSpace => STATUS_DISK_FULL,

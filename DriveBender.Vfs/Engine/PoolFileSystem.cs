@@ -453,6 +453,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       }
 
       this._integrity.RecordWholeFile(target, normalized, true, content);
+      this._activity.Publish(ActivityKind.Duplicate, normalized, content.LongLength,
+        fromMember: holders.Count > 0 ? holders[0].DisplayName : null, toMember: target.DisplayName,
+        reason: $"duplication level {duplication}");
       holders.Add(target);
     }
   }
@@ -670,7 +673,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
-      var length = this._writeBuffer.OverlayLength(path, copies[0].Volume.Stat(path, copies[0].Shadow)?.Length ?? 0);
+      var length = this._writeBuffer.OverlayLength(path, _StatAnyCopy(copies, path)?.Length ?? 0);
       if (offset >= length)
         return 0; // reads past EOF return 0 bytes (FR-READ)
 
@@ -701,6 +704,24 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   private void _ReadRange(string path, IReadOnlyList<PhysicalCopy> copies, Span<byte> buffer, long offset, bool mirrorSplit) {
     var blockSize = this._cache.Pages.BlockSize;
+
+    // FR-MIRROR: a large read pulls its uncached blocks from MULTIPLE copies CONCURRENTLY — each
+    // copy serves different offsets, so independent disks add up their throughput
+    if (mirrorSplit && copies.Count > 1) {
+      var missing = new List<long>();
+      for (var blockIndex = offset / blockSize; blockIndex <= (offset + buffer.Length - 1) / blockSize; ++blockIndex)
+        if (!this._cache.Pages.TryGet(new(this._poolId, path, blockIndex), out _))
+          missing.Add(blockIndex);
+
+      if (missing.Count > 1)
+        try {
+          Parallel.ForEach(missing, new ParallelOptions { MaxDegreeOfParallelism = copies.Count },
+            blockIndex => this._LoadBlock(path, copies, blockIndex, mirrorSplit: true));
+        } catch (AggregateException e) when (e.InnerExceptions.OfType<PoolFsException>().FirstOrDefault() is { } inner) {
+          throw inner;
+        }
+    }
+
     var written = 0;
     while (written < buffer.Length) {
       var absolute = offset + written;
@@ -721,12 +742,46 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._cache.Pages.TryGet(key, out var cached))
       return cached;
 
-    // mirror block routing (FR-MIRROR): large reads alternate blocks across copies
-    var copy = mirrorSplit && copies.Count > 1
-      ? copies[(int)(blockIndex % copies.Count)]
-      : copies[0];
+    // mirror block routing (FR-MIRROR): large reads alternate blocks across copies; when the
+    // routed copy fails mid-read (dying disk, vanished member) every other copy is tried before
+    // the read is allowed to fail — a duplicated file survives losing a storage DURING the read
+    var preferred = mirrorSplit && copies.Count > 1 ? (int)(blockIndex % copies.Count) : 0;
+    PoolFsException? lastError = null;
+    for (var attempt = 0; attempt < copies.Count; ++attempt) {
+      var copy = copies[(preferred + attempt) % copies.Count];
+      byte[] block;
+      try {
+        block = _ReadBlockFrom(copy, path, blockIndex, this._cache.Pages.BlockSize);
+      } catch (PoolFsException e) {
+        lastError = e;
+        continue;
+      }
 
-    var blockSize = this._cache.Pages.BlockSize;
+      if (attempt > 0)
+        this._activity.Publish(ActivityKind.Recovery, path, block.Length, fromMember: copy.Volume.DisplayName,
+          reason: "read failover — a copy failed mid-read, another one served the block");
+
+      this._cache.Pages.Put(key, block);
+      return block;
+    }
+
+    throw lastError ?? new PoolFsException(PoolFsError.IoError, $"No copy of '{path}' could be read");
+  }
+
+  /// <summary>Stat with failover: any surviving copy answers when the first one's storage just died.</summary>
+  private static FileMeta? _StatAnyCopy(IReadOnlyList<PhysicalCopy> copies, string path) {
+    PoolFsException? lastError = null;
+    foreach (var copy in copies)
+      try {
+        return copy.Volume.Stat(path, copy.Shadow);
+      } catch (PoolFsException e) {
+        lastError = e;
+      }
+
+    throw lastError ?? new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
+  }
+
+  private static byte[] _ReadBlockFrom(PhysicalCopy copy, string path, long blockIndex, int blockSize) {
     using var stream = copy.Volume.OpenRead(path, copy.Shadow);
     stream.Seek(blockIndex * blockSize, SeekOrigin.Begin);
     var block = new byte[blockSize];
@@ -742,7 +797,6 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (total < blockSize)
       Array.Resize(ref block, total);
 
-    this._cache.Pages.Put(key, block);
     return block;
   }
 
@@ -809,6 +863,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // deferred: the intent stays open until the owed copies are applied, so a crash
       // in the gap reconciles from the durable primary) (SAFE-ORDER, FR-WT, FR-WB)
       var sequence = this._journal.LogIntent(JournalOp.Write, path, offset: offset, length: bytes.Length);
+      var mirroredNow = requiredCopies > 1;
       for (var i = 0; i < requiredCopies; ++i) {
         var copy = copies[i];
         using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
@@ -828,6 +883,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           stream.Seek(offset, SeekOrigin.Begin);
           stream.Write(bytes, 0, bytes.Length);
           stream.Flush();
+          mirroredNow = true;
         }
 
         this._journal.Complete(sequence, JournalOp.Write);
@@ -840,12 +896,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           stream.Seek(offset, SeekOrigin.Begin);
           stream.Write(bytes, 0, bytes.Length);
           stream.Flush();
+          mirroredNow = true;
         }
 
         this._journal.Complete(sequence, JournalOp.Write);
       }
 
       this._activity.Publish(ActivityKind.Write, path, bytes.Length, toMember: copies.Count > 0 ? copies[0].Volume.DisplayName : null, reason: policy.ToString());
+      // the mirrored copy is its own visible movement (FR-UI-MAP: the duplicate leg to the second member)
+      if (mirroredNow && copies.Count > 1)
+        this._activity.Publish(ActivityKind.Duplicate, path, bytes.Length, fromMember: copies[0].Volume.DisplayName, toMember: copies[1].Volume.DisplayName, reason: "mirrored write");
 
       // coherency: a read after this write must return the new bytes (SAFE-COHERE)
       this._integrity.InvalidateFile(path);

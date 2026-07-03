@@ -28,6 +28,8 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
     PoolFsError.InvalidArgument => DokanResult.InvalidParameter,
     PoolFsError.NotADirectory => DokanResult.NotADirectory,
     PoolFsError.IsADirectory => DokanResult.AccessDenied,
+    // a member offline / ack quorum not met is a "device not ready", not an anonymous error
+    PoolFsError.Offline => (NtStatus)unchecked((int)0xC00000A3),
     _ => DokanResult.Error,
   };
 
