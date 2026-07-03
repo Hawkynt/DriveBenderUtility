@@ -568,12 +568,19 @@ function mountPool(pool) {
 }
 
 async function post(url, body) {
-  try {
-    const opts = { method: "POST", headers: { ...auth.headers } };
-    if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
-    const r = await fetch(url, opts);
-    return await r.json().catch(() => ({ ok: r.ok }));
-  } catch (e) { return { ok: false, error: String(e) }; }
+  // one silent retry through a transient gap (e.g. the daemon restarting on its stable port):
+  // a network-level "Failed to fetch" is retried after a short pause before it ever surfaces
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const opts = { method: "POST", headers: { ...auth.headers } };
+      if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+      const r = await fetch(url, opts);
+      return await r.json().catch(() => ({ ok: r.ok }));
+    } catch (e) {
+      if (attempt === 0) { await new Promise(res => setTimeout(res, 1200)); continue; }
+      return { ok: false, error: "the manager service is momentarily unavailable — please retry" };
+    }
+  }
 }
 
 async function op(url, body) {

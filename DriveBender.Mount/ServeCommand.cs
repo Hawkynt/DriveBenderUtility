@@ -33,44 +33,67 @@ internal sealed class ServeCommand(
   private string _token = "";
 
   public int Run(ServeOptions options) {
-    this._token = _NewToken();
+    // a fixed token (from the desktop shell) keeps the URL stable across a daemon restart, so the
+    // page's SSE/fetches just resume and open dialogs survive; else a fresh per-session token
+    this._token = string.IsNullOrWhiteSpace(options.Token) ? _NewToken() : options.Token!;
     var prefix = $"http://127.0.0.1:{options.Port}/";
-    using var listener = new HttpListener();
-    listener.Prefixes.Add(prefix);
-    try {
-      listener.Start();
-    } catch (HttpListenerException e) {
-      Console.Error.WriteLine($"Could not bind {prefix}: {e.Message}");
-      return 1;
-    }
-
-    var url = $"{prefix}?token={this._token}";
-    Console.WriteLine($"Management UI: {url}");
-    if (options.OpenBrowser)
-      _TryOpenBrowser(url);
 
     using var stop = new ManualResetEventSlim();
-    Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Set(); listener.Stop(); };
+    var announced = false;
 
+    // the listener is self-healing: if HTTP.sys drops it we rebuild and keep serving instead of
+    // exiting the process — an exit would force the desktop shell to reload and lose UI state
+    while (!stop.IsSet) {
+      using var listener = new HttpListener();
+      listener.Prefixes.Add(prefix);
+      try {
+        listener.Start();
+      } catch (HttpListenerException e) {
+        Console.Error.WriteLine($"Could not bind {prefix}: {e.Message}");
+        return 1;
+      }
+
+      if (!announced) {
+        var url = $"{prefix}?token={this._token}";
+        Console.WriteLine($"Management UI: {url}");
+        if (options.OpenBrowser)
+          _TryOpenBrowser(url);
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Set(); try { listener.Stop(); } catch { } };
+        announced = true;
+      }
+
+      try {
+        this._Accept(listener, stop);
+      } catch (Exception e) {
+        if (stop.IsSet)
+          break;
+
+        DriveBender.Logger($"[Warning]listener died ({e.Message}) — rebuilding");
+        Thread.Sleep(250); // let HTTP.sys settle before rebinding
+      }
+    }
+
+    return 0;
+  }
+
+  private void _Accept(HttpListener listener, ManualResetEventSlim stop) {
     while (!stop.IsSet) {
       HttpListenerContext context;
       try {
         context = listener.GetContext();
-      } catch (Exception e) {
-        // only a requested stop ends the daemon — a transient accept failure (aborted
-        // connection etc.) must never silently kill it, or every client is stuck "reconnecting"
+      } catch (Exception) {
         if (stop.IsSet || !listener.IsListening)
-          break;
-
-        DriveBender.Logger($"[Warning]management accept failed: {e.Message}");
-        continue;
+          return; // rebuild (or stop) handled by the caller
+        throw;    // unexpected — let Run rebuild the listener
       }
 
-      // each request handled on the thread pool so the SSE stream doesn't block the API
-      ThreadPool.QueueUserWorkItem(_ => this._Handle(context));
+      // the SSE stream blocks for the life of the connection; run it on a DEDICATED thread so it
+      // can never starve the request thread pool. Short requests stay on the pool.
+      if ((context.Request.Url?.AbsolutePath ?? "") == "/api/stream")
+        new Thread(() => this._Handle(context)) { IsBackground = true }.Start();
+      else
+        ThreadPool.QueueUserWorkItem(_ => this._Handle(context));
     }
-
-    return 0;
   }
 
   private void _Handle(HttpListenerContext context) {
@@ -309,16 +332,31 @@ internal sealed class ServeCommand(
     context.Response.ContentType = "text/event-stream";
     context.Response.Headers.Add("Cache-Control", "no-cache");
     context.Response.SendChunked = true;
-    using var writer = new StreamWriter(context.Response.OutputStream, new UTF8Encoding(false));
     try {
-      while (true) {
-        var frame = JsonSerializer.Serialize(this._Pools(), _Json);
-        writer.Write($"data: {frame}\n\n");
-        writer.Flush();
-        Thread.Sleep(1000); // 1 Hz live feed (NFR-UI-LIVE)
+      using var writer = new StreamWriter(context.Response.OutputStream, new UTF8Encoding(false));
+      writer.Write("retry: 1000\n\n"); // reconnect within 1s if the daemon restarts (stable URL)
+      writer.Flush();
+      try {
+        while (true) {
+          string frame;
+          try {
+            frame = JsonSerializer.Serialize(this._Pools(), _Json);
+          } catch (Exception e) {
+            // a slow/blocked member must not break the whole feed — skip this tick
+            DriveBender.Logger($"[Warning]metrics frame skipped: {e.Message}");
+            Thread.Sleep(1000);
+            continue;
+          }
+
+          writer.Write($"data: {frame}\n\n");
+          writer.Flush(); // throws once the client is gone → ends the stream
+          Thread.Sleep(1000); // 1 Hz live feed (NFR-UI-LIVE)
+        }
+      } catch (Exception) {
+        // client disconnected — normal
       }
     } catch (Exception) {
-      // client disconnected
+      // response already torn down; nothing to clean up
     }
   }
 

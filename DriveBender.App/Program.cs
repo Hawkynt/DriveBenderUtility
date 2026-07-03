@@ -14,6 +14,11 @@ internal static class Program {
   private static Process? _daemon;
   private static volatile bool _closing;
 
+  // a stable port + token for this app session: a daemon restart reuses BOTH, so the URL is
+  // unchanged, the page's EventSource/fetches just resume, and open dialogs are never lost
+  private static int _port;
+  private static readonly string _token = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+
   [STAThread]
   private static int Main(string[] args) {
     var dbmount = _LocateDbmount();
@@ -22,6 +27,7 @@ internal static class Program {
       return 1;
     }
 
+    _port = _FreeLoopbackPort();
     var url = _LaunchDaemon(dbmount);
     if (url == null) {
       Console.Error.WriteLine("The management daemon did not report a URL in time.");
@@ -37,8 +43,10 @@ internal static class Program {
       .SetResizable(true)
       .Load(new Uri(url));
 
-    // supervise the daemon: if it ever dies while the window is open, relaunch it and point the
-    // WebView at the fresh URL (new port + token) — otherwise the UI is stuck at "reconnecting…"
+    // supervise the daemon: if it ever dies while the window is open, relaunch it on the SAME
+    // port + token. The URL is unchanged, so the WebView is NOT reloaded — the page's own
+    // EventSource reconnects and pending requests retry, leaving any open dialog untouched.
+    // Only when the port had to change (e.g. it was stuck) do we navigate to the new URL.
     new Thread(() => {
       while (!_closing) {
         try {
@@ -52,15 +60,23 @@ internal static class Program {
 
         var fresh = _LaunchDaemon(dbmount);
         if (fresh == null) {
-          Thread.Sleep(3000); // relaunch failed (port race / transient) — retry
-          continue;
+          // same port failed to bind — pick a new one and reload (rare)
+          _port = _FreeLoopbackPort();
+          fresh = _LaunchDaemon(dbmount);
+          if (fresh == null) {
+            Thread.Sleep(3000);
+            continue;
+          }
         }
 
+        if (fresh == url)
+          continue; // stable URL — the live page recovers on its own, no reload, dialogs kept
+
+        url = fresh;
         try {
           window.Invoke(() => window.Load(new Uri(fresh)));
         } catch (Exception) {
-          // window is closing
-          return;
+          return; // window is closing
         }
       }
     }) { IsBackground = true, Name = "daemon-supervisor" }.Start();
@@ -75,12 +91,12 @@ internal static class Program {
     return 0;
   }
 
-  /// <summary>Starts <c>dbmount serve</c> and returns its tokenised URL (null on timeout).</summary>
+  /// <summary>Starts <c>dbmount serve</c> on the session port+token and returns its URL (null on failure).</summary>
   private static string? _LaunchDaemon(string dbmount) {
-    var port = _FreeLoopbackPort();
     var daemon = new Process {
       StartInfo = new(dbmount.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? "dotnet" : dbmount) {
         RedirectStandardOutput = true,
+        RedirectStandardError = true,
         UseShellExecute = false,
         CreateNoWindow = true,
       },
@@ -89,7 +105,9 @@ internal static class Program {
       daemon.StartInfo.ArgumentList.Add(dbmount);
     daemon.StartInfo.ArgumentList.Add("serve");
     daemon.StartInfo.ArgumentList.Add("--port");
-    daemon.StartInfo.ArgumentList.Add(port.ToString());
+    daemon.StartInfo.ArgumentList.Add(_port.ToString());
+    daemon.StartInfo.ArgumentList.Add("--token");
+    daemon.StartInfo.ArgumentList.Add(_token);
 
     string? url = null;
     using var ready = new ManualResetEventSlim();
@@ -111,6 +129,9 @@ internal static class Program {
     }
 
     daemon.BeginOutputReadLine();
+    // if the daemon exits early (e.g. port bind failure) stop waiting immediately
+    daemon.Exited += (_, _) => ready.Set();
+    daemon.EnableRaisingEvents = true;
     _daemon = daemon;
     return ready.Wait(TimeSpan.FromSeconds(15)) ? url : null;
   }

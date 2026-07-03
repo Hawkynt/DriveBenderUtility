@@ -190,6 +190,9 @@ public sealed class ServeOptions {
 
   [Option("open", HelpText = "Open the UI in the default browser.")]
   public bool OpenBrowser { get; set; }
+
+  [Option("token", HelpText = "Fixed bearer token (the desktop shell passes a stable one so a daemon restart keeps the same URL, and open dialogs survive).")]
+  public string? Token { get; set; }
 }
 
 [Verb("unmount", HelpText = "Unmount a mounted pool.")]
