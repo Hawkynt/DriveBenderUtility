@@ -11,6 +11,12 @@ public sealed record ActivityRow(string Kind, string Path, long Bytes, string? F
 public sealed record MemberLatencyRow(Guid MemberId, double AvgMs, long Samples);
 
 /// <summary>
+/// One member's live free/total space, tracked by the POOL and published in the snapshot — the
+/// manager reads this instead of probing disks itself (the pool already refreshes it cyclically).
+/// </summary>
+public sealed record MemberSpaceRow(Guid MemberId, bool Online, long BytesFree, long BytesTotal);
+
+/// <summary>
 /// A mounted pool's live metrics + recent activity, published each second by the mount
 /// process to the config dir so the <c>serve</c> daemon can stream it to the web UI
 /// without hosting the engine itself (§6.13 the GUI talks to the daemon over a local API).
@@ -37,6 +43,7 @@ public sealed record MetricsSnapshot {
   public required string StampUtc { get; init; }
   public IReadOnlyList<ActivityRow> RecentActivity { get; init; } = [];
   public IReadOnlyList<MemberLatencyRow> MemberLatencies { get; init; } = [];
+  public IReadOnlyList<MemberSpaceRow> MemberSpace { get; init; } = [];
 }
 
 /// <summary>Writes/reads the per-pool metrics snapshot files the daemon aggregates.</summary>
@@ -70,6 +77,10 @@ public sealed class MetricsPublisher(IHostEnvironment host) {
       MemberLatencies = members == null
         ? []
         : [.. members.OfType<MeasuredVolumeIO>().Select(m => new MemberLatencyRow(m.MemberId, Math.Round(m.AverageLatencyMs, 2), m.Samples))],
+      // per-member free/total from the engine's own live view — no disk probing needed downstream
+      MemberSpace = members == null
+        ? []
+        : [.. members.Select(m => new MemberSpaceRow(m.MemberId, m.IsOnline, m.IsOnline ? m.BytesFree : 0, m.IsOnline ? m.BytesTotal : 0))],
     };
 
     try {

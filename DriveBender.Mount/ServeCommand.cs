@@ -32,6 +32,18 @@ internal sealed class ServeCommand(
   private readonly MetricsPublisher _metrics = new(host);
   private string _token = "";
 
+  // the manager MANAGES; it does not probe. One background sampler builds the live frame off the
+  // client path and caches it as JSON — every SSE client and /api/pools just ship this cache, so a
+  // client connection can never stall on a drive scan. Discovery (the expensive drive walk) is
+  // cached separately and refreshed slowly; a mounted pool's per-storage space comes from the
+  // pool's own published snapshot, never a fresh disk probe here.
+  private volatile string _frameJson = "{\"pools\":[]}";
+  private readonly Lock _discoLock = new();
+  private DateTime _discoAtUtc = DateTime.MinValue;
+  private IReadOnlyList<DiscoveredPool>? _disco;
+
+  private sealed record DiscoveredPool(PoolRef Pool, PoolHealth Health, IReadOnlyDictionary<Guid, (long free, long total)> MemberSpace);
+
   public int Run(ServeOptions options) {
     // a fixed token (from the desktop shell) keeps the URL stable across a daemon restart, so the
     // page's SSE/fetches just resume and open dialogs survive; else a fresh per-session token
@@ -40,6 +52,9 @@ internal sealed class ServeCommand(
 
     using var stop = new ManualResetEventSlim();
     var announced = false;
+
+    // the single frame sampler runs for the whole daemon lifetime, independent of any client
+    new Thread(() => this._Sampler(stop)) { IsBackground = true, Name = "frame-sampler" }.Start();
 
     // the listener is self-healing: if HTTP.sys drops it we rebuild and keep serving instead of
     // exiting the process — an exit would force the desktop shell to reload and lose UI state
@@ -125,7 +140,7 @@ internal sealed class ServeCommand(
           this._ServeAsset(context, "styles.css", "text/css; charset=utf-8");
           break;
         case "/api/pools":
-          this._WriteJson(context, this._Pools());
+          this._WriteRawJson(context, this._frameJson); // the sampler's cached frame — no collection on this request
           break;
         case "/api/fs/list":
           this._WriteJson(context, this._FsList(request));
@@ -226,13 +241,48 @@ internal sealed class ServeCommand(
     return request.QueryString["token"] == this._token;
   }
 
-  /// <summary>Live pool DTOs: health from Inspect (always current) merged with the mounted-pool metrics snapshot.</summary>
-  private object _Pools() {
+  /// <summary>Rebuilds the cached live frame once per second off the client path (never blocks a stream).</summary>
+  private void _Sampler(ManualResetEventSlim stop) {
+    while (!stop.IsSet) {
+      try {
+        this._frameJson = JsonSerializer.Serialize(this._BuildFrame(), _Json);
+      } catch (Exception e) {
+        DriveBender.Logger($"[Warning]dashboard sampler tick failed (last frame kept): {e.Message}");
+      }
+
+      stop.Wait(TimeSpan.FromSeconds(1));
+    }
+  }
+
+  /// <summary>Discovery + health + per-member space, cached and refreshed slowly — the expensive drive walk runs at most every few seconds regardless of how many clients are connected.</summary>
+  private IReadOnlyList<DiscoveredPool> _Discovery() {
+    lock (this._discoLock)
+      if (this._disco != null && DateTime.UtcNow - this._discoAtUtc < TimeSpan.FromSeconds(3))
+        return this._disco;
+
+    var built = provider.Discover().Select(pool => {
+      var health = provider.Inspect(pool);
+      var space = health.Members.ToDictionary(m => m.MemberId, m => this._MemberSpace(m));
+      return new DiscoveredPool(pool, health, space);
+    }).ToArray();
+
+    lock (this._discoLock) {
+      this._disco = built;
+      this._discoAtUtc = DateTime.UtcNow;
+    }
+
+    return built;
+  }
+
+  /// <summary>Live pool DTOs: slowly-cached discovery merged with the mounted pool's own published snapshot (space + metrics).</summary>
+  private object _BuildFrame() {
     var mounted = mountRegistry.List().ToDictionary(m => m.PoolId);
     return new {
-      pools = provider.Discover().Select(pool => {
-        var health = provider.Inspect(pool);
-        var metrics = mounted.ContainsKey(pool.PoolId) ? this._metrics.TryRead(pool.PoolId) : null;
+      pools = this._Discovery().Select(d => {
+        var (pool, health, discoveredSpace) = d;
+        var snapshot = mounted.ContainsKey(pool.PoolId) ? this._metrics.TryRead(pool.PoolId) : null;
+        // mounted → the POOL reports each storage's live space; unmounted → the slow discovery probe
+        var liveSpace = snapshot?.MemberSpace.ToDictionary(s => s.MemberId) ?? [];
         return new {
           id = pool.PoolId,
           name = pool.Name,
@@ -244,12 +294,14 @@ internal sealed class ServeCommand(
           allowSamePhysical = _AllowSamePhysicalOf(pool.Manifest),
           autoLandingZone = _PlacementFlagOf(pool.Manifest, "autoLandingZone"),
           placementStrategy = _PlacementStringOf(pool.Manifest, "strategy") ?? "most-free-space",
-          bytesFree = health.BytesFree,
-          bytesTotal = health.BytesTotal,
+          bytesFree = snapshot?.BytesFree ?? health.BytesFree,
+          bytesTotal = snapshot?.BytesTotal ?? health.BytesTotal,
           failureDomains = health.IndependentFailureDomains,
           warnings = health.Warnings,
           members = health.Members.Select(m => {
-            var (free, total) = _MemberSpace(m);
+            var hasLive = liveSpace.TryGetValue(m.MemberId, out var live);
+            var free = hasLive ? live!.BytesFree : discoveredSpace.TryGetValue(m.MemberId, out var f) ? f.free : 0;
+            var total = hasLive ? live!.BytesTotal : discoveredSpace.TryGetValue(m.MemberId, out var t) ? t.total : 0;
             return new {
               id = m.MemberId,
               path = m.ResolvedPath,
@@ -261,23 +313,29 @@ internal sealed class ServeCommand(
               bytesTotal = total,
             };
           }),
-          metrics = metrics == null ? null : new {
-            metrics.ReadBytes,
-            metrics.WrittenBytes,
-            metrics.CacheHitRate,
-            metrics.DirtyFiles,
-            metrics.DrainedFiles,
-            metrics.CacheReadUsedBytes,
-            metrics.CacheReadMaxBytes,
-            metrics.CacheWriteUsedBytes,
-            metrics.CacheWriteMaxBytes,
-            memberLatencies = metrics.MemberLatencies,
-            activity = metrics.RecentActivity,
+          metrics = snapshot == null ? null : new {
+            snapshot.ReadBytes,
+            snapshot.WrittenBytes,
+            snapshot.CacheHitRate,
+            snapshot.DirtyFiles,
+            snapshot.DrainedFiles,
+            snapshot.CacheReadUsedBytes,
+            snapshot.CacheReadMaxBytes,
+            snapshot.CacheWriteUsedBytes,
+            snapshot.CacheWriteMaxBytes,
+            memberLatencies = snapshot.MemberLatencies,
+            activity = snapshot.RecentActivity,
           },
         };
       }),
       stampUtc = DateTime.UtcNow.ToString("O"),
     };
+  }
+
+  /// <summary>Invalidates the discovery cache so the next sample reflects a create/mount/delete immediately.</summary>
+  private void _InvalidateDiscovery() {
+    lock (this._discoLock)
+      this._discoAtUtc = DateTime.MinValue;
   }
 
   /// <summary>
@@ -361,18 +419,17 @@ internal sealed class ServeCommand(
       writer.Write("retry: 1000\n\n"); // reconnect within 1s if the daemon restarts (stable URL)
       writer.Flush();
       try {
+        // ships the SAMPLER'S cached frame — this loop never collects, so it can never stall; a
+        // heartbeat comment keeps the connection alive even if the sampler pauses on a slow drive
+        var lastSent = "";
         while (true) {
-          string frame;
-          try {
-            frame = JsonSerializer.Serialize(this._Pools(), _Json);
-          } catch (Exception e) {
-            // a slow/blocked member must not break the whole feed — skip this tick
-            DriveBender.Logger($"[Warning]metrics frame skipped: {e.Message}");
-            Thread.Sleep(1000);
-            continue;
-          }
+          var frame = this._frameJson;
+          if (!ReferenceEquals(frame, lastSent) && frame != lastSent) {
+            writer.Write($"data: {frame}\n\n");
+            lastSent = frame;
+          } else
+            writer.Write(": ping\n\n");
 
-          writer.Write($"data: {frame}\n\n");
           writer.Flush(); // throws once the client is gone → ends the stream
           Thread.Sleep(1000); // 1 Hz live feed (NFR-UI-LIVE)
         }
@@ -640,7 +697,14 @@ internal sealed class ServeCommand(
   }
 
   private void _WriteJson(HttpListenerContext context, object payload) {
-    var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload, _Json));
+    // any mutating API result invalidates the discovery cache so a create/mount/delete/role
+    // change shows up on the very next sample instead of up to 3s later
+    this._InvalidateDiscovery();
+    this._WriteRawJson(context, JsonSerializer.Serialize(payload, _Json));
+  }
+
+  private void _WriteRawJson(HttpListenerContext context, string json) {
+    var bytes = Encoding.UTF8.GetBytes(json);
     context.Response.ContentType = "application/json; charset=utf-8";
     context.Response.OutputStream.Write(bytes);
     context.Response.Close();
