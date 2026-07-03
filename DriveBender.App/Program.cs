@@ -163,15 +163,17 @@ internal static class Program {
       if (!Directory.Exists(mountBin))
         continue;
 
-      var candidates = names.SelectMany(name => _SafeFind(mountBin, name)).ToArray();
-      if (candidates.Length == 0)
-        continue;
-
-      // pick the build matching this OS: dbmount is per-TFM (net10.0-windows carries the
-      // WinFsp/Dokan code, net10.0 the FUSE code). Launching the wrong one is why an
-      // install can report "no package manager found" on Windows.
+      // ONLY the build matching this OS is acceptable: dbmount is per-TFM (net10.0-windows
+      // carries the WinFsp/Dokan code, net10.0 the FUSE code). A wrong-flavor build must never
+      // launch — on Windows it would claim "FUSE is missing" — so a half-built repo (only the
+      // other TFM present) surfaces as "dbmount not found" instead of a nonsense prereq.
       var wantsWindows = OperatingSystem.IsWindows();
-      return candidates.OrderByDescending(p => p.Contains("windows", StringComparison.OrdinalIgnoreCase) == wantsWindows).First();
+      var matching = names
+        .SelectMany(name => _SafeFind(mountBin, name))
+        .Where(p => p.Contains("windows", StringComparison.OrdinalIgnoreCase) == wantsWindows)
+        .ToArray();
+      if (matching.Length > 0)
+        return matching[0];
     }
 
     return null;

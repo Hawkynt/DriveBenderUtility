@@ -42,6 +42,13 @@ internal static class Prerequisites {
 
     return new(false, "WinFsp/Dokan", "No filesystem driver (WinFsp or Dokan) is installed.", true, false);
 #else
+    // the non-Windows build running on Windows can never mount there — say THAT instead of
+    // nonsensically demanding FUSE on a Windows box
+    if (OperatingSystem.IsWindows())
+      return new(false, "WinFsp/Dokan",
+        "This dbmount is the non-Windows build and cannot mount on Windows — launch the net10.0-windows dbmount (rebuild the solution so both flavors exist).",
+        false, false);
+
     if (Linux.LinuxFuseMountHost.IsFuseAvailable())
       return new(true, "FUSE", "FUSE is available.", false, false);
 
@@ -68,6 +75,9 @@ internal static class Prerequisites {
       ? (true, "WinFsp installed. You can mount now.")
       : (false, "The installer ran but WinFsp is still not detected — reopen the app and retry. If it persists, install manually from https://winfsp.dev.");
 #else
+    if (OperatingSystem.IsWindows())
+      return (false, "This dbmount is the non-Windows build — there is nothing to install on Windows; launch the net10.0-windows dbmount instead.");
+
     // Linux: fuse3 is a system package, so run the distro's own installer directly. We probe absolute
     // paths (not just $PATH via `which`, which a sandboxed daemon may lack) across the major managers.
     foreach (var (tool, args) in new[] {
