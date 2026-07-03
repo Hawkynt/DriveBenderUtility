@@ -209,8 +209,9 @@ without a real pool.
   are auto-discovered if present.)
 - **To mount on Windows:** [**WinFsp**](https://winfsp.dev) *or*
   [**Dokan**](https://dokan-dev.github.io) — `dbmount` uses whichever is present
-  (WinFsp preferred, Dokan is the no-extra-install fallback). Mounting needs an
-  elevated shell.
+  (WinFsp preferred, Dokan is the no-extra-install fallback). *Installing* the
+  driver needs admin (the app/UI can do it for you); *mounting* does not — mount
+  as your normal user so the drive is visible in your own Explorer session.
 - **To mount on Linux:** `fuse3` (`/dev/fuse`) — e.g. `sudo apt install fuse3`.
 - **Remote/cloud members** need nothing extra; the SDKs are bundled.
 
@@ -261,7 +262,8 @@ folder already owned by another pool is always refused.
 ### 2. Mount it
 
 ```bash
-# Windows (run elevated; WinFsp or Dokan must be installed)
+# Windows (WinFsp or Dokan must be installed; run as your normal user — NOT elevated, or the
+# drive lands in a different session than Explorer and won't be visible)
 dbmount mount --manifest MyPool            # mounts at the manifest's target, or pass --target Y:\
 dbmount status                             # what's mounted right now
 dbmount unmount X:\                        # clean unmount (flushes dirty data); or Ctrl+C the mount

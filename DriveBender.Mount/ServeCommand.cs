@@ -334,7 +334,7 @@ internal sealed class ServeCommand(
       throw new ManifestException("No mount target — choose a drive letter (e.g. X:) or an empty folder to mount at.");
 
     mountRegistry.TakeError(pool.PoolId); // discard any stale failure report from a previous attempt
-    var (process, needsElevation) = _LaunchMount(pool.PoolId, target);
+    var process = _LaunchMount(pool.PoolId, target);
 
     // wait for the mount to actually appear (or the child to fail) so "Mount" reports the truth
     for (var i = 0; i < 40; ++i) {
@@ -342,7 +342,7 @@ internal sealed class ServeCommand(
         return "mounted";
 
       if (process is { HasExited: true }) {
-        // prefer the child's own reported reason — the only channel back from an elevated child
+        // prefer the child's own reported reason, then its captured stderr
         var reported = mountRegistry.TakeError(pool.PoolId);
         if (reported == null) {
           Thread.Sleep(250); // give a crashing child a moment to flush its report
@@ -353,7 +353,6 @@ internal sealed class ServeCommand(
         throw new ManifestException(
           !string.IsNullOrEmpty(reported) ? reported
           : error.Length > 0 ? error
-          : needsElevation ? "Mounting was cancelled or denied — it needs administrator rights (accept the UAC prompt)."
           : "The mount process exited before the pool came up. Check that a filesystem driver is installed.");
       }
 
@@ -404,47 +403,34 @@ internal sealed class ServeCommand(
   }
 
   /// <summary>
-  /// Launches a detached <c>dbmount mount</c> child so the daemon never holds the mount
-  /// itself. On Windows, mounting needs elevation: if the daemon isn't already privileged
-  /// the child is launched via ShellExecute "runas" so the OS prompts for it (UAC).
+  /// Launches a detached <c>dbmount mount</c> child so the daemon never holds the mount itself.
+  /// The child runs in the SAME (interactive, non-elevated) session as the daemon on purpose:
+  /// mounting a WinFsp/Dokan/FUSE volume doesn't need elevation, and a drive letter created by an
+  /// elevated process lives in a different logon session than the user's Explorer — so it would
+  /// mount but never appear. Only installing the driver needs elevation (handled separately).
   /// </summary>
-  private static (System.Diagnostics.Process? process, bool needsElevation) _LaunchMount(Guid poolId, string? target) {
+  private static System.Diagnostics.Process? _LaunchMount(Guid poolId, string? target) {
     var entryDll = Assembly.GetEntryAssembly()!.Location;
     var exe = Environment.ProcessPath ?? "dotnet";
     var viaDotnet = exe.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase) || exe.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase);
 
-    var args = new List<string>();
+    var start = new System.Diagnostics.ProcessStartInfo {
+      FileName = exe,
+      UseShellExecute = false,
+      CreateNoWindow = true,
+      RedirectStandardError = true,
+    };
     if (viaDotnet)
-      args.Add(entryDll);
-    args.Add("mount");
-    args.Add("--manifest");
-    args.Add(poolId.ToString());
+      start.ArgumentList.Add(entryDll);
+    start.ArgumentList.Add("mount");
+    start.ArgumentList.Add("--manifest");
+    start.ArgumentList.Add(poolId.ToString());
     if (!string.IsNullOrWhiteSpace(target)) {
-      args.Add("--target");
-      args.Add(target);
+      start.ArgumentList.Add("--target");
+      start.ArgumentList.Add(target);
     }
 
-    var needsElevation = OperatingSystem.IsWindows() && !Prerequisites.IsElevated;
-    var start = new System.Diagnostics.ProcessStartInfo { FileName = viaDotnet ? exe : exe };
-    if (needsElevation) {
-      // ShellExecute + runas triggers UAC; output can't be redirected in this mode
-      start.UseShellExecute = true;
-      start.Verb = "runas";
-      start.Arguments = string.Join(' ', args.Select(a => a.Contains(' ') ? $"\"{a}\"" : a));
-    } else {
-      start.UseShellExecute = false;
-      start.CreateNoWindow = true;
-      start.RedirectStandardError = true;
-      foreach (var a in args)
-        start.ArgumentList.Add(a);
-    }
-
-    try {
-      return (System.Diagnostics.Process.Start(start), needsElevation);
-    } catch (System.ComponentModel.Win32Exception e) when (needsElevation) {
-      // user declined the UAC prompt
-      throw new ManifestException("Mounting needs administrator rights and the elevation prompt was declined.");
-    }
+    return System.Diagnostics.Process.Start(start);
   }
 
   private static T? _ReadBody<T>(HttpListenerRequest request) {

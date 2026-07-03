@@ -36,7 +36,9 @@ internal static class Prerequisites {
     var winfsp = Windows.WinFspMountHost.IsWinFspAvailable();
     var dokan = Windows.DokanMountHost.IsDokanAvailable();
     if (winfsp || dokan)
-      return new(true, winfsp ? "WinFsp" : "Dokan", $"{(winfsp ? "WinFsp" : "Dokan")} is installed.", false, !IsElevated);
+      // mounting a drive letter does not need elevation (and must NOT be elevated, or the drive
+      // lands in a different session than Explorer) — only the driver install does
+      return new(true, winfsp ? "WinFsp" : "Dokan", $"{(winfsp ? "WinFsp" : "Dokan")} is installed.", false, false);
 
     return new(false, "WinFsp/Dokan", "No filesystem driver (WinFsp or Dokan) is installed.", true, false);
 #else
