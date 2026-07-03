@@ -162,6 +162,7 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .pkt.drain { fill: #f0883e; color: #f0883e; }
 .pkt.dup { fill: var(--ok); color: var(--ok); }
 .activity .mv { color: var(--accent); }
+.activity .age { color: var(--muted); opacity: .8; }
 .activity .rsn, .rsn { color: var(--muted); font-style: italic; }
 
 /* health report */

@@ -13,6 +13,17 @@ function fmtBytes(n) {
 }
 function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
 
+// coarse relative age (5 s buckets under a minute) — coarse on purpose, so the rendered HTML
+// doesn't change every second and re-trigger the anti-flicker diff
+function ago(stamp) {
+  if (!stamp) return "";
+  const s = Math.max(0, (Date.now() - Date.parse(stamp)) / 1000);
+  if (s < 5) return "· just now";
+  if (s < 60) return "· " + Math.floor(s / 5) * 5 + "s ago";
+  if (s < 3600) return "· " + Math.floor(s / 60) + "m ago";
+  return "· " + Math.floor(s / 3600) + "h ago";
+}
+
 function donut(free, total) {
   const used = total > 0 ? (total - free) / total : 0;
   const r = 34, c = 2 * Math.PI * r, off = c * (1 - used);
@@ -155,13 +166,18 @@ function updateFlowmap(wrap, pool) {
   if (!pool.mounted) return;
 
   // real activity rows first: distinct FILES flying between the exact nodes involved —
-  // reads leave the member that served them, writes land on the member that took them
+  // reads leave the member that served them, writes land on the member that took them.
+  // Only rows NEWER than the last seen stamp animate: the ring buffer is history, and finished
+  // work must not replay — neither on page load (baseline first) nor when rows carry no stamp.
+  const newest = (m.activity || []).length ? m.activity[0].stamp : null;
   const fresh = [];
-  for (const a of m.activity || []) {
-    if (st.lastStamp && a.stamp <= st.lastStamp) break;
-    fresh.push(a);
+  if (st.lastStamp !== null && newest) {
+    for (const a of m.activity || []) {
+      if (!a.stamp || a.stamp <= st.lastStamp) break;
+      fresh.push(a);
+    }
   }
-  if ((m.activity || []).length) st.lastStamp = m.activity[0].stamp;
+  if (newest !== null || st.lastStamp === null) st.lastStamp = newest || ""; // "" = baselined, nothing to replay
 
   let labeled = 0;
   for (const a of fresh.reverse()) { // oldest first so the motion reads causally
@@ -307,7 +323,7 @@ function patchCard(c, pool) {
   const m = pool.metrics || (pool.mounted ? {} : null);
   const hist = history.get(pool.id) || [];
 
-  top.innerHTML = `
+  const topHtml = `
     <h2>${pool.name} ${health} ${mountBadge}</h2>
     <div class="sub">${pool.source} · ${pool.failureDomains} failure domain(s) · <span title="primary placement strategy — change it via the Duplication dialog">⚖ ${pool.placementStrategy || "most-free-space"}</span>${pool.autoLandingZone ? ' · <span title="placement.autoLandingZone: the landing zone follows the measured-fastest drive automatically">🚀 auto-LZ</span>' : ""}</div>
     <div class="capacity-row">
@@ -330,17 +346,30 @@ function patchCard(c, pool) {
     <div class="meter"><div class="label"><span>Hit-rate history (2 min)</span><span>read ${fmtBytes(m.readBytes)} · wrote ${fmtBytes(m.writtenBytes)} · drained ${m.drainedFiles||0}</span></div>
       ${sparkline(hist)}</div>` : '<div class="nostats">📊 Mount the pool to see live I/O statistics.</div>'}`;
 
+  // anti-flicker: only touch the DOM when the rendered HTML actually changed — rebuilding
+  // identical nodes every second makes badges/emoji shimmer and closes an open role dropdown
+  if (c._topHtml !== topHtml) {
+    top.innerHTML = topHtml;
+    c._topHtml = topHtml;
+  }
+
   updateFlowmap(fm, pool);
 
-  bottom.innerHTML = `
+  const bottomHtml = `
     <div class="members"></div>
     ${pool.warnings && pool.warnings.length ? `<div class="warnings">${pool.warnings.map(w => "<div>⚠ " + w + "</div>").join("")}</div>` : ""}
     ${m ? `<div class="activity">${(m.activity && m.activity.length ? m.activity.slice(0,10).map(a => {
       const icon = ({Read:"📖",Write:"✍️",Drain:"⬇️",Duplicate:"🔁",Rebalance:"⚖️",RemoteTransfer:"☁️",CacheAdmit:"📥",CacheEvict:"📤",Recovery:"🩹",Scrub:"🔬",TrashMove:"🗑️"})[a.kind] || "•";
       const move = a.from || a.to ? ` <span class="mv">${a.from || "?"} → ${a.to || "?"}</span>` : "";
-      return `<div>${icon} ${a.kind} <b>${a.path||""}</b> ${a.bytes?fmtBytes(a.bytes):""}${move} ${a.reason?`<span class="rsn">${a.reason}</span>`:""}</div>`;
+      return `<div>${icon} ${a.kind} <b>${a.path||""}</b> ${a.bytes?fmtBytes(a.bytes):""}${move} ${a.reason?`<span class="rsn">${a.reason}</span>`:""} <span class="age">${ago(a.stamp)}</span></div>`;
     }).join("") : '<div class="rsn">no activity yet — reads, writes, drains and duplications appear here live</div>')}</div>` : ""}
     <div class="actions"></div>`;
+
+  if (c._bottomHtml === bottomHtml)
+    return; // nothing below the flow map changed — keep the existing nodes (and any open dropdown)
+
+  bottom.innerHTML = bottomHtml;
+  c._bottomHtml = bottomHtml;
 
   const memberBox = bottom.querySelector(".members");
   pool.members.forEach(mem => memberBox.appendChild(memberRow(pool, mem)));
