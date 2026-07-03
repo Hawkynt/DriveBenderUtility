@@ -233,8 +233,13 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
   }
 
   public override int Rename(object fileNode, object fileDesc, string fileName, string newFileName, bool replaceIfExists) {
+    var descriptor = (FileDescriptor)fileDesc;
     try {
       pool.Rename(_ToPoolPath(fileName), _ToPoolPath(newFileName), replaceIfExists ? RenameFlags.ReplaceExisting : RenameFlags.None);
+      // WinFsp keeps the handle open across the rename and immediately calls GetFileInfo/Cleanup/Close
+      // on it — repoint the descriptor to the new path, or those hit the old (gone) name and Explorer
+      // reports "the item has moved".
+      descriptor.Path = _ToPoolPath(newFileName);
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);

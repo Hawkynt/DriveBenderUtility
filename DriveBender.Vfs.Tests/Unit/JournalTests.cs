@@ -45,6 +45,23 @@ public class JournalTests {
 
   [Test]
   [Category("HappyPath")]
+  public void Complete_GivenAllIntentsDone_WhenQuiesced_ThenJournalHoldsOnlyOpenEntries() {
+    var a = this._journal.LogIntent(JournalOp.Write, "a.txt");
+    var b = this._journal.LogIntent(JournalOp.Write, "b.txt");
+    this._journal.Complete(a, JournalOp.Write);
+
+    // b still open: it remains the one outstanding intent while 'a' is done
+    this._journal.ReadIncomplete().Should().ContainSingle().Which.Sequence.Should().Be(b);
+
+    this._journal.Complete(b, JournalOp.Write);
+
+    // quiesced: with nothing open, the log carries no lingering completed history (only-open invariant)
+    this._journal.ReadAll().Should().BeEmpty();
+    this._journal.ReadIncomplete().Should().BeEmpty();
+  }
+
+  [Test]
+  [Category("HappyPath")]
   public void Append_GivenTwoMembers_WhenOneVanishes_ThenJournalStillReadableFromSurvivor() {
     this._journal.LogIntent(JournalOp.Rename, "a.txt", "b.txt");
     this._member1.IsOnline = false;

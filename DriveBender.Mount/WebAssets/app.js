@@ -123,6 +123,14 @@ function memberRow(pool, m) {
 function card(pool) {
   const c = el("div", "card");
   c.dataset.id = pool.id;
+  patchCard(c, pool);
+  return c;
+}
+
+// Update a card's contents in place. The card NODE is reused across the 1 Hz refresh on purpose:
+// replacing it re-triggers the :hover lift transform (and reflows the grid), which is the "jumps a
+// few pixels up and down" the user saw. Only the inner content is refreshed.
+function patchCard(c, pool) {
   const health = pool.degraded ? '<span class="badge warn">degraded</span>' : '<span class="badge ok">healthy</span>';
   const mountBadge = pool.mounted ? `<span class="badge info">mounted ${pool.mounted}</span>` : "";
   const m = pool.metrics;
@@ -167,10 +175,38 @@ function card(pool) {
   add("Restore", "", () => op("/api/restore?pool=" + pool.id));
   add("Add member", "", () => addMemberDialog(pool));
   if (pool.source === "manifest")
+    add("Duplication", "", () => duplicationDialog(pool));
+  if (pool.source === "manifest")
     add("Forget", "", () => confirm(`Remove "${pool.name}" from this machine's list? Data and on-disk markers are kept — the pool can be restored or re-imported later.`) && op("/api/pool/forget?pool=" + pool.id));
   add("Delete", "danger", () => confirm(`Delete pool "${pool.name}"? The manifest is removed; your files are kept on disk.`) && op("/api/pool/delete?pool=" + pool.id));
   add("Purge", "danger", () => prompt(`PURGE wipes all data in "${pool.name}". Type the pool name to confirm:`) === pool.name && op("/api/pool/purge?pool=" + pool.id));
-  return c;
+}
+
+// Configure how many copies of each file the pool keeps — pool-wide and optionally per folder/file.
+function duplicationDialog(pool) {
+  const form = el("div");
+  form.innerHTML = `
+    <label>Copies of every file, pool-wide (1 = no duplication)</label>
+    <input class="dup" type="number" min="1" max="10" value="${pool.duplication || 1}">
+    <p class="hint">Copies are only placed on <b>independent physical disks</b> — members on the same
+    disk are one failure domain, so an extra copy can't be stored there (SAFE-PHYS). This pool has
+    <b>${pool.failureDomains}</b> independent domain(s), so at most ${pool.failureDomains} cop${pool.failureDomains === 1 ? "y" : "ies"}
+    can actually be kept. Changes take effect on the next mount.</p>
+    <label>Optional — override a folder or file (glob, e.g. <code>Photos/**</code> or <code>Docs/tax.pdf</code>)</label>
+    <input class="dupfolder" placeholder="leave empty to set only the pool-wide default">
+    <label>Copies for that pattern</label>
+    <input class="dupfolderlevel" type="number" min="1" max="10" value="2">`;
+  showModal(`Duplication — ${pool.name}`, form, async () => {
+    const folder = form.querySelector(".dupfolder").value.trim();
+    if (folder) {
+      const flvl = parseInt(form.querySelector(".dupfolderlevel").value, 10);
+      if (!(flvl >= 1)) return "Enter a valid copy count for the pattern.";
+      if (!await op("/api/pool/duplication?pool=" + pool.id, { level: flvl, folder })) return "Could not set the folder override.";
+    }
+    const level = parseInt(form.querySelector(".dup").value, 10);
+    if (!(level >= 1)) return "Enter a valid pool-wide copy count.";
+    return await op("/api/pool/duplication?pool=" + pool.id, { level }) ? null : "Could not set duplication.";
+  }, "Save");
 }
 
 // Mount at the pool's configured target, or ask for a drive letter / folder when it has none.
@@ -282,8 +318,7 @@ function render(data) {
     const h = history.get(pool.id) || [];
     if (pool.metrics) { h.push(pool.metrics.cacheHitRate || 0); while (h.length > HIST) h.shift(); history.set(pool.id, h); }
     const existing = container.querySelector(`.card[data-id="${pool.id}"]`);
-    const fresh = card(pool);
-    if (existing) container.replaceChild(fresh, existing); else container.appendChild(fresh);
+    if (existing) patchCard(existing, pool); else container.appendChild(card(pool));
   }
   container.querySelectorAll(".card").forEach(c => { if (!seen.has(c.dataset.id)) c.remove(); });
 }

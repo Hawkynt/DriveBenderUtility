@@ -113,6 +113,9 @@ internal sealed class ServeCommand(
         case "/api/pool/forget" when request.HttpMethod == "POST":
           this._WriteJson(context, this._Forget(request));
           break;
+        case "/api/pool/duplication" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._SetDuplication(request));
+          break;
         case "/api/prereqs":
           this._WriteJson(context, _PrereqPayload(Prerequisites.Check()));
           break;
@@ -185,6 +188,7 @@ internal sealed class ServeCommand(
           degraded = health.IsDegraded,
           mounted = mounted.TryGetValue(pool.PoolId, out var entry) ? entry.Target : null,
           configuredTarget = pool.Manifest.Mount?.Target,
+          duplication = _DuplicationOf(pool.Manifest),
           bytesFree = health.BytesFree,
           bytesTotal = health.BytesTotal,
           failureDomains = health.IndependentFailureDomains,
@@ -239,6 +243,15 @@ internal sealed class ServeCommand(
     var trimmed = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     var leaf = Path.GetFileName(trimmed);
     return leaf.Length > 0 ? leaf : path; // volume roots (e.g. "C:\") have no leaf — show the root itself
+  }
+
+  /// <summary>The pool-wide duplication level from the manifest defaults (1 when unset).</summary>
+  private static int _DuplicationOf(PoolManifest manifest) {
+    if (manifest.Defaults is { ValueKind: JsonValueKind.Object } defaults
+        && defaults.TryGetProperty("duplication", out var d) && d.ValueKind == JsonValueKind.Number)
+      return d.GetInt32();
+
+    return 1;
   }
 
   private void _Stream(HttpListenerContext context) {
@@ -307,6 +320,19 @@ internal sealed class ServeCommand(
 
     var manifest = lifecycle.Recover(path);
     return new { manifest.PoolId, manifest.Name };
+  });
+
+  private sealed record DuplicationBody(int? Level, string? Folder);
+
+  /// <summary>Sets pool-wide (or per-folder) duplication; takes effect on the next mount.</summary>
+  private object _SetDuplication(HttpListenerRequest request) => _Guard(() => {
+    var body = _ReadBody<DuplicationBody>(request);
+    var pool = this._Discover(this._RequirePool(request));
+    if (body?.Level == null)
+      throw new ManifestException("duplication needs a level (1-10)");
+
+    lifecycle.SetDuplication(pool.Manifest, body.Level.Value, string.IsNullOrWhiteSpace(body.Folder) ? null : body.Folder);
+    return "ok";
   });
 
   /// <summary>Removes a pool from this machine's registry only — data and on-media markers stay.</summary>

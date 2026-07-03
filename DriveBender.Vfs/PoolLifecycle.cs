@@ -1,3 +1,6 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
 namespace DivisonM.Vfs;
 
 /// <summary>An operation would touch pre-existing data without explicit consent (SAFE-NONDESTRUCTIVE).</summary>
@@ -172,6 +175,38 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
   }
 
   public string Export(PoolManifest manifest) => ManifestSerializer.Write(manifest);
+
+  /// <summary>
+  /// Sets the duplication level D (total copies to keep) for a pool, either pool-wide or for a
+  /// single folder/file glob (§6.3). Persisted into the manifest's defaults block; it takes effect
+  /// on the next mount, after which the background duplicator creates any owed copies. Copies only
+  /// ever land on independent physical volumes (SAFE-PHYS), so D&gt;domains keeps owed duplication
+  /// pending rather than co-locating copies.
+  /// </summary>
+  public PoolManifest SetDuplication(PoolManifest manifest, int level, string? folderGlob = null) {
+    if (level is < 1 or > 10)
+      throw new ManifestException("Duplication level must be between 1 and 10 (1 = a single copy, no duplication)");
+    if (manifest.IsVirtual)
+      throw new ManifestException("Adopt the native pool first (pool adopt) before configuring duplication");
+
+    var defaults = manifest.Defaults is { ValueKind: JsonValueKind.Object } existing
+      ? JsonNode.Parse(existing.GetRawText())!.AsObject()
+      : new JsonObject();
+
+    if (string.IsNullOrWhiteSpace(folderGlob))
+      defaults["duplication"] = level;
+    else {
+      if (defaults["folders"] is not JsonObject folders)
+        defaults["folders"] = folders = new JsonObject();
+      if (folders[folderGlob] is not JsonObject entry)
+        folders[folderGlob] = entry = new JsonObject();
+      entry["duplication"] = level;
+    }
+
+    var updated = manifest with { Defaults = JsonSerializer.SerializeToElement(defaults) };
+    DriveBender.Logger($"Set duplication of pool '{manifest.Name}'{(string.IsNullOrWhiteSpace(folderGlob) ? "" : $" for '{folderGlob}'")} to {level} cop{(level == 1 ? "y" : "ies")} (effective on next mount)");
+    return store.Save(updated);
+  }
 
   /// <summary>
   /// Rebuilds a pool the registry has lost from a member folder's manifest mirror and

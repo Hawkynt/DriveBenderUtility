@@ -127,13 +127,24 @@ public sealed class Journal(IJournalStore store) {
   private long _nextSequence;
   private bool _loaded;
 
+  // sequences of intents still awaiting completion; the journal is compacted down to just these so
+  // at rest it holds only open entries (completed history is redundant once its mutation is durable)
+  private readonly HashSet<long> _open = [];
+  private int _completedSinceCompact;
+  private const int _COMPACT_THRESHOLD = 512; // bound growth under sustained load that never quiesces
+
   private static readonly JsonSerializerOptions _OPTIONS = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault };
 
   private void _EnsureLoaded() {
     if (this._loaded)
       return;
 
-    this._nextSequence = this.ReadAll().Select(r => r.Sequence).DefaultIfEmpty(0).Max();
+    var all = this.ReadAll();
+    this._nextSequence = all.Select(r => r.Sequence).DefaultIfEmpty(0).Max();
+    var completed = all.Where(r => r.Completed).Select(r => r.Sequence).ToHashSet();
+    foreach (var record in all)
+      if (!record.Completed && !completed.Contains(record.Sequence))
+        this._open.Add(record.Sequence);
     this._loaded = true;
   }
 
@@ -150,13 +161,30 @@ public sealed class Journal(IJournalStore store) {
         MemberId = memberId,
       };
       store.Append(JsonSerializer.Serialize(record, _OPTIONS));
+      this._open.Add(record.Sequence);
       return record.Sequence;
     }
   }
 
   public void Complete(long sequence, JournalOp op) {
-    lock (this._lock)
+    lock (this._lock) {
+      this._EnsureLoaded();
       store.Append(JsonSerializer.Serialize(new JournalRecord { Sequence = sequence, Op = op, Completed = true }, _OPTIONS));
+      this._open.Remove(sequence);
+      ++this._completedSinceCompact;
+
+      // once every logged mutation has completed, the log carries no open work — clear it so it
+      // only ever accumulates genuinely-open entries; otherwise bound growth by periodic compaction
+      if (this._open.Count == 0) {
+        store.Rewrite([]);
+        this._completedSinceCompact = 0;
+      } else if (this._completedSinceCompact >= _COMPACT_THRESHOLD) {
+        store.Rewrite(this.ReadAll()
+          .Where(r => !r.Completed && this._open.Contains(r.Sequence))
+          .Select(r => JsonSerializer.Serialize(r, _OPTIONS)));
+        this._completedSinceCompact = 0;
+      }
+    }
   }
 
   public IReadOnlyList<JournalRecord> ReadAll() {

@@ -320,8 +320,9 @@ browser**, or add remote members whose **credentials are collected by a
 scheme-aware dialog** — user/password for FTP·WebDAV, password *or* private key
 for SFTP, access/secret keys for S3, account key for Azure, token for
 Dropbox·OneDrive, service-account JSON for Google — stored under a reference the
-manifest never inlines), mount / unmount, add or remove members, remove- and
-replace-media,
+manifest never inlines), mount / unmount, add or remove members, set
+**duplication** (copies to keep — pool-wide or per folder/file glob; copies only
+land on independent physical disks, SAFE-PHYS), remove- and replace-media,
 run health / fix / restore, **forget** a pool (drop it from this machine's list
 while leaving its data and on-disk markers intact, so it can be re-imported or
 recovered later), and delete (keep data) or purge (wipe data, guarded by a
