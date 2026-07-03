@@ -152,6 +152,14 @@ internal sealed class ServeCommand(
         case "/api/pool/add-member" when request.HttpMethod == "POST":
           this._WriteJson(context, this._AddMember(request));
           break;
+        case "/api/pool/member-role" when request.HttpMethod == "POST":
+          this._WriteJson(context, _Guard(() => {
+            var pool = this._Discover(this._RequirePool(request));
+            var memberId = Guid.TryParse(request.QueryString["member"], out var id) ? id : throw new ManifestException("member-role needs ?member=<id>");
+            lifecycle.SetMemberRole(pool.Manifest, memberId, _ParseRole(request.QueryString["role"]));
+            return this._ApplyLive(pool);
+          }));
+          break;
         case "/api/pool/remove-member" when request.HttpMethod == "POST":
           this._WriteJson(context, _Guard(() => { PoolOpsCommand.RemoveMedia(host, store, provider, lifecycle, remoteResolver, new() { Pool = this._RequirePool(request), Member = request.QueryString["member"] }); return "ok"; }));
           break;

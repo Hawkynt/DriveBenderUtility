@@ -144,6 +144,20 @@ public class PoolLifecycleTests {
   }
 
   [Test]
+  [Category("HappyPath")]
+  public void SetMemberRole_GivenCapacityMember_WhenPromotedToLanding_ThenPersistedWithVersionBump() {
+    this._host.AddDirectory(@"B:\test");
+    var manifest = this._lifecycle.Create("MyPool", [new(@"A:\", MemberRole.Capacity, "SSD"), new(@"B:\test")], force: true);
+    var member = manifest.Members.First(m => m.Label == "SSD");
+
+    var updated = this._lifecycle.SetMemberRole(manifest, member.MemberId, MemberRole.Landing);
+
+    updated.FindMember(member.MemberId)!.Role.Should().Be(MemberRole.Landing);
+    updated.Version.Should().BeGreaterThan(manifest.Version, "the change is persisted");
+    this._store.TryLoadRegistry(manifest.PoolId)!.FindMember(member.MemberId)!.Role.Should().Be(MemberRole.Landing);
+  }
+
+  [Test]
   [Category("Exception")]
   public void Forget_GivenNativePool_WhenForgotten_ThenRefused() {
     var virtualManifest = new PoolManifest { PoolId = Guid.NewGuid(), Name = "Native", Members = [], IsVirtual = true };

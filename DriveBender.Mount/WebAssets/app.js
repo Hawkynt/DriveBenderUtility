@@ -125,8 +125,19 @@ function credPayload(kind, v) {
 function memberRow(pool, m) {
   const row = el("div", "member");
   row.innerHTML = `<span class="status ${m.online ? "" : "off"}"></span>
-    <span>${m.label || m.path}</span>${m.network ? '<span class="badge info">remote</span>' : ""}
-    <span class="role">${m.role}</span>`;
+    <span>${m.label || m.path}</span>${m.network ? '<span class="badge info">remote</span>' : ""}`;
+  if (pool.source === "manifest") {
+    // live tier reconfiguration: switching the role reflows new writes immediately on a mounted pool
+    const sel = el("select", "role-select");
+    sel.innerHTML = ROLES.map(r => `<option value="${r}" ${r === m.role ? "selected" : ""}>${r}</option>`).join("");
+    sel.title = "Change this storage's tier: landing = fast intake that drains to capacity; readonly = no new data";
+    sel.onchange = async () => {
+      if (!await op(`/api/pool/member-role?pool=${pool.id}&member=${encodeURIComponent(m.id)}&role=${sel.value}`))
+        sel.value = m.role; // rejected — snap back
+    };
+    row.appendChild(sel);
+  } else
+    row.appendChild(el("span", "role", m.role));
   const scatter = el("button", "small danger", "remove");
   scatter.title = "Scatter this member's data to the others, then remove it";
   scatter.onclick = () => confirm(`Remove member "${m.label || m.path}"? Its data is scattered to the other members first.`)

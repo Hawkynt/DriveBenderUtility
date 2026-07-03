@@ -147,6 +147,21 @@ public class PlacementResolverTests {
 
   [Test]
   [Category("HappyPath")]
+  public void UpdateRoles_GivenCapacityPromotedToLanding_WhenPlacingPrimary_ThenNewLandingPreferred() {
+    var resolver = this._Resolver(ssdIsLanding: false); // everything starts as capacity
+
+    resolver.UpdateRoles(new Dictionary<Guid, MemberRole> {
+      [this._ssd.MemberId] = MemberRole.Landing,
+      [this._hdd1.MemberId] = MemberRole.Capacity,
+      [this._hdd2.MemberId] = MemberRole.Capacity,
+    });
+
+    resolver.ChoosePrimaryTarget(100).Should().Be(this._ssd,
+      "the live role change makes the SSD the landing tier, which takes new writes first");
+  }
+
+  [Test]
+  [Category("HappyPath")]
   public void ChooseShadowTarget_GivenSameDiskAllowedButIndependentDomainFree_WhenPlacing_ThenStillPrefersIndependentDomain() {
     var config = ConfigResolver.ResolveEffective(null, """{"placement":{"shadowNeverSamePhysical":false}}""");
 

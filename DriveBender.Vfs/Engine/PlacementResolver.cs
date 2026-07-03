@@ -14,9 +14,13 @@ public sealed record PhysicalCopy(IVolumeIO Volume, bool Shadow);
 public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> members, MetadataCache metadata, PoolConfig config, IReadOnlyDictionary<Guid, MemberRole>? memberRoles = null) {
 
   private int _roundRobinCounter;
+  private IReadOnlyDictionary<Guid, MemberRole>? _roles = memberRoles;
 
   /// <summary>Swaps the tuning config live (CFG.reload); placement decisions use the new values immediately.</summary>
   public void UpdateConfig(PoolConfig newConfig) => config = newConfig;
+
+  /// <summary>Swaps the member-role map live (reconfigure storage without remount): new writes place by the new tiers immediately.</summary>
+  public void UpdateRoles(IReadOnlyDictionary<Guid, MemberRole> roles) => this._roles = roles;
 
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
@@ -65,7 +69,7 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
   }
 
   private MemberRole _RoleOf(IVolumeIO member)
-    => memberRoles != null && memberRoles.TryGetValue(member.MemberId, out var role) ? role : MemberRole.Capacity;
+    => this._roles != null && this._roles.TryGetValue(member.MemberId, out var role) ? role : MemberRole.Capacity;
 
   /// <summary>
   /// Picks the member for a new primary (FR-PLACE): fast tier first when one exists and

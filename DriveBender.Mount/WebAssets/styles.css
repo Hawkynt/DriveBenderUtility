@@ -69,6 +69,8 @@ main { padding: 22px; max-width: 1200px; margin: 0 auto; }
 .members { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
 .member { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 5px 8px; background: var(--panel-2); border-radius: 8px; }
 .member .role { color: var(--muted); margin-left: auto; }
+.member .role-select { margin-left: auto; background: var(--panel); color: var(--muted); border: 1px solid var(--line);
+  border-radius: 6px; font-size: 11px; padding: 2px 4px; }
 .member .status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
 .member .status.off { background: var(--bad); }
 

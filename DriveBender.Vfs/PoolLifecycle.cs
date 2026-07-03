@@ -130,6 +130,27 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     return store.Save(updated);
   }
 
+  /// <summary>
+  /// Changes a member's role (capacity ↔ landing ↔ readonly) — reconfigure storage tiers
+  /// without touching data. A mounted pool applies it live via the reload channel.
+  /// </summary>
+  public PoolManifest SetMemberRole(PoolManifest manifest, Guid memberId, MemberRole role) {
+    if (manifest.IsVirtual)
+      throw new ManifestException("Adopt the native pool first (pool adopt) before editing its membership");
+
+    var member = manifest.FindMember(memberId)
+                 ?? throw new ManifestException($"Pool '{manifest.Name}' has no member '{memberId}'");
+    if (member.Role == role)
+      return manifest;
+
+    var updated = manifest with {
+      Members = [.. manifest.Members.Select(m => m.MemberId == memberId ? m with { Role = role } : m)],
+    };
+
+    DriveBender.Logger($"Member '{member.Label ?? member.Path}' of pool '{manifest.Name}' is now role '{role}'");
+    return store.Save(updated);
+  }
+
   /// <summary>Removes a member from the manifest; its data stays untouched — only our sidecars are removed.</summary>
   public PoolManifest RemoveMember(PoolManifest manifest, Guid memberId) {
     var member = manifest.FindMember(memberId)

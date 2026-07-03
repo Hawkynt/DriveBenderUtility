@@ -108,6 +108,7 @@ internal static class MountCommand {
       var globalJson = host.FileExists(globalConfigPath) ? host.ReadAllText(globalConfigPath) : null;
       var config = ConfigResolver.ResolveEffective(globalJson, manifest.Defaults?.GetRawText());
       fs.ReloadConfig(config);
+      fs.UpdateMemberRoles(manifest.Members.ToDictionary(m => m.MemberId, m => m.Role)); // tier changes act on new writes immediately
 
       var duplication = Math.Max(1, config.Duplication ?? 1);
       if (duplication >= 2) {

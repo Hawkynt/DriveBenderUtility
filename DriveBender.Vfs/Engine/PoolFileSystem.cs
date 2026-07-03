@@ -110,6 +110,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     DriveBender.Logger("Configuration reloaded live");
   }
 
+  /// <summary>
+  /// Applies changed member roles live (reconfigure storage without remount): new writes land
+  /// per the new tier layout right away; already-placed data moves via the drainer/rebalancer.
+  /// </summary>
+  public void UpdateMemberRoles(IReadOnlyDictionary<Guid, MemberRole> roles) {
+    this._placement.UpdateRoles(roles);
+    this._placement.InvalidateAll();
+    this._activity.Publish(ActivityKind.Recovery, "", reason: "member roles reloaded");
+    DriveBender.Logger("Member roles reloaded live");
+  }
+
   private void _OnMemberLost(IVolumeIO member) {
     this._activity.Publish(ActivityKind.Recovery, "", reason: $"member lost: {member.DisplayName}");
     if (this._memberLossPolicy == MemberLossPolicy.DiscardInaccessible) {
