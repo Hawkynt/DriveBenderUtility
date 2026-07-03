@@ -170,7 +170,6 @@ function updateFlowmap(wrap, pool) {
     if (f && mm.bytesTotal > 0) {
       const frac = (mm.bytesTotal - mm.bytesFree) / mm.bytesTotal;
       f.setAttribute("width", Math.max(0, Math.min(78, Math.round(frac * 78))));
-      f.style.fill = usageColor(frac);
     }
   });
   if (st.cacheSub) st.cacheSub.textContent = (m.dirtyFiles || 0) > 0 ? m.dirtyFiles + " dirty" : "cache";
@@ -282,8 +281,6 @@ function credPayload(kind, v) {
   }
 }
 
-function usageColor(frac) { return frac > 0.9 ? "var(--bad)" : frac > 0.75 ? "var(--warn)" : "var(--ok)"; }
-
 function memberRow(pool, m) {
   const row = el("div", "member");
   row.innerHTML = `<span class="status ${m.online ? "" : "off"}"></span>
@@ -310,8 +307,8 @@ function memberRow(pool, m) {
   if (m.bytesTotal > 0) {
     const used = m.bytesTotal - m.bytesFree;
     const frac = used / m.bytesTotal;
-    row.appendChild(el("div", "fillbar",
-      `<span style="width:${Math.min(100, Math.round(frac * 100))}%;background:${usageColor(frac)}"></span>
+    row.appendChild(el("div", "fillbar", // used = dodgerblue, free = white — a glanceable gauge
+      `<span style="width:${Math.min(100, Math.round(frac * 100))}%"></span>
        <i>${fmtBytes(used)} used · ${fmtBytes(m.bytesFree)} free</i>`));
   }
   return row;
