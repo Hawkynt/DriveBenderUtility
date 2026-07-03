@@ -115,8 +115,9 @@ public class PoolFileSystemWriteTests {
     this._fs.Read(handle, buffer, 0).Should().Be(6);
     buffer.Should().Equal(new byte[] { 1, 2, 0, 0, 0, 0 }, "growth zero-fills (FR-TRUNC)");
 
+    var staged = "t.bin." + DivisonM.DriveBender.DriveBenderConstants.TEMP_EXTENSION; // still open — physically a temp (FR-STAGED-WRITE)
     var holders = new[] { this._volume1, this._volume2 };
-    holders.Single(v => v.FileExists("t.bin", true)).GetContent("t.bin", true)!.Length.Should().Be(6, "truncate applies to all copies");
+    holders.Single(v => v.FileExists(staged, true)).GetContent(staged, true)!.Length.Should().Be(6, "truncate applies to all copies");
     this._fs.Close(handle);
   }
 
@@ -293,9 +294,10 @@ public class PoolFileSystemWriteTests {
   public void Write_GivenQuorumUnreachable_WhenWriting_ThenNoAckAndError() {
     var handle = this._CreateFileWithContent("critical.bin", [1, 2]);
     // the shadow holder disappears — only 1 of the required 2 copies is reachable
-    var shadowHolder = new[] { this._volume1, this._volume2 }.Single(v => v.FileExists("critical.bin", true));
+    var staged = "critical.bin." + DivisonM.DriveBender.DriveBenderConstants.TEMP_EXTENSION; // still open — physically a temp
+    var shadowHolder = new[] { this._volume1, this._volume2 }.Single(v => v.FileExists(staged, true));
     shadowHolder.IsOnline = false;
-    this._fs.Placement.Invalidate("critical.bin");
+    this._fs.Placement.Invalidate(staged);
 
     var act = () => this._fs.Write(handle, [9], 0, WriteMode.Normal);
     act.Should().Throw<PoolFsException>("fewer copies than minCopiesBeforeAck must never be acknowledged (SAFE-LZ)");

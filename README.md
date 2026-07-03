@@ -165,6 +165,16 @@ without a real pool.
 - ✅ Replace drives with seamless data transfer
 - ✅ Space checking with user warnings
 
+### 🚀 Write & read pipeline
+- ✅ Staged writes: in-progress files live under a hidden temp name and only the atomic
+  temp→final rename — the last action before the journal releases — makes them appear;
+  a crash mid-write leaves no half-written file (fsync publishes early)
+- ✅ Striped acks: with a relaxed ack quorum, consecutive blocks rotate across storages
+  while the journal-backed owed-sync converges every copy in the background
+- ✅ Parallel mirrored writes, parallel mirror-split reads (different offsets from
+  different storages at once), per-block read failover, pooled positional I/O handles,
+  background read-ahead
+
 ### 💾 Advanced Duplication
 - ✅ Enable/disable duplication on folders
 - ✅ Support for multiple shadow copies (beyond standard 2-copy limit)

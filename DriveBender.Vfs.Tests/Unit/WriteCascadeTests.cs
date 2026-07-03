@@ -47,8 +47,11 @@ public class WriteCascadeTests {
 
   private FakeVolumeIO[] _All => [this._ssd, this._hdd1, this._hdd2];
 
+  private static string _Staged(string path) => path + "." + DivisonM.DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+
+  /// <summary>Durable copies under the final OR the in-progress staged name (FR-STAGED-WRITE) — durability is what counts.</summary>
   private int _DurableCopyCount(string path, byte[] expected)
-    => this._All.SelectMany(v => new[] { v.GetContent(path, false), v.GetContent(path, true) })
+    => this._All.SelectMany(v => new[] { v.GetContent(path, false), v.GetContent(path, true), v.GetContent(_Staged(path), false), v.GetContent(_Staged(path), true) })
       .Count(content => content != null && content.SequenceEqual(expected));
 
   [Test]
@@ -67,25 +70,28 @@ public class WriteCascadeTests {
 
     this._DurableCopyCount("f.bin", [1, 2, 3]).Should().Be(3, "background sync converges to the duplication level (SAFE-DUP)");
     fs.WriteBuffer.IsDirty("f.bin").Should().BeFalse();
+
+    fs.Close(handle); // publishes the staged temp — the Create intent completes with the rename
     fs.Journal.ReadIncomplete().Should().BeEmpty();
-    fs.Close(handle);
   }
 
   [Test]
   [Category("HappyPath")]
-  public void WriteBack_GivenCrashBeforeOwedCopyApplied_WhenRecovered_ThenAllCopiesConverge() {
+  public void WriteBack_GivenCrashBeforeClose_WhenRecovered_ThenHalfWrittenFileNeverAppears() {
     var fs = this._CreateFs("""{ "duplication": 3, "write": { "policy": "write-back", "minCopiesBeforeAck": 2 } }""");
     var handle = fs.Create("f.bin", NodeKind.File, CreateFlags.None);
     fs.Write(handle, [9, 9], 0, WriteMode.Normal);
 
-    // power loss with the third copy still owed (RAM only)
+    // power loss before the file was ever closed or fsynced: it was never fully written
     foreach (var volume in this._All)
       volume.SimulateCrash();
 
     var fs2 = this._CreateFs("""{ "duplication": 3, "write": { "policy": "write-back", "minCopiesBeforeAck": 2 } }""");
 
-    this._DurableCopyCount("f.bin", [9, 9]).Should().Be(3, "recovery resyncs the lagging copy from the durable primary (SAFE-NOLOSS, SAFE-DUP)");
-    fs2.Journal.ReadIncomplete().Should().BeEmpty();
+    this._DurableCopyCount("f.bin", [9, 9]).Should().Be(0, "a file that never finished writing must not appear after a crash (FR-STAGED-WRITE)");
+    var probe = () => fs2.GetAttributes("f.bin");
+    probe.Should().Throw<PoolFsException>("no half-written file surfaces in the namespace");
+    fs2.Journal.ReadIncomplete().Should().BeEmpty("recovery swept the orphaned temp and its intent");
   }
 
   [Test]
@@ -203,7 +209,7 @@ public class WriteCascadeTests {
     fs.Write(handle, [1], 0, WriteMode.Normal);
 
     fs.DrainOneLandingFile().Should().BeFalse("open files never move under the writer");
-    this._ssd.FileExists("open.bin", false).Should().BeTrue();
+    (this._ssd.FileExists("open.bin", false) || this._ssd.FileExists(_Staged("open.bin"), false)).Should().BeTrue();
     fs.Close(handle);
   }
 

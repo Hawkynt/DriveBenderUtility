@@ -28,6 +28,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly IntegrityService _integrity;
   private readonly ActivityFeed _activity;
   private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _prefetching = new(StringComparer.OrdinalIgnoreCase);
+
+  // FR-STAGED-WRITE: a file between Create and its last Close lives under a temp physical name
+  // (*.TEMP.$DRIVEBENDER, hidden on disk), so it never looks fully written until it is. The value
+  // is the still-open Create journal sequence — the atomic temp→final rename is the LAST action
+  // before that intent completes; a crash before it leaves only temps the recovery sweep removes.
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _staging = new(StringComparer.OrdinalIgnoreCase);
+
+  private static string _StagedNameOf(string normalized) => normalized + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+
+  /// <summary>The physical name data ops must use: the staged temp while the file is being written, the real name after.</summary>
+  private string _DataName(string normalized) => this._staging.ContainsKey(normalized) ? _StagedNameOf(normalized) : normalized;
   private readonly ShadowNamespace _shadow = new();
   private readonly MemberWatcher _watcher;
   private readonly Func<DateTime> _clock;
@@ -233,7 +244,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._mountOptions == null)
       return;
 
-    // clean unmount: every owed copy is applied before the mount releases (FR-CLEAN-UNMOUNT)
+    // clean unmount: staged files publish and every owed copy applies before the mount releases (FR-CLEAN-UNMOUNT)
+    foreach (var stagedPath in this._staging.Keys.ToArray())
+      this._PublishStaged(stagedPath);
     foreach (var path in this._writeBuffer.DirtyPaths)
       this.FlushPath(path);
 
@@ -289,9 +302,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return new(0, DateTime.MinValue, DateTime.MinValue, FileAttributes.Directory);
 
     // logical size = one copy's size, never the sum of copies (FR-STAT)
-    var copies = this._placement.ResolveCopies(normalized);
+    var dataName = this._DataName(normalized);
+    var copies = this._placement.ResolveCopies(dataName);
     if (copies.Count > 0)
-      return copies[0].Volume.Stat(normalized, copies[0].Shadow);
+      return copies[0].Volume.Stat(dataName, copies[0].Shadow);
 
     foreach (var member in this._Online)
       if (member.FolderExists(normalized, false))
@@ -303,12 +317,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void SetAttributes(string path, FileMetaPatch patch) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
-    var copies = this._placement.ResolveCopies(normalized);
+    var dataName = this._DataName(normalized);
+    var copies = this._placement.ResolveCopies(dataName);
     if (copies.Count == 0)
       throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {path}");
 
     foreach (var copy in copies)
-      copy.Volume.SetTimestamps(normalized, copy.Shadow, patch.CreationTimeUtc, patch.LastWriteTimeUtc);
+      copy.Volume.SetTimestamps(dataName, copy.Shadow, patch.CreationTimeUtc, patch.LastWriteTimeUtc);
 
     this._cache.Metadata.InvalidatePath(this._poolId, normalized);
   }
@@ -353,6 +368,26 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
         entries.Add(entry.Name, new(entry.Name, NodeKind.File, entry.Length, entry.LastWriteTimeUtc, entry.LastWriteTimeUtc));
       }
+    }
+
+    // files still being written are physically hidden temps — the listing shows them logically
+    // with their live size (FR-STAGED-WRITE)
+    var stagingPrefix = normalized.Length == 0 ? "" : normalized + "/";
+    foreach (var stagedPath in this._staging.Keys) {
+      if (!stagedPath.StartsWith(stagingPrefix, StringComparison.OrdinalIgnoreCase)
+          || stagedPath.Length <= stagingPrefix.Length
+          || stagedPath.IndexOf('/', stagingPrefix.Length) >= 0)
+        continue;
+
+      var name = stagedPath[stagingPrefix.Length..];
+      if (entries.ContainsKey(name))
+        continue;
+
+      var meta = this._StatUncached(stagedPath);
+      var length = this._writeBuffer.OverlayLength(stagedPath, meta?.Length ?? 0);
+      var written = meta?.LastWriteTimeUtc ?? this._clock();
+      entries[name] = new(name, NodeKind.File, length, written, written);
+      folderSeen = true;
     }
 
     // retain-metadata: complete the listing with remembered entries whose members have dropped out (§10 SAFE-DEGRADE)
@@ -412,18 +447,28 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var target = this._placement.ChoosePrimaryTarget(0)
                  ?? throw new PoolFsException(PoolFsError.NoSpace, "No pool member can take the new file");
 
-    var sequence = this._journal.LogIntent(JournalOp.Create, normalized, memberId: target.MemberId);
+    // staged temp-name lifecycle needs an atomic rename on every member to publish; members
+    // without it (whole-file remote backends) fall back to writing the final name in place
+    var staged = this._Online.All(m => (m.Caps & BackendCaps.AtomicRename) != 0);
+    var physical = staged ? _StagedNameOf(normalized) : normalized;
+
+    var sequence = this._journal.LogIntent(JournalOp.Create, physical, memberId: target.MemberId);
     var parent = PoolPaths.GetParent(normalized);
     if (parent.Length > 0)
       target.EnsureFolder(parent, false);
 
-    using (var stream = target.OpenWrite(normalized, false, true))
+    using (var stream = target.OpenWrite(physical, false, true))
       stream.Flush();
 
-    this._integrity.RecordWholeFile(target, normalized, false, []);
-    this._EnsureShadows(normalized, [], content: []);
-    this._journal.Complete(sequence, JournalOp.Create);
+    this._integrity.RecordWholeFile(target, physical, false, []);
+    this._EnsureShadows(physical, [], content: []);
+    if (staged)
+      this._staging[normalized] = sequence; // the Create intent stays open until the publish rename
+    else
+      this._journal.Complete(sequence, JournalOp.Create);
+
     this._Invalidate(normalized);
+    this._Invalidate(physical);
     this._shadow.Record(normalized, new(NodeKind.File, 0, this._clock()));
     return this._handles.Open(normalized, AccessMode.ReadWrite).Handle;
   }
@@ -465,6 +510,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._RequireWritable();
     var fromNormalized = PoolPaths.Normalize(from);
     var toNormalized = PoolPaths.Normalize(to);
+
+    // renaming a file that is still being written publishes it first (temp → final), then renames
+    if (this._staging.ContainsKey(fromNormalized))
+      this._PublishStaged(fromNormalized);
+
     var copies = this._placement.ResolveCopies(fromNormalized);
     if (copies.Count == 0) {
       // not a file — folders resolve by their directory presence (FR-RENAME for directories)
@@ -525,8 +575,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._Online.Any(m => m.FolderExists(toNormalized, false) || m.FileExists(toNormalized, false)))
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toNormalized}");
 
-    // dirty children must land under the old name before the tree moves (SAFE-NOLOSS)
+    // dirty children must land under the old name before the tree moves (SAFE-NOLOSS), and
+    // children still being written publish first so no temp names travel with the subtree
     var fromPrefix = fromNormalized + "/";
+    foreach (var stagedChild in this._staging.Keys.Where(k => k.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray())
+      this._PublishStaged(stagedChild);
     foreach (var dirty in this._writeBuffer.DirtyPaths.Where(p => p.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray())
       this.FlushPath(dirty);
 
@@ -554,6 +607,24 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void Unlink(string path) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
+
+    // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
+    if (this._staging.TryRemove(normalized, out var createSequence)) {
+      var stagedName = _StagedNameOf(normalized);
+      this._writeBuffer.Drain(normalized); // buffered blocks are moot
+      foreach (var member in this._Online)
+      foreach (var shadow in new[] { false, true })
+        if (member.FileExists(stagedName, shadow))
+          member.Delete(stagedName, shadow);
+
+      this._journal.Complete(createSequence, JournalOp.Create);
+      this._integrity.InvalidateFile(stagedName);
+      this._Invalidate(stagedName);
+      this._Invalidate(normalized);
+      this._shadow.Remove(normalized);
+      return;
+    }
+
     var copies = this._placement.ResolveCopies(normalized);
     if (copies.Count == 0)
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
@@ -655,7 +726,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._RequireWritable();
 
     var normalized = PoolPaths.Normalize(path);
-    if (this._placement.ResolveCopies(normalized).Count == 0)
+    if (this._placement.ResolveCopies(this._DataName(normalized)).Count == 0)
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
 
     return this._handles.Open(normalized, mode).Handle;
@@ -670,16 +741,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     open.File.Lock.EnterReadLock();
     try {
       var path = open.File.Path;
-      var copies = this._placement.ResolveCopies(path);
+      var dataPath = this._DataName(path); // a staging file reads from its temp physical
+      var copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
-      var length = this._writeBuffer.OverlayLength(path, _StatAnyCopy(copies, path)?.Length ?? 0);
+      var length = this._writeBuffer.OverlayLength(path, _StatAnyCopy(copies, dataPath)?.Length ?? 0);
       if (offset >= length)
         return 0; // reads past EOF return 0 bytes (FR-READ)
 
       var count = (int)Math.Min(buffer.Length, length - offset);
-      this._ReadRange(path, copies, buffer[..count], offset, count >= this._mirrorSplitThreshold);
+      this._ReadRange(path, dataPath, copies, buffer[..count], offset, count >= this._mirrorSplitThreshold);
       this._activity.Publish(ActivityKind.Read, path, count, fromMember: copies[0].Volume.DisplayName, reason: "user I/O");
 
       if (this._readAheadEnabled) {
@@ -699,7 +771,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           var from = offset + count;
           ThreadPool.QueueUserWorkItem(_ => {
             try {
-              this._Prefetch(path, copies, from, prefetchBytes, length);
+              this._Prefetch(dataPath, copies, from, prefetchBytes, length);
             } catch (Exception) {
               // prefetch is strictly best-effort — the foreground read surfaces real errors
             } finally {
@@ -715,7 +787,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
-  private void _ReadRange(string path, IReadOnlyList<PhysicalCopy> copies, Span<byte> buffer, long offset, bool mirrorSplit) {
+  private void _ReadRange(string path, string dataPath, IReadOnlyList<PhysicalCopy> copies, Span<byte> buffer, long offset, bool mirrorSplit) {
     var blockSize = this._cache.Pages.BlockSize;
 
     // FR-MIRROR: a large read pulls its uncached blocks from MULTIPLE copies CONCURRENTLY — each
@@ -723,13 +795,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (mirrorSplit && copies.Count > 1) {
       var missing = new List<long>();
       for (var blockIndex = offset / blockSize; blockIndex <= (offset + buffer.Length - 1) / blockSize; ++blockIndex)
-        if (!this._cache.Pages.TryGet(new(this._poolId, path, blockIndex), out _))
+        if (!this._cache.Pages.TryGet(new(this._poolId, dataPath, blockIndex), out _))
           missing.Add(blockIndex);
 
       if (missing.Count > 1)
         try {
           Parallel.ForEach(missing, new ParallelOptions { MaxDegreeOfParallelism = copies.Count },
-            blockIndex => this._LoadBlock(path, copies, blockIndex, mirrorSplit: true));
+            blockIndex => this._LoadBlock(dataPath, copies, blockIndex, mirrorSplit: true));
         } catch (AggregateException e) when (e.InnerExceptions.OfType<PoolFsException>().FirstOrDefault() is { } inner) {
           throw inner;
         }
@@ -740,7 +812,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var absolute = offset + written;
       var blockIndex = absolute / blockSize;
       var blockOffset = (int)(absolute % blockSize);
-      var block = this._writeBuffer.OverlayBlock(path, blockIndex, blockSize, this._LoadBlock(path, copies, blockIndex, mirrorSplit));
+      // the overlay (dirty write buffer) is keyed by the LOGICAL name; disk blocks by the physical one
+      var block = this._writeBuffer.OverlayBlock(path, blockIndex, blockSize, this._LoadBlock(dataPath, copies, blockIndex, mirrorSplit));
       var available = Math.Min(buffer.Length - written, block.Length - blockOffset);
       if (available <= 0)
         throw new PoolFsException(PoolFsError.IoError, $"Short read at block {blockIndex} of '{path}'");
@@ -841,12 +914,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     open.File.Lock.EnterWriteLock();
     try {
       var path = open.File.Path;
-      IReadOnlyList<PhysicalCopy> copies = this._placement.ResolveCopies(path);
+      var dataPath = this._DataName(path); // a staging file writes into its temp physical
+      IReadOnlyList<PhysicalCopy> copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
       if (mode == WriteMode.Append)
-        offset = this._writeBuffer.OverlayLength(path, copies[0].Volume.Stat(path, copies[0].Shadow)?.Length ?? 0);
+        offset = this._writeBuffer.OverlayLength(path, copies[0].Volume.Stat(dataPath, copies[0].Shadow)?.Length ?? 0);
 
       var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(path));
       var policy = effective.Write?.Policy ?? WritePolicy.WriteBack;
@@ -872,25 +946,37 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       this._RequireAckQuorum(path, eligibleCount);
 
+      // FR-STRIPE: when the ack needs fewer copies than exist, consecutive blocks ROTATE which
+      // storage takes them synchronously — a sequential writer spreads its blocks across the
+      // storages (each carries ~1/N of the load) while the owed-sync job converges the rest in
+      // the background, gearing towards per-storage-throughput × storages
+      if (eligibleCount > 1 && requiredCopies < eligibleCount) {
+        var rotation = (int)(offset / Math.Max(1, this._cache.Pages.BlockSize) % eligibleCount);
+        if (rotation > 0) {
+          var eligible = orderedCopies.Take(eligibleCount).ToArray();
+          copies = [.. eligible.Skip(rotation), .. eligible.Take(rotation), .. orderedCopies.Skip(eligibleCount)];
+        }
+      }
+
       // intent → mutate the ack set durably → (write-through: complete now; write-back /
       // deferred: the intent stays open until the owed copies are applied, so a crash
       // in the gap reconciles from the durable primary) (SAFE-ORDER, FR-WT, FR-WB)
-      var sequence = this._journal.LogIntent(JournalOp.Write, path, offset: offset, length: bytes.Length);
+      var sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
       var mirroredNow = requiredCopies > 1;
-      _WriteCopiesParallel(copies, 0, requiredCopies, path, bytes, offset);
+      _WriteCopiesParallel(copies, 0, requiredCopies, dataPath, bytes, offset);
 
       if (requiredCopies >= copies.Count)
         this._journal.Complete(sequence, JournalOp.Write);
       else if (policy == WritePolicy.WriteThrough) {
         // write-through with weak-flush members: apply their copies now (best effort), the
         // intent stays open so recovery reconciles them if they were lost (SAFE-REMOTE)
-        _WriteCopiesParallel(copies, requiredCopies, copies.Count, path, bytes, offset);
+        _WriteCopiesParallel(copies, requiredCopies, copies.Count, dataPath, bytes, offset);
         mirroredNow = true;
         this._journal.Complete(sequence, JournalOp.Write);
       }
       else if (!this._writeBuffer.StageWrite(path, offset, bytes, sequence, requiredCopies)) {
         // write-buffer backpressure: degrade to write-through instead of growing RAM (FR-BACKP)
-        _WriteCopiesParallel(copies, requiredCopies, copies.Count, path, bytes, offset);
+        _WriteCopiesParallel(copies, requiredCopies, copies.Count, dataPath, bytes, offset);
         mirroredNow = true;
         this._journal.Complete(sequence, JournalOp.Write);
       }
@@ -901,8 +987,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._activity.Publish(ActivityKind.Duplicate, path, bytes.Length, fromMember: copies[0].Volume.DisplayName, toMember: copies[1].Volume.DisplayName, reason: "mirrored write");
 
       // coherency: a read after this write must return the new bytes (SAFE-COHERE)
-      this._integrity.InvalidateFile(path);
-      this._cache.Pages.InvalidatePath(this._poolId, path);
+      this._integrity.InvalidateFile(dataPath);
+      this._cache.Pages.InvalidatePath(this._poolId, dataPath);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
       return bytes.Length;
     } finally {
@@ -956,17 +1042,18 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     try {
       var path = open.File.Path;
       this.FlushPath(path); // pending buffered writes apply before the truncate so ordering stays linear
-      var copies = this._placement.ResolveCopies(path);
+      var dataPath = this._DataName(path);
+      var copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
-      var sequence = this._journal.LogIntent(JournalOp.Truncate, path, length: length);
+      var sequence = this._journal.LogIntent(JournalOp.Truncate, dataPath, length: length);
       foreach (var copy in copies)
-        copy.Volume.Truncate(path, copy.Shadow, length); // grows zero-filled or shrinks on all copies (FR-TRUNC)
+        copy.Volume.Truncate(dataPath, copy.Shadow, length); // grows zero-filled or shrinks on all copies (FR-TRUNC)
 
       this._journal.Complete(sequence, JournalOp.Truncate);
-      this._integrity.InvalidateFile(path);
-      this._cache.Pages.InvalidatePath(this._poolId, path);
+      this._integrity.InvalidateFile(dataPath);
+      this._cache.Pages.InvalidatePath(this._poolId, dataPath);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
     } finally {
       open.File.Lock.ExitWriteLock();
@@ -977,6 +1064,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._RequireMounted();
     var open = this._handles.Get(handle);
     this.FlushPath(open.File.Path); // fsync is an absolute durability barrier in every mode (SAFE-FSYNC)
+
+    // fsync promises the data survives a crash — a staged file publishes NOW (temp → final);
+    // without it the temp would be swept on recovery and the promised data lost
+    if (this._staging.ContainsKey(open.File.Path))
+      this._PublishStaged(open.File.Path);
   }
 
   /// <summary>
@@ -990,14 +1082,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return;
 
     var (ops, journalSequences, _) = drained.Value;
+    var dataName = this._DataName(normalized); // a staging file's owed blocks land in its temp physical
     if (ops.Count > 0) {
-      var copies = this._placement.ResolveCopies(normalized);
+      var copies = this._placement.ResolveCopies(dataName);
       var volatileSequence = journalSequences.Count == 0 && copies.Count > 0
-        ? this._journal.LogIntent(JournalOp.Write, normalized)
+        ? this._journal.LogIntent(JournalOp.Write, dataName)
         : 0;
 
       foreach (var copy in copies) {
-        using var stream = copy.Volume.OpenWrite(normalized, copy.Shadow, false);
+        using var stream = copy.Volume.OpenWrite(dataName, copy.Shadow, false);
         foreach (var op in ops) {
           if (op.TruncateLength is { } truncateLength) {
             stream.SetLength(truncateLength);
@@ -1018,8 +1111,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     foreach (var sequence in journalSequences)
       this._journal.Complete(sequence, JournalOp.Write);
 
-    this._integrity.InvalidateFile(normalized);
-    this._cache.Pages.InvalidatePath(this._poolId, normalized);
+    this._integrity.InvalidateFile(dataName);
+    this._cache.Pages.InvalidatePath(this._poolId, dataName);
     this._cache.Metadata.InvalidatePath(this._poolId, normalized);
   }
 
@@ -1102,7 +1195,42 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
-  public void Close(NodeHandle handle) => this._handles.Close(handle);
+  public void Close(NodeHandle handle) {
+    var open = this._handles.Get(handle);
+    var path = open.File.Path;
+    this._handles.Close(handle);
+
+    // last handle gone: publish the staged temp to its final name — the atomic rename is the
+    // LAST action before the Create journal intent completes (FR-STAGED-WRITE)
+    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path))
+      this._PublishStaged(path);
+  }
+
+  /// <summary>
+  /// Publishes a staged file: flushes its buffered blocks into the temp physical, atomically
+  /// renames temp → final on every copy, and only then completes the Create intent. Until this
+  /// ran, the file never looked fully written on any physical disk.
+  /// </summary>
+  private void _PublishStaged(string normalized) {
+    if (!this._staging.ContainsKey(normalized))
+      return;
+
+    this.FlushPath(normalized); // owed blocks land in the temp physical first (mapping still active)
+    if (!this._staging.TryRemove(normalized, out var createSequence))
+      return; // another thread published concurrently
+
+    var stagedName = _StagedNameOf(normalized);
+    var copies = this._placement.ResolveCopies(stagedName);
+    foreach (var copy in copies)
+      copy.Volume.AtomicReplace(stagedName, normalized, copy.Shadow);
+
+    this._integrity.RenameFile(stagedName, normalized);
+    this._journal.Complete(createSequence, JournalOp.Create);
+    this._Invalidate(stagedName);
+    this._Invalidate(normalized);
+    this._cache.Pages.InvalidatePath(this._poolId, stagedName);
+    this._activity.Publish(ActivityKind.Write, normalized, 0, reason: "staged file published (temp → final)");
+  }
 
   #endregion
 

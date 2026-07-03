@@ -22,7 +22,10 @@ public enum JournalOp {
 /// <summary>One journal line: an intent (Completed=false) or its completion marker.</summary>
 public sealed record JournalRecord {
   [JsonPropertyName("seq")] public required long Sequence { get; init; }
-  [JsonPropertyName("op")] public required JournalOp Op { get; init; }
+
+  // ALWAYS serialized: Create is enum value 0, and the compact writer omits defaults — a
+  // required property missing on read made every Create record silently unparseable
+  [JsonPropertyName("op")] [JsonIgnore(Condition = JsonIgnoreCondition.Never)] public required JournalOp Op { get; init; }
   [JsonPropertyName("path")] public string? Path { get; init; }
   [JsonPropertyName("target")] public string? TargetPath { get; init; }
   [JsonPropertyName("offset")] public long Offset { get; init; }
