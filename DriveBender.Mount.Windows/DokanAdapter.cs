@@ -114,6 +114,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       }
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -138,6 +142,8 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       }
     } catch (PoolFsException e) {
       DriveBender.Logger($"[Warning]Cleanup of '{path}' failed: {e.Message}");
+    } catch (Exception e) {
+      DriveBender.Logger($"[Warning]unexpected error in Cleanup of '{path}': {e}");
     }
   }
 
@@ -173,6 +179,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       return DokanResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -194,6 +204,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       return DokanResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -206,6 +220,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       return DokanResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -217,6 +235,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       return DokanResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -234,6 +256,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       return DokanResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -254,6 +280,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       return meta.IsDirectory ? DokanResult.AccessDenied : DokanResult.Success; // validation only; Cleanup deletes
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -264,6 +294,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
         : DokanResult.Success; // validation only; Cleanup deletes
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -279,6 +313,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       return DokanResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -299,6 +337,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       return DokanResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 
@@ -320,6 +362,10 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
       return DokanResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return DokanResult.Error;
     }
   }
 

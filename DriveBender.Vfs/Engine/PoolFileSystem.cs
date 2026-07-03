@@ -27,6 +27,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly PoolTrash _trash;
   private readonly IntegrityService _integrity;
   private readonly ActivityFeed _activity;
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _prefetching = new(StringComparer.OrdinalIgnoreCase);
   private readonly ShadowNamespace _shadow = new();
   private readonly MemberWatcher _watcher;
   private readonly Func<DateTime> _clock;
@@ -692,8 +693,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         lock (state)
           prefetchBytes = state.OnRead(offset, count);
 
-        if (prefetchBytes > 0)
-          this._Prefetch(path, copies, offset + count, prefetchBytes, length);
+        // background prefetch (FR-RA): the window loads on the thread pool so the foreground
+        // read returns at once; one prefetch chain per path at a time prevents pile-up
+        if (prefetchBytes > 0 && this._prefetching.TryAdd(path, 0)) {
+          var from = offset + count;
+          ThreadPool.QueueUserWorkItem(_ => {
+            try {
+              this._Prefetch(path, copies, from, prefetchBytes, length);
+            } catch (Exception) {
+              // prefetch is strictly best-effort — the foreground read surfaces real errors
+            } finally {
+              this._prefetching.TryRemove(path, out var _);
+            }
+          });
+        }
       }
 
       return count;
@@ -864,41 +877,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // in the gap reconciles from the durable primary) (SAFE-ORDER, FR-WT, FR-WB)
       var sequence = this._journal.LogIntent(JournalOp.Write, path, offset: offset, length: bytes.Length);
       var mirroredNow = requiredCopies > 1;
-      for (var i = 0; i < requiredCopies; ++i) {
-        var copy = copies[i];
-        using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
-        stream.Seek(offset, SeekOrigin.Begin);
-        stream.Write(bytes, 0, bytes.Length);
-        stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
-      }
+      _WriteCopiesParallel(copies, 0, requiredCopies, path, bytes, offset);
 
       if (requiredCopies >= copies.Count)
         this._journal.Complete(sequence, JournalOp.Write);
       else if (policy == WritePolicy.WriteThrough) {
         // write-through with weak-flush members: apply their copies now (best effort), the
         // intent stays open so recovery reconciles them if they were lost (SAFE-REMOTE)
-        for (var i = requiredCopies; i < copies.Count; ++i) {
-          var copy = copies[i];
-          using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
-          stream.Seek(offset, SeekOrigin.Begin);
-          stream.Write(bytes, 0, bytes.Length);
-          stream.Flush();
-          mirroredNow = true;
-        }
-
+        _WriteCopiesParallel(copies, requiredCopies, copies.Count, path, bytes, offset);
+        mirroredNow = true;
         this._journal.Complete(sequence, JournalOp.Write);
       }
       else if (!this._writeBuffer.StageWrite(path, offset, bytes, sequence, requiredCopies)) {
         // write-buffer backpressure: degrade to write-through instead of growing RAM (FR-BACKP)
-        for (var i = requiredCopies; i < copies.Count; ++i) {
-          var copy = copies[i];
-          using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
-          stream.Seek(offset, SeekOrigin.Begin);
-          stream.Write(bytes, 0, bytes.Length);
-          stream.Flush();
-          mirroredNow = true;
-        }
-
+        _WriteCopiesParallel(copies, requiredCopies, copies.Count, path, bytes, offset);
+        mirroredNow = true;
         this._journal.Complete(sequence, JournalOp.Write);
       }
 
@@ -914,6 +907,32 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return bytes.Length;
     } finally {
       open.File.Lock.ExitWriteLock();
+    }
+  }
+
+  /// <summary>
+  /// Applies one write to a span of copies CONCURRENTLY — independent disks take their mirror
+  /// leg in parallel instead of doubling the latency (NFR-THROUGHPUT). All copies must land
+  /// (each with its own durability barrier) before this returns; the first failure surfaces.
+  /// </summary>
+  private static void _WriteCopiesParallel(IReadOnlyList<PhysicalCopy> copies, int fromInclusive, int toExclusive, string path, byte[] bytes, long offset) {
+    void WriteOne(PhysicalCopy copy) {
+      using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
+      stream.Seek(offset, SeekOrigin.Begin);
+      stream.Write(bytes, 0, bytes.Length);
+      stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+    }
+
+    if (toExclusive - fromInclusive <= 1) {
+      if (toExclusive > fromInclusive)
+        WriteOne(copies[fromInclusive]);
+      return;
+    }
+
+    try {
+      Parallel.For(fromInclusive, toExclusive, i => WriteOne(copies[i]));
+    } catch (AggregateException e) when (e.InnerExceptions.OfType<PoolFsException>().FirstOrDefault() is { } inner) {
+      throw inner;
     }
   }
 

@@ -190,14 +190,20 @@ internal static class MountCommand {
       var advisor = new AutoTierAdvisor();
       var tick = 0L;
       using var pump = new Timer(_ => {
-        scheduler.Pump();
-        metrics.Publish(fs, entry, ios); // live snapshot for the serve daemon (§6.13)
-        if (registry.ConsumeReload(pool.PoolId)) // the daemon changed settings — apply them live
-          currentConfig = _ReloadLive(host, store, fs, pool, ios) ?? currentConfig;
-        if (++tick % 30 == 0 && currentConfig.Placement?.AutoLandingZone == true)
-          _AutoTier(host, store, fs, pool, ios, advisor);
-        if (registry.StopRequested(pool.PoolId)) // another dbmount asked for a clean unmount
-          stop.Set();
+        // an unhandled exception in a Timer callback kills the process — the background pump
+        // must never take the driver-event loop down with it (process-isolation hardening)
+        try {
+          scheduler.Pump();
+          metrics.Publish(fs, entry, ios); // live snapshot for the serve daemon (§6.13)
+          if (registry.ConsumeReload(pool.PoolId)) // the daemon changed settings — apply them live
+            currentConfig = _ReloadLive(host, store, fs, pool, ios) ?? currentConfig;
+          if (++tick % 30 == 0 && currentConfig.Placement?.AutoLandingZone == true)
+            _AutoTier(host, store, fs, pool, ios, advisor);
+          if (registry.StopRequested(pool.PoolId)) // another dbmount asked for a clean unmount
+            stop.Set();
+        } catch (Exception e) {
+          DriveBender.Logger($"[Warning]background pump tick failed: {e.Message}");
+        }
       }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
 
       Console.WriteLine($"Pool mounted at '{target}'. Press Ctrl+C or run 'dbmount unmount {target}' to unmount.");

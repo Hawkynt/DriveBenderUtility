@@ -1,13 +1,184 @@
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace DivisonM.Vfs;
 
 /// <summary>
 /// <see cref="IVolumeIO"/> over a local (or UNC-mapped) directory tree — the backend for
 /// drive-root, subfolder and UNC members. Honours the Drive Bender on-disk layout via
-/// <see cref="PoolPaths"/> (SAFE-COMPAT).
+/// <see cref="PoolPaths"/> (SAFE-COMPAT). I/O goes through a pooled-handle layer with
+/// positional (offset-based) reads/writes: no per-chunk file opens, and any number of
+/// threads can hit the same file concurrently without seek-state races (NFR-THROUGHPUT).
 /// </summary>
 public sealed class LocalVolumeIO(Guid memberId, string displayName, string rootPath, string physicalVolumeId) : IVolumeIO {
+
+  #region pooled positional I/O
+
+  /// <summary>A refcounted OS handle: streams borrow it; it closes when evicted AND unused.</summary>
+  private sealed class HandleLease(SafeFileHandle handle) {
+    public readonly SafeFileHandle Handle = handle;
+    private int _refs = 1; // the pool's own reference
+    public bool Evicted;
+    public long LastUseTicks = Environment.TickCount64;
+
+    public void AddRef() {
+      lock (this) {
+        ++this._refs;
+        this.LastUseTicks = Environment.TickCount64;
+      }
+    }
+
+    public void Release() {
+      bool close;
+      lock (this)
+        close = --this._refs == 0 && this.Evicted;
+      if (close)
+        this.Handle.Dispose();
+    }
+  }
+
+  /// <summary>
+  /// LRU pool of open file handles keyed by (access, physical path). Writable handles carry
+  /// WRITE_THROUGH so every positional write is a durability barrier (SAFE-FSYNC parity with
+  /// the previous per-call streams). Idle handles retire after a short TTL so directory
+  /// metadata (sizes) stays fresh for outside observers.
+  /// </summary>
+  private sealed class HandlePool {
+    private const int _CAPACITY = 64;
+    private const long _IDLE_TTL_MS = 3000;
+
+    private readonly Dictionary<string, HandleLease> _leases = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Lock _lock = new();
+
+    private static string _Key(string physicalPath, bool writable) => (writable ? "w|" : "r|") + physicalPath;
+
+    public HandleLease Rent(string physicalPath, bool writable, bool create) {
+      var key = _Key(physicalPath, writable);
+      lock (this._lock) {
+        this._EvictIdle();
+        if (this._leases.TryGetValue(key, out var cached)) {
+          cached.AddRef();
+          return cached;
+        }
+      }
+
+      // the actual open happens outside the pool lock — it is disk I/O
+      var handle = File.OpenHandle(
+        physicalPath,
+        writable ? (create ? FileMode.OpenOrCreate : FileMode.Open) : FileMode.Open,
+        writable ? FileAccess.ReadWrite : FileAccess.Read,
+        FileShare.ReadWrite | FileShare.Delete,
+        writable ? FileOptions.WriteThrough : FileOptions.None);
+      var fresh = new HandleLease(handle);
+      fresh.AddRef(); // the caller's reference
+
+      lock (this._lock) {
+        if (this._leases.TryGetValue(key, out var raced)) {
+          // lost an open race: keep the established lease, retire ours
+          fresh.Evicted = true;
+          fresh.Release(); // caller ref
+          fresh.Release(); // pool ref → closes
+          raced.AddRef();
+          return raced;
+        }
+
+        this._leases[key] = fresh;
+        if (this._leases.Count > _CAPACITY)
+          this._EvictOldest();
+        return fresh;
+      }
+    }
+
+    /// <summary>The authoritative length while a pooled write handle is open (directory metadata lags on NTFS).</summary>
+    public bool TryGetWriteLength(string physicalPath, out long length) {
+      lock (this._lock) {
+        if (this._leases.TryGetValue(_Key(physicalPath, true), out var lease)) {
+          length = RandomAccess.GetLength(lease.Handle);
+          return true;
+        }
+      }
+
+      length = 0;
+      return false;
+    }
+
+    public void Invalidate(string physicalPath) {
+      lock (this._lock) {
+        this._Retire(_Key(physicalPath, false));
+        this._Retire(_Key(physicalPath, true));
+      }
+    }
+
+    public void InvalidatePrefix(string physicalPrefix) {
+      lock (this._lock)
+        foreach (var key in this._leases.Keys.Where(k => k.AsSpan(2).StartsWith(physicalPrefix, StringComparison.OrdinalIgnoreCase)).ToArray())
+          this._Retire(key);
+    }
+
+    private void _Retire(string key) {
+      if (!this._leases.Remove(key, out var lease))
+        return;
+
+      lease.Evicted = true;
+      lease.Release(); // pool ref — closes once the last borrower returns it
+    }
+
+    private void _EvictIdle() {
+      var now = Environment.TickCount64;
+      foreach (var (key, lease) in this._leases.Where(kv => now - kv.Value.LastUseTicks > _IDLE_TTL_MS).ToArray())
+        this._Retire(key);
+    }
+
+    private void _EvictOldest() {
+      var oldest = this._leases.OrderBy(kv => kv.Value.LastUseTicks).First();
+      this._Retire(oldest.Key);
+    }
+  }
+
+  /// <summary>Positional stream over a leased handle: offset-based I/O, no shared seek state.</summary>
+  private sealed class PooledStream(HandleLease lease, bool writable) : Stream {
+    private long _position;
+    private int _disposed;
+
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => writable;
+    public override long Length => RandomAccess.GetLength(lease.Handle);
+    public override long Position { get => this._position; set => this._position = value; }
+
+    public override int Read(byte[] buffer, int offset, int count) {
+      var read = RandomAccess.Read(lease.Handle, buffer.AsSpan(offset, count), this._position);
+      this._position += read;
+      return read;
+    }
+
+    public override void Write(byte[] buffer, int offset, int count) {
+      RandomAccess.Write(lease.Handle, buffer.AsSpan(offset, count), this._position);
+      this._position += count;
+    }
+
+    public override void Flush() {
+      // the handle carries WRITE_THROUGH — every write already hit stable storage
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => this._position = origin switch {
+      SeekOrigin.Current => this._position + offset,
+      SeekOrigin.End => this.Length + offset,
+      _ => offset,
+    };
+
+    public override void SetLength(long value) => RandomAccess.SetLength(lease.Handle, value);
+
+    protected override void Dispose(bool disposing) {
+      if (disposing && Interlocked.Exchange(ref this._disposed, 1) == 0)
+        lease.Release();
+      base.Dispose(disposing);
+    }
+  }
+
+  private readonly HandlePool _pool = new();
+
+  #endregion
 
   private static class NativeMethods {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto, EntryPoint = "GetDiskFreeSpaceEx")]
@@ -81,7 +252,7 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
   };
 
   public Stream OpenRead(string relativePath, bool shadow)
-    => this._Guard(() => (Stream)new FileStream(this._Resolve(relativePath, shadow), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+    => this._Guard(() => (Stream)new PooledStream(this._pool.Rent(this._Resolve(relativePath, shadow), writable: false, create: false), writable: false));
 
   public Stream OpenWrite(string relativePath, bool shadow, bool create) {
     return this._Guard(() => {
@@ -89,18 +260,23 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
       if (create)
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
 
-    // FileOptions.WriteThrough so Flush is a durability barrier (DurableFlush cap)
-      return (Stream)new FileStream(path, create ? FileMode.OpenOrCreate : FileMode.Open, FileAccess.ReadWrite, FileShare.Read, 64 * 1024, FileOptions.WriteThrough);
+      // pooled WRITE_THROUGH handle: positional writes are each a durability barrier (DurableFlush cap)
+      return (Stream)new PooledStream(this._pool.Rent(path, writable: true, create), writable: true);
     });
   }
 
   public void Truncate(string relativePath, bool shadow, long length) => this._Guard(() => {
-    using var stream = new FileStream(this._Resolve(relativePath, shadow), FileMode.Open, FileAccess.Write, FileShare.Read);
-    stream.SetLength(length);
+    var lease = this._pool.Rent(this._Resolve(relativePath, shadow), writable: true, create: false);
+    try {
+      RandomAccess.SetLength(lease.Handle, length);
+    } finally {
+      lease.Release();
+    }
   });
 
   public void Delete(string relativePath, bool shadow) => this._Guard(() => {
     var path = this._Resolve(relativePath, shadow);
+    this._pool.Invalidate(path); // no pooled handle may outlive the file
     var file = new FileInfo(path);
     if (!file.Exists)
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
@@ -131,6 +307,7 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     if (Directory.Exists(toPath) || File.Exists(toPath))
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toRelativeFolder}");
 
+    this._pool.InvalidatePrefix(fromPath + System.IO.Path.DirectorySeparatorChar); // pooled keys move with the subtree
     Directory.CreateDirectory(System.IO.Path.GetDirectoryName(toPath)!);
     Directory.Move(fromPath, toPath);
   });
@@ -141,6 +318,8 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     if (!File.Exists(tempPath))
       throw new PoolFsException(PoolFsError.NotFound, $"Staged file not found: {tempRelative}");
 
+    this._pool.Invalidate(tempPath);
+    this._pool.Invalidate(finalPath);
     Directory.CreateDirectory(System.IO.Path.GetDirectoryName(finalPath)!);
     if (File.Exists(finalPath))
       File.Replace(tempPath, finalPath, null, true);
@@ -152,7 +331,9 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     var path = this._Resolve(relativePath, shadow);
     var file = new FileInfo(path);
     if (file.Exists)
-      return new FileMeta(file.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, file.Attributes);
+      // while a pooled write handle is open, the handle's length is authoritative — NTFS
+      // directory metadata (what FileInfo reads) lags behind write-through data
+      return new FileMeta(this._pool.TryGetWriteLength(path, out var live) ? live : file.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, file.Attributes);
 
     var directory = new DirectoryInfo(path);
     if (directory.Exists)
@@ -172,7 +353,8 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
 
     foreach (var item in directory.EnumerateFileSystemInfos())
       yield return item switch {
-        FileInfo f => new VolumeEntry(f.Name, false, f.Length, f.LastWriteTimeUtc),
+        // live length from the pooled write handle when one is open — directory metadata lags it
+        FileInfo f => new VolumeEntry(f.Name, false, this._pool.TryGetWriteLength(f.FullName, out var live) ? live : f.Length, f.LastWriteTimeUtc),
         _ => new VolumeEntry(item.Name, true, 0, item.LastWriteTimeUtc),
       };
   }

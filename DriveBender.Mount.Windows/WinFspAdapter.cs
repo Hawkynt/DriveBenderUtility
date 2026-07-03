@@ -66,6 +66,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -77,6 +81,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -100,6 +108,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -123,6 +135,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -140,6 +156,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -166,6 +186,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -182,6 +206,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -193,6 +221,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -207,6 +239,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -221,6 +257,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -233,6 +273,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -247,6 +291,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
     }
   }
 
@@ -268,6 +316,8 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       }
     } catch (PoolFsException e) {
       DriveBender.Logger($"[Warning]Cleanup-delete of '{descriptor.Path}' failed: {e.Message}");
+    } catch (Exception e) {
+      DriveBender.Logger($"[Warning]unexpected error in Cleanup of '{descriptor.Path}': {e}");
     }
   }
 

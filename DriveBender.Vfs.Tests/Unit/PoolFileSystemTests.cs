@@ -148,7 +148,9 @@ public class PoolFileSystemTests {
     var handle = this._fs.Open("stream.bin", AccessMode.Read, ShareMode.Read);
 
     var buffer = new byte[16];
-    this._fs.Read(handle, buffer, 0);   // triggers read-ahead of the next window
+    this._fs.Read(handle, buffer, 0);   // triggers read-ahead of the next window (async, off the read path)
+    SpinWait.SpinUntil(() => this._cache.Pages.TryGet(new(_pool, "stream.bin", 1), out _), TimeSpan.FromSeconds(5))
+      .Should().BeTrue("the background prefetch fills the next block shortly after the read returns");
     this._volume1.AlwaysFail(VolumeOp.OpenRead); // volume now refuses — only the cache can serve
 
     var act = () => this._fs.Read(handle, buffer, 16);
