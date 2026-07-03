@@ -78,6 +78,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public PoolTrash Trash => this._trash;
   public IntegrityService Integrity => this._integrity;
   public ActivityFeed Activity => this._activity;
+  public Caching.CacheInstance Cache => this._cache;
   public MemberWatcher Watcher => this._watcher;
   public ShadowNamespace Shadow => this._shadow;
   public MemberLossPolicy MemberLossPolicy => this._memberLossPolicy;

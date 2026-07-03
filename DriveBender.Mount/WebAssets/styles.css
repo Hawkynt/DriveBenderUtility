@@ -143,3 +143,22 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .cfg-ref { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
   max-height: 34vh; overflow: auto; font-size: 11px; font-family: ui-monospace, monospace; color: var(--muted); }
 .nostats { color: var(--muted); font-size: 12px; padding: 8px 0; }
+.topo .tier .mem { fill: var(--muted); font-size: 9px; font-family: ui-monospace, monospace; }
+.activity .mv { color: var(--accent); }
+.activity .rsn, .rsn { color: var(--muted); font-style: italic; }
+
+/* health report */
+.modal.wide { width: min(860px, 96vw); }
+.report-row { display: flex; justify-content: space-between; padding: 6px 2px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.issues { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; font-size: 12px; }
+.issues > div { background: var(--panel-2); border-radius: 8px; padding: 7px 10px; }
+
+/* pool browser */
+table.browse { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.browse th { position: sticky; top: 0; background: var(--panel); font-size: 11px; color: var(--muted);
+  padding: 6px 8px; border-bottom: 1px solid var(--line); max-width: 90px; overflow: hidden; text-overflow: ellipsis; }
+table.browse td { padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; }
+table.browse td.sz { color: var(--muted); font-size: 11px; text-align: right; }
+table.browse td.pm { text-align: center; }
+table.browse tr.dir { cursor: pointer; }
+table.browse tr.dir:hover td { background: var(--panel-2); color: var(--accent); }

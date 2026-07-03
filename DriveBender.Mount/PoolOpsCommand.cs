@@ -35,14 +35,18 @@ internal static class PoolOpsCommand {
     return (pool, online, Math.Max(1, config.Duplication ?? 1));
   }
 
-  public static int Health(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, PoolHealthOptions options) {
-    var (pool, online, duplication) = _Open(host, provider, remoteResolver, options.Pool);
+  /// <summary>Runs the health scan (optionally correcting) and returns the structured report — shared by the CLI verb and the daemon's API.</summary>
+  public static HealthReport RunHealth(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, string poolNameOrId, bool fix) {
+    var (_, online, duplication) = _Open(host, provider, remoteResolver, poolNameOrId);
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
     var service = new HealthService(ios, new SmartctlMonitor(), new IntegrityService(ios), new MediaLifecycle(ios, journal, duplication));
+    return fix ? service.CheckAndCorrect() : service.Check();
+  }
 
-    var report = options.Fix ? service.CheckAndCorrect() : service.Check();
-    Console.WriteLine($"Pool '{pool.Name}' — {(report.Healthy ? "healthy" : "attention needed")}");
+  public static int Health(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, PoolHealthOptions options) {
+    var report = RunHealth(host, provider, remoteResolver, options.Pool, options.Fix);
+    Console.WriteLine($"Pool '{options.Pool}' — {(report.Healthy ? "healthy" : "attention needed")}");
     Console.WriteLine($"  Under-duplicated files: {report.UnderDuplicatedFiles}");
     if (report.Corrected)
       Console.WriteLine($"  Copies repaired/created: {report.CopiesRepaired}");
@@ -97,6 +101,62 @@ internal static class PoolOpsCommand {
     lifecycle.RemoveMember(withReplacement, oldMember.MemberId);
     Console.WriteLine($"Replaced media '{oldMember.Label ?? oldMember.Path}' with '{options.New}' in pool '{pool.Name}'.");
     return 0;
+  }
+
+  public sealed record BrowseMember(Guid Id, string Label);
+  public sealed record BrowsePresence(Guid MemberId, bool Primary, bool Shadow);
+  public sealed record BrowseEntry(string Name, bool IsDirectory, long Length, IReadOnlyList<BrowsePresence> Presence);
+  public sealed record BrowseResult(string Path, IReadOnlyList<BrowseMember> Members, IReadOnlyList<BrowseEntry> Entries);
+
+  /// <summary>
+  /// Union directory listing across all online members with per-member placement: for every
+  /// entry, which member holds a primary and which a shadow copy (FR-UI-MAP — "where exactly
+  /// is my data"). Read-only; sidecars and shadow folders are hidden like in the mounted view.
+  /// </summary>
+  public static BrowseResult Browse(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, string poolNameOrId, string? relativePath) {
+    var (_, online, _) = _Open(host, provider, remoteResolver, poolNameOrId);
+    var rel = (relativePath ?? "").Replace('\\', '/').Trim('/');
+
+    var union = new Dictionary<string, (bool dir, long len)>(StringComparer.OrdinalIgnoreCase);
+    var presence = new Dictionary<string, Dictionary<Guid, (bool primary, bool shadow)>>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var (def, io) in online)
+    foreach (var shadow in new[] { false, true }) {
+      VolumeEntry[] list;
+      try {
+        if (!io.FolderExists(rel, shadow))
+          continue;
+
+        list = [.. io.List(rel, shadow)];
+      } catch (PoolFsException) {
+        continue; // member unreadable right now — show what the others have
+      }
+
+      foreach (var entry in list) {
+        if (PoolPaths.IsHiddenName(entry.Name))
+          continue;
+
+        union[entry.Name] = union.TryGetValue(entry.Name, out var known)
+          ? (known.dir || entry.IsDirectory, Math.Max(known.len, entry.Length))
+          : (entry.IsDirectory, entry.Length);
+
+        if (!presence.TryGetValue(entry.Name, out var byMember))
+          presence[entry.Name] = byMember = [];
+        var flags = byMember.GetValueOrDefault(def.MemberId);
+        byMember[def.MemberId] = (flags.primary || !shadow, flags.shadow || shadow);
+      }
+    }
+
+    var members = online.Select(m => new BrowseMember(m.def.MemberId, m.def.Label ?? m.def.Path)).ToArray();
+    var entries = union
+      .OrderByDescending(e => e.Value.dir).ThenBy(e => e.Key, StringComparer.OrdinalIgnoreCase)
+      .Select(e => new BrowseEntry(e.Key, e.Value.dir, e.Value.len, [.. members.Select(m => {
+        var flags = presence[e.Key].GetValueOrDefault(m.Id);
+        return new BrowsePresence(m.Id, flags.primary, flags.shadow);
+      })]))
+      .ToArray();
+
+    return new(rel, members, entries);
   }
 
   private static PoolMemberDefinition _FindMember(PoolRef pool, string? memberRef) {

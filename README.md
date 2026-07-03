@@ -325,7 +325,10 @@ manifest never inlines), mount / unmount, add or remove members, set
 on independent physical disks by default, SAFE-PHYS, with an opt-in to also keep
 copies on the same disk for bit-rot protection when no independent disk is free),
 edit **all pool settings** via a validated JSON editor, remove- and replace-media,
-run health / fix / restore, **forget** a pool (drop it from this machine's list
+**browse the pool** with one column per storage showing exactly where every
+file/folder lives (✅ primary · 🔁 shadow · ❌ absent), run a **problem scan**
+with a full report (under-duplicated files, integrity issues, per-device SMART)
+plus one-click fix, restore, **forget** a pool (drop it from this machine's list
 while leaving its data and on-disk markers intact, so it can be re-imported or
 recovered later), and delete (keep data) or purge (wipe data, guarded by a
 name-confirmation). If a chosen member folder is still claimed by another —

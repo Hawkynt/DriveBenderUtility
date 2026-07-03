@@ -24,6 +24,13 @@ public sealed record MetricsSnapshot {
   public long RecoveredOperations { get; init; }
   public long BytesFree { get; init; }
   public long BytesTotal { get; init; }
+
+  // cache occupancy for the dashboard bars (read cache vs write buffer, used vs capacity)
+  public long CacheReadUsedBytes { get; init; }
+  public long CacheReadMaxBytes { get; init; }
+  public long CacheWriteUsedBytes { get; init; }
+  public long CacheWriteMaxBytes { get; init; }
+
   public required string StampUtc { get; init; }
   public IReadOnlyList<ActivityRow> RecentActivity { get; init; } = [];
 }
@@ -49,6 +56,10 @@ public sealed class MetricsPublisher(IHostEnvironment host) {
       RecoveredOperations = metrics.RecoveredOperations,
       BytesFree = stats.BytesFree,
       BytesTotal = stats.BytesTotal,
+      CacheReadUsedBytes = fs.Cache.Pages.GetStatistics(entry.PoolId).Bytes,
+      CacheReadMaxBytes = fs.Cache.ReadCacheMax,
+      CacheWriteUsedBytes = fs.Cache.WriteBytesReserved,
+      CacheWriteMaxBytes = fs.Cache.WriteBufferMax,
       StampUtc = DateTime.UtcNow.ToString("O"),
       RecentActivity = [.. fs.Activity.History.Take(40).Select(e => new ActivityRow(
         e.Kind.ToString(), e.Path, e.Bytes, e.FromMember, e.ToMember, e.Reason))],

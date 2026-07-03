@@ -3,7 +3,7 @@
 const token = new URLSearchParams(location.search).get("token") || "";
 const auth = { headers: { Authorization: "Bearer " + token } };
 const history = new Map();   // poolId -> [hitRate samples]
-const HIST = 40;
+const HIST = 120;            // 2 minutes of 1 Hz hit-rate history
 
 function fmtBytes(n) {
   if (!n || n <= 0) return "0 B";
@@ -37,22 +37,37 @@ function sparkline(samples) {
 }
 
 function topology(pool) {
-  // three tiers: RAM (T0) → fast (landing) → capacity; animated flow when draining/dirty
+  // tier map: RAM (cache) → fast (landing members) → capacity members, with the member names
+  // inside each tier box and animated flows labeled by what is moving right now
+  const leaf = p => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
   const fast = pool.members.filter(m => m.role === "landing");
   const cap = pool.members.filter(m => m.role !== "landing");
   const m = pool.metrics || {};
   const draining = (m.drainedFiles || 0) > 0;
   const dirty = (m.dirtyFiles || 0) > 0;
-  const box = (x, label, sub) => `<g class="tier"><rect x="${x}" y="10" width="90" height="46" rx="8"/>
-    <text x="${x+45}" y="32" text-anchor="middle">${label}</text>
-    <text class="cap" x="${x+45}" y="47" text-anchor="middle">${sub}</text></g>`;
-  const flow = (x1, x2, cls) => `<path class="flow ${cls}" d="M ${x1} 33 C ${(x1+x2)/2} 33, ${(x1+x2)/2} 33, ${x2} 33"/>`;
-  return `<svg class="topo" width="100%" height="66" viewBox="0 0 320 66" preserveAspectRatio="xMidYMid meet">
-    ${box(0, "RAM", dirty ? (m.dirtyFiles+" dirty") : "cache")}
-    ${dirty ? flow(90, 115, "") : ""}
-    ${box(115, "Fast", fast.length + " member" + (fast.length===1?"":"s"))}
-    ${draining ? flow(205, 230, "drain") : (pool.degraded ? "" : flow(205,230,"dup"))}
-    ${box(230, "Capacity", cap.length + " member" + (cap.length===1?"":"s"))}
+  const names = arr => arr.slice(0, 3).map(x => {
+    const n = leaf(x.label || x.path);
+    return (x.online ? "" : "⚠") + (n.length > 13 ? n.slice(0, 12) + "…" : n);
+  });
+  const box = (x, label, sub, list) => {
+    const lines = names(list || []);
+    const extra = (list || []).length > 3 ? [`+${list.length - 3} more`] : [];
+    const all = [...lines, ...extra];
+    return `<g class="tier"><rect x="${x}" y="4" width="98" height="${34 + all.length * 12}" rx="8"/>
+      <text x="${x+49}" y="21" text-anchor="middle">${label}</text>
+      <text class="cap" x="${x+49}" y="34" text-anchor="middle">${sub}</text>
+      ${all.map((n, i) => `<text class="mem" x="${x+49}" y="${46 + i * 12}" text-anchor="middle">${n}</text>`).join("")}</g>`;
+  };
+  const maxRows = Math.max(1, fast.length ? Math.min(4, Math.max(fast.length, Math.min(4, cap.length))) : Math.min(4, cap.length));
+  const h = 46 + maxRows * 12;
+  const flow = (x1, x2, cls, label) => `<path class="flow ${cls}" d="M ${x1} 24 C ${(x1+x2)/2} 24, ${(x1+x2)/2} 24, ${x2} 24"/>` +
+    (label ? `<text class="cap" x="${(x1+x2)/2}" y="18" text-anchor="middle">${label}</text>` : "");
+  return `<svg class="topo" width="100%" height="${h}" viewBox="0 0 340 ${h}" preserveAspectRatio="xMidYMid meet">
+    ${box(0, "RAM", dirty ? m.dirtyFiles + " dirty" : "cache", [])}
+    ${dirty ? flow(98, 120, "", "flush") : ""}
+    ${box(120, "Fast", fast.length ? fast.length + " member" + (fast.length===1?"":"s") : "no landing tier", fast)}
+    ${draining ? flow(218, 240, "drain", "drain") : (pool.degraded || !pool.mounted ? "" : flow(218, 240, "dup"))}
+    ${box(240, "Capacity", cap.length + " member" + (cap.length===1?"":"s"), cap)}
   </svg>`;
 }
 
@@ -153,14 +168,21 @@ function patchCard(c, pool) {
         <div class="bar hit"><span style="width:${Math.round((m.cacheHitRate||0)*100)}%"></span></div></div>
       <div class="meter"><div class="label"><span>Dirty files</span><span>${m.dirtyFiles||0}</span></div>
         <div class="bar write"><span style="width:${Math.min(100,(m.dirtyFiles||0)*10)}%"></span></div></div>
+      <div class="meter"><div class="label"><span>Read cache</span><span>${fmtBytes(m.cacheReadUsedBytes)} / ${fmtBytes(m.cacheReadMaxBytes)}</span></div>
+        <div class="bar hit"><span style="width:${m.cacheReadMaxBytes ? Math.min(100, Math.round(m.cacheReadUsedBytes / m.cacheReadMaxBytes * 100)) : 0}%"></span></div></div>
+      <div class="meter"><div class="label"><span>Write buffer</span><span>${fmtBytes(m.cacheWriteUsedBytes)} / ${fmtBytes(m.cacheWriteMaxBytes)}</span></div>
+        <div class="bar write"><span style="width:${m.cacheWriteMaxBytes ? Math.min(100, Math.round(m.cacheWriteUsedBytes / m.cacheWriteMaxBytes * 100)) : 0}%"></span></div></div>
     </div>
-    <div class="meter"><div class="label"><span>Cache hit rate</span><span>read ${fmtBytes(m.readBytes)} · wrote ${fmtBytes(m.writtenBytes)}</span></div>
+    <div class="meter"><div class="label"><span>Hit-rate history (2 min)</span><span>read ${fmtBytes(m.readBytes)} · wrote ${fmtBytes(m.writtenBytes)} · drained ${m.drainedFiles||0}</span></div>
       ${sparkline(hist)}</div>` : '<div class="nostats">📊 Mount the pool to see live I/O statistics.</div>'}
     ${topology(pool)}
     <div class="members"></div>
     ${pool.warnings && pool.warnings.length ? `<div class="warnings">${pool.warnings.map(w => "<div>⚠ " + w + "</div>").join("")}</div>` : ""}
-    ${m && m.activity && m.activity.length ? `<div class="activity">${m.activity.slice(0,8).map(a =>
-      `<div>${a.kind} ${a.path||""} ${a.bytes?fmtBytes(a.bytes):""} ${a.reason||""}</div>`).join("")}</div>` : ""}
+    ${m ? `<div class="activity">${(m.activity && m.activity.length ? m.activity.slice(0,10).map(a => {
+      const icon = ({Read:"📖",Write:"✍️",Drain:"⬇️",Duplicate:"🔁",Rebalance:"⚖️",RemoteTransfer:"☁️",CacheAdmit:"📥",CacheEvict:"📤",Recovery:"🩹",Scrub:"🔬",TrashMove:"🗑️"})[a.kind] || "•";
+      const move = a.from || a.to ? ` <span class="mv">${a.from || "?"} → ${a.to || "?"}</span>` : "";
+      return `<div>${icon} ${a.kind} <b>${a.path||""}</b> ${a.bytes?fmtBytes(a.bytes):""}${move} ${a.reason?`<span class="rsn">${a.reason}</span>`:""}</div>`;
+    }).join("") : '<div class="rsn">no activity yet — reads, writes, drains and duplications appear here live</div>')}</div>` : ""}
     <div class="actions"></div>`;
 
   const memberBox = c.querySelector(".members");
@@ -172,9 +194,10 @@ function patchCard(c, pool) {
     add("Unmount", "", () => op("/api/pool/unmount?pool=" + pool.id));
   else
     add("Mount", "primary", () => mountPool(pool));
-  add("Health", "", () => op("/api/health?pool=" + pool.id));
-  add("Fix", "", () => op("/api/health?fix=true&pool=" + pool.id));
-  add("Restore", "", () => op("/api/restore?pool=" + pool.id));
+  add("Browse", "", () => browseDialog(pool, ""));
+  add("Health", "", () => healthDialog(pool, false));
+  add("Fix", "", () => healthDialog(pool, true));
+  add("Restore", "", async () => { if (await op("/api/restore?pool=" + pool.id)) alert("Restore finished — missing copies were recreated."); });
   add("Add member", "", () => addMemberDialog(pool));
   if (pool.source === "manifest")
     add("Duplication", "", () => duplicationDialog(pool));
@@ -184,6 +207,93 @@ function patchCard(c, pool) {
     add("Forget", "", () => confirm(`Remove "${pool.name}" from this machine's list? Data and on-disk markers are kept — the pool can be restored or re-imported later.`) && op("/api/pool/forget?pool=" + pool.id));
   add("Delete", "danger", () => confirm(`Delete pool "${pool.name}"? The manifest is removed; your files are kept on disk.`) && op("/api/pool/delete?pool=" + pool.id));
   add("Purge", "danger", () => prompt(`PURGE wipes all data in "${pool.name}". Type the pool name to confirm:`) === pool.name && op("/api/pool/purge?pool=" + pool.id));
+}
+
+// modal with just a Close button (reports, browsers)
+function infoModal(title, bodyNode, wide) {
+  const overlay = el("div", "overlay");
+  const modal = el("div", "modal" + (wide ? " wide" : ""));
+  const actions = el("div", "modal-actions");
+  const close = el("button", "primary", "Close"); close.onclick = closeModal;
+  actions.appendChild(close);
+  modal.append(el("h2", null, title), bodyNode, actions);
+  overlay.appendChild(modal);
+  overlay.onclick = e => { if (e.target === overlay) closeModal(); };
+  document.getElementById("modal-root").appendChild(overlay);
+  return modal;
+}
+
+// Problem scan: runs the health check (optionally correcting) and shows the full report —
+// under-duplicated files, integrity issues (bit-rot, conflicts, external edits), device SMART.
+async function healthDialog(pool, fix) {
+  const body = el("div");
+  body.innerHTML = `<p class="hint">${fix ? "Scanning and repairing" : "Scanning"} <b>${pool.name}</b> —
+    checking duplication levels, integrity and device health…</p>`;
+  infoModal(fix ? "Fix problems" : "Pool problem scan", body);
+
+  const j = await post("/api/health?pool=" + pool.id + (fix ? "&fix=true" : ""));
+  if (!j.ok) { body.innerHTML = `<p class="hint">Scan failed: ${j.error || "unknown error"}</p>`; return; }
+  const r = j.result;
+  const smartBadge = h => h === "Healthy" ? '<span class="badge ok">healthy</span>'
+    : h === "Failing" ? '<span class="badge bad">FAILING</span>'
+    : h === "Warning" ? '<span class="badge warn">warning</span>' : '<span class="badge info">unknown</span>';
+  body.innerHTML = `
+    <p>${r.healthy ? '<span class="badge ok">no problems found</span>' : '<span class="badge warn">attention needed</span>'}</p>
+    <div class="report-row"><span>Files below their duplication level</span><b>${r.underDuplicatedFiles}</b></div>
+    ${r.corrected ? `<div class="report-row"><span>Copies repaired / created</span><b>${r.copiesRepaired}</b></div>` : ""}
+    ${r.issues && r.issues.length ? `<label>Integrity issues</label><div class="issues">${r.issues.map(i =>
+      `<div>⚠ <b>${i.kind}</b> ${i.path}<br><span class="rsn">${i.message}</span></div>`).join("")}</div>` : ""}
+    <label>Device health (SMART)</label>
+    <div class="issues">${(r.members || []).map(mm =>
+      `<div>${smartBadge(mm.health)} <b>${mm.name}</b>${mm.model ? " · " + mm.model : ""}${mm.temperatureC != null ? " · " + mm.temperatureC + "°C" : ""}${mm.reallocatedSectors ? " · " + mm.reallocatedSectors + " reallocated sectors" : ""}${mm.detail ? `<br><span class="rsn">${mm.detail}</span>` : ""}</div>`).join("")}</div>
+    ${!r.healthy && !fix ? `<p class="hint">The quick scan counts problems without changing anything. <b>Fix</b> runs the deep pass: it re-checksums every file, repairs bit-rot from a good copy, resolves conflicts and recreates missing copies.</p>` : ""}`;
+  if (!r.healthy && !fix) {
+    const fixBtn = el("button", "primary", "Fix problems now");
+    fixBtn.onclick = () => { closeModal(); healthDialog(pool, true); };
+    body.appendChild(fixBtn);
+  }
+}
+
+// Pool browser (FR-UI-MAP): a tree-style listing with one column per member showing exactly
+// where every file/folder physically lives — ✅ primary copy, 🔁 shadow copy, ❌ not present.
+async function browseDialog(pool, path) {
+  const body = el("div");
+  body.innerHTML = `<p class="hint">Loading…</p>`;
+  infoModal(`Browse — ${pool.name}`, body, true);
+  await browseInto(pool, path, body);
+}
+
+async function browseInto(pool, path, body) {
+  const j = await fetch(`/api/pool/browse?pool=${pool.id}&path=${encodeURIComponent(path)}&token=${encodeURIComponent(token)}`)
+    .then(r => r.json()).catch(e => ({ ok: false, error: String(e) }));
+  if (!j.ok) { body.innerHTML = `<p class="hint">Browse failed: ${j.error || ""}</p>`; return; }
+  const r = j.result;
+  const leaf = p => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
+  const crumbs = r.path ? r.path.split("/") : [];
+  body.innerHTML = `
+    <div class="fp-path">🗂 /${r.path || ""}</div>
+    <table class="browse"><thead><tr>
+      <th style="text-align:left">Name</th><th>Size</th>
+      ${r.members.map(mm => `<th title="${mm.label}">${leaf(mm.label)}</th>`).join("")}
+    </tr></thead><tbody>
+      ${r.path ? `<tr class="dir up"><td>⬆ ..</td><td></td>${r.members.map(() => "<td></td>").join("")}</tr>` : ""}
+      ${r.entries.map(e => `<tr class="${e.isDirectory ? "dir" : ""}" data-name="${e.name.replace(/"/g, "&quot;")}">
+        <td>${e.isDirectory ? "📁" : "📄"} ${e.name}</td>
+        <td class="sz">${e.isDirectory ? "" : fmtBytes(e.length)}</td>
+        ${e.presence.map(p => `<td class="pm">${p.primary ? "✅" : p.shadow ? "" : "❌"}${p.shadow ? "🔁" : ""}</td>`).join("")}
+      </tr>`).join("")}
+      ${!r.entries.length ? `<tr><td colspan="${2 + r.members.length}" class="rsn">(empty folder)</td></tr>` : ""}
+    </tbody></table>
+    <p class="hint">✅ primary copy · 🔁 shadow (duplicate) copy · ❌ not on this storage. Folders count as present when the member holds the folder itself.</p>`;
+  body.querySelectorAll("tr.dir").forEach(row => {
+    row.onclick = () => {
+      if (row.classList.contains("up")) {
+        const upPath = crumbs.slice(0, -1).join("/");
+        browseInto(pool, upPath, body);
+      } else
+        browseInto(pool, (r.path ? r.path + "/" : "") + row.dataset.name, body);
+    };
+  });
 }
 
 // Full settings editor: edit the pool's whole config block as JSON, validated on save. Every knob

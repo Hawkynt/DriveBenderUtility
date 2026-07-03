@@ -101,6 +101,9 @@ internal sealed class ServeCommand(
         case "/api/fs/list":
           this._WriteJson(context, this._FsList(request));
           break;
+        case "/api/pool/browse":
+          this._WriteJson(context, _Guard(() => PoolOpsCommand.Browse(host, provider, remoteResolver, this._RequirePool(request), request.QueryString["path"])));
+          break;
         case "/api/stream":
           this._Stream(context);
           break;
@@ -220,6 +223,10 @@ internal sealed class ServeCommand(
             metrics.CacheHitRate,
             metrics.DirtyFiles,
             metrics.DrainedFiles,
+            metrics.CacheReadUsedBytes,
+            metrics.CacheReadMaxBytes,
+            metrics.CacheWriteUsedBytes,
+            metrics.CacheWriteMaxBytes,
             activity = metrics.RecentActivity,
           },
         };
@@ -290,10 +297,28 @@ internal sealed class ServeCommand(
     }
   }
 
+  /// <summary>Runs the problem scan (optionally correcting) and returns the full structured report for the UI dialog.</summary>
   private object _RunHealth(HttpListenerRequest request) {
     var poolRef = this._RequirePool(request);
     var fix = request.QueryString["fix"] == "true";
-    return _Guard(() => PoolOpsCommand.Health(host, provider, remoteResolver, new() { Pool = poolRef, Fix = fix }) == 0 ? "ok" : "attention");
+    return _Guard(() => {
+      var report = PoolOpsCommand.RunHealth(host, provider, remoteResolver, poolRef, fix);
+      return new {
+        healthy = report.Healthy,
+        corrected = report.Corrected,
+        underDuplicatedFiles = report.UnderDuplicatedFiles,
+        copiesRepaired = report.CopiesRepaired,
+        issues = report.IntegrityIssues.Select(i => new { kind = i.Kind.ToString(), path = i.Path, message = i.Message }),
+        members = report.Members.Select(m => new {
+          name = m.Member,
+          health = m.Smart.Health.ToString(),
+          temperatureC = m.Smart.TemperatureCelsius,
+          reallocatedSectors = m.Smart.ReallocatedSectors,
+          model = m.Smart.Model,
+          detail = m.Smart.Detail,
+        }),
+      };
+    });
   }
 
   private object _RunRestore(HttpListenerRequest request) {
