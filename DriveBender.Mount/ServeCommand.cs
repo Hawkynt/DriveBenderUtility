@@ -205,10 +205,12 @@ internal sealed class ServeCommand(
           }));
           break;
         case "/api/pool/remove-member" when request.HttpMethod == "POST":
-          this._WriteJson(context, _Guard(() => { PoolOpsCommand.RemoveMedia(host, store, provider, lifecycle, remoteResolver, new() { Pool = this._RequirePool(request), Member = request.QueryString["member"] }); return "ok"; }));
+          this._WriteJson(context, _Guard(() => this._MediaOp(this._RequirePool(request),
+            ["pool-remove-media", this._RequirePool(request), "--member", request.QueryString["member"] ?? ""])));
           break;
         case "/api/pool/replace-media" when request.HttpMethod == "POST":
-          this._WriteJson(context, _Guard(() => { PoolOpsCommand.ReplaceMedia(host, store, provider, lifecycle, remoteResolver, new() { Pool = this._RequirePool(request), Old = request.QueryString["old"] ?? "", New = request.QueryString["new"] ?? "" }); return "ok"; }));
+          this._WriteJson(context, _Guard(() => this._MediaOp(this._RequirePool(request),
+            ["pool-replace-media", this._RequirePool(request), "--old", request.QueryString["old"] ?? "", "--new", request.QueryString["new"] ?? ""])));
           break;
         case "/api/pool/delete" when request.HttpMethod == "POST":
           this._WriteJson(context, this._Delete(request, purge: false));
@@ -441,33 +443,128 @@ internal sealed class ServeCommand(
     }
   }
 
-  /// <summary>Runs the problem scan (optionally correcting) and returns the full structured report for the UI dialog.</summary>
+  /// <summary>
+  /// Pool work never runs inside the manager (it is a reload-safe UI shell): a MOUNTED pool
+  /// executes the operation in its own process via the op channel; an unmounted pool gets a
+  /// TRANSIENT worker process. Either way, a manager reload cannot kill pool work.
+  /// </summary>
+  private object _PoolOp(string poolRef, string op, string[] workerArgs) => _Guard(() => {
+    var pool = this._Discover(poolRef);
+    string? json;
+    if (mountRegistry.Find(pool.PoolId.ToString()) != null) {
+      var id = Guid.NewGuid().ToString("N");
+      mountRegistry.RequestOp(pool.PoolId, id, op);
+      json = mountRegistry.WaitOpResult(pool.PoolId, id, TimeSpan.FromMinutes(30))
+             ?? throw new ManifestException("the pool's process did not answer — check the mount");
+    } else {
+      json = _RunWorker(workerArgs)
+             ?? throw new ManifestException("the worker process failed — check the daemon log");
+    }
+
+    using var document = JsonDocument.Parse(json);
+    if (document.RootElement.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.False)
+      throw new ManifestException(document.RootElement.TryGetProperty("error", out var error) ? error.GetString() ?? "pool operation failed" : "pool operation failed");
+
+    return document.RootElement.Clone();
+  });
+
+  /// <summary>Runs the problem scan (optionally correcting) — relayed to the pool's process or a transient worker.</summary>
   private object _RunHealth(HttpListenerRequest request) {
     var poolRef = this._RequirePool(request);
     var fix = request.QueryString["fix"] == "true";
-    return _Guard(() => {
-      var report = PoolOpsCommand.RunHealth(host, provider, remoteResolver, poolRef, fix);
-      return new {
-        healthy = report.Healthy,
-        corrected = report.Corrected,
-        underDuplicatedFiles = report.UnderDuplicatedFiles,
-        copiesRepaired = report.CopiesRepaired,
-        issues = report.IntegrityIssues.Select(i => new { kind = i.Kind.ToString(), path = i.Path, message = i.Message }),
-        members = report.Members.Select(m => new {
-          name = m.Member,
-          health = m.Smart.Health.ToString(),
-          temperatureC = m.Smart.TemperatureCelsius,
-          reallocatedSectors = m.Smart.ReallocatedSectors,
-          model = m.Smart.Model,
-          detail = m.Smart.Detail,
-        }),
-      };
-    });
+    return this._PoolOp(poolRef, fix ? "fix" : "health",
+      fix ? ["pool-health", poolRef, "--fix", "--json"] : ["pool-health", poolRef, "--json"]);
   }
 
   private object _RunRestore(HttpListenerRequest request) {
     var poolRef = this._RequirePool(request);
-    return _Guard(() => { PoolOpsCommand.Restore(host, provider, remoteResolver, new() { Pool = poolRef }); return "ok"; });
+    return this._PoolOp(poolRef, "restore", ["pool-restore", poolRef, "--json"]);
+  }
+
+  /// <summary>
+  /// Media surgery (scatter-remove / replace) runs in a transient worker process, never in the
+  /// manager — and never concurrently with the pool's own engine: a mounted pool must be
+  /// unmounted first (two engines over one member set would race).
+  /// </summary>
+  private object _MediaOp(string poolRef, string[] workerArgs) {
+    var pool = this._Discover(poolRef);
+    if (mountRegistry.Find(pool.PoolId.ToString()) != null)
+      throw new ManifestException("unmount the pool first — media operations rearrange the members' files and must not race the live mount");
+
+    var output = _RunWorkerText(workerArgs, out var exitCode);
+    if (exitCode != 0)
+      throw new ManifestException(output.Length > 0 ? output : "the media operation failed — check the daemon log");
+
+    return "ok";
+  }
+
+  /// <summary>Spawns a short-lived dbmount worker and returns its full output + exit code.</summary>
+  private static string _RunWorkerText(string[] args, out int exitCode) {
+    exitCode = -1;
+    var entryDll = Assembly.GetEntryAssembly()!.Location;
+    var exe = Environment.ProcessPath ?? "dotnet";
+    var viaDotnet = exe.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase) || exe.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase);
+
+    var start = new System.Diagnostics.ProcessStartInfo {
+      FileName = exe,
+      UseShellExecute = false,
+      CreateNoWindow = true,
+      RedirectStandardOutput = true,
+      RedirectStandardError = true,
+    };
+    if (viaDotnet)
+      start.ArgumentList.Add(entryDll);
+    foreach (var argument in args)
+      start.ArgumentList.Add(argument);
+
+    try {
+      using var worker = System.Diagnostics.Process.Start(start);
+      if (worker == null)
+        return "";
+
+      var stdout = worker.StandardOutput.ReadToEnd();
+      var stderr = worker.StandardError.ReadToEnd();
+      worker.WaitForExit(30 * 60 * 1000);
+      exitCode = worker.ExitCode;
+      return (stderr.Trim().Length > 0 ? stderr : stdout).Trim();
+    } catch (Exception e) {
+      DriveBender.Logger($"[Warning]worker spawn failed: {e.Message}");
+      return e.Message;
+    }
+  }
+
+  /// <summary>Spawns a short-lived dbmount worker and returns the JSON line it printed (null on failure).</summary>
+  private static string? _RunWorker(string[] args) {
+    var entryDll = Assembly.GetEntryAssembly()!.Location;
+    var exe = Environment.ProcessPath ?? "dotnet";
+    var viaDotnet = exe.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase) || exe.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase);
+
+    var start = new System.Diagnostics.ProcessStartInfo {
+      FileName = exe,
+      UseShellExecute = false,
+      CreateNoWindow = true,
+      RedirectStandardOutput = true,
+      RedirectStandardError = true,
+    };
+    if (viaDotnet)
+      start.ArgumentList.Add(entryDll);
+    foreach (var argument in args)
+      start.ArgumentList.Add(argument);
+
+    try {
+      using var worker = System.Diagnostics.Process.Start(start);
+      if (worker == null)
+        return null;
+
+      var stdout = worker.StandardOutput.ReadToEnd();
+      worker.StandardError.ReadToEnd();
+      worker.WaitForExit(30 * 60 * 1000);
+      // the JSON result is the last line that looks like an object
+      return stdout.Split('\n').Select(l => l.Trim()).LastOrDefault(l => l.StartsWith('{'));
+    } catch (Exception e) {
+      DriveBender.Logger($"[Warning]worker spawn failed: {e.Message}");
+      return null;
+    }
   }
 
   private sealed record CreateBody(string? Name, string? MountTarget, MemberBody[]? Members, bool TakeOver = false);

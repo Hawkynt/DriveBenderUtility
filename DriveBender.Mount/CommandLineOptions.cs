@@ -96,12 +96,18 @@ public sealed class PoolHealthOptions {
 
   [Option("fix", HelpText = "Repair bit-rot from good copies, resolve conflicts, and restore missing shadows/primaries.")]
   public bool Fix { get; set; }
+
+  [Option("json", HelpText = "Print the report as JSON (used by the manager's transient worker).")]
+  public bool Json { get; set; }
 }
 
 [Verb("pool-restore", HelpText = "Restore the pool to its duplication level (recreate missing shadows, promote surviving shadows).")]
 public sealed class PoolRestoreOptions {
   [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
   public string Pool { get; set; } = "";
+
+  [Option("json", HelpText = "Print the result as JSON (used by the manager's transient worker).")]
+  public bool Json { get; set; }
 }
 
 [Verb("pool-remove-media", HelpText = "Scatter a member's data over the remaining members, then remove it from the pool.")]

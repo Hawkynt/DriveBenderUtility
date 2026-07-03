@@ -44,8 +44,31 @@ internal static class PoolOpsCommand {
     return fix ? service.CheckAndCorrect() : service.Check();
   }
 
+  /// <summary>The wire shape shared by the daemon relay, the pool process and the transient worker.</summary>
+  public static string HealthReportJson(HealthReport report) => System.Text.Json.JsonSerializer.Serialize(new {
+    ok = true,
+    healthy = report.Healthy,
+    corrected = report.Corrected,
+    underDuplicatedFiles = report.UnderDuplicatedFiles,
+    copiesRepaired = report.CopiesRepaired,
+    issues = report.IntegrityIssues.Select(i => new { kind = i.Kind.ToString(), path = i.Path, message = i.Message }),
+    members = report.Members.Select(m => new {
+      name = m.Member,
+      health = m.Smart.Health.ToString(),
+      temperatureC = m.Smart.TemperatureCelsius,
+      reallocatedSectors = m.Smart.ReallocatedSectors,
+      model = m.Smart.Model,
+      detail = m.Smart.Detail,
+    }),
+  });
+
   public static int Health(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, PoolHealthOptions options) {
     var report = RunHealth(host, provider, remoteResolver, options.Pool, options.Fix);
+    if (options.Json) {
+      Console.WriteLine(HealthReportJson(report));
+      return report.Healthy ? 0 : 1;
+    }
+
     Console.WriteLine($"Pool '{options.Pool}' — {(report.Healthy ? "healthy" : "attention needed")}");
     Console.WriteLine($"  Under-duplicated files: {report.UnderDuplicatedFiles}");
     if (report.Corrected)
@@ -67,6 +90,11 @@ internal static class PoolOpsCommand {
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
     var report = new MediaLifecycle(ios, journal, duplication, allowSamePhysical).RestorePool();
+    if (options.Json) {
+      Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new { ok = true, copiesCreated = report.CopiesCreated }));
+      return 0;
+    }
+
     Console.WriteLine($"Restored pool '{pool.Name}': {report.CopiesCreated} copy(ies) created/promoted to duplication level {duplication}.");
     return 0;
   }

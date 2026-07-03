@@ -160,6 +160,40 @@ internal static class MountCommand {
     }
   }
 
+  /// <summary>
+  /// Executes a manager-filed operation INSIDE the pool's own process (the pool cares for its
+  /// pool; the manager only relays): health scan, correcting fix, or duplication restore — all
+  /// against the live engine's members, off the pump thread, result filed for the manager.
+  /// </summary>
+  private static void _RunPoolOp(PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, PoolConfig config, MountRegistry registry, string id, string op) {
+    string json;
+    try {
+      var duplication = Math.Max(1, config.Duplication ?? 1);
+      var allowSamePhysical = config.Placement?.ShadowNeverSamePhysical == false;
+      var media = new MediaLifecycle(ios, fs.Journal, duplication, allowSamePhysical);
+      switch (op) {
+        case "health" or "fix": {
+          var service = new HealthService(ios, new SmartctlMonitor(), fs.Integrity, media);
+          var report = op == "fix" ? service.CheckAndCorrect() : service.Check();
+          json = PoolOpsCommand.HealthReportJson(report);
+          break;
+        }
+        case "restore": {
+          var report = media.RestorePool();
+          json = System.Text.Json.JsonSerializer.Serialize(new { ok = true, copiesCreated = report.CopiesCreated });
+          break;
+        }
+        default:
+          json = System.Text.Json.JsonSerializer.Serialize(new { ok = false, error = $"unknown pool operation '{op}'" });
+          break;
+      }
+    } catch (Exception e) {
+      json = System.Text.Json.JsonSerializer.Serialize(new { ok = false, error = e.Message });
+    }
+
+    registry.WriteOpResult(pool.PoolId, id, json);
+  }
+
   private static int _MountPlatform(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, PoolConfig config, string target, string label, MountRegistry registry, MountOptions options) {
 #if WINDOWS
     // WinFsp preferred (richer semantics); Dokan (LGPL) as the no-extra-install fallback (§4.1)
@@ -197,6 +231,10 @@ internal static class MountCommand {
           metrics.Publish(fs, entry, ios); // live snapshot for the serve daemon (§6.13)
           if (registry.ConsumeReload(pool.PoolId)) // the daemon changed settings — apply them live
             currentConfig = _ReloadLive(host, store, fs, pool, ios) ?? currentConfig;
+          foreach (var (opId, op) in registry.ConsumeOps(pool.PoolId)) { // manager-filed pool work runs HERE, in the pool's process
+            var cfg = currentConfig;
+            new Thread(() => _RunPoolOp(fs, pool, ios, cfg, registry, opId, op)) { IsBackground = true }.Start();
+          }
           if (++tick % 30 == 0 && currentConfig.Placement?.AutoLandingZone == true)
             _AutoTier(host, store, fs, pool, ios, advisor);
           if (registry.StopRequested(pool.PoolId)) // another dbmount asked for a clean unmount
@@ -242,6 +280,10 @@ internal static class MountCommand {
         fuseMetrics.Publish(fs, fuseEntry, ios);
         if (registry.ConsumeReload(pool.PoolId))
           fuseConfig = _ReloadLive(host, store, fs, pool, ios) ?? fuseConfig;
+        foreach (var (opId, op) in registry.ConsumeOps(pool.PoolId)) {
+          var cfg = fuseConfig;
+          new Thread(() => _RunPoolOp(fs, pool, ios, cfg, registry, opId, op)) { IsBackground = true }.Start();
+        }
         if (++fuseTick % 30 == 0 && fuseConfig.Placement?.AutoLandingZone == true)
           _AutoTier(host, store, fs, pool, ios, fuseAdvisor);
       });

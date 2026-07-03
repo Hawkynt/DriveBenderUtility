@@ -36,6 +36,66 @@ public sealed class MountRegistry(IHostEnvironment host) {
         host.DeleteFile(path);
   }
 
+  private string _OpPath(Guid poolId, string id) => Path.Combine(this._Directory, $"{poolId:D}.op-{id}.json");
+  private string _OpResultPath(Guid poolId, string id) => Path.Combine(this._Directory, $"{poolId:D}.opdone-{id}.json");
+
+  /// <summary>
+  /// Cross-process pool operations (health/fix/restore): the MANAGER only files the request —
+  /// the pool's own process executes it and files the result. The manager stays a pure UI shell
+  /// that can be reloaded at any time without killing pool work.
+  /// </summary>
+  public void RequestOp(Guid poolId, string id, string op) {
+    host.CreateDirectory(this._Directory);
+    host.WriteAllTextAtomic(this._OpPath(poolId, id), op);
+  }
+
+  /// <summary>The pool process consumes its pending operation requests (checked each pump tick).</summary>
+  public IReadOnlyList<(string id, string op)> ConsumeOps(Guid poolId) {
+    var results = new List<(string, string)>();
+    var prefix = $"{poolId:D}.op-";
+    foreach (var file in host.EnumerateFiles(this._Directory, $"{poolId:D}.op-*.json")) {
+      var name = Path.GetFileName(file);
+      var id = name[prefix.Length..^".json".Length];
+      string op;
+      try {
+        op = host.ReadAllText(file).Trim();
+        host.DeleteFile(file);
+      } catch (IOException) {
+        continue; // racing writer — next tick
+      }
+
+      results.Add((id, op));
+    }
+
+    return results;
+  }
+
+  /// <summary>The pool process files an operation's result for the manager to pick up.</summary>
+  public void WriteOpResult(Guid poolId, string id, string json) {
+    host.CreateDirectory(this._Directory);
+    host.WriteAllTextAtomic(this._OpResultPath(poolId, id), json);
+  }
+
+  /// <summary>The manager waits for the pool process's result (long ops allowed; null on timeout).</summary>
+  public string? WaitOpResult(Guid poolId, string id, TimeSpan timeout) {
+    var path = this._OpResultPath(poolId, id);
+    var deadline = DateTime.UtcNow + timeout;
+    while (DateTime.UtcNow < deadline) {
+      if (host.FileExists(path))
+        try {
+          var json = host.ReadAllText(path);
+          host.DeleteFile(path);
+          return json;
+        } catch (IOException) {
+          // mid-write — retry
+        }
+
+      Thread.Sleep(250);
+    }
+
+    return null;
+  }
+
   /// <summary>Asks the running mount process to re-read its configuration live (CFG.reload, cross-process).</summary>
   public void RequestReload(Guid poolId) {
     host.CreateDirectory(this._Directory);
