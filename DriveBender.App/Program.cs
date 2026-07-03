@@ -11,6 +11,9 @@ namespace DivisonM.App;
 /// </summary>
 internal static class Program {
 
+  private static Process? _daemon;
+  private static volatile bool _closing;
+
   [STAThread]
   private static int Main(string[] args) {
     var dbmount = _LocateDbmount();
@@ -19,8 +22,63 @@ internal static class Program {
       return 1;
     }
 
+    var url = _LaunchDaemon(dbmount);
+    if (url == null) {
+      Console.Error.WriteLine("The management daemon did not report a URL in time.");
+      _Stop();
+      return 2;
+    }
+
+    var window = new PhotinoWindow()
+      .SetTitle("Drive Bender Pool Manager")
+      .SetUseOsDefaultSize(false)
+      .SetSize(1180, 760)
+      .Center()
+      .SetResizable(true)
+      .Load(new Uri(url));
+
+    // supervise the daemon: if it ever dies while the window is open, relaunch it and point the
+    // WebView at the fresh URL (new port + token) — otherwise the UI is stuck at "reconnecting…"
+    new Thread(() => {
+      while (!_closing) {
+        try {
+          _daemon?.WaitForExit();
+        } catch (Exception) {
+          // process handle gone — treat as exited
+        }
+
+        if (_closing)
+          return;
+
+        var fresh = _LaunchDaemon(dbmount);
+        if (fresh == null) {
+          Thread.Sleep(3000); // relaunch failed (port race / transient) — retry
+          continue;
+        }
+
+        try {
+          window.Invoke(() => window.Load(new Uri(fresh)));
+        } catch (Exception) {
+          // window is closing
+          return;
+        }
+      }
+    }) { IsBackground = true, Name = "daemon-supervisor" }.Start();
+
+    try {
+      window.WaitForClose();
+    } finally {
+      _closing = true;
+      _Stop();
+    }
+
+    return 0;
+  }
+
+  /// <summary>Starts <c>dbmount serve</c> and returns its tokenised URL (null on timeout).</summary>
+  private static string? _LaunchDaemon(string dbmount) {
     var port = _FreeLoopbackPort();
-    using var daemon = new Process {
+    var daemon = new Process {
       StartInfo = new(dbmount.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? "dotnet" : dbmount) {
         RedirectStandardOutput = true,
         UseShellExecute = false,
@@ -46,34 +104,23 @@ internal static class Program {
       }
     };
 
-    daemon.Start();
-    daemon.BeginOutputReadLine();
-    if (!ready.Wait(TimeSpan.FromSeconds(15)) || url == null) {
-      Console.Error.WriteLine("The management daemon did not report a URL in time.");
-      _Stop(daemon);
-      return 2;
-    }
-
     try {
-      new PhotinoWindow()
-        .SetTitle("Drive Bender Pool Manager")
-        .SetUseOsDefaultSize(false)
-        .SetSize(1180, 760)
-        .Center()
-        .SetResizable(true)
-        .Load(new Uri(url))
-        .WaitForClose();
-    } finally {
-      _Stop(daemon);
+      daemon.Start();
+    } catch (Exception) {
+      return null;
     }
 
-    return 0;
+    daemon.BeginOutputReadLine();
+    _daemon = daemon;
+    return ready.Wait(TimeSpan.FromSeconds(15)) ? url : null;
   }
 
-  private static void _Stop(Process daemon) {
+  private static void _Stop() {
     try {
-      if (!daemon.HasExited)
-        daemon.Kill(entireProcessTree: true);
+      // kill ONLY the daemon — never the whole tree: mount children it spawned must keep serving
+      // their drives after the manager window closes (unmount is an explicit user action)
+      if (_daemon is { HasExited: false })
+        _daemon.Kill(entireProcessTree: false);
     } catch (InvalidOperationException) {
       // already gone
     }

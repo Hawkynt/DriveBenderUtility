@@ -56,8 +56,14 @@ internal sealed class ServeCommand(
       HttpListenerContext context;
       try {
         context = listener.GetContext();
-      } catch (Exception) {
-        break; // listener stopped
+      } catch (Exception e) {
+        // only a requested stop ends the daemon — a transient accept failure (aborted
+        // connection etc.) must never silently kill it, or every client is stuck "reconnecting"
+        if (stop.IsSet || !listener.IsListening)
+          break;
+
+        DriveBender.Logger($"[Warning]management accept failed: {e.Message}");
+        continue;
       }
 
       // each request handled on the thread pool so the SSE stream doesn't block the API

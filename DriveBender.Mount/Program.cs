@@ -14,7 +14,15 @@ internal static class Program {
   private const int ExitNotImplemented = 3;
 
   private static int Main(string[] args) {
-    DriveBender.Logger = Console.WriteLine;
+    // never let logging kill the process: a long-lived daemon/mount child whose parent's stdout
+    // pipe broke would otherwise die inside a catch block the first time it tries to log
+    DriveBender.Logger = message => {
+      try {
+        Console.WriteLine(message);
+      } catch (IOException) {
+        // stdout is gone (parent exited) — the process must keep serving/mounting regardless
+      }
+    };
 
     var host = new RealHostEnvironment();
     var store = new ManifestStore(host);

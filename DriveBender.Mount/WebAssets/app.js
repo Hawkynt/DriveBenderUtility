@@ -133,7 +133,9 @@ function card(pool) {
 function patchCard(c, pool) {
   const health = pool.degraded ? '<span class="badge warn">degraded</span>' : '<span class="badge ok">healthy</span>';
   const mountBadge = pool.mounted ? `<span class="badge info">mounted ${pool.mounted}</span>` : "";
-  const m = pool.metrics;
+  // a mounted pool always shows its live-stats section (zeros until the first snapshot lands);
+  // an unmounted pool shows a hint where the stats will appear
+  const m = pool.metrics || (pool.mounted ? {} : null);
   const hist = history.get(pool.id) || [];
 
   c.innerHTML = `
@@ -153,7 +155,7 @@ function patchCard(c, pool) {
         <div class="bar write"><span style="width:${Math.min(100,(m.dirtyFiles||0)*10)}%"></span></div></div>
     </div>
     <div class="meter"><div class="label"><span>Cache hit rate</span><span>read ${fmtBytes(m.readBytes)} · wrote ${fmtBytes(m.writtenBytes)}</span></div>
-      ${sparkline(hist)}</div>` : ""}
+      ${sparkline(hist)}</div>` : '<div class="nostats">📊 Mount the pool to see live I/O statistics.</div>'}
     ${topology(pool)}
     <div class="members"></div>
     ${pool.warnings && pool.warnings.length ? `<div class="warnings">${pool.warnings.map(w => "<div>⚠ " + w + "</div>").join("")}</div>` : ""}

@@ -142,3 +142,4 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .modal .hint code { background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
 .cfg-ref { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
   max-height: 34vh; overflow: auto; font-size: 11px; font-family: ui-monospace, monospace; color: var(--muted); }
+.nostats { color: var(--muted); font-size: 12px; padding: 8px 0; }
