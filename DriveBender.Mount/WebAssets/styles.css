@@ -140,3 +140,5 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .modal .err { color: var(--bad); font-size: 12px; margin-top: 8px; min-height: 16px; }
 .modal .hint { font-size: 12px; color: var(--muted); margin: 8px 0; line-height: 1.45; }
 .modal .hint code { background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
+.cfg-ref { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+  max-height: 34vh; overflow: auto; font-size: 11px; font-family: ui-monospace, monospace; color: var(--muted); }

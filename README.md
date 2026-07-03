@@ -321,8 +321,10 @@ scheme-aware dialog** — user/password for FTP·WebDAV, password *or* private k
 for SFTP, access/secret keys for S3, account key for Azure, token for
 Dropbox·OneDrive, service-account JSON for Google — stored under a reference the
 manifest never inlines), mount / unmount, add or remove members, set
-**duplication** (copies to keep — pool-wide or per folder/file glob; copies only
-land on independent physical disks, SAFE-PHYS), remove- and replace-media,
+**duplication** (copies to keep — pool-wide or per folder/file glob; copies land
+on independent physical disks by default, SAFE-PHYS, with an opt-in to also keep
+copies on the same disk for bit-rot protection when no independent disk is free),
+edit **all pool settings** via a validated JSON editor, remove- and replace-media,
 run health / fix / restore, **forget** a pool (drop it from this machine's list
 while leaving its data and on-disk markers intact, so it can be re-imported or
 recovered later), and delete (keep data) or purge (wipe data, guarded by a

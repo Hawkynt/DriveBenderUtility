@@ -177,9 +177,43 @@ function patchCard(c, pool) {
   if (pool.source === "manifest")
     add("Duplication", "", () => duplicationDialog(pool));
   if (pool.source === "manifest")
+    add("Settings", "", () => settingsDialog(pool));
+  if (pool.source === "manifest")
     add("Forget", "", () => confirm(`Remove "${pool.name}" from this machine's list? Data and on-disk markers are kept — the pool can be restored or re-imported later.`) && op("/api/pool/forget?pool=" + pool.id));
   add("Delete", "danger", () => confirm(`Delete pool "${pool.name}"? The manifest is removed; your files are kept on disk.`) && op("/api/pool/delete?pool=" + pool.id));
   add("Purge", "danger", () => prompt(`PURGE wipes all data in "${pool.name}". Type the pool name to confirm:`) === pool.name && op("/api/pool/purge?pool=" + pool.id));
+}
+
+// Full settings editor: edit the pool's whole config block as JSON, validated on save. Every knob
+// lives here (write policy, cache, tiers, background, safety, resilience, integrity, trash,
+// placement, duplication, observability); the dedicated dialogs are shortcuts to common ones.
+async function settingsDialog(pool) {
+  const j = await fetch("/api/pool/config?pool=" + pool.id, auth).then(r => r.json()).catch(() => ({}));
+  const data = (j && j.result) || {};
+  const pretty = (s) => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch (_) { return s || ""; } };
+  const current = data.current ? pretty(data.current) : "";
+  const template = pretty(data.template || "{}");
+
+  const form = el("div");
+  form.innerHTML = `
+    <p class="hint">These are this pool's settings, merged over the built-in defaults on mount. Edit any
+    keys you want to override and leave the rest out — omitted keys keep inheriting. Saved changes take
+    effect on the next mount. Invalid values are rejected with a reason.</p>
+    <label>Pool settings (JSON)</label>
+    <textarea class="cfg" rows="16" spellcheck="false" placeholder="{ }">${current}</textarea>
+    <div class="row" style="margin-top:6px">
+      <button type="button" class="cfg-template" style="flex:0 0 auto">Load all defaults as a template</button>
+    </div>
+    <details style="margin-top:8px"><summary class="hint" style="cursor:pointer">Show built-in defaults (reference)</summary>
+      <pre class="cfg-ref">${template.replace(/</g, "&lt;")}</pre></details>`;
+  const area = form.querySelector(".cfg");
+  form.querySelector(".cfg-template").onclick = () => { area.value = template; };
+  showModal(`Settings — ${pool.name}`, form, async () => {
+    const text = area.value.trim();
+    if (!text) return "Enter a JSON object (or click ‘Load all defaults as a template’).";
+    try { JSON.parse(text); } catch (e) { return "Not valid JSON: " + e.message; }
+    return await op("/api/pool/config?pool=" + pool.id, { json: text }) ? null : "Settings were rejected.";
+  }, "Save settings");
 }
 
 // Configure how many copies of each file the pool keeps — pool-wide and optionally per folder/file.
@@ -188,10 +222,15 @@ function duplicationDialog(pool) {
   form.innerHTML = `
     <label>Copies of every file, pool-wide (1 = no duplication)</label>
     <input class="dup" type="number" min="1" max="10" value="${pool.duplication || 1}">
-    <p class="hint">Copies are only placed on <b>independent physical disks</b> — members on the same
-    disk are one failure domain, so an extra copy can't be stored there (SAFE-PHYS). This pool has
-    <b>${pool.failureDomains}</b> independent domain(s), so at most ${pool.failureDomains} cop${pool.failureDomains === 1 ? "y" : "ies"}
-    can actually be kept. Changes take effect on the next mount.</p>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
+      <input class="dupsame" type="checkbox" style="width:auto" ${pool.allowSamePhysical ? "checked" : ""}>
+      Keep extra copies even on the same physical disk
+    </label>
+    <p class="hint">By default copies only land on <b>independent physical disks</b> — members on the
+    same disk are one failure domain (SAFE-PHYS), and this pool has <b>${pool.failureDomains}</b> of them.
+    Tick the box to store the extra copies anyway when no independent disk is free: that guards against
+    <b>bit-rot / silent corruption</b> (a scrub can heal from the good copy) but <b>not</b> against the
+    disk failing. Changes take effect on the next mount.</p>
     <label>Optional — override a folder or file (glob, e.g. <code>Photos/**</code> or <code>Docs/tax.pdf</code>)</label>
     <input class="dupfolder" placeholder="leave empty to set only the pool-wide default">
     <label>Copies for that pattern</label>
@@ -205,7 +244,8 @@ function duplicationDialog(pool) {
     }
     const level = parseInt(form.querySelector(".dup").value, 10);
     if (!(level >= 1)) return "Enter a valid pool-wide copy count.";
-    return await op("/api/pool/duplication?pool=" + pool.id, { level }) ? null : "Could not set duplication.";
+    const allowSamePhysical = form.querySelector(".dupsame").checked;
+    return await op("/api/pool/duplication?pool=" + pool.id, { level, allowSamePhysical }) ? null : "Could not set duplication.";
   }, "Save");
 }
 

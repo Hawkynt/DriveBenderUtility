@@ -183,7 +183,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
   /// ever land on independent physical volumes (SAFE-PHYS), so D&gt;domains keeps owed duplication
   /// pending rather than co-locating copies.
   /// </summary>
-  public PoolManifest SetDuplication(PoolManifest manifest, int level, string? folderGlob = null) {
+  public PoolManifest SetDuplication(PoolManifest manifest, int level, string? folderGlob = null, bool? allowSamePhysical = null) {
     if (level is < 1 or > 10)
       throw new ManifestException("Duplication level must be between 1 and 10 (1 = a single copy, no duplication)");
     if (manifest.IsVirtual)
@@ -203,8 +203,46 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
       entry["duplication"] = level;
     }
 
+    if (allowSamePhysical != null) {
+      // opting in lets copies co-locate on one disk (bit-rot protection, not disk-loss protection)
+      if (defaults["placement"] is not JsonObject placement)
+        defaults["placement"] = placement = new JsonObject();
+      placement["shadowNeverSamePhysical"] = !allowSamePhysical.Value;
+    }
+
     var updated = manifest with { Defaults = JsonSerializer.SerializeToElement(defaults) };
     DriveBender.Logger($"Set duplication of pool '{manifest.Name}'{(string.IsNullOrWhiteSpace(folderGlob) ? "" : $" for '{folderGlob}'")} to {level} cop{(level == 1 ? "y" : "ies")} (effective on next mount)");
+    return store.Save(updated);
+  }
+
+  /// <summary>
+  /// Replaces the pool's whole defaults/settings block with an edited JSON object (the "change all
+  /// settings" editor). Validated exactly as a mount would (built-in ← global ← these), so an
+  /// invalid value is rejected with the validator's message rather than breaking the next mount.
+  /// </summary>
+  public PoolManifest SetConfig(PoolManifest manifest, string json) {
+    if (manifest.IsVirtual)
+      throw new ManifestException("Adopt the native pool first (pool adopt) before editing its settings");
+
+    JsonElement element;
+    try {
+      element = JsonSerializer.Deserialize<JsonElement>(json);
+    } catch (JsonException e) {
+      throw new ManifestException($"Settings are not valid JSON: {e.Message}");
+    }
+
+    if (element.ValueKind != JsonValueKind.Object)
+      throw new ManifestException("Settings must be a JSON object.");
+
+    var updated = manifest with { Defaults = element };
+
+    var globalConfigPath = Path.Combine(host.ConfigRoot, "config.json");
+    var globalJson = host.FileExists(globalConfigPath) ? host.ReadAllText(globalConfigPath) : null;
+    var effective = ConfigResolver.ResolveEffective(globalJson, element.GetRawText());
+    ConfigValidator.Validate(effective, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+    ConfigValidator.ValidateTierAssignments(updated, effective);
+
+    DriveBender.Logger($"Updated settings of pool '{manifest.Name}' (effective on next mount)");
     return store.Save(updated);
   }
 

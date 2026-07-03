@@ -134,6 +134,29 @@ public class PlacementResolverTests {
   }
 
   [Test]
+  [Category("EdgeCase")]
+  public void ChooseShadowTarget_GivenSameDiskAllowedAndNoIndependentDomain_WhenPlacing_ThenCoLocatesForBitRotProtection() {
+    var sameDisk = new FakeVolumeIO(Guid.NewGuid(), "same-disk-other-folder", "PHYS-HDD1", capacity: 50_000);
+    var members = new IVolumeIO[] { this._hdd1, sameDisk };
+    var config = ConfigResolver.ResolveEffective(null, """{"placement":{"shadowNeverSamePhysical":false}}""");
+    var resolver = new PlacementResolver(_pool, members, this._metadata, config);
+
+    resolver.ChooseShadowTarget(100, [this._hdd1]).Should().Be(sameDisk,
+      "opting out of shadowNeverSamePhysical lets a second copy land on another member of the same disk (bit-rot protection, not disk-loss protection)");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void ChooseShadowTarget_GivenSameDiskAllowedButIndependentDomainFree_WhenPlacing_ThenStillPrefersIndependentDomain() {
+    var config = ConfigResolver.ResolveEffective(null, """{"placement":{"shadowNeverSamePhysical":false}}""");
+
+    var target = this._Resolver(config).ChooseShadowTarget(100, [this._hdd1]);
+
+    target!.PhysicalVolumeId.Should().NotBe(this._hdd1.PhysicalVolumeId,
+      "an independent failure domain is still preferred — same-disk is only a last resort");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public void ResolveCopies_GivenSecondCall_WhenCached_ThenServedFromMetadataCache() {
     this._hdd1.Seed("f.txt", false, [1]);

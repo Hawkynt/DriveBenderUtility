@@ -116,6 +116,12 @@ internal sealed class ServeCommand(
         case "/api/pool/duplication" when request.HttpMethod == "POST":
           this._WriteJson(context, this._SetDuplication(request));
           break;
+        case "/api/pool/config" when request.HttpMethod == "GET":
+          this._WriteJson(context, this._GetConfig(request));
+          break;
+        case "/api/pool/config" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._SetConfig(request));
+          break;
         case "/api/prereqs":
           this._WriteJson(context, _PrereqPayload(Prerequisites.Check()));
           break;
@@ -189,6 +195,7 @@ internal sealed class ServeCommand(
           mounted = mounted.TryGetValue(pool.PoolId, out var entry) ? entry.Target : null,
           configuredTarget = pool.Manifest.Mount?.Target,
           duplication = _DuplicationOf(pool.Manifest),
+          allowSamePhysical = _AllowSamePhysicalOf(pool.Manifest),
           bytesFree = health.BytesFree,
           bytesTotal = health.BytesTotal,
           failureDomains = health.IndependentFailureDomains,
@@ -253,6 +260,12 @@ internal sealed class ServeCommand(
 
     return 1;
   }
+
+  /// <summary>Whether the pool opted into co-locating copies on one disk (placement.shadowNeverSamePhysical = false).</summary>
+  private static bool _AllowSamePhysicalOf(PoolManifest manifest)
+    => manifest.Defaults is { ValueKind: JsonValueKind.Object } defaults
+       && defaults.TryGetProperty("placement", out var p) && p.ValueKind == JsonValueKind.Object
+       && p.TryGetProperty("shadowNeverSamePhysical", out var s) && s.ValueKind == JsonValueKind.False;
 
   private void _Stream(HttpListenerContext context) {
     context.Response.ContentType = "text/event-stream";
@@ -322,7 +335,8 @@ internal sealed class ServeCommand(
     return new { manifest.PoolId, manifest.Name };
   });
 
-  private sealed record DuplicationBody(int? Level, string? Folder);
+  private sealed record DuplicationBody(int? Level, string? Folder, bool? AllowSamePhysical);
+  private sealed record ConfigBody(string? Json);
 
   /// <summary>Sets pool-wide (or per-folder) duplication; takes effect on the next mount.</summary>
   private object _SetDuplication(HttpListenerRequest request) => _Guard(() => {
@@ -331,7 +345,25 @@ internal sealed class ServeCommand(
     if (body?.Level == null)
       throw new ManifestException("duplication needs a level (1-10)");
 
-    lifecycle.SetDuplication(pool.Manifest, body.Level.Value, string.IsNullOrWhiteSpace(body.Folder) ? null : body.Folder);
+    lifecycle.SetDuplication(pool.Manifest, body.Level.Value, string.IsNullOrWhiteSpace(body.Folder) ? null : body.Folder, body.AllowSamePhysical);
+    return "ok";
+  });
+
+  /// <summary>Returns the pool's current settings block plus the built-in defaults as a template.</summary>
+  private object _GetConfig(HttpListenerRequest request) => _Guard(() => {
+    var pool = this._Discover(this._RequirePool(request));
+    var current = pool.Manifest.Defaults is { ValueKind: JsonValueKind.Object } d ? d.GetRawText() : "";
+    return new { current, template = ConfigResolver.BuiltInDefaultsJson };
+  });
+
+  /// <summary>Validates and stores the pool's whole settings block (the settings editor); next-mount effective.</summary>
+  private object _SetConfig(HttpListenerRequest request) => _Guard(() => {
+    var body = _ReadBody<ConfigBody>(request);
+    var pool = this._Discover(this._RequirePool(request));
+    if (string.IsNullOrWhiteSpace(body?.Json))
+      throw new ManifestException("settings need a JSON object");
+
+    lifecycle.SetConfig(pool.Manifest, body.Json);
     return "ok";
   });
 

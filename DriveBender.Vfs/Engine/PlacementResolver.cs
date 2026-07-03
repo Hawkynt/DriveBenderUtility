@@ -88,16 +88,34 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
   }
 
   /// <summary>
-  /// Picks the member for the next shadow copy: most free space, never the failure
-  /// domain of an existing copy (SAFE-PHYS). Null when no independent domain has room —
-  /// the caller records owed duplication instead of co-locating copies.
+  /// Picks the member for the next shadow copy: most free space, preferring an independent
+  /// failure domain (SAFE-PHYS — real redundancy against disk loss). If none has room it returns
+  /// null (the caller records owed duplication) UNLESS the pool opted out of
+  /// <c>placement.shadowNeverSamePhysical</c>, in which case it falls back to another member on an
+  /// already-used disk — that copy guards against bit-rot/corruption but not disk failure.
   /// </summary>
   public IVolumeIO? ChooseShadowTarget(long size, IEnumerable<IVolumeIO> existingCopyHolders) {
-    var occupiedDomains = new HashSet<string>(existingCopyHolders.Select(m => m.PhysicalVolumeId), StringComparer.OrdinalIgnoreCase);
-    return this._Online
+    var holders = existingCopyHolders.ToArray();
+    var occupiedDomains = new HashSet<string>(holders.Select(m => m.PhysicalVolumeId), StringComparer.OrdinalIgnoreCase);
+
+    var independent = this._Online
       .Where(m => this._IsEligible(m, size, null) && !occupiedDomains.Contains(m.PhysicalVolumeId))
       .OrderByDescending(m => m.BytesFree)
       .FirstOrDefault();
+    if (independent != null)
+      return independent;
+
+    // no independent domain left — only co-locate on an occupied disk if the pool allows it,
+    // and never on a member that already holds a copy of this file (that would be the same data)
+    if (config.Placement?.ShadowNeverSamePhysical == false) {
+      var holderIds = new HashSet<Guid>(holders.Select(m => m.MemberId));
+      return this._Online
+        .Where(m => this._IsEligible(m, size, null) && !holderIds.Contains(m.MemberId))
+        .OrderByDescending(m => m.BytesFree)
+        .FirstOrDefault();
+    }
+
+    return null;
   }
 
   /// <summary>
