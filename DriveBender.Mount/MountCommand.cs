@@ -49,7 +49,8 @@ internal static class MountCommand {
         IVolumeIO io = MemberSchemes.IsRemoteMember(definition)
           ? remoteResolver.OpenVolume(definition)
           : new LocalVolumeIO(m.MemberId, m.Label ?? m.ResolvedPath, m.ResolvedPath, m.PhysicalVolumeId);
-        return new EngineMember(io, m.Role, m.ReserveBytes);
+        // measured so the auto-tier advisor and the dashboard see real per-member latency (FR-AUTO-TIER)
+        return new EngineMember(new MeasuredVolumeIO(io), m.Role, m.ReserveBytes);
       }).ToArray();
 
       if (members.Length == 0)
@@ -71,7 +72,7 @@ internal static class MountCommand {
       var label = pool.Manifest.Mount?.VolumeLabel ?? pool.Name;
       var fs = new PoolFileSystem(pool.PoolId, members, cache, config);
 
-      return _MountPlatform(host, store, fs, pool, [.. members.Select(m => m.Io)], target, label, registry, options);
+      return _MountPlatform(host, store, fs, pool, [.. members.Select(m => m.Io)], config, target, label, registry, options);
     } catch (Exception e) {
       // record the reason before it bubbles to Program's stderr guard (invisible when elevated);
       // unwrap so a driver mismatch surfaces "incorrect dll version …", not the generic wrapper
@@ -100,8 +101,9 @@ internal static class MountCommand {
   /// Re-reads the manifest + global config and applies them to the running mount (CFG.reload,
   /// requested cross-process by the daemon). A raised duplication level immediately creates
   /// the owed copies for existing files instead of waiting for the next write to each.
+  /// Returns the new effective config (null when the reload failed).
   /// </summary>
-  private static void _ReloadLive(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios) {
+  private static PoolConfig? _ReloadLive(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios) {
     try {
       var manifest = store.TryLoadRegistry(pool.PoolId) ?? pool.Manifest;
       var globalConfigPath = Path.Combine(host.ConfigRoot, "config.json");
@@ -117,12 +119,48 @@ internal static class MountCommand {
         if (report.CopiesCreated > 0)
           DriveBender.Logger($"Live reload: created {report.CopiesCreated} owed cop(ies) to reach duplication level {duplication}");
       }
+
+      return config;
     } catch (Exception e) {
       DriveBender.Logger($"[Warning]Live config reload failed: {e.Message}");
+      return null;
     }
   }
 
-  private static int _MountPlatform(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, string target, string label, MountRegistry registry, MountOptions options) {
+  /// <summary>
+  /// Auto landing-zone pass (FR-AUTO-TIER, placement.autoLandingZone): feeds measured member
+  /// latencies to the advisor; on advice it re-tiers the manifest, applies the roles live and
+  /// logs why — the landing zone follows the actually-fastest drive as load shifts.
+  /// </summary>
+  private static void _AutoTier(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, AutoTierAdvisor advisor) {
+    try {
+      var manifest = store.TryLoadRegistry(pool.PoolId);
+      if (manifest == null || manifest.IsVirtual)
+        return;
+
+      var speeds = ios.OfType<MeasuredVolumeIO>().Select(m => {
+        var definition = manifest.FindMember(m.MemberId);
+        return definition == null ? null : new MemberSpeed(m.MemberId, m.DisplayName, m.AverageLatencyMs, m.Samples, definition.Network, definition.Role);
+      }).Where(s => s != null).Select(s => s!).ToArray();
+
+      var advice = advisor.Advise(speeds);
+      if (advice == null)
+        return;
+
+      var lifecycle = new PoolLifecycle(host, store);
+      var updated = lifecycle.SetMemberRole(manifest, advice.PromoteToLanding, MemberRole.Landing);
+      if (advice.DemoteToCapacity is { } demoted)
+        updated = lifecycle.SetMemberRole(updated, demoted, MemberRole.Capacity);
+
+      fs.UpdateMemberRoles(updated.Members.ToDictionary(m => m.MemberId, m => m.Role));
+      fs.Activity.Publish(ActivityKind.Rebalance, "", reason: advice.Reason);
+      DriveBender.Logger($"[AutoTier]{advice.Reason}");
+    } catch (Exception e) {
+      DriveBender.Logger($"[Warning]auto-tier pass failed: {e.Message}");
+    }
+  }
+
+  private static int _MountPlatform(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, PoolConfig config, string target, string label, MountRegistry registry, MountOptions options) {
 #if WINDOWS
     // WinFsp preferred (richer semantics); Dokan (LGPL) as the no-extra-install fallback (§4.1)
     IDisposable mountHost;
@@ -148,11 +186,16 @@ internal static class MountCommand {
     using (mountHost) {
       var scheduler = fs.CreateScheduler();
       using var stop = new ManualResetEventSlim();
+      var currentConfig = config;
+      var advisor = new AutoTierAdvisor();
+      var tick = 0L;
       using var pump = new Timer(_ => {
         scheduler.Pump();
-        metrics.Publish(fs, entry); // live snapshot for the serve daemon (§6.13)
+        metrics.Publish(fs, entry, ios); // live snapshot for the serve daemon (§6.13)
         if (registry.ConsumeReload(pool.PoolId)) // the daemon changed settings — apply them live
-          _ReloadLive(host, store, fs, pool, ios);
+          currentConfig = _ReloadLive(host, store, fs, pool, ios) ?? currentConfig;
+        if (++tick % 30 == 0 && currentConfig.Placement?.AutoLandingZone == true)
+          _AutoTier(host, store, fs, pool, ios, advisor);
         if (registry.StopRequested(pool.PoolId)) // another dbmount asked for a clean unmount
           stop.Set();
       }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
@@ -182,14 +225,19 @@ internal static class MountCommand {
 
     var fuseEntry = new MountEntry { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = "fuse", StartedUtc = DateTime.UtcNow.ToString("O") };
     var fuseMetrics = new MetricsPublisher(host);
+    var fuseConfig = config;
+    var fuseAdvisor = new AutoTierAdvisor();
+    var fuseTick = 0L;
     return Linux.LinuxFuseMountHost.Run(fs, target, options.ReadOnly,
       onMounted: () => registry.Register(fuseEntry),
       stopRequested: () => registry.StopRequested(pool.PoolId),
       onUnmounted: () => { registry.Unregister(pool.PoolId); fuseMetrics.Remove(pool.PoolId); },
       onTick: () => {
-        fuseMetrics.Publish(fs, fuseEntry);
+        fuseMetrics.Publish(fs, fuseEntry, ios);
         if (registry.ConsumeReload(pool.PoolId))
-          _ReloadLive(host, store, fs, pool, ios);
+          fuseConfig = _ReloadLive(host, store, fs, pool, ios) ?? fuseConfig;
+        if (++fuseTick % 30 == 0 && fuseConfig.Placement?.AutoLandingZone == true)
+          _AutoTier(host, store, fs, pool, ios, fuseAdvisor);
       });
 #endif
   }

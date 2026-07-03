@@ -5,7 +5,10 @@ using DivisonM.Vfs.Engine;
 namespace DivisonM.Mount;
 
 /// <summary>One activity row for the live feed (mirrors OPS-EVENTS for cross-process transport).</summary>
-public sealed record ActivityRow(string Kind, string Path, long Bytes, string? From, string? To, string Reason);
+public sealed record ActivityRow(string Kind, string Path, long Bytes, string? From, string? To, string Reason, string Stamp);
+
+/// <summary>One member's measured latency for the dashboard (FR-AUTO-TIER visibility).</summary>
+public sealed record MemberLatencyRow(Guid MemberId, double AvgMs, long Samples);
 
 /// <summary>
 /// A mounted pool's live metrics + recent activity, published each second by the mount
@@ -33,6 +36,7 @@ public sealed record MetricsSnapshot {
 
   public required string StampUtc { get; init; }
   public IReadOnlyList<ActivityRow> RecentActivity { get; init; } = [];
+  public IReadOnlyList<MemberLatencyRow> MemberLatencies { get; init; } = [];
 }
 
 /// <summary>Writes/reads the per-pool metrics snapshot files the daemon aggregates.</summary>
@@ -41,7 +45,7 @@ public sealed class MetricsPublisher(IHostEnvironment host) {
   private string _Directory => Path.Combine(host.ConfigRoot, "mounts");
   private string _Path(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.metrics.json");
 
-  public void Publish(PoolFileSystem fs, MountEntry entry) {
+  public void Publish(PoolFileSystem fs, MountEntry entry, IReadOnlyList<IVolumeIO>? members = null) {
     var metrics = fs.GetMetrics();
     var stats = fs.StatFs();
     var snapshot = new MetricsSnapshot {
@@ -62,7 +66,10 @@ public sealed class MetricsPublisher(IHostEnvironment host) {
       CacheWriteMaxBytes = fs.Cache.WriteBufferMax,
       StampUtc = DateTime.UtcNow.ToString("O"),
       RecentActivity = [.. fs.Activity.History.Take(40).Select(e => new ActivityRow(
-        e.Kind.ToString(), e.Path, e.Bytes, e.FromMember, e.ToMember, e.Reason))],
+        e.Kind.ToString(), e.Path, e.Bytes, e.FromMember, e.ToMember, e.Reason, e.TimestampUtc.ToString("O")))],
+      MemberLatencies = members == null
+        ? []
+        : [.. members.OfType<MeasuredVolumeIO>().Select(m => new MemberLatencyRow(m.MemberId, Math.Round(m.AverageLatencyMs, 2), m.Samples))],
     };
 
     try {

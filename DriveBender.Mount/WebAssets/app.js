@@ -36,39 +36,141 @@ function sparkline(samples) {
     <path class="area" d="${area}"/><path class="line" d="${line}"/></svg>`;
 }
 
-function topology(pool) {
-  // tier map: RAM (cache) → fast (landing members) → capacity members, with the member names
-  // inside each tier box and animated flows labeled by what is moving right now
-  const leaf = p => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
-  const fast = pool.members.filter(m => m.role === "landing");
-  const cap = pool.members.filter(m => m.role !== "landing");
-  const m = pool.metrics || {};
-  const draining = (m.drainedFiles || 0) > 0;
-  const dirty = (m.dirtyFiles || 0) > 0;
-  const names = arr => arr.slice(0, 3).map(x => {
-    const n = leaf(x.label || x.path);
-    return (x.online ? "" : "⚠") + (n.length > 13 ? n.slice(0, 12) + "…" : n);
-  });
-  const box = (x, label, sub, list) => {
-    const lines = names(list || []);
-    const extra = (list || []).length > 3 ? [`+${list.length - 3} more`] : [];
-    const all = [...lines, ...extra];
-    return `<g class="tier"><rect x="${x}" y="4" width="98" height="${34 + all.length * 12}" rx="8"/>
-      <text x="${x+49}" y="21" text-anchor="middle">${label}</text>
-      <text class="cap" x="${x+49}" y="34" text-anchor="middle">${sub}</text>
-      ${all.map((n, i) => `<text class="mem" x="${x+49}" y="${46 + i * 12}" text-anchor="middle">${n}</text>`).join("")}</g>`;
+// ---- live flow map: pool entry → RAM cache → fast tier → capacity storage, with data-block ----
+// particles flying on curves. The SVG PERSISTS across the 1 Hz refresh (rebuilding it would kill
+// running animations); only labels update in place, and particles spawn from real activity rows
+// and counter deltas, so what flies is what actually moves inside the pool.
+const flowState = new Map(); // poolId -> { sig, svg, pos, latEls, ... }
+
+function leafName(p) { return (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p; }
+
+function pathBetween(a, b) {
+  const ax = a.x + a.w, ay = a.y + a.h / 2, bx = b.x, by = b.y + b.h / 2;
+  return `M ${ax} ${ay} C ${ax + 36} ${ay}, ${bx - 36} ${by}, ${bx} ${by}`;
+}
+
+function spawnParticle(svg, d, cls, dur) {
+  const ns = "http://www.w3.org/2000/svg";
+  const p = document.createElementNS(ns, "circle");
+  p.setAttribute("r", "3.2");
+  p.setAttribute("class", "pkt " + cls);
+  const am = document.createElementNS(ns, "animateMotion");
+  am.setAttribute("dur", (dur || 900) + "ms");
+  am.setAttribute("path", d);
+  am.setAttribute("fill", "freeze");
+  am.setAttribute("calcMode", "spline");
+  am.setAttribute("keyTimes", "0;1");
+  am.setAttribute("keySplines", "0.4 0 0.2 1");
+  p.appendChild(am);
+  svg.appendChild(p);
+  setTimeout(() => p.remove(), (dur || 900) + 200);
+}
+
+function burst(st, fromId, toId, cls, n) {
+  const a = st.pos[fromId], b = st.pos[toId];
+  if (!a || !b) return;
+  const d = pathBetween(a, b);
+  for (let i = 0; i < (n || 1); i++)
+    setTimeout(() => st.svg.isConnected && spawnParticle(st.svg, d, cls, 850), i * 140);
+}
+
+function buildFlowmap(wrap, pool, fast, cap) {
+  const rows = Math.max(fast.length, cap.length, 1);
+  const H = Math.max(64, 12 + rows * 38);
+  const midY = Math.max(4, H / 2 - 22);
+  const pos = { entry: { x: 1, y: midY, w: 58, h: 44 }, cache: { x: 89, y: midY, w: 58, h: 44 } };
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const memberBox = (mm, x, y) => {
+    pos[mm.id] = { x, y, w: 86, h: 30 };
+    const name = leafName(mm.label || mm.path);
+    return `<g class="fnode ${mm.online ? "" : "off"}"><rect x="${x}" y="${y}" width="86" height="30" rx="7"/>
+      <text x="${x + 43}" y="${y + 13}" text-anchor="middle">${mm.online ? "" : "⚠"}${esc(name.length > 12 ? name.slice(0, 11) + "…" : name)}</text>
+      <text class="lat" data-lat="${mm.id}" x="${x + 43}" y="${y + 25}" text-anchor="middle"></text></g>`;
   };
-  const maxRows = Math.max(1, fast.length ? Math.min(4, Math.max(fast.length, Math.min(4, cap.length))) : Math.min(4, cap.length));
-  const h = 46 + maxRows * 12;
-  const flow = (x1, x2, cls, label) => `<path class="flow ${cls}" d="M ${x1} 24 C ${(x1+x2)/2} 24, ${(x1+x2)/2} 24, ${x2} 24"/>` +
-    (label ? `<text class="cap" x="${(x1+x2)/2}" y="18" text-anchor="middle">${label}</text>` : "");
-  return `<svg class="topo" width="100%" height="${h}" viewBox="0 0 340 ${h}" preserveAspectRatio="xMidYMid meet">
-    ${box(0, "RAM", dirty ? m.dirtyFiles + " dirty" : "cache", [])}
-    ${dirty ? flow(98, 120, "", "flush") : ""}
-    ${box(120, "Fast", fast.length ? fast.length + " member" + (fast.length===1?"":"s") : "no landing tier", fast)}
-    ${draining ? flow(218, 240, "drain", "drain") : (pool.degraded || !pool.mounted ? "" : flow(218, 240, "dup"))}
-    ${box(240, "Capacity", cap.length + " member" + (cap.length===1?"":"s"), cap)}
+  const fastBoxes = fast.map((mm, i) => memberBox(mm, 177, 8 + i * 38)).join("");
+  const capBoxes = cap.map((mm, i) => memberBox(mm, 295, 8 + i * 38)).join("");
+  const guides = [pathBetween(pos.entry, pos.cache)];
+  fast.forEach(mm => guides.push(pathBetween(pos.cache, pos[mm.id])));
+  cap.forEach(mm => guides.push(pathBetween(fast.length ? pos[fast[0].id] : pos.cache, pos[mm.id])));
+  wrap.innerHTML = `<svg class="flowmap" width="100%" viewBox="0 0 382 ${H}" preserveAspectRatio="xMidYMid meet">
+    ${guides.map(d => `<path class="guide" d="${d}"/>`).join("")}
+    <g class="fnode hub"><rect x="${pos.entry.x}" y="${pos.entry.y}" width="58" height="44" rx="8"/>
+      <text x="${pos.entry.x + 29}" y="${pos.entry.y + 19}" text-anchor="middle">Pool I/O</text>
+      <text class="lat" x="${pos.entry.x + 29}" y="${pos.entry.y + 33}" text-anchor="middle">${esc(pool.mounted || "not mounted")}</text></g>
+    <g class="fnode hub"><rect x="${pos.cache.x}" y="${pos.cache.y}" width="58" height="44" rx="8"/>
+      <text x="${pos.cache.x + 29}" y="${pos.cache.y + 19}" text-anchor="middle">RAM</text>
+      <text class="lat" data-cachesub="1" x="${pos.cache.x + 29}" y="${pos.cache.y + 33}" text-anchor="middle">cache</text></g>
+    ${fast.length ? `<text class="collabel" x="220" y="${H - 1}">fast (landing)</text>` : ""}
+    <text class="collabel" x="338" y="${H - 1}">capacity</text>
+    ${fastBoxes}${capBoxes}
   </svg>`;
+  const svgEl = wrap.querySelector("svg");
+  const latEls = {};
+  svgEl.querySelectorAll("[data-lat]").forEach(t => latEls[t.dataset.lat] = t);
+  return {
+    sig: null, svg: svgEl, pos, latEls,
+    cacheSub: svgEl.querySelector("[data-cachesub]"),
+    firstFast: fast.length ? fast[0].id : null,
+    firstCap: cap.length ? cap[0].id : null,
+    lastStamp: null, lastRead: null, lastWrite: null,
+  };
+}
+
+function memberNodeId(st, pool, displayName) {
+  if (!displayName) return null;
+  const hit = pool.members.find(mm => (mm.label || mm.path) === displayName || leafName(mm.label || mm.path) === leafName(displayName));
+  return hit && st.pos[hit.id] ? hit.id : null;
+}
+
+function updateFlowmap(wrap, pool) {
+  const fast = pool.members.filter(mm => mm.role === "landing");
+  const cap = pool.members.filter(mm => mm.role !== "landing");
+  const sig = pool.members.map(mm => mm.id + mm.role + (mm.online ? 1 : 0)).join("|") + "|" + (pool.mounted || "");
+  let st = flowState.get(pool.id);
+  if (!st || st.sig !== sig) {
+    st = buildFlowmap(wrap, pool, fast, cap);
+    st.sig = sig;
+    flowState.set(pool.id, st);
+  }
+  const m = pool.metrics || {};
+
+  // live labels: measured per-member latency (the auto-tier signal) + cache state
+  const lat = {};
+  (m.memberLatencies || []).forEach(l => lat[l.memberId] = l.avgMs);
+  pool.members.forEach(mm => {
+    const t = st.latEls[mm.id];
+    if (t) t.textContent = !mm.online ? "offline" : lat[mm.id] != null ? lat[mm.id].toFixed(1) + " ms" : "";
+  });
+  if (st.cacheSub) st.cacheSub.textContent = (m.dirtyFiles || 0) > 0 ? m.dirtyFiles + " dirty" : "cache";
+  if (!pool.mounted) return;
+
+  // counter deltas → ambient flows (entry ↔ cache ↔ tiers); particle count scales with volume
+  const nOf = b => Math.max(1, Math.min(4, Math.round(Math.log2(1 + b / 4096))));
+  const rd = st.lastRead == null ? 0 : (m.readBytes || 0) - st.lastRead;
+  const wr = st.lastWrite == null ? 0 : (m.writtenBytes || 0) - st.lastWrite;
+  st.lastRead = m.readBytes || 0;
+  st.lastWrite = m.writtenBytes || 0;
+  if (wr > 0) {
+    burst(st, "entry", "cache", "write", nOf(wr));
+    const tgt = st.firstFast || st.firstCap;
+    if (tgt) setTimeout(() => burst(st, "cache", tgt, "write", 1), 400);
+  }
+  if (rd > 0) {
+    const src = st.firstFast || st.firstCap;
+    if (src) burst(st, src, "cache", "read", nOf(rd));
+    setTimeout(() => burst(st, "cache", "entry", "read", 1), 400);
+  }
+
+  // real activity rows → member-to-member movements (drain, duplicate, rebalance, remote)
+  for (const a of m.activity || []) {
+    if (st.lastStamp && a.stamp <= st.lastStamp) break;
+    const from = memberNodeId(st, pool, a.from), to = memberNodeId(st, pool, a.to);
+    if ((a.kind === "Drain" || a.kind === "Rebalance" || a.kind === "RemoteTransfer") && from && to)
+      burst(st, from, to, "drain", 2);
+    else if ((a.kind === "Duplicate" || a.kind === "ShadowCreate") && to)
+      burst(st, from || st.firstFast || "cache", to, "dup", 2);
+  }
+  if ((m.activity || []).length) st.lastStamp = m.activity[0].stamp;
 }
 
 const KINDS = [
@@ -157,6 +259,16 @@ function card(pool) {
 // replacing it re-triggers the :hover lift transform (and reflows the grid), which is the "jumps a
 // few pixels up and down" the user saw. Only the inner content is refreshed.
 function patchCard(c, pool) {
+  // three zones: the flow map in the middle persists across refreshes (rebuilding it every second
+  // would kill its running particle animations); top and bottom are re-rendered
+  let top = c.querySelector(":scope > .card-top"), fm = c.querySelector(":scope > .flowmap-wrap"), bottom = c.querySelector(":scope > .card-bottom");
+  if (!top) {
+    top = el("div", "card-top");
+    fm = el("div", "flowmap-wrap");
+    bottom = el("div", "card-bottom");
+    c.append(top, fm, bottom);
+  }
+
   const health = pool.degraded ? '<span class="badge warn">degraded</span>' : '<span class="badge ok">healthy</span>';
   const mountBadge = pool.mounted ? `<span class="badge info">mounted ${pool.mounted}</span>` : "";
   // a mounted pool always shows its live-stats section (zeros until the first snapshot lands);
@@ -164,9 +276,9 @@ function patchCard(c, pool) {
   const m = pool.metrics || (pool.mounted ? {} : null);
   const hist = history.get(pool.id) || [];
 
-  c.innerHTML = `
+  top.innerHTML = `
     <h2>${pool.name} ${health} ${mountBadge}</h2>
-    <div class="sub">${pool.source} · ${pool.failureDomains} failure domain(s)</div>
+    <div class="sub">${pool.source} · ${pool.failureDomains} failure domain(s)${pool.autoLandingZone ? ' · <span title="placement.autoLandingZone: the landing zone follows the measured-fastest drive automatically">🚀 auto-LZ</span>' : ""}</div>
     <div class="capacity-row">
       ${donut(pool.bytesFree, pool.bytesTotal)}
       <div class="cap-legend">
@@ -185,8 +297,11 @@ function patchCard(c, pool) {
         <div class="bar write"><span style="width:${m.cacheWriteMaxBytes ? Math.min(100, Math.round(m.cacheWriteUsedBytes / m.cacheWriteMaxBytes * 100)) : 0}%"></span></div></div>
     </div>
     <div class="meter"><div class="label"><span>Hit-rate history (2 min)</span><span>read ${fmtBytes(m.readBytes)} · wrote ${fmtBytes(m.writtenBytes)} · drained ${m.drainedFiles||0}</span></div>
-      ${sparkline(hist)}</div>` : '<div class="nostats">📊 Mount the pool to see live I/O statistics.</div>'}
-    ${topology(pool)}
+      ${sparkline(hist)}</div>` : '<div class="nostats">📊 Mount the pool to see live I/O statistics.</div>'}`;
+
+  updateFlowmap(fm, pool);
+
+  bottom.innerHTML = `
     <div class="members"></div>
     ${pool.warnings && pool.warnings.length ? `<div class="warnings">${pool.warnings.map(w => "<div>⚠ " + w + "</div>").join("")}</div>` : ""}
     ${m ? `<div class="activity">${(m.activity && m.activity.length ? m.activity.slice(0,10).map(a => {
@@ -196,10 +311,10 @@ function patchCard(c, pool) {
     }).join("") : '<div class="rsn">no activity yet — reads, writes, drains and duplications appear here live</div>')}</div>` : ""}
     <div class="actions"></div>`;
 
-  const memberBox = c.querySelector(".members");
+  const memberBox = bottom.querySelector(".members");
   pool.members.forEach(mem => memberBox.appendChild(memberRow(pool, mem)));
 
-  const actions = c.querySelector(".actions");
+  const actions = bottom.querySelector(".actions");
   const add = (label, cls, fn) => { const b = el("button", cls, label); b.onclick = fn; actions.appendChild(b); };
   if (pool.mounted)
     add("Unmount", "", () => op("/api/pool/unmount?pool=" + pool.id));
@@ -484,7 +599,7 @@ function render(data) {
     const existing = container.querySelector(`.card[data-id="${pool.id}"]`);
     if (existing) patchCard(existing, pool); else container.appendChild(card(pool));
   }
-  container.querySelectorAll(".card").forEach(c => { if (!seen.has(c.dataset.id)) c.remove(); });
+  container.querySelectorAll(".card").forEach(c => { if (!seen.has(c.dataset.id)) { flowState.delete(c.dataset.id); c.remove(); } });
 }
 
 // ---- modals: a stack so a folder picker / credential dialog can open on top of the -----------

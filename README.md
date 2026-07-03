@@ -312,9 +312,14 @@ above for the secret format each expects).
 dbmount serve --open      # animated live dashboard at http://127.0.0.1:9723 (token-gated)
 ```
 
-The page shows every pool with live capacity donuts, cache-hit/dirty meters, a
-RAM→fast→capacity tier diagram with animated data flows, and per-member health —
-updated once a second while pools are mounted. From the same page you can run the
+The page shows every pool with live capacity donuts, cache-hit/dirty and
+cache-occupancy meters, a hit-rate history, and a **live flow map** — pool I/O →
+RAM cache → fast tier → capacity storage — where **data blocks fly along curves**
+as reads, writes, drains and duplications actually happen, with each storage's
+measured latency shown in its node; updated once a second while pools are
+mounted. With `placement.autoLandingZone` enabled, the **landing zone follows
+the measured-fastest drive automatically** (hysteresis + cooldown prevent
+flapping; a slow or busy drive gets demoted live). From the same page you can run the
 **entire lifecycle**: create a pool (pick local folders with a built-in **folder
 browser**, or add remote members whose **credentials are collected by a
 scheme-aware dialog** — user/password for FTP·WebDAV, password *or* private key

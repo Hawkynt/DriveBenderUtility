@@ -217,6 +217,10 @@ public sealed record IoConfig {
 public sealed record PlacementConfig {
   [JsonPropertyName("strategy")] public PlacementStrategy? Strategy { get; init; }
   [JsonPropertyName("shadowNeverSamePhysical")] public bool? ShadowNeverSamePhysical { get; init; }
+
+  /// <summary>FR-AUTO-TIER: measure member latency and re-tier the landing zone live when a drive gets slow/busy.</summary>
+  [JsonPropertyName("autoLandingZone")] public bool? AutoLandingZone { get; init; }
+
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
 }
 

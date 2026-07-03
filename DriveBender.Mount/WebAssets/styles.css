@@ -145,7 +145,21 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .cfg-ref { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
   max-height: 34vh; overflow: auto; font-size: 11px; font-family: ui-monospace, monospace; color: var(--muted); }
 .nostats { color: var(--muted); font-size: 12px; padding: 8px 0; }
-.topo .tier .mem { fill: var(--muted); font-size: 9px; font-family: ui-monospace, monospace; }
+
+/* live flow map: pool entry → cache → tiers → storage, with flying data blocks */
+.flowmap-wrap { margin-top: 10px; }
+.flowmap .fnode rect { fill: var(--panel-2); stroke: var(--line); stroke-width: 1; }
+.flowmap .fnode.hub rect { stroke: var(--accent); }
+.flowmap .fnode.off rect { stroke: var(--bad); }
+.flowmap .fnode text { fill: var(--text); font-size: 10px; font-weight: 600; }
+.flowmap .fnode .lat { fill: var(--muted); font-size: 8.5px; font-weight: 400; font-family: ui-monospace, monospace; }
+.flowmap .guide { fill: none; stroke: var(--line); stroke-width: 1; opacity: .55; }
+.flowmap .collabel { fill: var(--muted); font-size: 8px; text-anchor: middle; }
+.pkt { filter: drop-shadow(0 0 3px currentColor); }
+.pkt.read { fill: var(--accent); color: var(--accent); }
+.pkt.write { fill: var(--warn); color: var(--warn); }
+.pkt.drain { fill: #f0883e; color: #f0883e; }
+.pkt.dup { fill: var(--ok); color: var(--ok); }
 .activity .mv { color: var(--accent); }
 .activity .rsn, .rsn { color: var(--muted); font-style: italic; }
 
