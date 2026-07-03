@@ -15,6 +15,12 @@ public sealed record PrereqStatus(bool Ok, string Driver, string Detail, bool In
 /// </summary>
 internal static class Prerequisites {
 
+  // Install the exact WinFsp release the bundled winfsp.net binding was built against — its
+  // CheckVersion() demands a matching major.minor native runtime, so installing "latest" (which
+  // may be a newer/older line) would crash the mount with "incorrect dll version". Keep in
+  // lockstep with the winfsp.net PackageReference in DriveBender.Mount.Windows.csproj.
+  private const string _WINFSP_TAG = "v2.1";
+
   public static bool IsElevated {
     get {
       try {
@@ -99,7 +105,7 @@ internal static class Prerequisites {
       using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
       http.DefaultRequestHeaders.UserAgent.ParseAdd("DriveBenderUtility");
 
-      var releaseJson = http.GetStringAsync("https://api.github.com/repos/winfsp/winfsp/releases/latest").GetAwaiter().GetResult();
+      var releaseJson = http.GetStringAsync($"https://api.github.com/repos/winfsp/winfsp/releases/tags/{_WINFSP_TAG}").GetAwaiter().GetResult();
       using var doc = JsonDocument.Parse(releaseJson);
       var url = doc.RootElement.GetProperty("assets").EnumerateArray()
         .Select(a => a.GetProperty("browser_download_url").GetString())

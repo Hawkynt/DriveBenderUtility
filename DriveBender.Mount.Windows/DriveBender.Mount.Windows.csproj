@@ -15,7 +15,11 @@
     <ProjectReference Include="..\DriveBender.Vfs\DriveBender.Vfs.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="winfsp.net" Version="2.2.26112" />
+    <!-- winfsp.net build numbers track the native WinFsp MSI exactly: the managed binding's
+         CheckVersion() demands the same major.minor native runtime. Pin to the latest STABLE
+         WinFsp (v2.1 / 2.1.25156) — 2.2.x is an unreleased beta. Keep this in lockstep with
+         Prerequisites._WINFSP_TAG, which installs the matching native runtime. -->
+    <PackageReference Include="winfsp.net" Version="2.1.25156" />
     <PackageReference Include="DokanNet" Version="2.3.0.3" />
   </ItemGroup>
 </Project>

@@ -73,11 +73,20 @@ internal static class MountCommand {
 
       return _MountPlatform(host, fs, pool, target, label, registry, options);
     } catch (Exception e) {
-      // record the reason before it bubbles to Program's stderr guard (invisible when elevated)
+      // record the reason before it bubbles to Program's stderr guard (invisible when elevated);
+      // unwrap so a driver mismatch surfaces "incorrect dll version …", not the generic wrapper
       if (errorKey != null)
-        registry.ReportError(errorKey.Value, e.Message);
+        registry.ReportError(errorKey.Value, _Unwrap(e));
       throw;
     }
+  }
+
+  /// <summary>The innermost message — TypeInitializationException/wrappers hide the real cause otherwise.</summary>
+  private static string _Unwrap(Exception e) {
+    var inner = e;
+    while (inner.InnerException != null)
+      inner = inner.InnerException;
+    return inner.Message;
   }
 
   private static int _Fail(MountRegistry registry, Guid? errorKey, string message, int code) {

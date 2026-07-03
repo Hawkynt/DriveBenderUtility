@@ -133,6 +133,14 @@ internal static class Program {
     } catch (UnauthorizedAccessException e) {
       Console.Error.WriteLine($"Access denied: {e.Message}");
       return ExitError;
+    } catch (Exception e) {
+      // last resort: an unexpected failure (e.g. a native driver version mismatch throwing
+      // TypeInitializationException) should exit with a readable message, not an unhandled crash
+      var inner = e;
+      while (inner.InnerException != null)
+        inner = inner.InnerException;
+      Console.Error.WriteLine($"Error: {inner.Message}");
+      return ExitError;
     }
   }
 
