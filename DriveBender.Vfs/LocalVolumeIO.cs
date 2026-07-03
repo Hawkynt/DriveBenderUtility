@@ -123,6 +123,18 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     Directory.Delete(path, false);
   });
 
+  public void RenameFolder(string fromRelativeFolder, string toRelativeFolder) => this._Guard(() => {
+    var fromPath = this._ResolveFolder(fromRelativeFolder, false);
+    var toPath = this._ResolveFolder(toRelativeFolder, false);
+    if (!Directory.Exists(fromPath))
+      throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {fromRelativeFolder}");
+    if (Directory.Exists(toPath) || File.Exists(toPath))
+      throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toRelativeFolder}");
+
+    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(toPath)!);
+    Directory.Move(fromPath, toPath);
+  });
+
   public void AtomicReplace(string tempRelative, string finalRelative, bool shadow) => this._Guard(() => {
     var tempPath = this._Resolve(tempRelative, shadow);
     var finalPath = this._Resolve(finalRelative, shadow);

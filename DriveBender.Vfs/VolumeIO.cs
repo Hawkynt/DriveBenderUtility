@@ -42,6 +42,12 @@ public interface IVolumeIO {
   void DeleteFolder(string relativeFolder, bool shadow);
 
   /// <summary>
+  /// Renames a folder subtree in the primary namespace (FR-RENAME for directories). The
+  /// on-disk shadow folders live inside their parent folder, so they travel with the subtree.
+  /// </summary>
+  void RenameFolder(string fromRelativeFolder, string toRelativeFolder);
+
+  /// <summary>
   /// Atomically publishes staged content: the temp name (written under
   /// *.TEMP.$DRIVEBENDER) replaces the final name in one rename (SAFE-ATOMIC). The only
   /// way new content ever becomes visible.

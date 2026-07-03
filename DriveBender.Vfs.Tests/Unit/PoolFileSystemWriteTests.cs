@@ -185,6 +185,65 @@ public class PoolFileSystemWriteTests {
 
   [Test]
   [Category("HappyPath")]
+  public void Rename_GivenFolderWithFilesAndShadows_WhenRenamed_ThenSubtreeFlipsOnEveryMember() {
+    this._fs.MakeDir("photos");
+    this._fs.Close(this._CreateFileWithContent("photos/pic.bin", [1, 2, 3]));
+
+    this._fs.Rename("photos", "images", RenameFlags.None);
+
+    this._fs.GetAttributes("images/pic.bin").Length.Should().Be(3, "the file follows the renamed folder");
+    var members = new[] { this._volume1, this._volume2 };
+    members.Count(v => v.FileExists("images/pic.bin", false)).Should().Be(1, "the primary moved");
+    members.Count(v => v.FileExists("images/pic.bin", true)).Should().Be(1, "the embedded shadow moved with the folder");
+    members.Any(v => v.FolderExists("photos", false)).Should().BeFalse("nothing lingers under the old name");
+
+    var readHandle = this._fs.Open("images/pic.bin", AccessMode.Read, ShareMode.Read);
+    var buffer = new byte[3];
+    this._fs.Read(readHandle, buffer, 0);
+    this._fs.Close(readHandle);
+    buffer.Should().Equal(1, 2, 3);
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Rename_GivenFolderWithOpenChildHandle_WhenRenamed_ThenHandleStaysUsable() {
+    this._fs.MakeDir("work");
+    var handle = this._CreateFileWithContent("work/doc.bin", [9, 9]);
+
+    this._fs.Rename("work", "done", RenameFlags.None);
+    this._fs.Write(handle, [7], 2, WriteMode.Normal);
+    this._fs.Close(handle);
+
+    var readHandle = this._fs.Open("done/doc.bin", AccessMode.Read, ShareMode.Read);
+    var buffer = new byte[3];
+    this._fs.Read(readHandle, buffer, 0);
+    this._fs.Close(readHandle);
+    buffer.Should().Equal(9, 9, 7); // the open handle followed the folder rename
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Rename_GivenFolderTargetAlreadyExists_WhenRenamed_ThenExists() {
+    this._fs.MakeDir("a");
+    this._fs.MakeDir("b");
+
+    var act = () => this._fs.Rename("a", "b", RenameFlags.None);
+
+    act.Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.Exists);
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Rename_GivenFolderMovedIntoItself_WhenRenamed_ThenRefused() {
+    this._fs.MakeDir("a");
+
+    var act = () => this._fs.Rename("a", "a/b", RenameFlags.None);
+
+    act.Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.InvalidArgument);
+  }
+
+  [Test]
+  [Category("HappyPath")]
   public void MakeDirRemoveDir_GivenEmptyFolder_WhenRoundTripped_ThenNamespaceConsistent() {
     this._fs.MakeDir("newdir");
     this._fs.ReadDirectory("").Should().ContainSingle(e => e.Name == "newdir" && e.Kind == NodeKind.Directory);

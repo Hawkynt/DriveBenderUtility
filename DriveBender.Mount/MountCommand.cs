@@ -71,7 +71,7 @@ internal static class MountCommand {
       var label = pool.Manifest.Mount?.VolumeLabel ?? pool.Name;
       var fs = new PoolFileSystem(pool.PoolId, members, cache, config);
 
-      return _MountPlatform(host, fs, pool, target, label, registry, options);
+      return _MountPlatform(host, store, fs, pool, [.. members.Select(m => m.Io)], target, label, registry, options);
     } catch (Exception e) {
       // record the reason before it bubbles to Program's stderr guard (invisible when elevated);
       // unwrap so a driver mismatch surfaces "incorrect dll version …", not the generic wrapper
@@ -96,7 +96,32 @@ internal static class MountCommand {
     return code;
   }
 
-  private static int _MountPlatform(IHostEnvironment host, PoolFileSystem fs, PoolRef pool, string target, string label, MountRegistry registry, MountOptions options) {
+  /// <summary>
+  /// Re-reads the manifest + global config and applies them to the running mount (CFG.reload,
+  /// requested cross-process by the daemon). A raised duplication level immediately creates
+  /// the owed copies for existing files instead of waiting for the next write to each.
+  /// </summary>
+  private static void _ReloadLive(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios) {
+    try {
+      var manifest = store.TryLoadRegistry(pool.PoolId) ?? pool.Manifest;
+      var globalConfigPath = Path.Combine(host.ConfigRoot, "config.json");
+      var globalJson = host.FileExists(globalConfigPath) ? host.ReadAllText(globalConfigPath) : null;
+      var config = ConfigResolver.ResolveEffective(globalJson, manifest.Defaults?.GetRawText());
+      fs.ReloadConfig(config);
+
+      var duplication = Math.Max(1, config.Duplication ?? 1);
+      if (duplication >= 2) {
+        var allowSamePhysical = config.Placement?.ShadowNeverSamePhysical == false;
+        var report = new MediaLifecycle(ios, fs.Journal, duplication, allowSamePhysical).RestorePool();
+        if (report.CopiesCreated > 0)
+          DriveBender.Logger($"Live reload: created {report.CopiesCreated} owed cop(ies) to reach duplication level {duplication}");
+      }
+    } catch (Exception e) {
+      DriveBender.Logger($"[Warning]Live config reload failed: {e.Message}");
+    }
+  }
+
+  private static int _MountPlatform(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, string target, string label, MountRegistry registry, MountOptions options) {
 #if WINDOWS
     // WinFsp preferred (richer semantics); Dokan (LGPL) as the no-extra-install fallback (§4.1)
     IDisposable mountHost;
@@ -125,6 +150,8 @@ internal static class MountCommand {
       using var pump = new Timer(_ => {
         scheduler.Pump();
         metrics.Publish(fs, entry); // live snapshot for the serve daemon (§6.13)
+        if (registry.ConsumeReload(pool.PoolId)) // the daemon changed settings — apply them live
+          _ReloadLive(host, store, fs, pool, ios);
         if (registry.StopRequested(pool.PoolId)) // another dbmount asked for a clean unmount
           stop.Set();
       }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
@@ -158,7 +185,11 @@ internal static class MountCommand {
       onMounted: () => registry.Register(fuseEntry),
       stopRequested: () => registry.StopRequested(pool.PoolId),
       onUnmounted: () => { registry.Unregister(pool.PoolId); fuseMetrics.Remove(pool.PoolId); },
-      onTick: () => fuseMetrics.Publish(fs, fuseEntry));
+      onTick: () => {
+        fuseMetrics.Publish(fs, fuseEntry);
+        if (registry.ConsumeReload(pool.PoolId))
+          _ReloadLive(host, store, fs, pool, ios);
+      });
 #endif
   }
 

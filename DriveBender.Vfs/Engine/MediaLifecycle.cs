@@ -8,23 +8,28 @@ public sealed record MediaLifecycleReport(int FilesMoved, int CopiesCreated, int
 /// Administrative media operations over a pool's members (§1.1 whole-file model):
 /// scatter-and-remove a member, replace a member, and restore the pool to its
 /// duplication level. Each operation moves whole files via <see cref="WholeFilePublisher"/>
-/// under journalled intents, honours failure domains (SAFE-PHYS), and only ever removes a
-/// copy once another exists (SAFE-DUP) — safe to interrupt and resume.
+/// under journalled intents, honours failure domains (SAFE-PHYS) — with
+/// <paramref name="allowSamePhysical"/> as the pool's explicit opt-in to co-locate copies
+/// on one disk (bit-rot protection without disk-loss protection) — and only ever removes a
+/// copy once another exists (SAFE-DUP); safe to interrupt and resume.
 /// </summary>
-public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal journal, int duplicationLevel) {
+public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal journal, int duplicationLevel, bool allowSamePhysical = false) {
 
   private sealed record Copy(IVolumeIO Member, string Path, bool Shadow);
 
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
+  /// <summary>How well a file is covered: independent disks by default, distinct members when same-disk copies are allowed.</summary>
+  private int _Coverage(IEnumerable<Copy> copies) => allowSamePhysical
+    ? copies.Select(c => c.Member.MemberId).Distinct().Count()
+    : copies.Select(c => c.Member.PhysicalVolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+
   /// <summary>Files that are below their duplication level or missing a primary (read-only audit for health checks).</summary>
   public int CountUnderDuplicated() {
     var count = 0;
-    foreach (var (_, copies) in this._EnumerateLogicalFiles()) {
-      var domains = copies.Select(c => c.Member.PhysicalVolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count();
-      if (domains < duplicationLevel || !copies.Any(c => !c.Shadow))
+    foreach (var (_, copies) in this._EnumerateLogicalFiles())
+      if (this._Coverage(copies) < duplicationLevel || !copies.Any(c => !c.Shadow))
         ++count;
-    }
 
     return count;
   }
@@ -87,9 +92,20 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
   }
 
   private IVolumeIO? _ChooseTarget(IEnumerable<Copy> existing, long size, IVolumeIO? exclude) {
-    var occupiedDomains = new HashSet<string>(existing.Select(c => c.Member.PhysicalVolumeId), StringComparer.OrdinalIgnoreCase);
-    return this._Online
+    var list = existing.ToArray();
+    var occupiedDomains = new HashSet<string>(list.Select(c => c.Member.PhysicalVolumeId), StringComparer.OrdinalIgnoreCase);
+    var independent = this._Online
       .Where(m => m != exclude && m.BytesFree >= size && !occupiedDomains.Contains(m.PhysicalVolumeId))
+      .OrderByDescending(m => m.BytesFree)
+      .FirstOrDefault();
+    if (independent != null || !allowSamePhysical)
+      return independent;
+
+    // opted in: no independent disk left — use another member on an occupied disk, but never
+    // one that already holds a copy of this file (that would duplicate onto itself)
+    var holders = new HashSet<Guid>(list.Select(c => c.Member.MemberId));
+    return this._Online
+      .Where(m => m != exclude && m.BytesFree >= size && !holders.Contains(m.MemberId))
       .OrderByDescending(m => m.BytesFree)
       .FirstOrDefault();
   }
@@ -114,8 +130,10 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
 
       var elsewhere = allCopies.Where(c => c.Member.MemberId != memberId).ToList();
       foreach (var copy in here) {
-        // ensure the content survives on another domain before deleting this copy
-        var survivesElsewhere = elsewhere.Any(c => c.Member.PhysicalVolumeId != leaving.PhysicalVolumeId);
+        // ensure the content survives on another domain (or member, when co-location is allowed) first
+        var survivesElsewhere = allowSamePhysical
+          ? elsewhere.Count > 0
+          : elsewhere.Any(c => c.Member.PhysicalVolumeId != leaving.PhysicalVolumeId);
         if (!survivesElsewhere) {
           var content = _Read(copy);
           var target = this._ChooseTarget(elsewhere, content.LongLength, leaving)
@@ -176,7 +194,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
   public MediaLifecycleReport RestorePool() {
     var created = 0;
     foreach (var (path, copies) in this._EnumerateLogicalFiles()) {
-      var distinctDomains = copies.Select(c => c.Member.PhysicalVolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+      var distinctDomains = this._Coverage(copies);
       var hasPrimary = copies.Any(c => !c.Shadow);
       var source = copies[0];
       byte[]? content = null;

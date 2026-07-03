@@ -377,8 +377,17 @@ internal sealed class ServeCommand(
       throw new ManifestException("duplication needs a level (1-10)");
 
     lifecycle.SetDuplication(pool.Manifest, body.Level.Value, string.IsNullOrWhiteSpace(body.Folder) ? null : body.Folder, body.AllowSamePhysical);
-    return "ok";
+    return this._ApplyLive(pool);
   });
+
+  /// <summary>After a settings change: asks a running mount to reload live; otherwise it lands on the next mount.</summary>
+  private string _ApplyLive(PoolRef pool) {
+    if (mountRegistry.Find(pool.PoolId.ToString()) == null)
+      return "saved — takes effect on the next mount";
+
+    mountRegistry.RequestReload(pool.PoolId);
+    return "saved — applying live to the running mount (owed copies are being created in the background)";
+  }
 
   /// <summary>Returns the pool's current settings block plus the built-in defaults as a template.</summary>
   private object _GetConfig(HttpListenerRequest request) => _Guard(() => {
@@ -395,7 +404,7 @@ internal sealed class ServeCommand(
       throw new ManifestException("settings need a JSON object");
 
     lifecycle.SetConfig(pool.Manifest, body.Json);
-    return "ok";
+    return this._ApplyLive(pool);
   });
 
   /// <summary>Removes a pool from this machine's registry only — data and on-media markers stay.</summary>

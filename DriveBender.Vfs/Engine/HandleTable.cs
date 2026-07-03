@@ -75,6 +75,19 @@ public sealed class HandleTable {
     }
   }
 
+  /// <summary>Follows every open file under a renamed folder so their handles stay valid (folder FR-RENAME).</summary>
+  public void RenameSubtree(string fromNormalized, string toNormalized) {
+    lock (this._lock) {
+      var fromPrefix = fromNormalized + "/";
+      foreach (var key in this._files.Keys.Where(k => k.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray()) {
+        var file = this._files[key];
+        this._files.Remove(key);
+        file.Path = toNormalized + "/" + key[fromPrefix.Length..];
+        this._files[file.Path] = file;
+      }
+    }
+  }
+
   public int OpenHandleCount {
     get {
       lock (this._lock)

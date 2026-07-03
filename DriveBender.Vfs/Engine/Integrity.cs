@@ -82,6 +82,19 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
     }
   }
 
+  /// <summary>Remaps every entry under a renamed folder (embedded shadow entries included) so checksums survive folder renames.</summary>
+  public void RenamePrefix(string fromPhysicalFolder, string toPhysicalFolder) {
+    lock (this._lock) {
+      var entries = this._Load();
+      var fromPrefix = fromPhysicalFolder + "/";
+      foreach (var key in entries.Keys.Where(k => k.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray()) {
+        entries.Remove(key, out var entry);
+        entries[toPhysicalFolder + "/" + key[fromPrefix.Length..]] = entry!;
+        this._dirty = true;
+      }
+    }
+  }
+
   public void Save() {
     lock (this._lock) {
       if (!this._dirty || this._entries == null || !member.IsOnline)
@@ -154,6 +167,12 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     foreach (var database in this._databases.Values)
     foreach (var shadow in new[] { false, true })
       database.Rename(PoolPaths.ToPhysical(fromNormalized, shadow), PoolPaths.ToPhysical(toNormalized, shadow));
+  }
+
+  /// <summary>Folder rename: every checksum under the subtree follows the new physical prefix.</summary>
+  public void RenameSubtree(string fromNormalized, string toNormalized) {
+    foreach (var database in this._databases.Values)
+      database.RenamePrefix(fromNormalized, toNormalized);
   }
 
   public void SaveAll() {

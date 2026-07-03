@@ -237,6 +237,38 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   public void AtomicReplace(string tempRelative, string finalRelative, bool shadow)
     => throw new PoolFsException(PoolFsError.NotSupported, $"Backend '{this.DisplayName}' has no atomic rename — use whole-file publication");
 
+  /// <summary>
+  /// Whole-file backends have no server-side directory move: the subtree is copied object by
+  /// object and the source removed afterwards (FR-CAP-ADAPT — correctness over speed).
+  /// </summary>
+  public void RenameFolder(string fromRelativeFolder, string toRelativeFolder) => this._Guard(() => {
+    var fromPhysical = _Folder(fromRelativeFolder, false);
+    var toPhysical = _Folder(toRelativeFolder, false);
+    if (store.Stat(fromPhysical) is not { IsFolder: true })
+      throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {fromRelativeFolder}");
+    if (store.Stat(toPhysical) != null)
+      throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toRelativeFolder}");
+
+    this._EnsureFolderRecursive(toPhysical);
+    this._MoveTree(fromPhysical, toPhysical);
+    store.DeleteFolder(fromPhysical);
+  });
+
+  private void _MoveTree(string fromPhysical, string toPhysical) {
+    foreach (var entry in store.List(fromPhysical).ToArray()) {
+      var source = $"{fromPhysical}/{entry.Name}";
+      var target = $"{toPhysical}/{entry.Name}";
+      if (entry.IsFolder) {
+        store.CreateFolder(target);
+        this._MoveTree(source, target);
+        store.DeleteFolder(source);
+      } else {
+        store.Upload(target, store.Download(source));
+        store.DeleteFile(source);
+      }
+    }
+  }
+
   public FileMeta? Stat(string relativePath, bool shadow) => this._Guard<FileMeta?>(() => {
     var meta = store.Stat(_File(relativePath, shadow));
     return meta == null

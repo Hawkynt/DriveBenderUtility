@@ -64,6 +64,21 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
   }
 
   private bool _RollForwardRename(string from, string to) {
+    // folder rename: some members may have flipped before the crash — finish the rest the same way
+    if (this._Online.Any(m => m.FolderExists(to, false)) && !this._Online.Any(m => m.FileExists(to, false) || m.FileExists(to, true))) {
+      var movedFolders = false;
+      foreach (var member in this._Online.Where(m => m.FolderExists(from, false) && !m.FolderExists(to, false))) {
+        var toParent = PoolPaths.GetParent(to);
+        if (toParent.Length > 0)
+          member.EnsureFolder(toParent, false);
+
+        member.RenameFolder(from, to);
+        movedFolders = true;
+      }
+
+      return movedFolders;
+    }
+
     var targetExists = this._Online.Any(m => m.FileExists(to, false) || m.FileExists(to, true));
     if (!targetExists)
       return false; // nothing moved yet — the intent never took effect; source stays authoritative

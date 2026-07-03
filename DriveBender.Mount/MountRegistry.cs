@@ -25,14 +25,36 @@ public sealed class MountRegistry(IHostEnvironment host) {
   private string _EntryPath(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.json");
   private string _StopPath(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.stop");
   private string _ErrorPath(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.error");
+  private string _ReloadPath(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.reload");
 
   public void Register(MountEntry entry) {
     host.CreateDirectory(this._Directory);
     host.WriteAllTextAtomic(this._EntryPath(entry.PoolId), JsonSerializer.Serialize(entry, new JsonSerializerOptions { WriteIndented = true }));
-    // mount succeeded: clear any stop-request and stale failure report
-    foreach (var path in new[] { this._StopPath(entry.PoolId), this._ErrorPath(entry.PoolId) })
+    // mount succeeded: clear any stop-request, stale failure report and pending reload marker
+    foreach (var path in new[] { this._StopPath(entry.PoolId), this._ErrorPath(entry.PoolId), this._ReloadPath(entry.PoolId) })
       if (host.FileExists(path))
         host.DeleteFile(path);
+  }
+
+  /// <summary>Asks the running mount process to re-read its configuration live (CFG.reload, cross-process).</summary>
+  public void RequestReload(Guid poolId) {
+    host.CreateDirectory(this._Directory);
+    host.WriteAllTextAtomic(this._ReloadPath(poolId), DateTime.UtcNow.ToString("O"));
+  }
+
+  /// <summary>Consumes a pending reload request (checked by the mount pump each second).</summary>
+  public bool ConsumeReload(Guid poolId) {
+    var path = this._ReloadPath(poolId);
+    if (!host.FileExists(path))
+      return false;
+
+    try {
+      host.DeleteFile(path);
+    } catch (IOException) {
+      return false; // racing writer — pick it up next tick
+    }
+
+    return true;
   }
 
   /// <summary>

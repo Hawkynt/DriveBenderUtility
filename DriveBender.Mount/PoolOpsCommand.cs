@@ -11,7 +11,7 @@ namespace DivisonM.Mount;
 /// </summary>
 internal static class PoolOpsCommand {
 
-  private static (PoolRef pool, IReadOnlyList<(PoolMemberDefinition def, IVolumeIO io)> online, int duplication) _Open(
+  private static (PoolRef pool, IReadOnlyList<(PoolMemberDefinition def, IVolumeIO io)> online, int duplication, bool allowSamePhysical) _Open(
     IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, string poolNameOrId) {
     var pools = provider.Discover();
     var pool = Guid.TryParse(poolNameOrId, out var id)
@@ -32,15 +32,15 @@ internal static class PoolOpsCommand {
     var config = ConfigResolver.ResolveEffective(
       host.FileExists(Path.Combine(host.ConfigRoot, "config.json")) ? host.ReadAllText(Path.Combine(host.ConfigRoot, "config.json")) : null,
       pool.Manifest.Defaults?.GetRawText());
-    return (pool, online, Math.Max(1, config.Duplication ?? 1));
+    return (pool, online, Math.Max(1, config.Duplication ?? 1), config.Placement?.ShadowNeverSamePhysical == false);
   }
 
   /// <summary>Runs the health scan (optionally correcting) and returns the structured report — shared by the CLI verb and the daemon's API.</summary>
   public static HealthReport RunHealth(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, string poolNameOrId, bool fix) {
-    var (_, online, duplication) = _Open(host, provider, remoteResolver, poolNameOrId);
+    var (_, online, duplication, allowSamePhysical) = _Open(host, provider, remoteResolver, poolNameOrId);
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
-    var service = new HealthService(ios, new SmartctlMonitor(), new IntegrityService(ios), new MediaLifecycle(ios, journal, duplication));
+    var service = new HealthService(ios, new SmartctlMonitor(), new IntegrityService(ios), new MediaLifecycle(ios, journal, duplication, allowSamePhysical));
     return fix ? service.CheckAndCorrect() : service.Check();
   }
 
@@ -63,28 +63,28 @@ internal static class PoolOpsCommand {
   }
 
   public static int Restore(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, PoolRestoreOptions options) {
-    var (pool, online, duplication) = _Open(host, provider, remoteResolver, options.Pool);
+    var (pool, online, duplication, allowSamePhysical) = _Open(host, provider, remoteResolver, options.Pool);
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
-    var report = new MediaLifecycle(ios, journal, duplication).RestorePool();
+    var report = new MediaLifecycle(ios, journal, duplication, allowSamePhysical).RestorePool();
     Console.WriteLine($"Restored pool '{pool.Name}': {report.CopiesCreated} copy(ies) created/promoted to duplication level {duplication}.");
     return 0;
   }
 
   public static int RemoveMedia(IHostEnvironment host, ManifestStore store, IPoolProvider provider, PoolLifecycle lifecycle, BackendMemberResolver remoteResolver, PoolRemoveMediaOptions options) {
-    var (pool, online, duplication) = _Open(host, provider, remoteResolver, options.Member == null ? options.Pool : options.Pool);
+    var (pool, online, duplication, allowSamePhysical) = _Open(host, provider, remoteResolver, options.Member == null ? options.Pool : options.Pool);
     var member = _FindMember(pool, options.Member);
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
 
-    new MediaLifecycle(ios, journal, duplication).ScatterAndRemove(member.MemberId);
+    new MediaLifecycle(ios, journal, duplication, allowSamePhysical).ScatterAndRemove(member.MemberId);
     lifecycle.RemoveMember(pool.Manifest, member.MemberId); // drop from the manifest once its data is scattered
     Console.WriteLine($"Removed media '{member.Label ?? member.Path}' from pool '{pool.Name}'; data scattered over the remaining members.");
     return 0;
   }
 
   public static int ReplaceMedia(IHostEnvironment host, ManifestStore store, IPoolProvider provider, PoolLifecycle lifecycle, BackendMemberResolver remoteResolver, PoolReplaceMediaOptions options) {
-    var (pool, online, duplication) = _Open(host, provider, remoteResolver, options.Pool);
+    var (pool, online, duplication, allowSamePhysical) = _Open(host, provider, remoteResolver, options.Pool);
     var oldMember = _FindMember(pool, options.Old);
 
     // the replacement is a fresh local member folder (created if missing)
@@ -95,7 +95,7 @@ internal static class PoolOpsCommand {
 
     var ios = online.Select(m => m.io).Append(replacement).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
-    new MediaLifecycle(ios, journal, duplication).Replace(oldMember.MemberId, replacement);
+    new MediaLifecycle(ios, journal, duplication, allowSamePhysical).Replace(oldMember.MemberId, replacement);
 
     var withReplacement = lifecycle.AddMember(pool.Manifest, new(options.New), force: true);
     lifecycle.RemoveMember(withReplacement, oldMember.MemberId);
@@ -114,7 +114,7 @@ internal static class PoolOpsCommand {
   /// is my data"). Read-only; sidecars and shadow folders are hidden like in the mounted view.
   /// </summary>
   public static BrowseResult Browse(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, string poolNameOrId, string? relativePath) {
-    var (_, online, _) = _Open(host, provider, remoteResolver, poolNameOrId);
+    var (_, online, _, _) = _Open(host, provider, remoteResolver, poolNameOrId);
     var rel = (relativePath ?? "").Replace('\\', '/').Trim('/');
 
     var union = new Dictionary<string, (bool dir, long len)>(StringComparer.OrdinalIgnoreCase);

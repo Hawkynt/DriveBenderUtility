@@ -309,8 +309,8 @@ async function settingsDialog(pool) {
   const form = el("div");
   form.innerHTML = `
     <p class="hint">These are this pool's settings, merged over the built-in defaults on mount. Edit any
-    keys you want to override and leave the rest out — omitted keys keep inheriting. Saved changes take
-    effect on the next mount. Invalid values are rejected with a reason.</p>
+    keys you want to override and leave the rest out — omitted keys keep inheriting. Saved changes apply
+    <b>live</b> to a mounted pool, otherwise on the next mount. Invalid values are rejected with a reason.</p>
     <label>Pool settings (JSON)</label>
     <textarea class="cfg" rows="16" spellcheck="false" placeholder="{ }">${current}</textarea>
     <div class="row" style="margin-top:6px">
@@ -342,7 +342,8 @@ function duplicationDialog(pool) {
     same disk are one failure domain (SAFE-PHYS), and this pool has <b>${pool.failureDomains}</b> of them.
     Tick the box to store the extra copies anyway when no independent disk is free: that guards against
     <b>bit-rot / silent corruption</b> (a scrub can heal from the good copy) but <b>not</b> against the
-    disk failing. Changes take effect on the next mount.</p>
+    disk failing. Changes apply <b>live</b> to a mounted pool — owed copies are created right away —
+    otherwise on the next mount.</p>
     <label>Optional — override a folder or file (glob, e.g. <code>Photos/**</code> or <code>Docs/tax.pdf</code>)</label>
     <input class="dupfolder" placeholder="leave empty to set only the pool-wide default">
     <label>Copies for that pattern</label>

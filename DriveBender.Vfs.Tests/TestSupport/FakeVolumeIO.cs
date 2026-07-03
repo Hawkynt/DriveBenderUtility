@@ -179,6 +179,31 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
     this._folders.Remove(physical);
   }
 
+  public void RenameFolder(string fromRelativeFolder, string toRelativeFolder) {
+    this._Check(VolumeOp.EnsureFolder);
+    var fromPhysical = PoolPaths.ToPhysicalFolder(fromRelativeFolder, false);
+    var toPhysical = PoolPaths.ToPhysicalFolder(toRelativeFolder, false);
+    if (!this._folders.Contains(fromPhysical))
+      throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {fromRelativeFolder}");
+    if (this._folders.Contains(toPhysical) || this._files.ContainsKey(toPhysical))
+      throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toRelativeFolder}");
+
+    this._EnsureParents(toPhysical + "/x");
+    var fromPrefix = fromPhysical + "/";
+    foreach (var folder in this._folders.Where(f => f.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray()) {
+      this._folders.Remove(folder);
+      this._folders.Add(toPhysical + "/" + folder[fromPrefix.Length..]);
+    }
+
+    this._folders.Remove(fromPhysical);
+    this._folders.Add(toPhysical);
+
+    foreach (var (key, file) in this._files.Where(kv => kv.Key.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray()) {
+      this._files.Remove(key);
+      this._files[toPhysical + "/" + key[fromPrefix.Length..]] = file;
+    }
+  }
+
   public void AtomicReplace(string tempRelative, string finalRelative, bool shadow) {
     this._Check(VolumeOp.AtomicReplace);
     if ((this.Caps & BackendCaps.AtomicRename) == 0)

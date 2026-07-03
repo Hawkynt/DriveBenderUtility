@@ -451,8 +451,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var fromNormalized = PoolPaths.Normalize(from);
     var toNormalized = PoolPaths.Normalize(to);
     var copies = this._placement.ResolveCopies(fromNormalized);
-    if (copies.Count == 0)
+    if (copies.Count == 0) {
+      // not a file — folders resolve by their directory presence (FR-RENAME for directories)
+      if (this._Online.Any(m => m.FolderExists(fromNormalized, false))) {
+        this._RenameFolder(fromNormalized, toNormalized);
+        return;
+      }
+
       throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {from}");
+    }
 
     if (!this._ParentExists(toNormalized))
       throw new PoolFsException(PoolFsError.NotFound, $"Target parent folder not found: {to}");
@@ -486,6 +493,47 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._shadow.Rename(fromNormalized, toNormalized);
     this._Invalidate(fromNormalized);
     this._Invalidate(toNormalized);
+  }
+
+  /// <summary>
+  /// Renames a directory subtree (FR-RENAME for folders): the folder flips via one directory
+  /// rename on every member that holds it — the embedded shadow folders travel along — then
+  /// checksums, open handles, the shadow namespace and caches follow the new prefix.
+  /// </summary>
+  private void _RenameFolder(string fromNormalized, string toNormalized) {
+    if (toNormalized.Length == 0 || fromNormalized.Length == 0)
+      throw new PoolFsException(PoolFsError.AccessDenied, "The pool root cannot be renamed");
+    if ((toNormalized + "/").StartsWith(fromNormalized + "/", StringComparison.OrdinalIgnoreCase))
+      throw new PoolFsException(PoolFsError.InvalidArgument, $"Cannot move a folder into itself: {fromNormalized} → {toNormalized}");
+    if (!this._ParentExists(toNormalized))
+      throw new PoolFsException(PoolFsError.NotFound, $"Target parent folder not found: {toNormalized}");
+    if (this._Online.Any(m => m.FolderExists(toNormalized, false) || m.FileExists(toNormalized, false)))
+      throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toNormalized}");
+
+    // dirty children must land under the old name before the tree moves (SAFE-NOLOSS)
+    var fromPrefix = fromNormalized + "/";
+    foreach (var dirty in this._writeBuffer.DirtyPaths.Where(p => p.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray())
+      this.FlushPath(dirty);
+
+    var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
+
+    var parent = PoolPaths.GetParent(toNormalized);
+    foreach (var member in this._Online.Where(m => m.FolderExists(fromNormalized, false))) {
+      if (parent.Length > 0)
+        member.EnsureFolder(parent, false);
+
+      member.RenameFolder(fromNormalized, toNormalized);
+    }
+
+    this._journal.Complete(sequence, JournalOp.Rename);
+    this._integrity.RenameSubtree(fromNormalized, toNormalized);
+    this._handles.RenameSubtree(fromNormalized, toNormalized);
+    this._shadow.Rename(fromNormalized, toNormalized);
+
+    // every cached child listing/placement under the old prefix is stale — drop the pool's caches
+    this._cache.Metadata.InvalidatePool(this._poolId);
+    this._placement.InvalidateAll();
+    DriveBender.Logger($"Renamed folder '{fromNormalized}' to '{toNormalized}' across {this._Online.Count(m => m.FolderExists(toNormalized, false))} member(s)");
   }
 
   public void Unlink(string path) {

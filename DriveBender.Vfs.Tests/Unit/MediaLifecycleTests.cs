@@ -30,6 +30,23 @@ public class MediaLifecycleTests {
   private static byte[] _Bytes(params byte[] b) => b;
 
   [Test]
+  [Category("EdgeCase")]
+  public void RestorePool_GivenSameDiskMembersAndOptIn_WhenRestored_ThenCopyCoLocatedForBitRotProtection() {
+    var sameDisk = new FakeVolumeIO(Guid.NewGuid(), "same-disk", "PHYS-1", capacity: 1L << 20);
+    this._v1.Seed("only.bin", false, _Bytes(3, 1, 4));
+
+    // strict SAFE-PHYS: nothing to place on — the file stays single-copy
+    this._Lifecycle(2, this._v1, sameDisk).RestorePool().CopiesCreated.Should().Be(0);
+    this._Lifecycle(2, this._v1, sameDisk).CountUnderDuplicated().Should().Be(1);
+
+    // opted in: the second copy lands on the same disk's other member (bit-rot protection)
+    var allowing = new MediaLifecycle([this._v1, sameDisk], this._journal, 2, allowSamePhysical: true);
+    allowing.RestorePool().CopiesCreated.Should().Be(1);
+    sameDisk.GetContent("only.bin", true).Should().Equal(new byte[] { 3, 1, 4 });
+    allowing.CountUnderDuplicated().Should().Be(0, "with same-disk copies allowed, two members satisfy duplication 2");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public void ScatterAndRemove_GivenSingleCopyFiles_WhenRemoved_ThenDataMovedToOtherMembers() {
     this._v1.Seed("docs/a.txt", false, _Bytes(1, 2, 3));
