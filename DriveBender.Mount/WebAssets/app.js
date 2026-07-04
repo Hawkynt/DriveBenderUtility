@@ -501,35 +501,149 @@ async function browseInto(pool, path, body) {
   });
 }
 
-// Full settings editor: edit the pool's whole config block as JSON, validated on save. Every knob
-// lives here (write policy, cache, tiers, background, safety, resilience, integrity, trash,
-// placement, duplication, observability); the dedicated dialogs are shortcuts to common ones.
+// nested-path helpers for the visual settings form (paths like "write.policy")
+function getPath(o, path) { return path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o); }
+function setPath(o, path, v) {
+  const ks = path.split("."); let a = o;
+  for (let i = 0; i < ks.length - 1; i++) { if (typeof a[ks[i]] !== "object" || a[ks[i]] == null) a[ks[i]] = {}; a = a[ks[i]]; }
+  a[ks[ks.length - 1]] = v;
+}
+function deletePath(o, path) {
+  const ks = path.split("."); let a = o; const stack = [];
+  for (let i = 0; i < ks.length - 1; i++) { if (a == null || typeof a[ks[i]] !== "object") return; stack.push([a, ks[i]]); a = a[ks[i]]; }
+  delete a[ks[ks.length - 1]];
+  for (let i = stack.length - 1; i >= 0; i--) { const [par, k] = stack[i]; if (par[k] && typeof par[k] === "object" && !Object.keys(par[k]).length) delete par[k]; }
+}
+
+// The knobs shown as form controls. Everything else stays reachable via the Advanced (JSON) box,
+// and omitted controls keep inheriting the built-in default (§8). "inherit" = don't override.
+const SETTINGS_SCHEMA = [
+  ["Writing", [
+    { path: "write.policy", label: "Write policy", type: "enum", options: [
+      ["write-through", "Write-through — safest; acknowledge only once on stable storage"],
+      ["write-back", "Write-back — cache writes and flush in the background (faster)"],
+      ["deferred", "Deferred — batch writes over a short window"],
+      ["performance", "Performance — lowest latency, weakest durability"]] },
+    { path: "write.minCopiesBeforeAck", label: "Copies that must be written before a write is acknowledged", type: "int", min: 1, max: 10 },
+  ]],
+  ["Cache", [
+    { path: "cache.size", label: "Cache size (e.g. 4GiB, 512MiB, or 10%)", type: "size" },
+    { path: "readAhead.enabled", label: "Read-ahead — prefetch sequential reads", type: "bool" },
+  ]],
+  ["Background maintenance", [
+    { path: "background.balancerEnabled", label: "Rebalance data across drives in the background", type: "bool" },
+    { path: "background.duplicatorEnabled", label: "Create owed duplicate copies in the background", type: "bool" },
+    { path: "background.maxThroughput", label: "Background throughput cap (e.g. 100MiB; empty = unlimited)", type: "size" },
+  ]],
+  ["Safety", [
+    { path: "safety.journalEnabled", label: "Write-ahead journal (crash-consistent)", type: "bool" },
+    { path: "safety.refuseMountOnUnrecoverable", label: "Refuse to mount on unrecoverable damage", type: "bool" },
+    { path: "placement.autoLandingZone", label: "Auto landing zone — let the fastest drive lead", type: "bool" },
+  ]],
+  ["Resilience", [
+    { path: "resilience.onMemberLoss", label: "When a member drive goes offline", type: "enum", options: [
+      ["retain-metadata", "Keep serving — complete metadata from the in-memory shadow"],
+      ["discard-inaccessible", "Hide files that live only on the lost member"]] },
+    { path: "resilience.memberPollSeconds", label: "Re-check an offline member every (seconds)", type: "number", min: 1 },
+  ]],
+  ["Integrity", [
+    { path: "integrity.checksumDb", label: "Maintain a checksum database (enables scrub / heal)", type: "bool" },
+    { path: "integrity.onExternalEdit", label: "When a file is edited outside the pool", type: "enum", options: [
+      ["accept-newest", "Accept the newest copy"],
+      ["conflict-only", "Flag it as a conflict only"],
+      ["read-only-until-reconciled", "Make it read-only until reconciled"]] },
+  ]],
+];
+
+// Visual settings: a form of the common knobs + the pool's mount location, with an Advanced (JSON)
+// box that still exposes every setting. The dedicated Duplication dialog owns copies/placement.
 async function settingsDialog(pool) {
   const j = await fetch("/api/pool/config?pool=" + pool.id, auth).then(r => r.json()).catch(() => ({}));
   const data = (j && j.result) || {};
-  const pretty = (s) => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch (_) { return s || ""; } };
-  const current = data.current ? pretty(data.current) : "";
-  const template = pretty(data.template || "{}");
+  let cfg = {}; try { cfg = data.current ? JSON.parse(data.current) : {}; } catch (_) { cfg = {}; }
+  const template = (() => { try { return JSON.stringify(JSON.parse(data.template || "{}"), null, 2); } catch (_) { return "{}"; } })();
 
   const form = el("div");
-  form.innerHTML = `
-    <p class="hint">These are this pool's settings, merged over the built-in defaults on mount. Edit any
-    keys you want to override and leave the rest out — omitted keys keep inheriting. Saved changes apply
-    <b>live</b> to a mounted pool, otherwise on the next mount. Invalid values are rejected with a reason.</p>
-    <label>Pool settings (JSON)</label>
-    <textarea class="cfg" rows="16" spellcheck="false" placeholder="{ }">${current}</textarea>
-    <div class="row" style="margin-top:6px">
-      <button type="button" class="cfg-template" style="flex:0 0 auto">Load all defaults as a template</button>
-    </div>
-    <details style="margin-top:8px"><summary class="hint" style="cursor:pointer">Show built-in defaults (reference)</summary>
-      <pre class="cfg-ref">${template.replace(/</g, "&lt;")}</pre></details>`;
-  const area = form.querySelector(".cfg");
-  form.querySelector(".cfg-template").onclick = () => { area.value = template; };
+  form.append(el("p", "hint", "Overrides on top of the built-in defaults. Leave a control on “inherit” to keep the default. Changes apply live to a mounted pool, otherwise on the next mount."));
+
+  // --- mount location -------------------------------------------------------
+  const mountWrap = el("div", "setgroup");
+  mountWrap.innerHTML = `<h3>Mount location</h3>
+    <div class="row"><input class="mtpath" placeholder="X:\\ or /mnt/pool (empty = ask each time)" value="${(pool.configuredTarget || "").replace(/"/g, "&quot;")}">
+    <button type="button" class="mtbrowse" style="flex:0 0 auto">📁 Browse</button></div>
+    <p class="hint">The default place this pool mounts. Pick a drive letter (Windows) or an empty folder you own (Linux/macOS).</p>`;
+  mountWrap.querySelector(".mtbrowse").onclick = () => folderPicker(p => { mountWrap.querySelector(".mtpath").value = p; });
+  form.appendChild(mountWrap);
+
+  // --- schema-driven controls ----------------------------------------------
+  const controls = [];
+  for (const [section, fields] of SETTINGS_SCHEMA) {
+    const g = el("div", "setgroup");
+    g.appendChild(el("h3", null, section));
+    for (const f of fields) {
+      const cur = getPath(cfg, f.path);
+      g.appendChild(el("label", null, f.label));
+      let input;
+      if (f.type === "enum" || f.type === "bool") {
+        input = el("select");
+        const opts = f.type === "bool" ? [["true", "On"], ["false", "Off"]] : f.options;
+        input.innerHTML = `<option value="">(inherit default)</option>` +
+          opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
+        input.value = cur === undefined || cur === null ? "" : String(cur);
+      } else {
+        input = el("input");
+        input.type = f.type === "int" || f.type === "number" ? "number" : "text";
+        if (f.min !== undefined) input.min = f.min;
+        if (f.max !== undefined) input.max = f.max;
+        input.placeholder = "inherit default";
+        input.value = cur === undefined || cur === null ? "" : cur;
+      }
+      g.appendChild(input);
+      controls.push({ f, input });
+    }
+    form.appendChild(g);
+  }
+
+  // --- advanced (raw JSON) escape hatch ------------------------------------
+  let rawEdited = false;
+  const adv = el("details"); adv.style.marginTop = "10px";
+  adv.innerHTML = `<summary class="hint" style="cursor:pointer">Advanced — edit every setting as JSON</summary>
+    <p class="hint">Editing here overrides the form above on save. Omitted keys keep inheriting.</p>
+    <textarea class="cfg" rows="12" spellcheck="false"></textarea>
+    <div class="row" style="margin-top:6px"><button type="button" class="cfg-template" style="flex:0 0 auto">Load all defaults as a template</button></div>`;
+  const area = adv.querySelector(".cfg");
+  area.value = Object.keys(cfg).length ? JSON.stringify(cfg, null, 2) : "";
+  area.oninput = () => { rawEdited = true; };
+  adv.querySelector(".cfg-template").onclick = () => { area.value = template; rawEdited = true; };
+  form.appendChild(adv);
+
   showModal(`Settings — ${pool.name}`, form, async () => {
-    const text = area.value.trim();
-    if (!text) return "Enter a JSON object (or click ‘Load all defaults as a template’).";
-    try { JSON.parse(text); } catch (e) { return "Not valid JSON: " + e.message; }
-    return await op("/api/pool/config?pool=" + pool.id, { json: text }) ? null : "Settings were rejected.";
+    // 1) mount location (its own endpoint)
+    const mt = mountWrap.querySelector(".mtpath").value.trim();
+    if (mt !== (pool.configuredTarget || "")) {
+      const r = await post("/api/pool/mount-target?pool=" + pool.id, { target: mt });
+      if (!r.ok) return "Mount location was rejected: " + (r.error || "");
+    }
+
+    // 2) settings: raw JSON overrides the form when edited
+    let out;
+    if (rawEdited) {
+      const text = area.value.trim();
+      if (!text) out = {};
+      else { try { out = JSON.parse(text); } catch (e) { return "Advanced JSON is not valid: " + e.message; } }
+    } else {
+      out = JSON.parse(JSON.stringify(cfg)); // preserve keys not covered by the form
+      for (const { f, input } of controls) {
+        const v = input.value.trim();
+        if (v === "") { deletePath(out, f.path); continue; }
+        if (f.type === "bool") setPath(out, f.path, v === "true");
+        else if (f.type === "int") setPath(out, f.path, parseInt(v, 10));
+        else if (f.type === "number") setPath(out, f.path, parseFloat(v));
+        else setPath(out, f.path, v);
+      }
+    }
+    const r = await post("/api/pool/config?pool=" + pool.id, { json: JSON.stringify(out) });
+    return r.ok ? null : "Settings were rejected" + (r.error ? ": " + r.error : "") + ".";
   }, "Save settings");
 }
 
@@ -777,29 +891,40 @@ function locationControls(rowFor) {
 }
 
 function memberEditor() {
-  // returns { node, getMembers() } — a location/credential row + a running member list
-  const members = [];
+  // returns { node, getMembers() } — a stack of open member-setting sections. Each "Add member"
+  // click opens ANOTHER section; every open section that has a location is collected into the pool
+  // on Create, with no separate per-member confirm step.
   const wrap = el("div");
-  wrap.appendChild(el("label", null, "Add member"));
-  const ctl = locationControls();
-  wrap.appendChild(ctl.node);
+  wrap.appendChild(el("label", null, "member"));
+  const sections = el("div", "member-sections");
+  wrap.appendChild(sections);
+  const controls = [];
+  const addSection = () => {
+    const sec = el("div", "membersec");
+    const ctl = locationControls();
+    sec.appendChild(ctl.node);
+    const rm = el("button", "small danger", "Remove member"); rm.style.marginTop = "8px";
+    rm.onclick = () => {
+      const i = controls.indexOf(ctl);
+      if (i >= 0) controls.splice(i, 1);
+      sec.remove();
+      if (!controls.length) addSection(); // always keep at least one section open
+    };
+    sec.appendChild(rm);
+    controls.push(ctl);
+    sections.appendChild(sec);
+    return ctl;
+  };
+  addSection(); // start with one open section
   const addBtn = el("button", null, "Add member"); addBtn.style.marginTop = "8px";
+  addBtn.onclick = () => addSection();
   wrap.appendChild(addBtn);
-  const list = el("div", "memberlist"); wrap.appendChild(list);
-  const redraw = () => {
-    list.innerHTML = "";
-    members.forEach((m, i) => {
-      const row = el("div", "m", `<span>${m.location}</span><span class="role">${m.role}${m.credential ? " · 🔑" : ""}</span>`);
-      const rm = el("button", "small danger", "×"); rm.onclick = () => { members.splice(i, 1); redraw(); };
-      row.appendChild(rm); list.appendChild(row);
-    });
+  return {
+    node: wrap,
+    getMembers: () => controls
+      .map(c => ({ location: c.getLocation(), role: c.getRole(), credential: c.getCred() }))
+      .filter(m => m.location),
   };
-  addBtn.onclick = () => {
-    const loc = ctl.getLocation(); if (!loc) return;
-    members.push({ location: loc, role: ctl.getRole(), credential: ctl.getCred() });
-    ctl.reset(); redraw();
-  };
-  return { node: wrap, getMembers: () => members };
 }
 
 function createPoolDialog() {

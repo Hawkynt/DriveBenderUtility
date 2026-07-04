@@ -152,6 +152,15 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .fp-manual { margin-top: 4px; }
 .modal .row { display: flex; gap: 8px; }
 .modal .row > * { flex: 1; }
+/* visual settings: knobs grouped into labelled sections */
+.setgroup { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 10px 0; background: var(--panel-2); }
+.setgroup h3 { margin: 0 0 8px; font-size: 13px; font-weight: 650; color: var(--text); letter-spacing: .2px; }
+.setgroup label { margin-top: 10px; }
+.setgroup label:first-of-type { margin-top: 4px; }
+
+/* create-pool: a stack of open member-setting sections, each collected on Create */
+.member-sections { display: flex; flex-direction: column; gap: 10px; margin: 8px 0; }
+.membersec { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--panel-2); }
 .modal .memberlist { margin: 8px 0; display: flex; flex-direction: column; gap: 5px; }
 .modal .memberlist .m { display: flex; align-items: center; gap: 8px; font-size: 12px; background: var(--panel-2); padding: 5px 8px; border-radius: 8px; }
 .modal .memberlist .m .role { color: var(--muted); }

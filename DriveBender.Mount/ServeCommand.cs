@@ -178,6 +178,9 @@ internal sealed class ServeCommand(
         case "/api/pool/config" when request.HttpMethod == "POST":
           this._WriteJson(context, this._SetConfig(request));
           break;
+        case "/api/pool/mount-target" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._SetMountTarget(request));
+          break;
         case "/api/prereqs":
           this._WriteJson(context, _PrereqPayload(Prerequisites.Check()));
           break;
@@ -649,6 +652,18 @@ internal sealed class ServeCommand(
 
     lifecycle.SetConfig(pool.Manifest, body.Json);
     return this._ApplyLive(pool);
+  });
+
+  private sealed record MountTargetBody(string? Target);
+
+  /// <summary>Sets the pool's default mount location; effective on the next mount.</summary>
+  private object _SetMountTarget(HttpListenerRequest request) => _Guard(() => {
+    var body = _ReadBody<MountTargetBody>(request);
+    var pool = this._Discover(this._RequirePool(request));
+    lifecycle.SetMountTarget(pool.Manifest, body?.Target);
+    return mountRegistry.Find(pool.PoolId.ToString()) != null
+      ? "saved — unmount and mount again to move the running pool to the new location"
+      : "saved — takes effect on the next mount";
   });
 
   /// <summary>Removes a pool from this machine's registry only — data and on-media markers stay.</summary>

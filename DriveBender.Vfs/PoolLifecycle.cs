@@ -282,6 +282,24 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
   }
 
   /// <summary>
+  /// Sets (or clears, when target is null/empty) the pool's default mount location — the drive
+  /// letter/folder the UI's Mount button and automount use. A local ~/… or %VAR% target is
+  /// expanded like a member path. Applies to the NEXT mount (an already-mounted pool keeps its
+  /// current mountpoint until remounted).
+  /// </summary>
+  public PoolManifest SetMountTarget(PoolManifest manifest, string? target) {
+    if (manifest.IsVirtual)
+      throw new ManifestException("Adopt the native pool first (pool adopt) before editing its mount location");
+
+    var trimmed = string.IsNullOrWhiteSpace(target) ? null : MemberSchemes.ExpandLocal(target.Trim());
+    var mount = (manifest.Mount ?? new MountSpec()) with { Target = trimmed, VolumeLabel = manifest.Mount?.VolumeLabel ?? manifest.Name };
+    var updated = manifest with { Mount = trimmed == null && manifest.Mount?.ReadOnly != true ? null : mount };
+
+    DriveBender.Logger($"Set mount location of pool '{manifest.Name}' to '{trimmed ?? "(none)"}' (effective on next mount)");
+    return store.Save(updated);
+  }
+
+  /// <summary>
   /// Rebuilds a pool the registry has lost from a member folder's manifest mirror and
   /// re-registers it (the "restore the old pool" choice for an orphaned member marker).
   /// Reconciles across the folder so the newest surviving copy wins (SAFE-MANIFEST).
