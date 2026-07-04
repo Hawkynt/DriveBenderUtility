@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Photino.NET;
 
 namespace DivisonM.App;
@@ -21,6 +22,15 @@ internal static class Program {
 
   [STAThread]
   private static int Main(string[] args) {
+    // preflight the native WebView runtime BEFORE launching anything: Photino loads it lazily on
+    // the message-loop thread, so a missing library surfaces as a native SIGABRT core dump with a
+    // wall of loader text. Fail here instead with one actionable line — and no dangling daemon.
+    var missingRuntime = _MissingWebViewRuntime();
+    if (missingRuntime != null) {
+      Console.Error.WriteLine(missingRuntime);
+      return 3;
+    }
+
     var dbmount = _LocateDbmount();
     if (dbmount == null) {
       Console.Error.WriteLine("The 'dbmount' tool was not found next to this app. Build/install DriveBender.Mount alongside it.");
@@ -83,12 +93,44 @@ internal static class Program {
 
     try {
       window.WaitForClose();
+    } catch (Exception e) when (e is DllNotFoundException || e is ApplicationException) {
+      // backstop for any native WebView failure the preflight could not foresee (e.g. no display):
+      // report it plainly rather than letting the native layer abort the process.
+      Console.Error.WriteLine($"The desktop window could not be created: {e.Message.Trim()}");
+      Console.Error.WriteLine("Run 'dbmount serve' and open the printed URL in a browser instead.");
+      _closing = true;
+      _Stop();
+      return 3;
     } finally {
       _closing = true;
       _Stop();
     }
 
     return 0;
+  }
+
+  /// <summary>
+  /// On Linux the Photino native shim links against WebKitGTK (<c>libwebkit2gtk-4.1.so.0</c>); when
+  /// it is absent the app would abort with a native core dump. Probe for it up front and return a
+  /// one-line, install-ready message when it is missing (null when the runtime is present/N.A.).
+  /// </summary>
+  private static string? _MissingWebViewRuntime() {
+    // only Linux needs an explicit probe: Windows ships WebView2 with Photino, macOS has WebKit built in
+    if (!OperatingSystem.IsLinux())
+      return null;
+
+    const string lib = "libwebkit2gtk-4.1.so.0";
+    if (NativeLibrary.TryLoad(lib, out var handle)) {
+      NativeLibrary.Free(handle);
+      return null;
+    }
+
+    return $"The WebView runtime '{lib}' is missing, so the desktop window cannot open.\n"
+      + "Install it, then relaunch:\n"
+      + "  Arch:          sudo pacman -S webkit2gtk-4.1\n"
+      + "  Debian/Ubuntu: sudo apt install libwebkit2gtk-4.1-0\n"
+      + "  Fedora:        sudo dnf install webkit2gtk4.1\n"
+      + "Or skip the desktop shell entirely: run 'dbmount serve' and open the printed URL in a browser.";
   }
 
   /// <summary>Starts <c>dbmount serve</c> on the session port+token and returns its URL (null on failure).</summary>
