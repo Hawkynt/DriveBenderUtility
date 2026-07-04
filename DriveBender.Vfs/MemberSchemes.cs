@@ -24,6 +24,29 @@ public static class MemberSchemes {
   public static bool IsRemoteMember(PoolMemberDefinition definition)
     => IsRemote(SchemeOf(definition.Scheme, definition.Path));
 
+  /// <summary>
+  /// Expands a LOCAL path the way a shell would, so a member/target typed as <c>~/test1/</c> works
+  /// instead of being stored verbatim (which created a folder literally named <c>~</c>): a leading
+  /// <c>~</c> / <c>~/</c> / <c>~\</c> becomes the user's home directory and environment variables
+  /// (<c>%VAR%</c>) are expanded. Remote URIs and UNC shares are returned unchanged, and a bare
+  /// drive letter like <c>X:</c> is preserved (no GetFullPath, which would resolve it to a cwd).
+  /// </summary>
+  public static string ExpandLocal(string path) {
+    if (string.IsNullOrWhiteSpace(path))
+      return path;
+
+    if (IsRemote(SchemeOf(null, path)) || path.StartsWith(@"\\", StringComparison.Ordinal))
+      return path; // remote endpoint or UNC share — not a local filesystem path
+
+    var expanded = path.Trim();
+    if (expanded == "~" || expanded.StartsWith("~/", StringComparison.Ordinal) || expanded.StartsWith("~\\", StringComparison.Ordinal)) {
+      var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+      expanded = expanded.Length == 1 ? home : Path.Combine(home, expanded[2..]);
+    }
+
+    return Environment.ExpandEnvironmentVariables(expanded);
+  }
+
 }
 
 /// <summary>

@@ -303,11 +303,20 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
 public static class LinuxFuseMountHost {
 
   static LinuxFuseMountHost() {
-    // distros ship only the versioned SONAME (libfuse3.so.3); the unversioned name needs the -dev package
-    System.Runtime.InteropServices.NativeLibrary.SetDllImportResolver(typeof(Fuse).Assembly, (name, _, _) =>
-      name is "fuse3" or "libfuse3" && System.Runtime.InteropServices.NativeLibrary.TryLoad("libfuse3.so.3", out var handle)
-        ? handle
-        : IntPtr.Zero);
+    // Resolve libfuse3 across releases: distros ship only the versioned SONAME, and it changed with
+    // the library ABI — libfuse3.so.3 up to 3.16, libfuse3.so.4 from 3.17 (e.g. current Arch). The
+    // unversioned libfuse3.so only exists with the -dev package. Try each so a runtime-only install
+    // of ANY modern libfuse3 resolves instead of failing with DllNotFoundException at mount time.
+    System.Runtime.InteropServices.NativeLibrary.SetDllImportResolver(typeof(Fuse).Assembly, (name, _, _) => {
+      if (name is not ("fuse3" or "libfuse3"))
+        return IntPtr.Zero;
+
+      foreach (var candidate in new[] { "libfuse3.so.3", "libfuse3.so.4", "libfuse3.so" })
+        if (System.Runtime.InteropServices.NativeLibrary.TryLoad(candidate, out var handle))
+          return handle;
+
+      return IntPtr.Zero;
+    });
   }
 
   public static bool IsFuseAvailable() => OperatingSystem.IsLinux() && File.Exists("/dev/fuse");
@@ -348,8 +357,22 @@ public static class LinuxFuseMountHost {
       args.Add("-d");
 
     try {
-      // "-f": stay in the foreground so this process owns the lifecycle
-      adapter.Mount(args);
+      // libfuse's setup path (the mount syscall / its fusermount3 fork+waitpid, and the first reads
+      // on /dev/fuse) can be interrupted by a signal the .NET runtime delivers — GC / child reaping —
+      // surfacing as a PosixException(EINTR) *before* the volume is up, i.e. "Interrupted system
+      // call (4)". That is transient, so retry the mount while it has not yet come up rather than
+      // failing outright; once mounted (registered) an EINTR is a real error and propagates.
+      const int maxAttempts = 10;
+      for (var attempt = 1; ; ++attempt) {
+        try {
+          // "-f": stay in the foreground so this process owns the lifecycle
+          adapter.Mount(args);
+          break;
+        } catch (PosixException e) when (e.NativeErrorCode == PosixResult.EINTR && !registered && attempt < maxAttempts) {
+          DriveBender.Logger($"[Warning]FUSE mount interrupted (EINTR) during setup — retrying ({attempt}/{maxAttempts - 1})");
+          Thread.Sleep(150);
+        }
+      }
     } finally {
       scheduler.Quiesce();
       fs.Unmount(); // clean unmount flushes everything (FR-CLEAN-UNMOUNT)
@@ -360,16 +383,45 @@ public static class LinuxFuseMountHost {
   }
 
   private static bool _IsMounted(string target) {
+    var want = target.TrimEnd('/');
     try {
       foreach (var line in File.ReadLines("/proc/mounts")) {
         var parts = line.Split(' ');
-        if (parts.Length >= 2 && parts[1] == target)
+        if (parts.Length >= 2 && parts[1].TrimEnd('/') == want)
           return true;
       }
     } catch (IOException) {
     }
 
     return false;
+  }
+
+  /// <summary>True if something is currently mounted at the target (any filesystem).</summary>
+  public static bool IsMountpoint(string target) => OperatingSystem.IsLinux() && _IsMounted(target);
+
+  /// <summary>
+  /// A crashed or force-killed mount leaves the target as a DEAD FUSE mount: it still shows in
+  /// /proc/mounts but every access fails ("Transport endpoint is not connected" / EACCES), so a
+  /// fresh mount is refused with "fusermount3: failed to access mountpoint … Permission denied".
+  /// Detect that specific state and lazily detach it so a remount can proceed; a live, healthy
+  /// mount is left untouched. Returns true when a stale mount was cleared.
+  /// </summary>
+  public static bool TryClearStaleMount(string target) {
+    if (!OperatingSystem.IsLinux() || !_IsMounted(target))
+      return false;
+
+    // a healthy mount answers a directory listing; a dead one throws
+    try {
+      using var walk = Directory.EnumerateFileSystemEntries(target).GetEnumerator();
+      walk.MoveNext();
+      return false; // accessible → not stale, leave it alone
+    } catch {
+      DriveBender.Logger($"[Warning]stale mount detected at '{target}' — detaching it before remounting");
+      try { System.Diagnostics.Process.Start("fusermount3", ["-uz", target])?.WaitForExit(3000); } catch { }
+      if (_IsMounted(target))
+        try { System.Diagnostics.Process.Start("umount", ["-l", target])?.WaitForExit(3000); } catch { }
+      return !_IsMounted(target);
+    }
   }
 
   public static void Unmount(string target) {

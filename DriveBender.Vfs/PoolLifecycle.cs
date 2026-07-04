@@ -46,12 +46,14 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     foreach (var spec in memberSpecs) {
       var scheme = MemberSchemes.SchemeOf(null, spec.Path);
       var remote = MemberSchemes.IsRemote(scheme);
+      // expand a local ~/… or %VAR% path before it is checked, created and stored
+      var path = remote ? spec.Path : MemberSchemes.ExpandLocal(spec.Path);
       if (!remote)
-        this._EnsureMemberFolderUsable(spec.Path, poolId, force, takeOver: takeOver);
+        this._EnsureMemberFolderUsable(path, poolId, force, takeOver: takeOver);
 
       definitions.Add(new() {
         MemberId = Guid.NewGuid(),
-        Path = spec.Path,
+        Path = path,
         Role = spec.Role,
         Label = spec.Label,
         ReserveBytes = spec.ReserveBytes,
@@ -69,7 +71,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
       PoolId = poolId,
       Name = name,
       Members = definitions,
-      Mount = mountTarget == null ? null : new() { Target = mountTarget, VolumeLabel = name },
+      Mount = mountTarget == null ? null : new() { Target = MemberSchemes.ExpandLocal(mountTarget), VolumeLabel = name },
     };
 
     DriveBender.Logger($"Creating manifest pool '{name}' ({poolId}) with {definitions.Count} member(s)");
@@ -102,21 +104,24 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
   public PoolManifest AddMember(PoolManifest manifest, MemberSpec spec, bool force = false, bool takeOver = false) {
     if (manifest.IsVirtual)
       throw new ManifestException("Adopt the native pool first (pool adopt) before editing its membership");
-    if (manifest.Members.Any(m => m.Path.Equals(spec.Path, StringComparison.OrdinalIgnoreCase)))
-      throw new ManifestException($"'{spec.Path}' is already a member of pool '{manifest.Name}'");
 
     var scheme = MemberSchemes.SchemeOf(null, spec.Path);
     var remote = MemberSchemes.IsRemote(scheme);
+    // expand a local ~/… or %VAR% path before dedup, checking, creating and storing
+    var path = remote ? spec.Path : MemberSchemes.ExpandLocal(spec.Path);
+    if (manifest.Members.Any(m => m.Path.Equals(path, StringComparison.OrdinalIgnoreCase)))
+      throw new ManifestException($"'{path}' is already a member of pool '{manifest.Name}'");
+
     if (!remote) {
-      this._EnsureMemberFolderUsable(spec.Path, manifest.PoolId, force, takeOver: takeOver);
-      if (!host.DirectoryExists(spec.Path))
-        host.CreateDirectory(spec.Path);
+      this._EnsureMemberFolderUsable(path, manifest.PoolId, force, takeOver: takeOver);
+      if (!host.DirectoryExists(path))
+        host.CreateDirectory(path);
     }
 
     var updated = manifest with {
       Members = [.. manifest.Members, new PoolMemberDefinition {
         MemberId = Guid.NewGuid(),
-        Path = spec.Path,
+        Path = path,
         Role = spec.Role,
         Label = spec.Label,
         ReserveBytes = spec.ReserveBytes,
@@ -126,7 +131,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
       }],
     };
 
-    DriveBender.Logger($"Adding member '{spec.Path}' to pool '{manifest.Name}'");
+    DriveBender.Logger($"Adding member '{path}' to pool '{manifest.Name}'");
     return store.Save(updated);
   }
 

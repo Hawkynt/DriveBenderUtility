@@ -12,6 +12,9 @@ internal sealed class PrereqException(PrereqStatus status) : Exception(status.De
   public PrereqStatus Status { get; } = status;
 }
 
+/// <summary>A mount was requested for a pool with no configured target — the UI should ask where.</summary>
+internal sealed class NeedsMountTargetException(string message) : Exception(message);
+
 /// <summary>
 /// The local management daemon (§6.13): a loopback-bound HTTP API + Server-Sent-Events
 /// metrics stream serving the animation-rich web UI. Bound to 127.0.0.1 and gated by a
@@ -668,12 +671,15 @@ internal sealed class ServeCommand(
     if (!prereq.Ok)
       throw new PrereqException(prereq);
 
+    // Prefer an explicit target, else the pool's CURRENT manifest target (read fresh above). The UI
+    // deliberately omits the target for a configured pool so a just-changed mount location always
+    // applies rather than a value the client cached; only a truly unset target asks the user.
     var target = request.QueryString["target"] ?? pool.Manifest.Mount?.Target;
     if (string.IsNullOrWhiteSpace(target))
-      throw new ManifestException("No mount target — choose a drive letter (e.g. X:) or an empty folder to mount at.");
+      throw new NeedsMountTargetException("No mount target — choose a drive letter (e.g. X:) or an empty folder to mount at.");
 
     mountRegistry.TakeError(pool.PoolId); // discard any stale failure report from a previous attempt
-    var process = _LaunchMount(pool.PoolId, target);
+    var (process, logPath) = this._LaunchMount(pool.PoolId, pool.Name, target);
 
     // wait for the mount to actually appear (or the child to fail) so "Mount" reports the truth
     for (var i = 0; i < 40; ++i) {
@@ -681,18 +687,21 @@ internal sealed class ServeCommand(
         return "mounted";
 
       if (process is { HasExited: true }) {
-        // prefer the child's own reported reason, then its captured stderr
+        // prefer the child's own reported reason, then the concrete libfuse/fusermount3 line from
+        // the debug log — never the bare, misleading EINTR when the log explains the real cause
         var reported = mountRegistry.TakeError(pool.PoolId);
         if (reported == null) {
           Thread.Sleep(250); // give a crashing child a moment to flush its report
           reported = mountRegistry.TakeError(pool.PoolId);
         }
 
-        var error = process.StartInfo.RedirectStandardError ? process.StandardError.ReadToEnd().Trim() : "";
-        throw new ManifestException(
-          !string.IsNullOrEmpty(reported) ? reported
-          : error.Length > 0 ? error
-          : "The mount process exited before the pool came up. Check that a filesystem driver is installed.");
+        var log = _ReadLog(logPath);
+        var concrete = _FuseFailureReason(log);
+        var reason = !string.IsNullOrEmpty(reported) ? reported
+          : concrete ?? (log.Length > 0
+            ? log[..Math.Min(log.Length, 500)]
+            : "The mount process exited before the pool came up. Check that a filesystem driver is installed.");
+        throw new ManifestException(logPath != null ? $"{reason}  (debug log: {logPath})" : reason);
       }
 
       Thread.Sleep(250);
@@ -700,6 +709,27 @@ internal sealed class ServeCommand(
 
     return "mounting"; // still coming up (large pools / remote members can take a moment)
   });
+
+  private static string _ReadLog(string? path) {
+    try {
+      return path != null && File.Exists(path) ? File.ReadAllText(path).Trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  /// <summary>The most specific libfuse/fusermount3 line in the child's output, or null.</summary>
+  private static string? _FuseFailureReason(string log) {
+    if (string.IsNullOrEmpty(log))
+      return null;
+
+    return log.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0)
+      .LastOrDefault(l =>
+        l.StartsWith("fusermount", StringComparison.OrdinalIgnoreCase)
+        || l.StartsWith("fuse:", StringComparison.OrdinalIgnoreCase)
+        || l.Contains("mountpoint", StringComparison.OrdinalIgnoreCase)
+        || l.Contains("permission denied", StringComparison.OrdinalIgnoreCase));
+  }
 
   private object _Unmount(HttpListenerRequest request) => _Guard(() => {
     var entry = mountRegistry.Find(this._RequirePool(request)) ?? throw new ManifestException("pool is not mounted");
@@ -748,7 +778,7 @@ internal sealed class ServeCommand(
   /// elevated process lives in a different logon session than the user's Explorer — so it would
   /// mount but never appear. Only installing the driver needs elevation (handled separately).
   /// </summary>
-  private static System.Diagnostics.Process? _LaunchMount(Guid poolId, string? target) {
+  private (System.Diagnostics.Process? process, string? logPath) _LaunchMount(Guid poolId, string name, string? target) {
     var entryDll = Assembly.GetEntryAssembly()!.Location;
     var exe = Environment.ProcessPath ?? "dotnet";
     var viaDotnet = exe.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase) || exe.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase);
@@ -757,6 +787,7 @@ internal sealed class ServeCommand(
       FileName = exe,
       UseShellExecute = false,
       CreateNoWindow = true,
+      RedirectStandardOutput = true,
       RedirectStandardError = true,
     };
     if (viaDotnet)
@@ -769,7 +800,45 @@ internal sealed class ServeCommand(
       start.ArgumentList.Add(target);
     }
 
-    return System.Diagnostics.Process.Start(start);
+    System.Diagnostics.Process process;
+    try {
+      process = System.Diagnostics.Process.Start(start)!;
+    } catch (Exception) {
+      return (null, null);
+    }
+
+    // Capture the child's FULL output — the manager's own log lines, libfuse, and fusermount3 —
+    // into a per-mount debug log. Draining both pipes on background threads also stops the detached
+    // child from ever blocking on a full pipe, so it is safe to keep running after Mount returns.
+    string? logPath = null;
+    try {
+      var logDir = Path.Combine(host.ConfigRoot, "logs");
+      Directory.CreateDirectory(logDir);
+      logPath = Path.Combine(logDir, $"mount-{_SafeFileName(name)}-{process.Id}.log");
+      var writer = new StreamWriter(logPath, append: false) { AutoFlush = true };
+      var open = 2;
+      void Drain(System.IO.StreamReader reader) => new Thread(() => {
+        try {
+          for (string? line; (line = reader.ReadLine()) != null;)
+            lock (writer)
+              writer.WriteLine(line);
+        } catch { /* stream closed */ } finally {
+          if (Interlocked.Decrement(ref open) == 0)
+            try { writer.Dispose(); } catch { }
+        }
+      }) { IsBackground = true }.Start();
+      Drain(process.StandardOutput);
+      Drain(process.StandardError);
+    } catch {
+      logPath = null; // logging is best-effort — never fail a mount because a log file couldn't open
+    }
+
+    return (process, logPath);
+  }
+
+  private static string _SafeFileName(string name) {
+    var safe = new string(name.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c).ToArray());
+    return string.IsNullOrWhiteSpace(safe) ? "pool" : safe;
   }
 
   private static T? _ReadBody<T>(HttpListenerRequest request) {
@@ -784,6 +853,8 @@ internal sealed class ServeCommand(
   private static object _Guard(Func<object> action) {
     try {
       return new { ok = true, result = action() };
+    } catch (NeedsMountTargetException e) {
+      return new { ok = false, error = e.Message, needsTarget = true };
     } catch (PrereqException e) {
       return new { ok = false, error = e.Message, needsPrereq = true, driver = e.Status.Driver, installable = e.Status.Installable };
     } catch (MemberClaimConflictException e) {

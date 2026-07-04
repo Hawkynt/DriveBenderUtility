@@ -38,6 +38,7 @@ internal static class MountCommand {
       var target = options.Target ?? pool.Manifest.Mount?.Target;
       if (string.IsNullOrWhiteSpace(target))
         return _Fail(registry, errorKey, "No mount target — choose a drive letter (e.g. X:) or an empty folder to mount at.", 1);
+      target = MemberSchemes.ExpandLocal(target); // a ~/… or %VAR% mount target resolves like a member path
 
       // resolve members and surface health before serving (SAFE-OFFLINE, SAFE-PHYS)
       var health = provider.Inspect(pool);
@@ -95,6 +96,33 @@ internal static class MountCommand {
     if (errorKey != null)
       registry.ReportError(errorKey.Value, message);
     return code;
+  }
+
+  /// <summary>
+  /// Returns a human-readable reason the Linux FUSE mountpoint can't be used (missing, not a
+  /// directory, or not writable by this user), or null when it is fine. An unprivileged FUSE mount
+  /// requires write access to the mountpoint — mounting on a root-owned dir like <c>/mnt</c> fails.
+  /// </summary>
+  private static string? _UnusableMountpoint(string target) {
+    if (!Directory.Exists(target)) {
+      if (File.Exists(target))
+        return $"Mount target '{target}' is a file, not a directory. Pick an empty directory to mount at.";
+      return $"Mount target '{target}' does not exist. Create the (empty) directory first — e.g. mkdir -p \"{target}\" — then mount.";
+    }
+
+    // fusermount3 needs the invoking user to be able to write the mountpoint; probe it directly
+    try {
+      var probe = Path.Combine(target, "." + Guid.NewGuid().ToString("N") + ".dbwritetest");
+      using (File.Create(probe)) { }
+      File.Delete(probe);
+      return null;
+    } catch (Exception e) when (e is UnauthorizedAccessException or IOException) {
+      var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+      return $"Mount target '{target}' is not writable by your user, so an unprivileged FUSE mount is refused "
+        + $"(fusermount3: \"user has no write access to mountpoint\"). Choose a directory you own — e.g. "
+        + $"'{Path.Combine(home, "pool")}' — or create and take ownership of a subdirectory: "
+        + $"sudo mkdir -p \"{Path.Combine(target, "pool")}\" && sudo chown \"$USER\" \"{Path.Combine(target, "pool")}\", then mount there.";
+    }
   }
 
   /// <summary>
@@ -266,6 +294,21 @@ internal static class MountCommand {
 
     if (!Linux.LinuxFuseMountHost.IsFuseAvailable())
       return _Fail(registry, pool.PoolId, "FUSE is not available (/dev/fuse missing) — install fuse3 and retry.", 3);
+
+    // Recover from a stale mount first: a previous mount whose process died without unmounting
+    // leaves the target as a dead FUSE mount, and mounting over it fails ("fusermount3: failed to
+    // access mountpoint … Permission denied"). Detach the dead mount so the remount can proceed.
+    if (Linux.LinuxFuseMountHost.TryClearStaleMount(target))
+      Console.WriteLine($"Cleared a stale mount left on '{target}' before remounting.");
+    if (Linux.LinuxFuseMountHost.IsMountpoint(target))
+      return _Fail(registry, pool.PoolId, $"Something is already mounted at '{target}'. Unmount it first — fusermount3 -u \"{target}\" — or pick another mount location.", 1);
+
+    // Preflight the mountpoint BEFORE libfuse: an unprivileged FUSE mount needs write access to the
+    // target, and fusermount3's refusal ("user has no write access to mountpoint") gets masked as a
+    // bare EINTR when a runtime signal interrupts libfuse's waitpid. Catching it here yields a clear,
+    // actionable message instead of "Interrupted system call (4)".
+    if (_UnusableMountpoint(target) is { } reason)
+      return _Fail(registry, pool.PoolId, reason, 1);
 
     var fuseEntry = new MountEntry { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = "fuse", StartedUtc = DateTime.UtcNow.ToString("O") };
     var fuseMetrics = new MetricsPublisher(host);

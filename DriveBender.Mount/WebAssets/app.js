@@ -576,14 +576,34 @@ function duplicationDialog(pool) {
   }, "Save");
 }
 
-// Mount at the pool's configured target, or ask for a drive letter / folder when it has none.
-function mountPool(pool) {
-  let target = pool.configuredTarget;
-  if (!target) {
-    target = prompt("Mount at which location?\n\nWindows: a free drive letter like X: (or an empty folder)\nLinux: an empty directory like /mnt/pool", "");
-    if (!target) return;
+// Mount the pool. We ask the daemon WITHOUT a target so it uses the pool's CURRENT manifest target
+// (a just-changed mount location applies immediately, not the value this client last cached); only
+// when the daemon reports no target set do we ask the user where to mount.
+async function mountPool(pool) {
+  const j = await post("/api/pool/mount?pool=" + pool.id);
+  if (j.ok) return;
+  if (!j.needsTarget) {
+    if (j.needsPrereq && j.installable && confirm(`${j.error}\n\nInstall ${j.driver} now?`)) { await installDriver(); return; }
+    alert("Failed: " + (j.error || ""));
+    return;
   }
-  op("/api/pool/mount?pool=" + pool.id + "&target=" + encodeURIComponent(target.trim()));
+  // No configured target — ask in an in-app modal. A hosting WebView's window.prompt() is
+  // unreliable (WebKitGTK returns null), which made "Mount" silently do nothing.
+  const form = el("div");
+  form.innerHTML = `<label>Mount location</label>
+    <input class="mt" placeholder="X:\\ or /mnt/mypool">
+    <p class="hint">Windows: a free drive letter like <code>X:</code> or an empty folder.<br>
+    Linux/macOS: an empty directory such as <code>/mnt/pool</code>.<br>
+    Set a permanent one in <b>Settings</b>.</p>`;
+  const browse = el("button", null, "📁 Browse"); browse.style.marginTop = "6px";
+  browse.onclick = () => folderPicker(p => { form.querySelector(".mt").value = p; });
+  form.appendChild(browse);
+  showModal(`Mount ${pool.name}`, form, async () => {
+    const target = form.querySelector(".mt").value.trim();
+    if (!target) return "Enter a mount location.";
+    const ok = await op("/api/pool/mount?pool=" + pool.id + "&target=" + encodeURIComponent(target));
+    return ok ? null : "Mount failed.";
+  }, "Mount");
 }
 
 async function post(url, body) {
