@@ -23,11 +23,18 @@
 storage pools — and mounting them as a live, read/write filesystem on Windows
 (WinFsp/Dokan) and Linux (FUSE). Pools are defined by a portable JSON manifest
 over arbitrary members: local drives, subfolders, UNC shares, and remote/cloud
-endpoints (FTP/SFTP/WebDAV/S3/Azure/Dropbox/OneDrive/Google). It adds a tiered
+endpoints (FTP/SFTP/WebDAV/S3/Azure/Dropbox/OneDrive/Google/Box/Yandex/HiDrive).
+It adds a tiered
 RAM→SSD→capacity write cascade, configurable duplication and write policies,
 crash-safe journaling, bit-rot/SMART health checks with correction, and both a
 CLI (`dbmount`) and an animated live web/desktop dashboard. Jump to
 [**Quick Start**](#-quick-start) to create and mount your first pool.
+
+![Drive Bender Pool Manager — live dashboard](docs/screenshots/dashboard.png)
+
+> The animated live dashboard (`dbmount serve`, and the desktop app) — one card per
+> pool with capacity donuts, a RAM→fast→capacity tier topology, per-member usage
+> and health. See more in [**Screenshots**](#-screenshots).
 
 ## 🏗️ Project Structure
 
@@ -86,20 +93,31 @@ Platform-agnostic VFS/I/O engine towards live pool mounting
 
 ### 🌐 DriveBender.Backends *(net10.0)*
 Members can be far more than local drives — any of these joins a pool as a
-whole-file capacity tier, over the **official first-party SDKs** (no wrapper
-libraries):
+whole-file capacity tier. The stores live in the standalone, provider-neutral
+**[`Hawkynt.CloudStorage`](Hawkynt.CloudStorage)** library (published to NuGet);
+`DriveBender.Backends` adapts them to the engine's `IVolumeIO` via
+`CloudStoreAdapter`:
 
-| Scheme | Backend | SDK |
+| Scheme | Backend | Client |
 |---|---|---|
 | `file` / `unc` | local drive, subfolder, UNC share | .NET |
 | `ftp` / `ftps` | FTP / FTPS | FluentFTP |
-| `sftp` | SFTP (password or private key) | SSH.NET |
-| `webdav` / `webdavs` | WebDAV | WebDav.Client |
+| `sftp` / `ssh` | SFTP (password or private key) | SSH.NET |
+| `webdav` / `webdavs` / `dav` / `davs` | WebDAV | WebDav.Client |
 | `s3` | Amazon S3 & S3-compatible (MinIO…) | AWSSDK.S3 |
 | `azblob` / `azfile` | Azure Blob / Azure Files | Azure.Storage.* |
 | `dropbox` | Dropbox | Dropbox.Api |
 | `onedrive` | Microsoft OneDrive | Microsoft.Graph |
 | `gdrive` / `gcs` | Google Drive / Cloud Storage | Google.Apis.* |
+| `box` | Box | REST |
+| `yandex` | Yandex Disk | REST |
+| `hidrive` | Strato HiDrive | REST |
+
+OAuth providers (`gdrive`, `onedrive`, `dropbox`, `box`, `yandex`, `hidrive`)
+use **bring-your-own client-id OAuth2** — a loopback-redirect + PKCE browser
+login via `dbmount credential-login`, with automatic access-token refresh so a
+long-lived pool never relies on a static token. (Box, Yandex Disk and HiDrive
+are wired up but not yet integration-tested against live accounts.)
 
 Remote members are capability-honest: no atomic rename and no durable flush, so
 the engine journals around the gaps and never counts a remote copy toward
@@ -209,6 +227,28 @@ without a real pool.
 - ✅ Input validation and sanitization
 - ✅ Compile-time safety for critical operations
 
+## 📸 Screenshots
+
+The GUI is a dependency-free web dashboard served by `dbmount serve` (and hosted
+verbatim in the desktop app) — theme-aware, so it follows your OS light/dark
+preference:
+
+| Live dashboard (dark) | Live dashboard (light) |
+|---|---|
+| ![Dashboard, dark theme](docs/screenshots/dashboard.png) | ![Dashboard, light theme](docs/screenshots/dashboard-light.png) |
+
+| Create a pool | Pool settings |
+|---|---|
+| ![Create pool dialog](docs/screenshots/create-pool.png) | ![Pool settings dialog](docs/screenshots/settings.png) |
+
+- **Dashboard** — one card per pool: a capacity donut, the RAM→fast→capacity
+  tier topology with animated flow lines, per-member usage bars and health, and
+  the full lifecycle actions (mount, browse, health/fix, duplication, settings…).
+- **Create a pool** — stack up members (local folder/drive, UNC, or any remote
+  URI) with a per-member role and a folder browser; no JSON required.
+- **Settings** — every pool knob as a labelled control (mount location, write
+  policy, cache, background maintenance…), with an advanced JSON escape hatch.
+
 ## 📦 Getting Started
 
 ### Prerequisites
@@ -308,13 +348,19 @@ Store the secret once (it goes to the OS credential store, never the manifest),
 then reference it by handle:
 
 ```bash
-dbmount credential set MyPool-nas --user backup      # prompts for the secret (hidden)
+# password / key based (FTP, SFTP, WebDAV, S3, Azure…)
+dbmount credential-set MyPool-nas --user backup      # prompts for the secret (hidden)
 dbmount pool add-member MyPool --member "sftp://backup@nas.local/pool" --credential MyPool-nas
+
+# OAuth providers (Google, OneDrive, Dropbox, Box, Yandex, HiDrive) — browser login
+# with your own registered client id (loopback + PKCE, auto-refresh)
+dbmount credential-login MyPool-gdrive --provider google --client-id <your-id> --client-secret <your-secret>
+dbmount pool add-member MyPool --member "gdrive://backups" --credential MyPool-gdrive
 ```
 
 Supported schemes: `file`/`unc`, `ftp`/`ftps`, `sftp`, `webdav`/`webdavs`, `s3`,
-`azblob`, `azfile`, `dropbox`, `onedrive`, `gdrive`, `gcs` (see the backend table
-above for the secret format each expects).
+`azblob`, `azfile`, `dropbox`, `onedrive`, `gdrive`, `gcs`, `box`, `yandex`,
+`hidrive` (see the backend table above for the secret format each expects).
 
 ### 4. The GUI — web dashboard & desktop app
 
