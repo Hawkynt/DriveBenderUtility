@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <!-- NuGet package metadata: published by the release CI to nuget.org -->
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageId>Hawkynt.CloudStorage</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Hawkynt</Authors>
+    <Company>»SynthelicZ«</Company>
+    <Product>Hawkynt.CloudStorage</Product>
+    <Title>Hawkynt.CloudStorage</Title>
+    <Description>Provider-neutral whole-file cloud storage stores (FTP, SFTP, WebDAV, Amazon S3, Azure Blob/File, Google Cloud Storage, Google Drive, Microsoft OneDrive, Dropbox, Box, Yandex Disk, Strato HiDrive) with a bring-your-own-client-id OAuth2 (loopback + PKCE + refresh) flow.</Description>
+    <Copyright>Copyright © Hawkynt 2017-2026</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>cloud;storage;s3;azure;google-drive;onedrive;dropbox;box;yandex;hidrive;webdav;ftp;sftp;oauth2</PackageTags>
+    <PackageProjectUrl>https://github.com/Hawkynt/DriveBenderUtility</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Hawkynt/DriveBenderUtility</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <!-- Official first-party SDKs only — no wrapper/meta libraries -->
+  <ItemGroup>
+    <PackageReference Include="FluentFTP" Version="54.2.0" />
+    <PackageReference Include="SSH.NET" Version="2025.1.0" />
+    <PackageReference Include="WebDav.Client" Version="2.9.0" />
+    <PackageReference Include="AWSSDK.S3" Version="4.0.100.1" />
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.29.1" />
+    <PackageReference Include="Azure.Storage.Files.Shares" Version="12.27.1" />
+    <PackageReference Include="Dropbox.Api" Version="7.0.0" />
+    <PackageReference Include="Microsoft.Graph" Version="6.2.0" />
+    <PackageReference Include="Google.Apis.Drive.v3" Version="1.75.0.4192" />
+    <PackageReference Include="Google.Cloud.Storage.V1" Version="4.15.0" />
+  </ItemGroup>
+</Project>

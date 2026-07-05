@@ -3,6 +3,7 @@ using CommandLine;
 using DivisonM;
 using DivisonM.Backends;
 using DivisonM.Vfs;
+using Hawkynt.CloudStorage.OAuth;
 
 namespace DivisonM.Mount;
 
@@ -38,7 +39,7 @@ internal static class Program {
       typeof(PoolCreateOptions), typeof(PoolImportOptions), typeof(PoolExportOptions), typeof(PoolListOptions),
       typeof(PoolAddMemberOptions), typeof(PoolRemoveMemberOptions), typeof(PoolAdoptOptions), typeof(PoolRepairManifestOptions),
       typeof(PoolHealthOptions), typeof(PoolRestoreOptions), typeof(PoolRemoveMediaOptions), typeof(PoolReplaceMediaOptions),
-      typeof(CredentialSetOptions), typeof(CredentialRemoveOptions),
+      typeof(CredentialSetOptions), typeof(CredentialRemoveOptions), typeof(CredentialLoginOptions),
       typeof(InstallServiceOptions), typeof(UninstallServiceOptions), typeof(InstallSystemdOptions), typeof(RegisterShellOptions),
       typeof(ServeOptions),
       typeof(MountOptions), typeof(UnmountOptions), typeof(StatusOptions), typeof(ListOptions),
@@ -60,6 +61,7 @@ internal static class Program {
         PoolReplaceMediaOptions o => PoolOpsCommand.ReplaceMedia(host, store, provider, lifecycle, remoteResolver, o),
         CredentialSetOptions o => _CredentialSet(credentialStore, o),
         CredentialRemoveOptions o => _CredentialRemove(credentialStore, o),
+        CredentialLoginOptions o => _CredentialLogin(credentialStore, o),
         InstallServiceOptions o => ServiceInstaller.InstallWindowsService(o.Manifest, o.Target),
         UninstallServiceOptions o => ServiceInstaller.UninstallWindowsService(o.Manifest),
         InstallSystemdOptions o => ServiceInstaller.InstallSystemd(o.Manifest, host),
@@ -389,6 +391,50 @@ internal static class Program {
       if (key.KeyChar != '\0')
         buffer.Append(key.KeyChar);
     }
+  }
+
+  private static int _CredentialLogin(CredentialStore credentials, CredentialLoginOptions options) {
+    Func<string, string, OAuth2Config>? factory = options.Provider.Trim().ToLowerInvariant() switch {
+      "google" or "gdrive" or "googledrive" => (id, secret) => CloudOAuthProviders.GoogleDrive(id, secret),
+      "onedrive" or "microsoft" => (id, secret) => CloudOAuthProviders.OneDrive(id, secret),
+      "dropbox" => (id, secret) => CloudOAuthProviders.Dropbox(id, secret),
+      "box" => (id, secret) => CloudOAuthProviders.Box(id, secret),
+      "yandex" => (id, secret) => CloudOAuthProviders.YandexDisk(id, secret),
+      "hidrive" or "strato" => (id, secret) => CloudOAuthProviders.HiDrive(id, secret),
+      _ => null,
+    };
+
+    if (factory == null) {
+      Console.Error.WriteLine($"Unknown provider '{options.Provider}'. Use one of: google, onedrive, dropbox, box, yandex, hidrive.");
+      return ExitError;
+    }
+
+    var config = factory(options.ClientId, options.ClientSecret);
+    Console.Error.WriteLine("Opening your browser to authorize; complete the consent there. Waiting for the redirect…");
+
+    OAuth2Token token;
+    try {
+      token = new LoopbackAuthorizer(new OAuth2Client(new HttpClient())).AuthorizeAsync(config).GetAwaiter().GetResult();
+    } catch (Exception e) {
+      Console.Error.WriteLine($"Login failed: {e.Message}");
+      return ExitError;
+    }
+
+    if (string.IsNullOrEmpty(token.RefreshToken)) {
+      Console.Error.WriteLine("The provider returned no refresh token. Ensure offline access is granted and re-run the login.");
+      return ExitError;
+    }
+
+    var secret = JsonSerializer.Serialize(new {
+      clientId = options.ClientId,
+      clientSecret = options.ClientSecret,
+      refreshToken = token.RefreshToken,
+      accessToken = token.AccessToken,
+      expiresAt = token.ExpiresAtUtc.ToString("o"),
+    });
+    credentials.Store(options.Name, "", secret);
+    Console.WriteLine($"Authorized '{CredentialStore.NormalizeReference(options.Name)}'; reference it from members as cred-ref:{CredentialStore.NormalizeReference(options.Name)}");
+    return ExitOk;
   }
 
   private static int _CredentialRemove(CredentialStore credentials, CredentialRemoveOptions options) {

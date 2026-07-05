@@ -1,4 +1,5 @@
 using DivisonM.Vfs;
+using Hawkynt.CloudStorage;
 
 namespace DivisonM.Backends;
 
@@ -111,6 +112,7 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
 
   internal static Exception Translate(Exception e, string member) => e switch {
     PoolFsException => e,
+    CloudStorageException cloud => cloud.ToPoolFs(member),
     AggregateException { InnerException: not null } aggregate => Translate(aggregate.InnerException!, member),
     FileNotFoundException or DirectoryNotFoundException => new PoolFsException(PoolFsError.NotFound, $"{e.Message} (member '{member}')", e),
     UnauthorizedAccessException => new PoolFsException(PoolFsError.AccessDenied, $"{e.Message} (member '{member}')", e),

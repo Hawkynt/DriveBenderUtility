@@ -34,6 +34,35 @@ jobs:
       release-kind: release
       changelog-flag: --release v${{ needs.version.outputs.version }}
 
+  nuget:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      # The cloud storage library is platform-agnostic (net10.0), so it packs and
+      # ships from the Linux runner independently of the Windows release artifacts.
+      - name: Pack Hawkynt.CloudStorage
+        run: >
+          dotnet pack Hawkynt.CloudStorage/Hawkynt.CloudStorage.csproj
+          -c Release
+          -p:Version=${{ needs.version.outputs.version }}
+          -p:PackageVersion=${{ needs.version.outputs.version }}
+          --output nupkg
+
+      - name: Push to NuGet
+        env:
+          NUGET_TOKEN: ${{ secrets.NUGET_TOKEN }}
+        run: >
+          dotnet nuget push "nupkg/*.nupkg"
+          --api-key "$NUGET_TOKEN"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
+
   publish:
     needs: [version, build]
     runs-on: ubuntu-latest

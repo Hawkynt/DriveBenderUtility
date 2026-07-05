@@ -203,7 +203,7 @@ public class BackendRegistryTests {
   [Category("HappyPath")]
   public void CreateDefault_GivenRegistry_WhenInspected_ThenAllPrdSchemesRegistered() {
     var registry = BackendRegistry.CreateDefault(new FakeHostEnvironment());
-    registry.Schemes.Should().Contain(["file", "unc", "ftp", "ftps", "sftp", "webdav", "webdavs", "s3", "azblob", "azfile", "dropbox", "onedrive", "gdrive", "gcs"]);
+    registry.Schemes.Should().Contain(["file", "unc", "ftp", "ftps", "sftp", "webdav", "webdavs", "s3", "azblob", "azfile", "dropbox", "onedrive", "gdrive", "gcs", "box", "yandex", "hidrive"]);
   }
 
   [Test]

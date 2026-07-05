@@ -149,6 +149,21 @@ public sealed class CredentialRemoveOptions {
   public string Name { get; set; } = "";
 }
 
+[Verb("credential-login", HelpText = "Run the OAuth browser login for a cloud provider (bring your own client id) and store the refresh token as cred-ref:<name>.")]
+public sealed class CredentialLoginOptions {
+  [Value(0, Required = true, MetaName = "name", HelpText = "Reference name (e.g. MyPool-gdrive).")]
+  public string Name { get; set; } = "";
+
+  [Option("provider", Required = true, HelpText = "One of: google, onedrive, dropbox, box, yandex, hidrive.")]
+  public string Provider { get; set; } = "";
+
+  [Option("client-id", Required = true, HelpText = "Your own registered OAuth client id for the provider.")]
+  public string ClientId { get; set; } = "";
+
+  [Option("client-secret", Default = "", HelpText = "Your registered OAuth client secret (required by most providers).")]
+  public string ClientSecret { get; set; } = "";
+}
+
 [Verb("mount", HelpText = "Mount a pool manifest at a target (drive letter, directory, or Linux mountpoint).")]
 public sealed class MountOptions {
   [Option("manifest", Required = true, HelpText = "Manifest path or pool id/name.")]

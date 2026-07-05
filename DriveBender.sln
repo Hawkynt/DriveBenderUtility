@@ -23,6 +23,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DriveBender.Mount.Linux", "
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DriveBender.App", "DriveBender.App\DriveBender.App.csproj", "{74305650-BE76-464F-BB3A-6A1D945F4CF8}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Hawkynt.CloudStorage", "Hawkynt.CloudStorage\Hawkynt.CloudStorage.csproj", "{B317E25F-8488-4053-AB55-8B15F12136EB}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -145,6 +147,18 @@ Global
 		{74305650-BE76-464F-BB3A-6A1D945F4CF8}.Release|x64.Build.0 = Release|Any CPU
 		{74305650-BE76-464F-BB3A-6A1D945F4CF8}.Release|x86.ActiveCfg = Release|Any CPU
 		{74305650-BE76-464F-BB3A-6A1D945F4CF8}.Release|x86.Build.0 = Release|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Debug|x64.Build.0 = Debug|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Debug|x86.Build.0 = Debug|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Release|x64.ActiveCfg = Release|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Release|x64.Build.0 = Release|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Release|x86.ActiveCfg = Release|Any CPU
+		{B317E25F-8488-4053-AB55-8B15F12136EB}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

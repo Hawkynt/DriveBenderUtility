@@ -33,6 +33,9 @@ public sealed class BackendRegistry {
     registry.Register(new OneDriveVolumeIOBackend());
     registry.Register(new GoogleDriveVolumeIOBackend());
     registry.Register(new GoogleCloudStorageVolumeIOBackend());
+    registry.Register(new BoxVolumeIOBackend());
+    registry.Register(new YandexDiskVolumeIOBackend());
+    registry.Register(new HiDriveVolumeIOBackend());
     return registry;
   }
 
