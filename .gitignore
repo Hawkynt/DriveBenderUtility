@@ -288,5 +288,7 @@ __pycache__/
 *.xsd.cs
 
 .claude/
+CLAUDE.md
+AGENTS.md
 publish-linux/
 publish-app/
