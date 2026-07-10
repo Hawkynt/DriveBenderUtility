@@ -99,7 +99,9 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
         return block;
 
       var blockStart = blockIndex * (long)blockSize;
-      var result = block;
+      // NEVER mutate the caller's array in place — it is the shared page-cache block; a
+      // concurrent reader would tear and the cache would end up holding unflushed overlay data
+      var result = (byte[])block.Clone();
       foreach (var op in buffer.Ops) {
         if (op.TruncateLength is { } truncateLength) {
           var keep = Math.Clamp(truncateLength - blockStart, 0, result.Length);
@@ -154,6 +156,53 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
         .Where(pair => pair.Value.Ops.Count > 0
                        && (now - pair.Value.Ops[^1].StagedUtc >= deferWindow || now - pair.Value.FirstStagedUtc >= maxDefer))
         .Select(pair => pair.Key)];
+  }
+
+  /// <summary>
+  /// Drops buffered bytes that a later write has already made durable on EVERY copy
+  /// (SAFE-NOLOSS): without this, an owed op still sitting in the buffer would flush over the
+  /// newer full-coverage write and roll the file back. Ops are trimmed at the superseded
+  /// range so bytes outside it (still legitimately owed) survive; truncates are untouched.
+  /// </summary>
+  public void Supersede(string path, long offset, long length) {
+    if (length <= 0)
+      return;
+
+    lock (this._lock) {
+      if (!this._files.TryGetValue(path, out var buffer))
+        return;
+
+      var end = offset + length;
+      var kept = new List<PendingOp>();
+      foreach (var op in buffer.Ops) {
+        if (op.TruncateLength is not null || op.Data is null) {
+          kept.Add(op); // a truncate is order-sensitive — never dropped here
+          continue;
+        }
+
+        var opStart = op.Offset;
+        var opEnd = op.Offset + op.Data.Length;
+        if (opEnd <= offset || opStart >= end) {
+          kept.Add(op); // no overlap with the superseded range
+          continue;
+        }
+
+        // keep the non-overlapping prefix and suffix; the overlapping middle is now durable
+        if (opStart < offset)
+          kept.Add(op with { Data = op.Data[..(int)(offset - opStart)] });
+        if (opEnd > end)
+          kept.Add(new PendingOp(end, op.Data[(int)(end - opStart)..], null, op.StagedUtc));
+      }
+
+      var newReserved = kept.Where(o => o.Data != null).Sum(o => (long)o.Data!.Length);
+      cache.ReleaseWrite(buffer.ReservedBytes - newReserved);
+      buffer.ReservedBytes = newReserved;
+      buffer.Ops.Clear();
+      buffer.Ops.AddRange(kept);
+
+      if (buffer.Ops.Count == 0)
+        this._files.Remove(path);
+    }
   }
 
   /// <summary>Removes and returns the pending image for application; the caller must complete the returned journal sequences.</summary>

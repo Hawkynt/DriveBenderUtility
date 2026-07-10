@@ -664,13 +664,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
     if (this._staging.TryRemove(normalized, out var createSequence)) {
       var stagedName = _StagedNameOf(normalized);
-      this._writeBuffer.Drain(normalized); // buffered blocks are moot
+      var discardedStaged = this._writeBuffer.Drain(normalized); // buffered blocks are moot
       foreach (var member in this._Online)
       foreach (var shadow in new[] { false, true })
         if (member.FileExists(stagedName, shadow))
           member.Delete(stagedName, shadow);
 
+      // complete the Create intent AND every owed-write intent the buffer held — otherwise they
+      // linger open forever and are replayed (noisily) at every subsequent mount
       this._journal.Complete(createSequence, JournalOp.Create);
+      if (discardedStaged != null)
+        foreach (var staleSequence in discardedStaged.Value.journalSequences)
+          this._journal.Complete(staleSequence, JournalOp.Write);
+
       this._integrity.InvalidateFile(stagedName);
       this._Invalidate(stagedName);
       this._Invalidate(normalized);
@@ -891,7 +897,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
-  private byte[] _LoadBlock(string path, IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit) {
+  private byte[] _LoadBlock(string path, IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit, long? guardEpoch = null) {
     var key = new PageKey(this._poolId, path, blockIndex);
     if (this._cache.Pages.TryGet(key, out var cached))
       return cached;
@@ -923,7 +929,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._activity.Publish(ActivityKind.Recovery, path, block.Length, fromMember: copy.Volume.DisplayName,
           reason: "read failover — a copy failed mid-read, another one served the block");
 
-      this._cache.Pages.Put(key, block);
+      // a lock-free prefetch guards its Put with the epoch it captured before reading, so a write
+      // that invalidated the path in the meantime rejects this now-stale block (SAFE-COHERE)
+      if (guardEpoch is { } epoch)
+        this._cache.Pages.PutIfCurrent(key, block, epoch);
+      else
+        this._cache.Pages.Put(key, block);
       return block;
     }
 
@@ -973,12 +984,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (missing.Count == 0)
       return;
 
+    // capture the invalidation epoch up front: any write that lands while this prefetch is in
+    // flight bumps it, so the guarded Put below drops the pre-write block instead of poisoning
+    var epoch = this._cache.Pages.EpochOf(this._poolId);
+
     // the whole window loads CONCURRENTLY across the copies (readiness-routed): fast storages keep
     // filling the cache while a slow one finishes its block, so once the slow block arrives a burst
     // of already-ready blocks hands over at once
     try {
       Parallel.ForEach(missing, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, copies.Count) },
-        blockIndex => this._LoadBlock(path, copies, blockIndex, mirrorSplit: copies.Count > 1));
+        blockIndex => this._LoadBlock(path, copies, blockIndex, mirrorSplit: copies.Count > 1, guardEpoch: epoch));
     } catch (Exception) {
       // prefetch is best-effort; the foreground read will surface real errors
     }
@@ -1061,22 +1076,29 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._WriteAckQuorum(copies, requiredCopies, dataPath, bytes, offset, appliedFlags);
       var appliedCount = appliedFlags.Count(f => f);
 
-      if (appliedCount >= copies.Count)
+      if (appliedCount >= copies.Count) {
+        // every copy now durably holds these bytes: any older buffered write of this range is
+        // obsolete and must not later flush over them (SAFE-NOLOSS)
+        this._writeBuffer.Supersede(path, offset, bytes.Length);
         this._journal.Complete(sequence, JournalOp.Write);
+      }
       else if (policy == WritePolicy.WriteThrough) {
         // write-through: apply the remaining copies now (best effort); a copy that fails stays
         // owed under the open intent so recovery reconciles it (SAFE-REMOTE)
         mirroredNow = true;
-        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset))
+        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset)) {
+          this._writeBuffer.Supersede(path, offset, bytes.Length);
           this._journal.Complete(sequence, JournalOp.Write);
-        else
+        } else
           this._StageWithThrottle(path, offset, bytes, sequence, appliedCount); // hold the block for the lagging copy
       }
       else if (!this._StageWithThrottle(path, offset, bytes, sequence, appliedCount)) {
         // buffer full even after throttling: degrade to synchronous catch-up (FR-BACKP)
         mirroredNow = true;
-        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset))
+        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset)) {
+          this._writeBuffer.Supersede(path, offset, bytes.Length);
           this._journal.Complete(sequence, JournalOp.Write);
+        }
         // else: the intent stays open — recovery reconciles the copies that never took the block
       }
 
@@ -1318,7 +1340,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
         var copies = this._placement.ResolveCopies(path);
         var holders = copies.Select(c => c.Volume).ToArray();
-        var size = landing.Stat(path, false)?.Length ?? 0;
+        var before = landing.Stat(path, false);
+        var size = before?.Length ?? 0;
         var target = this._placement.ChooseDrainTarget(size, holders.Where(h => h.MemberId != landing.MemberId));
         if (target == null)
           continue;
@@ -1331,6 +1354,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
         // streamed drain — the file is copied through a fixed buffer, never held in RAM (SAFE-BIGFILE)
         WholeFilePublisher.CopyBetween(landing, path, false, target, path, false);
+
+        // TOCTOU guard (SAFE-NOLOSS): between the initial check and here, a foreground write could
+        // have opened, rewritten and closed this file. If it is now open/dirty, or its size/mtime
+        // changed, the copy we just made is stale — remove it and leave the landing original (the
+        // authoritative new version) in place rather than deleting the only copy of fresh data.
+        var after = landing.Stat(path, false);
+        if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path)
+            || after is not { } stillThere || before is not { } was
+            || stillThere.Length != was.Length || stillThere.LastWriteTimeUtc != was.LastWriteTimeUtc) {
+          if (target.FileExists(path, false))
+            target.Delete(path, false);
+          this._journal.Complete(sequence, JournalOp.Drain);
+          continue; // try again on a later pump once the file settles
+        }
+
         landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
         this._journal.Complete(sequence, JournalOp.Drain);
         this._integrity.InvalidateFile(path);

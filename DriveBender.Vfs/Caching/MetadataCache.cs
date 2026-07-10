@@ -6,8 +6,19 @@ public enum MetadataKind {
   Placement,
 }
 
-/// <summary>Key of one metadata entry: pool, normalized pool-relative path, kind.</summary>
-public sealed record MetadataKey(Guid PoolId, string Path, MetadataKind Kind);
+/// <summary>
+/// Key of one metadata entry: pool, normalized pool-relative path, kind. The path compares
+/// case-INSENSITIVELY to match the engine's OrdinalIgnoreCase model, so a stat/placement
+/// cached under one casing is invalidated by a mutation under another (SAFE-COHERE).
+/// </summary>
+public sealed record MetadataKey(Guid PoolId, string Path, MetadataKind Kind) {
+  public bool Equals(MetadataKey? other)
+    => other != null && this.PoolId == other.PoolId && this.Kind == other.Kind
+       && string.Equals(this.Path, other.Path, StringComparison.OrdinalIgnoreCase);
+
+  public override int GetHashCode()
+    => HashCode.Combine(this.PoolId, StringComparer.OrdinalIgnoreCase.GetHashCode(this.Path), this.Kind);
+}
 
 /// <summary>
 /// Metadata cache (§6.5): dir listings, stat results and path→placement resolutions,

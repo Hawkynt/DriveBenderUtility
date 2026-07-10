@@ -1,7 +1,19 @@
 namespace DivisonM.Vfs.Caching;
 
-/// <summary>Key of one cached block: pool, normalized pool-relative path, block index.</summary>
-public sealed record PageKey(Guid PoolId, string Path, long BlockIndex);
+/// <summary>
+/// Key of one cached block: pool, normalized pool-relative path, block index. The path
+/// compares case-INSENSITIVELY to match the rest of the engine (handles, write buffer,
+/// staging all use OrdinalIgnoreCase) — otherwise an invalidation under one casing would
+/// leave a stale block cached under another for a full TTL (SAFE-COHERE).
+/// </summary>
+public sealed record PageKey(Guid PoolId, string Path, long BlockIndex) {
+  public bool Equals(PageKey? other)
+    => other != null && this.PoolId == other.PoolId && this.BlockIndex == other.BlockIndex
+       && string.Equals(this.Path, other.Path, StringComparison.OrdinalIgnoreCase);
+
+  public override int GetHashCode()
+    => HashCode.Combine(this.PoolId, StringComparer.OrdinalIgnoreCase.GetHashCode(this.Path), this.BlockIndex);
+}
 
 public sealed record CacheStatistics(long Hits, long Misses, long Bytes, int Entries) {
   public double HitRate => this.Hits + this.Misses == 0 ? 0 : (double)this.Hits / (this.Hits + this.Misses);
@@ -22,6 +34,7 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
     public long Hits;
     public long Misses;
     public double Weight = 1.0;
+    public long Epoch; // bumped on every invalidation — lets a lock-free prefetch reject a stale late Put
   }
 
   private readonly Dictionary<Guid, PoolShard> _shards = [];
@@ -75,20 +88,43 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
   }
 
   public void Put(PageKey key, byte[] block) {
-    lock (this._lock) {
-      var shard = this._Shard(key.PoolId);
-      if (shard.Blocks.TryGetValue(key, out var existing)) {
-        shard.Bytes += block.Length - existing.Length;
-        shard.Blocks[key] = block;
-        shard.Policy.OnAccess(key);
-      } else {
-        shard.Blocks.Add(key, block);
-        shard.Bytes += block.Length;
-        shard.Policy.OnInsert(key);
-      }
+    lock (this._lock)
+      this._PutLocked(key, block);
+  }
 
-      this._EvictUntilWithinBudget();
+  /// <summary>The current invalidation epoch of a pool — captured before a lock-free background load.</summary>
+  public long EpochOf(Guid poolId) {
+    lock (this._lock)
+      return this._Shard(poolId).Epoch;
+  }
+
+  /// <summary>
+  /// Inserts a block only if the pool has not been invalidated since <paramref name="expectedEpoch"/>
+  /// was captured — so a prefetch that read a block off disk BEFORE a concurrent write invalidated
+  /// the path can never poison the cache with pre-write bytes (SAFE-COHERE).
+  /// </summary>
+  public void PutIfCurrent(PageKey key, byte[] block, long expectedEpoch) {
+    lock (this._lock) {
+      if (this._Shard(key.PoolId).Epoch != expectedEpoch)
+        return;
+
+      this._PutLocked(key, block);
     }
+  }
+
+  private void _PutLocked(PageKey key, byte[] block) {
+    var shard = this._Shard(key.PoolId);
+    if (shard.Blocks.TryGetValue(key, out var existing)) {
+      shard.Bytes += block.Length - existing.Length;
+      shard.Blocks[key] = block;
+      shard.Policy.OnAccess(key);
+    } else {
+      shard.Blocks.Add(key, block);
+      shard.Bytes += block.Length;
+      shard.Policy.OnInsert(key);
+    }
+
+    this._EvictUntilWithinBudget();
   }
 
   /// <summary>Coherency (SAFE-COHERE): drop every cached block of a path after a mutation.</summary>
@@ -97,6 +133,7 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
       if (!this._shards.TryGetValue(poolId, out var shard))
         return;
 
+      ++shard.Epoch; // any in-flight background load's Put for this pool is now rejected
       foreach (var key in shard.Blocks.Keys.Where(k => k.Path.Equals(path, StringComparison.OrdinalIgnoreCase)).ToArray()) {
         shard.Bytes -= shard.Blocks[key].Length;
         shard.Blocks.Remove(key);
@@ -106,8 +143,11 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
   }
 
   public void InvalidatePool(Guid poolId) {
-    lock (this._lock)
+    lock (this._lock) {
+      if (this._shards.TryGetValue(poolId, out var shard))
+        ++shard.Epoch; // preserved across the reset below so late Puts capturing the old epoch are rejected
       this._shards.Remove(poolId);
+    }
   }
 
   public CacheStatistics GetStatistics(Guid poolId) {

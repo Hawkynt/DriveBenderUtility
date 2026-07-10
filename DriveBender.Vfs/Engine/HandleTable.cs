@@ -52,7 +52,10 @@ public sealed class HandleTable {
       if (!this._handles.Remove(handle.Value, out var open))
         throw new PoolFsException(PoolFsError.StaleHandle, $"Handle {handle.Value} is not open");
 
-      open.File.ReadAhead.Remove(handle.Value);
+      // the read path mutates ReadAhead under lock(File.ReadAhead) — take the SAME lock here so
+      // a concurrent Read + Close on one file never corrupts the dictionary
+      lock (open.File.ReadAhead)
+        open.File.ReadAhead.Remove(handle.Value);
       if (--open.File.RefCount == 0)
         this._files.Remove(open.File.Path);
     }
