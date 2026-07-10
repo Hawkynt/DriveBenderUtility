@@ -52,6 +52,15 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
 
   private static readonly TimeSpan _PROBE_TTL = TimeSpan.FromSeconds(30);
 
+  /// <summary>
+  /// Whole-object backends buffer the entire file in a single <c>byte[]</c>/<c>MemoryStream</c>,
+  /// which caps at <see cref="int.MaxValue"/>. Rather than silently truncate a larger file
+  /// (an <c>(int)</c> cast wraps), such a member REFUSES it with NoSpace — placement then keeps
+  /// the file on a local member that can hold it (SAFE-BIGFILE). Local/UNC members have no such
+  /// cap (positional I/O), so files far larger than this are fully supported there.
+  /// </summary>
+  internal const long MaxFileSize = int.MaxValue;
+
   private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
   private DateTime _lastProbeUtc = DateTime.MinValue;
   private bool _lastProbeResult;
@@ -168,16 +177,25 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     }
 
     public override void Write(byte[] buffer, int offset, int count) {
+      if (this.Position + count > MaxFileSize)
+        throw new PoolFsException(PoolFsError.NoSpace, $"File exceeds the {MaxFileSize} byte whole-object limit of '{this._owner.DisplayName}' — place large files on a local member");
+
       base.Write(buffer, offset, count);
       this._dirty = true;
     }
 
     public override void WriteByte(byte value) {
+      if (this.Position + 1 > MaxFileSize)
+        throw new PoolFsException(PoolFsError.NoSpace, $"File exceeds the {MaxFileSize} byte whole-object limit of '{this._owner.DisplayName}'");
+
       base.WriteByte(value);
       this._dirty = true;
     }
 
     public override void SetLength(long value) {
+      if (value > MaxFileSize)
+        throw new PoolFsException(PoolFsError.NoSpace, $"File exceeds the {MaxFileSize} byte whole-object limit of '{this._owner.DisplayName}'");
+
       base.SetLength(value);
       this._dirty = true;
     }
@@ -199,9 +217,12 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   }
 
   public void Truncate(string relativePath, bool shadow, long length) => this._Guard(() => {
+    if (length is < 0 or > MaxFileSize)
+      throw new PoolFsException(PoolFsError.NoSpace, $"Length {length} exceeds the {MaxFileSize} byte whole-object limit of '{this.DisplayName}'");
+
     var physical = _File(relativePath, shadow);
     var content = store.Download(physical);
-    Array.Resize(ref content, (int)length);
+    Array.Resize(ref content, (int)length); // guarded above — no silent wrap
     store.Upload(physical, content);
   });
 

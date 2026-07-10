@@ -108,60 +108,55 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
     return moved;
   }
 
-  /// <summary>Copies the authoritative primary over every other copy so all copies converge (SAFE-DUP).</summary>
+  /// <summary>
+  /// Converges every copy of a path to the authoritative one after an interrupted write
+  /// (SAFE-DUP / SAFE-NOLOSS). The source is the NEWEST copy by mtime — NOT "the first
+  /// primary" — because the ack quorum can land the only fresh block on a readiness-selected
+  /// shadow, so a stale primary must never win. Works with no surviving primary (shadow-only)
+  /// and streams the source so a multi-GB file never lands in RAM (SAFE-BIGFILE).
+  /// </summary>
   private bool _ResyncCopies(string path) {
-    var copies = new List<(IVolumeIO member, bool shadow)>();
-    foreach (var member in this._Online) {
-      if (member.FileExists(path, false))
-        copies.Add((member, false));
-      if (member.FileExists(path, true))
-        copies.Add((member, true));
+    var copies = new List<(IVolumeIO member, bool shadow, FileMeta meta, string hash)>();
+    foreach (var member in this._Online)
+    foreach (var shadow in new[] { false, true }) {
+      if (!member.FileExists(path, shadow))
+        continue;
+
+      var meta = member.Stat(path, shadow);
+      if (meta is not { } found || found.IsDirectory)
+        continue;
+
+      string hash;
+      try {
+        using var stream = member.OpenRead(path, shadow);
+        hash = ChecksumDatabase.HashOf(stream); // streamed
+      } catch (PoolFsException) {
+        continue;
+      }
+
+      copies.Add((member, shadow, found, hash));
     }
 
     if (copies.Count < 2)
       return false;
 
-    var (sourceMember, sourceShadow) = copies.First(c => !c.shadow);
-    byte[] content;
-    using (var stream = sourceMember.OpenRead(path, sourceShadow)) {
-      using var buffer = new MemoryStream();
-      stream.CopyTo(buffer);
-      content = buffer.ToArray();
-    }
+    // newest wins; a tie in mtime keeps whichever content the majority already holds (no needless rewrite)
+    var winner = copies
+      .OrderByDescending(c => c.meta.LastWriteTimeUtc.Ticks)
+      .ThenByDescending(c => copies.Count(o => o.hash == c.hash))
+      .First();
 
     var changed = false;
-    foreach (var (member, shadow) in copies) {
-      if (member == sourceMember && shadow == sourceShadow)
-        continue;
-
-      if (this._ContentEquals(member, path, shadow, content))
-        continue;
+    foreach (var (member, shadow, _, hash) in copies) {
+      if (hash == winner.hash)
+        continue; // already converged
 
       // temp + atomic rename where supported, put-and-verify emulation otherwise (SAFE-ATOMIC, FR-CAP-ADAPT)
-      WholeFilePublisher.Publish(member, path, shadow, content);
+      WholeFilePublisher.CopyBetween(winner.member, path, winner.shadow, member, path, shadow);
       changed = true;
     }
 
     return changed;
-  }
-
-  private bool _ContentEquals(IVolumeIO member, string path, bool shadow, byte[] expected) {
-    var meta = member.Stat(path, shadow);
-    if (meta == null || meta.Value.Length != expected.Length)
-      return false;
-
-    using var stream = member.OpenRead(path, shadow);
-    var actual = new byte[expected.Length];
-    var total = 0;
-    while (total < actual.Length) {
-      var read = stream.Read(actual, total, actual.Length - total);
-      if (read == 0)
-        break;
-
-      total += read;
-    }
-
-    return total == expected.Length && actual.AsSpan().SequenceEqual(expected);
   }
 
   private bool _RemoveDirEverywhere(string path) {

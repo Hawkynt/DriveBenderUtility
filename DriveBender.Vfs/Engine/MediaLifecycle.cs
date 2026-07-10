@@ -84,12 +84,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
     }
   }
 
-  private static byte[] _Read(Copy copy) {
-    using var stream = copy.Member.OpenRead(copy.Path, copy.Shadow);
-    using var buffer = new MemoryStream();
-    stream.CopyTo(buffer);
-    return buffer.ToArray();
-  }
+  private static long _Size(Copy copy) => copy.Member.Stat(copy.Path, copy.Shadow)?.Length ?? 0;
 
   private IVolumeIO? _ChooseTarget(IEnumerable<Copy> existing, long size, IVolumeIO? exclude) {
     var list = existing.ToArray();
@@ -135,8 +130,8 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
           ? elsewhere.Count > 0
           : elsewhere.Any(c => c.Member.PhysicalVolumeId != leaving.PhysicalVolumeId);
         if (!survivesElsewhere) {
-          var content = _Read(copy);
-          var target = this._ChooseTarget(elsewhere, content.LongLength, leaving)
+          var size = _Size(copy);
+          var target = this._ChooseTarget(elsewhere, size, leaving)
                        ?? throw new PoolFsException(PoolFsError.NoSpace, $"Nowhere to move '{path}' off '{leaving.DisplayName}'");
 
           var sequence = journal.LogIntent(JournalOp.Rebalance, path, memberId: target.MemberId);
@@ -144,7 +139,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
           if (parent.Length > 0)
             target.EnsureFolder(parent, copy.Shadow);
 
-          WholeFilePublisher.Publish(target, path, copy.Shadow, content);
+          WholeFilePublisher.CopyBetween(copy.Member, path, copy.Shadow, target, path, copy.Shadow);
           journal.Complete(sequence, JournalOp.Rebalance);
           elsewhere.Add(new(target, path, copy.Shadow));
           ++moved;
@@ -170,13 +165,12 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
 
     var moved = 0;
     foreach (var (path, shadow) in this._WalkMember(old).ToArray()) {
-      var content = _Read(new(old, path, shadow));
       var sequence = journal.LogIntent(JournalOp.Rebalance, path, memberId: replacement.MemberId);
       var parent = PoolPaths.GetParent(path);
       if (parent.Length > 0)
         replacement.EnsureFolder(parent, shadow);
 
-      WholeFilePublisher.Publish(replacement, path, shadow, content);
+      WholeFilePublisher.CopyBetween(old, path, shadow, replacement, path, shadow);
       journal.Complete(sequence, JournalOp.Rebalance);
       old.Delete(path, shadow);
       ++moved;
@@ -197,23 +191,21 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
       var distinctDomains = this._Coverage(copies);
       var hasPrimary = copies.Any(c => !c.Shadow);
       var source = copies[0];
-      byte[]? content = null;
 
-      // promote a shadow to primary when no primary survives (FixMissingPrimaries)
+      // promote a shadow to primary when no primary survives (FixMissingPrimaries) — streamed
       if (!hasPrimary) {
-        content ??= _Read(source);
         var sequence = journal.LogIntent(JournalOp.ShadowCreate, path, memberId: source.Member.MemberId);
-        WholeFilePublisher.Publish(source.Member, path, false, content);
+        WholeFilePublisher.CopyBetween(source.Member, path, true, source.Member, path, false);
         source.Member.Delete(path, true);
         journal.Complete(sequence, JournalOp.ShadowCreate);
         copies[0] = source with { Shadow = false };
         ++created;
       }
 
-      // create missing shadow copies up to the duplication level (FixMissingShadowCopies)
+      // create missing shadow copies up to the duplication level (FixMissingShadowCopies) — streamed
       while (distinctDomains < duplicationLevel) {
-        content ??= _Read(copies[0]);
-        var target = this._ChooseTarget(copies, content.LongLength, null);
+        var size = _Size(copies[0]);
+        var target = this._ChooseTarget(copies, size, null);
         if (target == null)
           break; // not placeable without co-locating (SAFE-PHYS) — leave for later
 
@@ -222,7 +214,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
         if (parent.Length > 0)
           target.EnsureFolder(parent, true);
 
-        WholeFilePublisher.Publish(target, path, true, content);
+        WholeFilePublisher.CopyBetween(copies[0].Member, path, copies[0].Shadow, target, path, true);
         journal.Complete(sequence, JournalOp.ShadowCreate);
         copies.Add(new(target, path, true));
         ++distinctDomains;

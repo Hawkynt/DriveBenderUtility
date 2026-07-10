@@ -238,15 +238,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var restored = this._trash.Restore(normalized)
                    ?? throw new PoolFsException(PoolFsError.NotFound, $"No trash entry for '{originalPath}'");
 
-    byte[] content;
-    using (var source = restored.member.OpenRead(normalized, false)) {
-      using var buffer = new MemoryStream();
-      source.CopyTo(buffer);
-      content = buffer.ToArray();
-    }
-
     this._Invalidate(normalized);
-    this._EnsureShadows(normalized, this._placement.ResolveCopies(normalized), content);
+    this._EnsureShadows(normalized, this._placement.ResolveCopies(normalized));
     this._Invalidate(normalized);
     DriveBender.Logger($" - Restored '{normalized}' from trash");
   }
@@ -509,7 +502,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       stream.Flush();
 
     this._integrity.RecordWholeFile(target, physical, false, []);
-    this._EnsureShadows(physical, [], content: []);
+    this._EnsureShadows(physical, []);
     if (staged)
       this._staging[normalized] = sequence; // the Create intent stays open until the publish rename
     else
@@ -521,8 +514,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     return this._handles.Open(normalized, AccessMode.ReadWrite).Handle;
   }
 
-  /// <summary>Brings a file up to its folder's duplication level D by creating missing shadow copies (SAFE-DUP).</summary>
-  private void _EnsureShadows(string normalized, IReadOnlyList<PhysicalCopy> knownCopies, byte[] content) {
+  /// <summary>
+  /// Brings a file up to its folder's duplication level D by creating missing shadow copies
+  /// (SAFE-DUP), streamed from an existing copy so the file is never held in RAM (SAFE-BIGFILE).
+  /// </summary>
+  private void _EnsureShadows(string normalized, IReadOnlyList<PhysicalCopy> knownCopies) {
     var duplication = this._placement.DuplicationLevelFor(PoolPaths.GetParent(normalized));
     if (duplication < 2)
       return;
@@ -530,9 +526,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var holders = knownCopies.Count > 0
       ? knownCopies.Select(c => c.Volume).ToList()
       : [.. this._Online.Where(m => m.FileExists(normalized, false) || m.FileExists(normalized, true))];
+    if (holders.Count == 0)
+      return;
+
+    var sourceVol = holders[0];
+    var sourceShadow = knownCopies.Count > 0 ? knownCopies[0].Shadow : !sourceVol.FileExists(normalized, false);
+    var size = sourceVol.Stat(normalized, sourceShadow)?.Length ?? 0;
 
     while (holders.Count < duplication) {
-      var target = this._placement.ChooseShadowTarget(content.LongLength, holders);
+      var target = this._placement.ChooseShadowTarget(size, holders);
       if (target == null) {
         DriveBender.Logger($"[Warning]Duplication level {duplication} for '{normalized}' not placeable — no independent failure domain left; owed copies deferred (SAFE-PHYS)");
         return;
@@ -540,15 +542,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       var parent = PoolPaths.GetParent(normalized);
       target.EnsureFolder(parent, true);
-      using (var stream = target.OpenWrite(normalized, true, true)) {
-        if (content.Length > 0)
-          stream.Write(content, 0, content.Length);
-        stream.Flush();
-      }
-
-      this._integrity.RecordWholeFile(target, normalized, true, content);
-      this._activity.Publish(ActivityKind.Duplicate, normalized, content.LongLength,
-        fromMember: holders.Count > 0 ? holders[0].DisplayName : null, toMember: target.DisplayName,
+      WholeFilePublisher.CopyBetween(sourceVol, normalized, sourceShadow, target, normalized, true);
+      this._activity.Publish(ActivityKind.Duplicate, normalized, size,
+        fromMember: sourceVol.DisplayName, toMember: target.DisplayName,
         reason: $"duplication level {duplication}");
       holders.Add(target);
     }
@@ -1322,28 +1318,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
         var sequence = this._journal.LogIntent(JournalOp.Drain, path, memberId: target.MemberId);
 
-        byte[] content;
-        using (var source = landing.OpenRead(path, false)) {
-          using var buffer = new MemoryStream();
-          source.CopyTo(buffer);
-          content = buffer.ToArray();
-        }
-
         var parent = PoolPaths.GetParent(path);
         if (parent.Length > 0)
           target.EnsureFolder(parent, false);
 
-        WholeFilePublisher.Publish(target, path, false, content);
+        // streamed drain — the file is copied through a fixed buffer, never held in RAM (SAFE-BIGFILE)
+        WholeFilePublisher.CopyBetween(landing, path, false, target, path, false);
         landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
         this._journal.Complete(sequence, JournalOp.Drain);
         this._integrity.InvalidateFile(path);
-        this._integrity.RecordWholeFile(target, path, false, content);
-        this._activity.Publish(ActivityKind.Drain, path, content.Length, landing.DisplayName, target.DisplayName, "landing-zone drain");
+        this._activity.Publish(ActivityKind.Drain, path, size, landing.DisplayName, target.DisplayName, "landing-zone drain");
 
         this._Invalidate(path);
-        this._EnsureShadows(path, this._placement.ResolveCopies(path), content);
+        this._EnsureShadows(path, this._placement.ResolveCopies(path));
         this._Invalidate(path);
-        DriveBender.Logger($" - Drained '{path}' from '{landing.DisplayName}' to '{target.DisplayName}' ({content.Length} bytes)");
+        DriveBender.Logger($" - Drained '{path}' from '{landing.DisplayName}' to '{target.DisplayName}' ({size} bytes)");
         return true;
       }
     }
@@ -1439,49 +1428,49 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (hasPrimary && holders.Count >= duplication)
       return;
 
-    byte[]? content = null;
-    foreach (var copy in copies)
-      try {
-        using var stream = copy.Volume.OpenRead(normalized, copy.Shadow);
-        using var buffer = new MemoryStream();
-        stream.CopyTo(buffer);
-        content = buffer.ToArray();
-        break;
-      } catch (PoolFsException) {
-        // the next copy answers (read failover)
-      }
-
-    if (content == null)
+    // a readable source copy, chosen by failover — never materialised in RAM (SAFE-BIGFILE)
+    var source = copies.FirstOrDefault(c => _CanRead(c.Volume, normalized, c.Shadow));
+    if (source == null)
       return;
+
+    var size = _StatAnyCopy(copies, normalized)?.Length ?? 0;
 
     if (!hasPrimary) {
       // promote: the shadow's member gets a primary so the file survives shadow-container loss
       var survivor = copies[0];
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: survivor.Volume.MemberId);
-      WholeFilePublisher.Publish(survivor.Volume, normalized, false, content);
+      WholeFilePublisher.CopyBetween(survivor.Volume, normalized, true, survivor.Volume, normalized, false);
       survivor.Volume.Delete(normalized, true);
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
-      this._integrity.RecordWholeFile(survivor.Volume, normalized, false, content);
-      this._activity.Publish(ActivityKind.Recovery, normalized, content.LongLength, toMember: survivor.Volume.DisplayName, reason: "primary restored from surviving shadow");
+      this._activity.Publish(ActivityKind.Recovery, normalized, size, toMember: survivor.Volume.DisplayName, reason: "primary restored from surviving shadow");
+      source = survivor with { Shadow = false };
     }
 
     while (holders.Count < duplication) {
-      var target = this._placement.ChooseShadowTarget(content.LongLength, holders);
+      var target = this._placement.ChooseShadowTarget(size, holders);
       if (target == null)
         break; // not placeable right now (SAFE-PHYS) — a later heal converges
 
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: target.MemberId);
       target.EnsureFolder(PoolPaths.GetParent(normalized), true);
-      WholeFilePublisher.Publish(target, normalized, true, content);
+      WholeFilePublisher.CopyBetween(source.Volume, normalized, source.Shadow, target, normalized, true);
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
-      this._integrity.RecordWholeFile(target, normalized, true, content);
-      this._activity.Publish(ActivityKind.Duplicate, normalized, content.LongLength,
-        fromMember: copies[0].Volume.DisplayName, toMember: target.DisplayName,
+      this._activity.Publish(ActivityKind.Duplicate, normalized, size,
+        fromMember: source.Volume.DisplayName, toMember: target.DisplayName,
         reason: $"healed to duplication level {duplication}");
       holders.Add(target);
     }
 
     this._Invalidate(normalized);
+  }
+
+  /// <summary>True when a copy is currently readable (member online and the file present) — a cheap failover probe.</summary>
+  private static bool _CanRead(IVolumeIO volume, string normalized, bool shadow) {
+    try {
+      return volume.IsOnline && volume.FileExists(normalized, shadow);
+    } catch (PoolFsException) {
+      return false;
+    }
   }
 
   /// <summary>Every logical file across all online members — primaries and shadow-only survivors alike.</summary>

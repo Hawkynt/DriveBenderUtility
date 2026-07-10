@@ -158,7 +158,11 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     }
 
     public override void Flush() {
-      // the handle carries WRITE_THROUGH — every write already hit stable storage
+      // WRITE_THROUGH forces the data past the OS cache, but not the drive's volatile cache
+      // nor the file-size metadata for an append — FlushFileBuffers/fsync is the real barrier
+      // the WAL's fsync-before-mutate ordering depends on (SAFE-ORDER / SAFE-FSYNC)
+      if (writable)
+        NativeMethods.FlushToDisk(lease.Handle);
     }
 
     public override long Seek(long offset, SeekOrigin origin) => this._position = origin switch {
@@ -184,6 +188,26 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto, EntryPoint = "GetDiskFreeSpaceEx")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GetDiskFreeSpaceEx(string lpDirectoryName, out ulong lpFreeBytesAvailable, out ulong lpTotalNumberOfBytes, out ulong lpTotalNumberOfFreeBytes);
+
+    [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "FlushFileBuffers")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FlushFileBuffers(SafeFileHandle hFile);
+
+    [DllImport("libc", SetLastError = true, EntryPoint = "fsync")]
+    private static extern int Fsync(int fd);
+
+    /// <summary>Forces buffered data AND file metadata to stable storage — the real durability barrier.</summary>
+    public static void FlushToDisk(SafeFileHandle handle) {
+      if (OperatingSystem.IsWindows()) {
+        if (!FlushFileBuffers(handle))
+          throw new IOException("FlushFileBuffers failed", Marshal.GetLastWin32Error());
+        return;
+      }
+
+      // fsync on the underlying fd; SafeFileHandle wraps the int fd on Unix
+      if (Fsync((int)handle.DangerousGetHandle()) != 0)
+        throw new IOException("fsync failed", Marshal.GetLastPInvokeError());
+    }
   }
 
   private readonly string _rootPath = System.IO.Path.GetFullPath(rootPath);
@@ -276,7 +300,6 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
 
   public void Delete(string relativePath, bool shadow) => this._Guard(() => {
     var path = this._Resolve(relativePath, shadow);
-    this._pool.Invalidate(path); // no pooled handle may outlive the file
     var file = new FileInfo(path);
     if (!file.Exists)
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
@@ -284,7 +307,11 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     if ((file.Attributes & (FileAttributes.ReadOnly | FileAttributes.System | FileAttributes.Hidden)) != 0)
       file.Attributes &= ~(FileAttributes.ReadOnly | FileAttributes.System | FileAttributes.Hidden);
 
+    // invalidate AFTER the destructive op: a reader that opened between an early invalidate and
+    // the delete would otherwise cache a handle to the (now removed) file and serve it forever
+    this._pool.Invalidate(path);
     file.Delete();
+    this._pool.Invalidate(path); // and again, in case a borrower re-cached during the delete
   });
 
   public void EnsureFolder(string relativeFolder, bool shadow) => this._Guard(() => {
@@ -307,9 +334,10 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     if (Directory.Exists(toPath) || File.Exists(toPath))
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toRelativeFolder}");
 
-    this._pool.InvalidatePrefix(fromPath + System.IO.Path.DirectorySeparatorChar); // pooled keys move with the subtree
     Directory.CreateDirectory(System.IO.Path.GetDirectoryName(toPath)!);
+    this._pool.InvalidatePrefix(fromPath + System.IO.Path.DirectorySeparatorChar); // pooled keys move with the subtree
     Directory.Move(fromPath, toPath);
+    this._pool.InvalidatePrefix(fromPath + System.IO.Path.DirectorySeparatorChar); // and any re-cached during the move
   });
 
   public void AtomicReplace(string tempRelative, string finalRelative, bool shadow) => this._Guard(() => {
@@ -318,13 +346,17 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     if (!File.Exists(tempPath))
       throw new PoolFsException(PoolFsError.NotFound, $"Staged file not found: {tempRelative}");
 
+    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(finalPath)!);
     this._pool.Invalidate(tempPath);
     this._pool.Invalidate(finalPath);
-    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(finalPath)!);
     if (File.Exists(finalPath))
       File.Replace(tempPath, finalPath, null, true);
     else
       File.Move(tempPath, finalPath);
+    // invalidate again AFTER: a reader that re-cached the old finalPath during the replace must
+    // not keep serving the pre-replace file (its handle stays valid under FileShare.Delete)
+    this._pool.Invalidate(finalPath);
+    this._pool.Invalidate(tempPath);
   });
 
   public FileMeta? Stat(string relativePath, bool shadow) => this._Guard<FileMeta?>(() => {

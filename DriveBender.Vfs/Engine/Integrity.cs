@@ -29,6 +29,17 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
 
   public static string HashOf(ReadOnlySpan<byte> content) => Convert.ToHexString(XxHash3.Hash(content));
 
+  /// <summary>Hashes a stream incrementally through a fixed buffer — never materialises the whole file (SAFE-BIGFILE).</summary>
+  public static string HashOf(Stream source) {
+    var hash = new XxHash3();
+    var buffer = new byte[1 << 20];
+    int read;
+    while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
+      hash.Append(buffer.AsSpan(0, read));
+
+    return Convert.ToHexString(hash.GetCurrentHash());
+  }
+
   private Dictionary<string, ChecksumEntry> _Load() {
     if (this._entries != null)
       return this._entries;
@@ -146,6 +157,10 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
   private readonly Dictionary<Guid, ChecksumDatabase> _databases = members.ToDictionary(m => m.MemberId, m => new ChecksumDatabase(m));
   private long _quarantineCounter;
 
+  // a per-instance token so a quarantine path from THIS run can never collide with (and overwrite)
+  // a version quarantined by an earlier run/process — every preserved version stays preserved
+  private readonly string _quarantineToken = Guid.NewGuid().ToString("N")[..8];
+
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
   private ChecksumDatabase _Db(IVolumeIO member) => this._databases[member.MemberId];
@@ -158,6 +173,15 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
       return;
 
     this._Db(member).Set(PoolPaths.ToPhysical(normalizedPath, shadow), new(content.Length, meta.Value.LastWriteTimeUtc.Ticks, ChecksumDatabase.HashOf(content)));
+  }
+
+  /// <summary>Records a copy's checksum from an already-computed hash (streaming repair path — no re-read, no byte[]).</summary>
+  public void RecordHash(IVolumeIO member, string normalizedPath, bool shadow, string hash) {
+    var meta = member.Stat(normalizedPath, shadow);
+    if (meta == null)
+      return;
+
+    this._Db(member).Set(PoolPaths.ToPhysical(normalizedPath, shadow), new(meta.Value.Length, meta.Value.LastWriteTimeUtc.Ticks, hash));
   }
 
   /// <summary>A positional write changed part of a file: the stale entries drop; the next scrub re-baselines.</summary>
@@ -205,7 +229,8 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
   public IReadOnlyList<IntegrityIssue> DetectQuick()
     => this._Scrub(quick: true, detectOnly: true, null);
 
-  private sealed record CopyView(IVolumeIO Member, bool Shadow, byte[] Content, long Size, long MTimeTicks, ChecksumEntry? Entry, string Hash) {
+  // no whole-file Content: the hash is computed by streaming, repair re-streams from the source
+  private sealed record CopyView(IVolumeIO Member, bool Shadow, long Size, long MTimeTicks, ChecksumEntry? Entry, string Hash) {
     public bool MatchesEntry => this.Entry != null && this.Hash == this.Entry.Hash;
     public bool MetaMatchesEntry => this.Entry != null && this.Size == this.Entry.Size && this.MTimeTicks == this.Entry.MTimeTicks;
   }
@@ -292,17 +317,15 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
 
     var views = new List<CopyView>();
     foreach (var (member, shadow, meta, entry) in metas) {
-      byte[] content;
+      string hash;
       try {
         using var stream = member.OpenRead(path, shadow);
-        using var buffer = new MemoryStream();
-        stream.CopyTo(buffer);
-        content = buffer.ToArray();
+        hash = ChecksumDatabase.HashOf(stream); // streamed — a multi-GB copy is never held in RAM
       } catch (PoolFsException) {
         continue;
       }
 
-      views.Add(new(member, shadow, content, meta.Length, meta.LastWriteTimeUtc.Ticks, entry, ChecksumDatabase.HashOf(content)));
+      views.Add(new(member, shadow, meta.Length, meta.LastWriteTimeUtc.Ticks, entry, hash));
     }
 
     return views.Count == 0 ? null : views;
@@ -328,8 +351,7 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
         var source = good.Length > 0 ? good[0] : edited.OrderByDescending(v => v.MTimeTicks).First();
         foreach (var corrupt in bitRot) {
           this._Quarantine(corrupt, path, "bitrot");
-          this._Publish(corrupt.Member, path, corrupt.Shadow, source.Content);
-          this.RecordWholeFile(corrupt.Member, path, corrupt.Shadow, source.Content);
+          this._Repair(source, corrupt, path);
           issues.Add(new(IntegrityIssueKind.BitRotRepaired, path, $"Repaired silent corruption on '{corrupt.Member.DisplayName}' from a checksum-verified copy; corrupt content quarantined"));
           DriveBender.Logger($" - Repaired bit-rot on '{path}' ({corrupt.Member.DisplayName})");
         }
@@ -372,22 +394,24 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
             return;
           }
 
+          // quarantine each stale copy BEFORE overwriting it — a skewed clock could make the
+          // "newest" wrong, so the replaced content is always recoverable (SAFE-NOLOSS)
           foreach (var stale in staleCopies) {
-            this._Publish(stale.Member, path, stale.Shadow, winner.Content);
-            this.RecordWholeFile(stale.Member, path, stale.Shadow, winner.Content);
+            this._Quarantine(stale, path, "stale");
+            this._Repair(winner, stale, path);
           }
 
-          this.RecordWholeFile(winner.Member, path, winner.Shadow, winner.Content);
+          this.RecordHash(winner.Member, path, winner.Shadow, winner.Hash);
           invalidateCaches?.Invoke(path);
-          issues.Add(new(IntegrityIssueKind.StaleCopyRepaired, path, $"Re-synchronized {staleCopies.Length} stale cop(ies) from the newest write"));
+          issues.Add(new(IntegrityIssueKind.StaleCopyRepaired, path, $"Re-synchronized {staleCopies.Length} stale cop(ies) from the newest write (replaced content quarantined)"));
           DriveBender.Logger($" - Re-synchronized {staleCopies.Length} stale cop(ies) of '{path}'");
           return;
         }
 
-        // no divergence — baseline anything the DB does not know yet
+        // no divergence — baseline anything the DB does not know yet (streamed re-hash)
         if (!detectOnly)
           foreach (var view in views.Where(v => v.Entry == null))
-            this.RecordWholeFile(view.Member, path, view.Shadow, view.Content);
+            this.RecordHash(view.Member, path, view.Shadow, view.Hash);
         return;
       }
 
@@ -397,14 +421,15 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
           return;
         }
 
-        // one coherent external edit: accept it as authoritative, re-propagate (SAFE-OOB case 2)
+        // one coherent external edit: accept it as authoritative, re-propagate (SAFE-OOB case 2).
+        // Quarantine each replaced copy first so an accepted-but-wrong edit stays recoverable.
         var winner = edited[0];
         foreach (var stale in views.Where(v => v.Hash != winner.Hash)) {
-          this._Publish(stale.Member, path, stale.Shadow, winner.Content);
-          this.RecordWholeFile(stale.Member, path, stale.Shadow, winner.Content);
+          this._Quarantine(stale, path, "replaced");
+          this._Repair(winner, stale, path);
         }
 
-        this.RecordWholeFile(winner.Member, path, winner.Shadow, winner.Content);
+        this.RecordHash(winner.Member, path, winner.Shadow, winner.Hash);
         invalidateCaches?.Invoke(path);
         issues.Add(new(IntegrityIssueKind.ExternalEditAccepted, path, "External edit accepted as authoritative and re-propagated to all copies"));
         DriveBender.Logger($" - Accepted external edit of '{path}' and re-synchronized {views.Count - 1} cop(ies)");
@@ -425,10 +450,8 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
           this._Quarantine(loser, path, "conflict");
 
         if (!ambiguous && editPolicy == ExternalEditPolicy.AcceptNewest)
-          foreach (var stale in views.Where(v => v.Hash != winner.Hash)) {
-            this._Publish(stale.Member, path, stale.Shadow, winner.Content);
-            this.RecordWholeFile(stale.Member, path, stale.Shadow, winner.Content);
-          }
+          foreach (var stale in views.Where(v => v.Hash != winner.Hash))
+            this._Repair(winner, stale, path);
 
         invalidateCaches?.Invoke(path);
         issues.Add(new(IntegrityIssueKind.Conflict, path, $"{distinctEdits.Length} divergent versions detected; all preserved under {PoolPaths.UtilityFolderName}/conflicts for resolution"));
@@ -438,19 +461,21 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     }
   }
 
+  /// <summary>Preserves a copy under conflicts/ before it is overwritten — streamed, with a per-run unique name so no earlier version is clobbered (SAFE-NOLOSS).</summary>
   private void _Quarantine(CopyView copy, string path, string reason) {
-    var quarantinePath = $"{PoolPaths.UtilityFolderName}/conflicts/{path}.{reason}.{Interlocked.Increment(ref this._quarantineCounter)}";
+    var quarantinePath = $"{PoolPaths.UtilityFolderName}/conflicts/{path}.{reason}.{this._quarantineToken}.{Interlocked.Increment(ref this._quarantineCounter)}";
     try {
       copy.Member.EnsureFolder(PoolPaths.GetParent(quarantinePath), false);
-      using var stream = copy.Member.OpenWrite(quarantinePath, false, true);
-      stream.Write(copy.Content, 0, copy.Content.Length);
-      stream.Flush();
+      WholeFilePublisher.CopyBetween(copy.Member, path, copy.Shadow, copy.Member, quarantinePath, false);
     } catch (PoolFsException e) {
       DriveBender.Logger($"[Warning]Could not quarantine '{path}' on '{copy.Member.DisplayName}': {e.Message}");
     }
   }
 
-  private void _Publish(IVolumeIO member, string path, bool shadow, byte[] content)
-    => WholeFilePublisher.Publish(member, path, shadow, content);
+  /// <summary>Overwrites a target copy with the source's content (streamed) and records the known hash — no re-read, no byte[].</summary>
+  private void _Repair(CopyView source, CopyView target, string path) {
+    WholeFilePublisher.CopyBetween(source.Member, path, source.Shadow, target.Member, path, target.Shadow);
+    this.RecordHash(target.Member, path, target.Shadow, source.Hash);
+  }
 
 }
