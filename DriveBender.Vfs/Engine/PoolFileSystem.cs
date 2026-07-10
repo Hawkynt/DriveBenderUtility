@@ -40,6 +40,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// <summary>The physical name data ops must use: the staged temp while the file is being written, the real name after.</summary>
   private string _DataName(string normalized) => this._staging.ContainsKey(normalized) ? _StagedNameOf(normalized) : normalized;
 
+  // SAFE-OFFLINE: namespace changes an offline member missed (deletes/renames) — replayed on
+  // its return so stale files never resurrect into the pool
+  private readonly TombstoneLog _tombstones;
+
+  // FR-HEAL: paths whose duplication level must be re-established (a member returned, or a
+  // scan found owed copies); drained incrementally by the background HealJob
+  private readonly System.Collections.Concurrent.ConcurrentQueue<string> _healQueue = new();
+  private int _healScanRequested;
+  private IEnumerator<string>? _healScan; // advanced only by HealStep (single pump thread)
+
+  // degraded-write warnings deduplicate per path; cleared when membership changes
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _degradedAckWarned = new(StringComparer.OrdinalIgnoreCase);
+
   // FR-STRIPE-READY: outstanding I/O per member — the stripe selector routes each block to the
   // storage that is READY, so a fast/idle SSD naturally takes more blocks than a slow/busy HDD
   private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, int> _memberLoad = new();
@@ -80,6 +93,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       effectiveConfig,
       members.ToDictionary(m => m.Io.MemberId, m => m.Role));
 
+    this._tombstones = new([.. members.Select(m => m.Io)]);
     this._watcher = new([.. members.Select(m => m.Io)]);
     this._watcher.MemberLost += this._OnMemberLost;
     this._watcher.MemberReturned += this._OnMemberReturned;
@@ -161,11 +175,24 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   private void _OnMemberReturned(IVolumeIO member) {
-    // a returned member may hold newer/owed data; drop caches and reconcile (SAFE-OFFLINE)
+    this._activity.Publish(ActivityKind.Recovery, "", reason: $"member returned: {member.DisplayName}");
+    this._degradedAckWarned.Clear();
+
+    // 1) namespace changes it missed apply first (deletes/renames — no ghost resurrection, SAFE-OFFLINE)
+    var replayed = this._tombstones.ReplayFor(member, [.. this._members.Select(m => m.Io.MemberId)]);
+    if (replayed > 0)
+      DriveBender.Logger($"Applied {replayed} missed namespace change(s) to returned member '{member.DisplayName}'");
+
+    // 2) a returned member may hold newer/owed data; drop caches so listings see its copies
     this._cache.Metadata.InvalidatePool(this._poolId);
     this._placement.InvalidateAll();
+
+    // 3) stale content reconciles (the newest write wins) …
     if (this._config.Integrity?.ChecksumDb != false)
       this._integrity.QuickScan(this._Invalidate);
+
+    // … 4) and owed duplication heals in the background (FR-HEAL: full health as fast as possible)
+    this.RequestHeal();
   }
 
   /// <summary>Dashboard counters for this pool (OPS-METRICS).</summary>
@@ -188,7 +215,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       ? DurationSpec.Parse(write?.DeferWindow ?? "5s")
       : TimeSpan.Zero;
     var maxDefer = TimeSpan.FromSeconds(write?.MaxDeferSeconds ?? 30);
-    var jobs = new List<IBackgroundJob> { new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this), new MemberWatchJob(this) };
+    var jobs = new List<IBackgroundJob> { new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this), new MemberWatchJob(this), new HealJob(this) };
     if (this._config.Trash?.Enabled == true)
       jobs.Add(new TrashMaintenanceJob(this));
 
@@ -242,6 +269,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._activity.Publish(ActivityKind.Recovery, "", report.RolledForward + report.Reconciled, reason: "journal replay on mount");
     }
 
+    // members that were offline while the pool last changed replay what they missed (SAFE-OFFLINE)
+    var tombstonesReplayed = this._tombstones.Replay([.. this._Online], [.. this._members.Select(m => m.Io.MemberId)]);
+    if (tombstonesReplayed > 0)
+      DriveBender.Logger($"Applied {tombstonesReplayed} missed namespace change(s) from the tombstone log");
+
     // externally-modified members are caught before serving stale data (FR-OOB-MOUNT)
     if (this._config.Integrity?.ChecksumDb != false) {
       var oob = this._integrity.QuickScan(this._Invalidate);
@@ -250,6 +282,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     this._mountOptions = options;
+
+    // any under-duplication (writes taken while a member was away, deferred shadow placement)
+    // converges in the background without waiting for an explicit repair (FR-HEAL)
+    this.RequestHeal();
   }
 
   public void Unmount() {
@@ -547,6 +583,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this.FlushPath(fromNormalized); // pending mutations land under the old name first
 
+    this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
 
     // overwrite-on-rename removes every copy of the old target first (no orphans)
@@ -595,6 +632,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     foreach (var dirty in this._writeBuffer.DirtyPaths.Where(p => p.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray())
       this.FlushPath(dirty);
 
+    this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
 
     var parent = PoolPaths.GetParent(toNormalized);
@@ -643,6 +681,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     // pending buffered mutations are moot once the file dies; their intents complete with the delete
     var discarded = this._writeBuffer.Drain(normalized);
+
+    // offline members keep their stale copies — record what they missed so no ghost resurrects
+    this._RecordTombstoneForOffline(JournalOp.Delete, normalized);
 
     var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(normalized));
     if (effective.Trash?.Enabled == true) {
@@ -710,6 +751,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this.ReadDirectory(normalized).Count > 0)
       throw new PoolFsException(PoolFsError.NotEmpty, $"Folder is not empty: {path}");
 
+    this._RecordTombstoneForOffline(JournalOp.RemoveDir, normalized);
     var sequence = this._journal.LogIntent(JournalOp.RemoveDir, normalized);
     foreach (var member in this._Online) {
       if (member.FolderExists(normalized, true))
@@ -726,6 +768,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _Invalidate(string normalized) {
     this._placement.Invalidate(normalized);
     this._cache.InvalidatePath(this._poolId, normalized);
+  }
+
+  /// <summary>
+  /// Records a namespace change for every member that is offline right now (SAFE-OFFLINE):
+  /// without it, a returning member would resurrect deleted/renamed files into the pool.
+  /// Called BEFORE the mutation so a crash in between merely replays a no-op.
+  /// </summary>
+  private void _RecordTombstoneForOffline(JournalOp op, string path, string? targetPath = null) {
+    var offline = this._members.Where(m => !m.Io.IsOnline).Select(m => m.Io.MemberId).ToArray();
+    if (offline.Length > 0)
+      this._tombstones.Record(op, path, targetPath, offline);
   }
 
   #endregion
@@ -1131,12 +1184,32 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     return this._writeBuffer.StageWrite(path, offset, bytes, sequence, durableCopies);
   }
 
-  /// <summary>Refuses an ack when fewer copies are reachable than the folder's effective minCopiesBeforeAck (SAFE-LZ).</summary>
+  /// <summary>
+  /// Refuses an ack when fewer copies are reachable than the folder's effective
+  /// minCopiesBeforeAck (SAFE-LZ) — UNLESS degraded writes are accepted (the default,
+  /// §10 SAFE-DEGRADE): one lost drive must not turn into a write outage while at least one
+  /// durable copy is reachable. The shortfall stays owed and heals when the member returns.
+  /// </summary>
   private void _RequireAckQuorum(string path, int reachableCopies) {
     var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(path));
     var required = ConfigValidator.EffectiveMinCopiesBeforeAck(effective.Write, effective.Duplication);
-    if (reachableCopies < required)
-      throw new PoolFsException(PoolFsError.Offline, $"Only {reachableCopies} of the required {required} copies of '{path}' are reachable — refusing to acknowledge (minCopiesBeforeAck)");
+    if (reachableCopies >= required)
+      return;
+
+    // degrade ONLY for a transient shortfall (a member is actually missing) — a structural one
+    // (e.g. an undurable remote backend that can never satisfy the quorum, SAFE-REMOTE) keeps
+    // refusing: it would otherwise silently weaken durability forever
+    var memberMissing = this._members.Any(m => !m.Io.IsOnline);
+    if (memberMissing && reachableCopies >= 1 && (this._config.Resilience?.AcceptDegradedWrites ?? true)) {
+      if (this._degradedAckWarned.TryAdd(path, 0)) {
+        DriveBender.Logger($"[Warning]Degraded write on '{path}': only {reachableCopies} of the required {required} copies are reachable — proceeding; the owed copies heal automatically");
+        this._activity.Publish(ActivityKind.Recovery, path, reason: $"degraded write — {reachableCopies}/{required} copies reachable");
+      }
+
+      return;
+    }
+
+    throw new PoolFsException(PoolFsError.Offline, $"Only {reachableCopies} of the required {required} copies of '{path}' are reachable — refusing to acknowledge (minCopiesBeforeAck)");
   }
 
   public void SetLength(NodeHandle handle, long length) {
@@ -1300,6 +1373,161 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           stack.Push(childPath);
         else
           yield return childPath;
+      }
+    }
+  }
+
+  /// <summary>
+  /// Requests a full duplication heal (FR-HEAL): the background HealJob enumerates every
+  /// logical file and restores missing primaries/shadows incrementally. Triggered on mount,
+  /// on member return, and by explicit repair operations; cheap to request repeatedly.
+  /// </summary>
+  public void RequestHeal() => Interlocked.Exchange(ref this._healScanRequested, 1);
+
+  /// <summary>True while a heal scan or queued heal work is outstanding (test/observability hook).</summary>
+  public bool HealPending => this._healScanRequested != 0 || this._healScan != null || !this._healQueue.IsEmpty;
+
+  /// <summary>
+  /// One bounded unit of heal work, driven by the scheduler: drains one queued path, or
+  /// advances the enumeration a chunk. Never runs concurrently with itself (single pump).
+  /// </summary>
+  public bool HealStep() {
+    if (this._mountOptions == null || this.IsReadOnly)
+      return false; // a read-only mount must not mutate members — an explicit repair op can
+
+    if (this._healQueue.TryDequeue(out var path)) {
+      this._HealOne(path);
+      return true;
+    }
+
+    var scan = this._healScan;
+    if (scan == null) {
+      if (Interlocked.Exchange(ref this._healScanRequested, 0) == 0)
+        return false;
+
+      this._healScan = scan = this._AllLogicalFiles().GetEnumerator();
+    }
+
+    for (var enqueued = 0; enqueued < 64; ++enqueued) {
+      if (!scan.MoveNext()) {
+        this._healScan = null;
+        return true;
+      }
+
+      this._healQueue.Enqueue(scan.Current);
+    }
+
+    return true;
+  }
+
+  /// <summary>
+  /// Restores one file to its duplication level: promotes a surviving shadow when the primary
+  /// is gone, then creates missing copies via temp + atomic rename under a journalled intent
+  /// (SAFE-DUP). Active files are skipped — they converge through the write path.
+  /// </summary>
+  private void _HealOne(string normalized) {
+    if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized))
+      return;
+
+    var copies = this._placement.ResolveCopies(normalized);
+    if (copies.Count == 0)
+      return;
+
+    var duplication = this._placement.DuplicationLevelFor(PoolPaths.GetParent(normalized));
+    var holders = copies.Select(c => c.Volume).Distinct().ToList();
+    var hasPrimary = copies.Any(c => !c.Shadow);
+    if (hasPrimary && holders.Count >= duplication)
+      return;
+
+    byte[]? content = null;
+    foreach (var copy in copies)
+      try {
+        using var stream = copy.Volume.OpenRead(normalized, copy.Shadow);
+        using var buffer = new MemoryStream();
+        stream.CopyTo(buffer);
+        content = buffer.ToArray();
+        break;
+      } catch (PoolFsException) {
+        // the next copy answers (read failover)
+      }
+
+    if (content == null)
+      return;
+
+    if (!hasPrimary) {
+      // promote: the shadow's member gets a primary so the file survives shadow-container loss
+      var survivor = copies[0];
+      var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: survivor.Volume.MemberId);
+      WholeFilePublisher.Publish(survivor.Volume, normalized, false, content);
+      survivor.Volume.Delete(normalized, true);
+      this._journal.Complete(sequence, JournalOp.ShadowCreate);
+      this._integrity.RecordWholeFile(survivor.Volume, normalized, false, content);
+      this._activity.Publish(ActivityKind.Recovery, normalized, content.LongLength, toMember: survivor.Volume.DisplayName, reason: "primary restored from surviving shadow");
+    }
+
+    while (holders.Count < duplication) {
+      var target = this._placement.ChooseShadowTarget(content.LongLength, holders);
+      if (target == null)
+        break; // not placeable right now (SAFE-PHYS) — a later heal converges
+
+      var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: target.MemberId);
+      target.EnsureFolder(PoolPaths.GetParent(normalized), true);
+      WholeFilePublisher.Publish(target, normalized, true, content);
+      this._journal.Complete(sequence, JournalOp.ShadowCreate);
+      this._integrity.RecordWholeFile(target, normalized, true, content);
+      this._activity.Publish(ActivityKind.Duplicate, normalized, content.LongLength,
+        fromMember: copies[0].Volume.DisplayName, toMember: target.DisplayName,
+        reason: $"healed to duplication level {duplication}");
+      holders.Add(target);
+    }
+
+    this._Invalidate(normalized);
+  }
+
+  /// <summary>Every logical file across all online members — primaries and shadow-only survivors alike.</summary>
+  private IEnumerable<string> _AllLogicalFiles() {
+    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var member in this._Online.ToArray()) {
+      var stack = new Stack<string>();
+      stack.Push("");
+      while (stack.Count > 0) {
+        var folder = stack.Pop();
+        VolumeEntry[] entries;
+        try {
+          entries = [.. member.List(folder, false)];
+        } catch (PoolFsException) {
+          continue;
+        }
+
+        foreach (var entry in entries) {
+          if (PoolPaths.IsHiddenName(entry.Name))
+            continue;
+
+          var childPath = folder.Length == 0 ? entry.Name : $"{folder}/{entry.Name}";
+          if (entry.IsDirectory) {
+            stack.Push(childPath);
+            continue;
+          }
+
+          if (seen.Add(childPath))
+            yield return childPath;
+        }
+
+        VolumeEntry[] shadows;
+        try {
+          shadows = member.FolderExists(folder, true) ? [.. member.List(folder, true)] : [];
+        } catch (PoolFsException) {
+          shadows = [];
+        }
+
+        foreach (var entry in shadows) {
+          if (entry.IsDirectory || PoolPaths.IsHiddenName(entry.Name))
+            continue;
+
+          var childPath = folder.Length == 0 ? entry.Name : $"{folder}/{entry.Name}";
+          if (seen.Add(childPath))
+            yield return childPath;
+        }
       }
     }
   }

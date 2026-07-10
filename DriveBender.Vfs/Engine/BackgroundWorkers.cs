@@ -96,3 +96,16 @@ public sealed class MemberWatchJob(PoolFileSystem fs) : IBackgroundJob {
   public bool RunOnce() => fs.PollMembers();
 
 }
+
+/// <summary>
+/// Restores the pool to full health after a mount or a member return (FR-HEAL): missing
+/// primaries promoted, missing shadow copies recreated — incrementally, so foreground I/O
+/// is never starved, and as fast as the pump allows.
+/// </summary>
+public sealed class HealJob(PoolFileSystem fs) : IBackgroundJob {
+
+  public string Name => "heal";
+
+  public bool RunOnce() => fs.HealStep();
+
+}

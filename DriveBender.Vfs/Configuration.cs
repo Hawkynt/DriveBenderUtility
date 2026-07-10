@@ -253,6 +253,13 @@ public sealed record ResilienceConfig {
   /// <summary>Behaviour when a mounted pool loses a member live (§10 SAFE-DEGRADE); default retain-metadata.</summary>
   [JsonPropertyName("onMemberLoss")] public MemberLossPolicy? OnMemberLoss { get; init; }
 
+  /// <summary>
+  /// Accept writes when fewer copies than <c>write.minCopiesBeforeAck</c> are reachable
+  /// (default true): one lost drive degrades redundancy, not availability — the owed copies
+  /// heal automatically when the member returns. Set false to refuse acks instead.
+  /// </summary>
+  [JsonPropertyName("acceptDegradedWrites")] public bool? AcceptDegradedWrites { get; init; }
+
   /// <summary>How often the member watcher polls member reachability while mounted.</summary>
   [JsonPropertyName("memberPollSeconds")] public double? MemberPollSeconds { get; init; }
 

@@ -99,6 +99,7 @@ public class WriteCascadeTests {
   public void Deferred_GivenCoalescingWindow_WhenClockAdvances_ThenOwedCopiesApplyOnlyAfterWindow() {
     var fs = this._CreateFs("""{ "duplication": 3, "write": { "policy": "deferred", "minCopiesBeforeAck": 2, "deferWindow": "5s", "maxDeferSeconds": 30 } }""");
     var scheduler = fs.CreateScheduler();
+    scheduler.Quiesce(); // drain the mount-time heal scan so only the deferred write is observed
     var handle = fs.Create("f.bin", NodeKind.File, CreateFlags.None);
     fs.Write(handle, [1], 0, WriteMode.Normal);
 

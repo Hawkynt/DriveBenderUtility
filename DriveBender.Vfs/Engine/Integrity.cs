@@ -125,6 +125,10 @@ public enum IntegrityIssueKind {
   BitRotUnrecoverable,
   ExternalEditAccepted,
   Conflict,
+  BitRotDetected,
+  ExternalEditDetected,
+  StaleCopyRepaired,
+  StaleCopyDetected,
 }
 
 public sealed record IntegrityIssue(IntegrityIssueKind Kind, string Path, string Message);
@@ -184,28 +188,40 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
 
   /// <summary>Full scrub: verifies every file on every member against the DB and across copies (FR-SCRUB).</summary>
   public IReadOnlyList<IntegrityIssue> ScrubAll(Action<string>? invalidateCaches = null)
-    => this._Scrub(quick: false, invalidateCaches);
+    => this._Scrub(quick: false, detectOnly: false, invalidateCaches);
 
   /// <summary>Mount-time delta scan (FR-OOB-MOUNT): only files whose (size, mtime) deviate from the DB are verified.</summary>
   public IReadOnlyList<IntegrityIssue> QuickScan(Action<string>? invalidateCaches = null)
-    => this._Scrub(quick: true, invalidateCaches);
+    => this._Scrub(quick: true, detectOnly: false, invalidateCaches);
+
+  /// <summary>
+  /// Deep detection pass: re-checksums every file (bit-rot, stale copies, conflicts) but
+  /// NEVER mutates the pool — health checking is read-only unless a fix is asked for.
+  /// </summary>
+  public IReadOnlyList<IntegrityIssue> DetectAll()
+    => this._Scrub(quick: false, detectOnly: true, null);
+
+  /// <summary>Cheap detection pass: only files whose metadata deviates (from the DB, or across copies) are verified; never mutates.</summary>
+  public IReadOnlyList<IntegrityIssue> DetectQuick()
+    => this._Scrub(quick: true, detectOnly: true, null);
 
   private sealed record CopyView(IVolumeIO Member, bool Shadow, byte[] Content, long Size, long MTimeTicks, ChecksumEntry? Entry, string Hash) {
     public bool MatchesEntry => this.Entry != null && this.Hash == this.Entry.Hash;
     public bool MetaMatchesEntry => this.Entry != null && this.Size == this.Entry.Size && this.MTimeTicks == this.Entry.MTimeTicks;
   }
 
-  private IReadOnlyList<IntegrityIssue> _Scrub(bool quick, Action<string>? invalidateCaches) {
+  private IReadOnlyList<IntegrityIssue> _Scrub(bool quick, bool detectOnly, Action<string>? invalidateCaches) {
     var issues = new List<IntegrityIssue>();
     foreach (var path in this._AllLogicalPaths()) {
       var views = this._CollectCopies(path, quick);
       if (views == null)
         continue; // quick scan: nothing deviates
 
-      this._ClassifyAndReconcile(path, views, issues, invalidateCaches);
+      this._ClassifyAndReconcile(path, views, issues, invalidateCaches, detectOnly);
     }
 
-    this.SaveAll();
+    if (!detectOnly)
+      this.SaveAll();
     return issues;
   }
 
@@ -269,8 +285,10 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     if (metas.Count == 0)
       return null;
 
-    if (quick && metas.All(m => m.entry != null && m.entry.Size == m.meta.Length && m.entry.MTimeTicks == m.meta.LastWriteTimeUtc.Ticks))
-      return null; // (size, mtime) unchanged everywhere — skip hashing
+    if (quick
+        && metas.All(m => m.entry != null && m.entry.Size == m.meta.Length && m.entry.MTimeTicks == m.meta.LastWriteTimeUtc.Ticks)
+        && metas.Select(m => m.meta.Length).Distinct().Count() == 1)
+      return null; // (size, mtime) unchanged everywhere AND all copies agree in size — skip hashing
 
     var views = new List<CopyView>();
     foreach (var (member, shadow, meta, entry) in metas) {
@@ -290,7 +308,7 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     return views.Count == 0 ? null : views;
   }
 
-  private void _ClassifyAndReconcile(string path, List<CopyView> views, List<IntegrityIssue> issues, Action<string>? invalidateCaches) {
+  private void _ClassifyAndReconcile(string path, List<CopyView> views, List<IntegrityIssue> issues, Action<string>? invalidateCaches, bool detectOnly = false) {
     var bitRot = views.Where(v => v.Entry != null && !v.MatchesEntry && v.MetaMatchesEntry).ToArray();
     var edited = views.Where(v => v.Entry != null && !v.MatchesEntry && !v.MetaMatchesEntry).ToArray();
     var good = views.Where(v => v.MatchesEntry).ToArray();
@@ -303,29 +321,82 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
         return;
       }
 
-      var source = good.Length > 0 ? good[0] : edited.OrderByDescending(v => v.MTimeTicks).First();
-      foreach (var corrupt in bitRot) {
-        this._Quarantine(corrupt, path, "bitrot");
-        this._Publish(corrupt.Member, path, corrupt.Shadow, source.Content);
-        this.RecordWholeFile(corrupt.Member, path, corrupt.Shadow, source.Content);
-        issues.Add(new(IntegrityIssueKind.BitRotRepaired, path, $"Repaired silent corruption on '{corrupt.Member.DisplayName}' from a checksum-verified copy; corrupt content quarantined"));
-        DriveBender.Logger($" - Repaired bit-rot on '{path}' ({corrupt.Member.DisplayName})");
+      if (detectOnly) {
+        foreach (var corrupt in bitRot)
+          issues.Add(new(IntegrityIssueKind.BitRotDetected, path, $"Silent corruption on '{corrupt.Member.DisplayName}' — a checksum-verified copy exists; a fix repairs it"));
+      } else {
+        var source = good.Length > 0 ? good[0] : edited.OrderByDescending(v => v.MTimeTicks).First();
+        foreach (var corrupt in bitRot) {
+          this._Quarantine(corrupt, path, "bitrot");
+          this._Publish(corrupt.Member, path, corrupt.Shadow, source.Content);
+          this.RecordWholeFile(corrupt.Member, path, corrupt.Shadow, source.Content);
+          issues.Add(new(IntegrityIssueKind.BitRotRepaired, path, $"Repaired silent corruption on '{corrupt.Member.DisplayName}' from a checksum-verified copy; corrupt content quarantined"));
+          DriveBender.Logger($" - Repaired bit-rot on '{path}' ({corrupt.Member.DisplayName})");
+        }
+
+        invalidateCaches?.Invoke(path);
       }
 
-      invalidateCaches?.Invoke(path);
       if (edited.Length == 0)
         return;
     }
 
     var distinctEdits = edited.GroupBy(v => v.Hash, StringComparer.Ordinal).ToArray();
     switch (distinctEdits.Length) {
-      case 0:
+      case 0: {
+        // no copy deviates from its own DB entry — but copies can still deviate from EACH OTHER
+        // (a member missed writes while offline and its stale copy re-baselined): the newest
+        // write wins, exactly like the engine's own last-writer semantics (SAFE-OFFLINE)
+        var distinctContents = views.GroupBy(v => v.Hash, StringComparer.Ordinal).ToArray();
+        if (distinctContents.Length > 1) {
+          var ranked = views.OrderByDescending(v => v.MTimeTicks).ToArray();
+          var winner = ranked[0];
+          if (ranked[0].MTimeTicks == ranked[1].MTimeTicks && ranked[0].Hash != ranked[1].Hash) {
+            // identical timestamps with different content: never guess — a conflict (SAFE-OOB case 3)
+            if (detectOnly) {
+              issues.Add(new(IntegrityIssueKind.Conflict, path, $"{distinctContents.Length} divergent copies with identical timestamps — a fix preserves every version for resolution"));
+              return;
+            }
+
+            foreach (var loser in views.Where(v => v.Hash != winner.Hash))
+              this._Quarantine(loser, path, "conflict");
+
+            issues.Add(new(IntegrityIssueKind.Conflict, path, $"{distinctContents.Length} divergent versions detected; all preserved under {PoolPaths.UtilityFolderName}/conflicts for resolution"));
+            DriveBender.Logger($"[Warning]Conflict on '{path}': divergent copies with identical timestamps kept for user resolution");
+            return;
+          }
+
+          var staleCopies = views.Where(v => v.Hash != winner.Hash).ToArray();
+          if (detectOnly) {
+            issues.Add(new(IntegrityIssueKind.StaleCopyDetected, path, $"{staleCopies.Length} cop(ies) lag behind the newest write (e.g. on '{staleCopies[0].Member.DisplayName}') — a fix re-synchronizes them"));
+            return;
+          }
+
+          foreach (var stale in staleCopies) {
+            this._Publish(stale.Member, path, stale.Shadow, winner.Content);
+            this.RecordWholeFile(stale.Member, path, stale.Shadow, winner.Content);
+          }
+
+          this.RecordWholeFile(winner.Member, path, winner.Shadow, winner.Content);
+          invalidateCaches?.Invoke(path);
+          issues.Add(new(IntegrityIssueKind.StaleCopyRepaired, path, $"Re-synchronized {staleCopies.Length} stale cop(ies) from the newest write"));
+          DriveBender.Logger($" - Re-synchronized {staleCopies.Length} stale cop(ies) of '{path}'");
+          return;
+        }
+
         // no divergence — baseline anything the DB does not know yet
-        foreach (var view in views.Where(v => v.Entry == null))
-          this.RecordWholeFile(view.Member, path, view.Shadow, view.Content);
+        if (!detectOnly)
+          foreach (var view in views.Where(v => v.Entry == null))
+            this.RecordWholeFile(view.Member, path, view.Shadow, view.Content);
         return;
+      }
 
       case 1 when editPolicy == ExternalEditPolicy.AcceptNewest: {
+        if (detectOnly) {
+          issues.Add(new(IntegrityIssueKind.ExternalEditDetected, path, "Externally edited behind the pool's back — a fix accepts it as authoritative and re-propagates it"));
+          return;
+        }
+
         // one coherent external edit: accept it as authoritative, re-propagate (SAFE-OOB case 2)
         var winner = edited[0];
         foreach (var stale in views.Where(v => v.Hash != winner.Hash)) {
@@ -341,6 +412,11 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
       }
 
       default: {
+        if (detectOnly) {
+          issues.Add(new(IntegrityIssueKind.Conflict, path, $"{distinctEdits.Length} divergent out-of-band versions — a fix preserves every version for resolution"));
+          return;
+        }
+
         // divergent edits or a conflict-only policy: keep every version, never guess (SAFE-OOB case 3)
         var ranked = edited.OrderByDescending(v => v.MTimeTicks).ToArray();
         var ambiguous = ranked.Length > 1 && ranked[0].MTimeTicks == ranked[1].MTimeTicks && ranked[0].Hash != ranked[1].Hash;

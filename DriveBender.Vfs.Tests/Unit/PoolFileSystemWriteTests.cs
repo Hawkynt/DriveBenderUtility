@@ -291,17 +291,40 @@ public class PoolFileSystemWriteTests {
 
   [Test]
   [Category("Exception")]
-  public void Write_GivenQuorumUnreachable_WhenWriting_ThenNoAckAndError() {
-    var handle = this._CreateFileWithContent("critical.bin", [1, 2]);
+  public void Write_GivenQuorumUnreachableAndDegradedWritesRefused_WhenWriting_ThenNoAckAndError() {
+    // strict mode: the pool explicitly opted out of degraded writes (SAFE-LZ stays a hard floor)
+    var fs = this._CreateFs("""{ "duplication": 2, "resilience": { "acceptDegradedWrites": false } }""");
+    fs.Mount(new(@"X:\"));
+    var handle = fs.Create("critical.bin", NodeKind.File, CreateFlags.None);
+    fs.Write(handle, [1, 2], 0, WriteMode.Normal);
+
     // the shadow holder disappears — only 1 of the required 2 copies is reachable
     var staged = "critical.bin." + DivisonM.DriveBender.DriveBenderConstants.TEMP_EXTENSION; // still open — physically a temp
     var shadowHolder = new[] { this._volume1, this._volume2 }.Single(v => v.FileExists(staged, true));
     shadowHolder.IsOnline = false;
+    fs.Placement.Invalidate(staged);
+
+    var act = () => fs.Write(handle, [9], 0, WriteMode.Normal);
+    act.Should().Throw<PoolFsException>("fewer copies than minCopiesBeforeAck must never be acknowledged when degraded writes are refused (SAFE-LZ)");
+    shadowHolder.IsOnline = true; // Close publishes the staged file — both members reachable again
+    fs.Close(handle);
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Write_GivenMemberLostMidFile_WhenWriting_ThenDegradedWriteSucceedsOnSurvivor() {
+    // default mode (§10 SAFE-DEGRADE): one lost drive degrades redundancy, not availability
+    var handle = this._CreateFileWithContent("keep-going.bin", [1, 2]);
+    var staged = "keep-going.bin." + DivisonM.DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+    var shadowHolder = new[] { this._volume1, this._volume2 }.Single(v => v.FileExists(staged, true));
+    shadowHolder.IsOnline = false;
     this._fs.Placement.Invalidate(staged);
 
-    var act = () => this._fs.Write(handle, [9], 0, WriteMode.Normal);
-    act.Should().Throw<PoolFsException>("fewer copies than minCopiesBeforeAck must never be acknowledged (SAFE-LZ)");
+    this._fs.Write(handle, [9], 0, WriteMode.Normal);
     this._fs.Close(handle);
+
+    var survivor = new[] { this._volume1, this._volume2 }.Single(v => v != shadowHolder);
+    survivor.GetContent("keep-going.bin", false).Should().Equal(new byte[] { 9, 2 }, "the surviving copy carries every acknowledged byte (SAFE-NOLOSS)");
   }
 
   [Test]
