@@ -383,12 +383,13 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     if (!directory.Exists)
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {relativeFolder}");
 
-    foreach (var item in directory.EnumerateFileSystemInfos())
-      yield return item switch {
-        // live length from the pooled write handle when one is open — directory metadata lags it
-        FileInfo f => new VolumeEntry(f.Name, false, this._pool.TryGetWriteLength(f.FullName, out var live) ? live : f.Length, f.LastWriteTimeUtc),
-        _ => new VolumeEntry(item.Name, true, 0, item.LastWriteTimeUtc),
-      };
+    // materialise inside the guard so a drive yanked mid-enumeration surfaces as a
+    // PoolFsException (the error model every engine catch relies on), not a raw IOException
+    return this._Guard(() => directory.EnumerateFileSystemInfos().Select(item => item switch {
+      // live length from the pooled write handle when one is open — directory metadata lags it
+      FileInfo f => new VolumeEntry(f.Name, false, this._pool.TryGetWriteLength(f.FullName, out var live) ? live : f.Length, f.LastWriteTimeUtc),
+      _ => new VolumeEntry(item.Name, true, 0, item.LastWriteTimeUtc),
+    }).ToArray());
   }
 
   public void SetTimestamps(string relativePath, bool shadow, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) => this._Guard(() => {

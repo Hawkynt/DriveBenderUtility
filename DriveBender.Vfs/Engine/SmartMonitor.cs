@@ -64,18 +64,38 @@ public sealed class SmartctlMonitor : ISmartMonitor {
       return SmartStatus.Unavailable(physicalPathOrDevice);
 
     var device = _DeviceFor(physicalPathOrDevice);
+    System.Diagnostics.Process? process = null;
     try {
-      var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(this._smartctl, $"-j -H -A \"{device}\"") {
+      // pass the device via ArgumentList (no manual quoting) and read BOTH streams asynchronously:
+      // reading only stdout deadlocks if smartctl fills the stderr pipe, and the process was never
+      // disposed or killed on timeout — leaking a handle (and an orphan) per query
+      var psi = new System.Diagnostics.ProcessStartInfo(this._smartctl) {
         RedirectStandardOutput = true,
         RedirectStandardError = true,
         UseShellExecute = false,
-      })!;
-      var json = process.StandardOutput.ReadToEnd();
-      process.WaitForExit(10000);
-      return SmartParsing.Parse(device, json);
+        CreateNoWindow = true,
+      };
+      psi.ArgumentList.Add("-j");
+      psi.ArgumentList.Add("-H");
+      psi.ArgumentList.Add("-A");
+      psi.ArgumentList.Add(device);
+
+      process = System.Diagnostics.Process.Start(psi)!;
+      var stdout = process.StandardOutput.ReadToEndAsync();
+      var stderr = process.StandardError.ReadToEndAsync(); // drained so it never blocks the child
+      if (!process.WaitForExit(10000)) {
+        try { process.Kill(entireProcessTree: true); } catch { /* already gone */ }
+        DriveBender.Logger($"[Warning]smartctl query for '{device}' timed out");
+        return SmartStatus.Unavailable(device);
+      }
+
+      System.Threading.Tasks.Task.WaitAll(stdout, stderr);
+      return SmartParsing.Parse(device, stdout.Result);
     } catch (Exception e) {
       DriveBender.Logger($"[Warning]smartctl query for '{device}' failed: {e.Message}");
       return SmartStatus.Unavailable(device);
+    } finally {
+      process?.Dispose();
     }
   }
 

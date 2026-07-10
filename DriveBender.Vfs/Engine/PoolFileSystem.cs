@@ -562,6 +562,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var fromNormalized = PoolPaths.Normalize(from);
     var toNormalized = PoolPaths.Normalize(to);
 
+    // renaming a path to itself (identical, or only a case change on a case-insensitive backend)
+    // must NEVER go through the overwrite path — "the target" resolves to the source's own copies,
+    // and deleting them would destroy the file. An exact no-op returns; a case change flips in place.
+    var sameFile = fromNormalized.Equals(toNormalized, StringComparison.OrdinalIgnoreCase);
+    if (sameFile && fromNormalized.Equals(toNormalized, StringComparison.Ordinal))
+      return; // pure no-op
+
     // renaming a file that is still being written publishes it first (temp → final), then renames
     if (this._staging.ContainsKey(fromNormalized))
       this._PublishStaged(fromNormalized);
@@ -580,7 +587,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (!this._ParentExists(toNormalized))
       throw new PoolFsException(PoolFsError.NotFound, $"Target parent folder not found: {to}");
 
-    var targetCopies = this._placement.ResolveCopies(toNormalized);
+    // a case-only rename has no distinct target to conflict with or overwrite — its "target
+    // copies" ARE the source; only a genuinely different path is a real target
+    var targetCopies = sameFile ? [] : this._placement.ResolveCopies(toNormalized);
     if (targetCopies.Count > 0 && (flags & RenameFlags.ReplaceExisting) == 0)
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {to}");
 
@@ -589,7 +598,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
 
-    // overwrite-on-rename removes every copy of the old target first (no orphans)
+    // overwrite-on-rename removes every copy of the old target first (no orphans); never for a
+    // case-only rename — that would delete the source we are about to move
     foreach (var stale in targetCopies)
       stale.Volume.Delete(toNormalized, stale.Shadow);
 

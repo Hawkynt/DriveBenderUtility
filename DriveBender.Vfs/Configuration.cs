@@ -52,7 +52,12 @@ public readonly record struct SizeSpec {
       if (!double.TryParse(numberText, NumberStyles.Float, CultureInfo.InvariantCulture, out var value) || value < 0)
         throw new ManifestException($"Invalid size '{text}'");
 
-      return checked((long)(value * factor));
+      // a too-large size ("20EiB") must surface as a config error, not an uncaught OverflowException
+      var scaled = value * factor;
+      if (scaled > long.MaxValue)
+        throw new ManifestException($"Size '{text}' is too large (exceeds {long.MaxValue} bytes)");
+
+      return (long)scaled;
     }
 
     if (long.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out var bytes) && bytes >= 0)

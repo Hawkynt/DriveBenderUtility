@@ -152,6 +152,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
       Members = [.. manifest.Members.Select(m => m.MemberId == memberId ? m with { Role = role } : m)],
     };
 
+    this._ValidateOrThrow(updated); // a role change that contradicts tiers.*.members must fail now, not at mount
     DriveBender.Logger($"Member '{member.Label ?? member.Path}' of pool '{manifest.Name}' is now role '{role}'");
     return store.Save(updated);
   }
@@ -279,8 +280,18 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     }
 
     var updated = manifest with { Defaults = JsonSerializer.SerializeToElement(defaults) };
+    this._ValidateOrThrow(updated); // never persist a config that would refuse the next mount
     DriveBender.Logger($"Set duplication of pool '{manifest.Name}'{(string.IsNullOrWhiteSpace(folderGlob) ? "" : $" for '{folderGlob}'")} to {level} cop{(level == 1 ? "y" : "ies")} (effective on next mount)");
     return store.Save(updated);
+  }
+
+  /// <summary>Validates a manifest's effective config exactly as the next mount would, so a lifecycle edit can never leave the pool unmountable.</summary>
+  private void _ValidateOrThrow(PoolManifest manifest) {
+    var globalConfigPath = Path.Combine(host.ConfigRoot, "config.json");
+    var globalJson = host.FileExists(globalConfigPath) ? host.ReadAllText(globalConfigPath) : null;
+    var effective = ConfigResolver.ResolveEffective(globalJson, manifest.Defaults?.GetRawText());
+    ConfigValidator.Validate(effective, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+    ConfigValidator.ValidateTierAssignments(manifest, effective);
   }
 
   /// <summary>
