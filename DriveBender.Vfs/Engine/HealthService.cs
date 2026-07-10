@@ -13,7 +13,8 @@ public sealed record HealthReport(
   IReadOnlyList<IntegrityIssue> IntegrityIssues,
   int UnderDuplicatedFiles,
   int CopiesRepaired,
-  bool Corrected
+  bool Corrected,
+  bool DeepScan = false
 ) {
   public bool Healthy => this.UnderDuplicatedFiles == 0
     && this.IntegrityIssues.All(i => i.Kind == IntegrityIssueKind.ExternalEditAccepted)
@@ -39,15 +40,21 @@ public sealed class HealthService(
   private IReadOnlyList<MemberHealth> _MemberHealth()
     => [.. members.Where(m => m.IsOnline).Select(m => new MemberHealth(m.DisplayName, smart.Query(this._deviceOf(m))))];
 
-  /// <summary>Reports health without changing anything (a quick scrub detects, but does not repair here beyond what QuickScan does).</summary>
-  public HealthReport Check()
-    => new(this._MemberHealth(), [], media.CountUnderDuplicated(), 0, Corrected: false);
+  /// <summary>
+  /// Reports health WITHOUT changing anything: SMART/temperature, under-duplication, and an
+  /// integrity detection pass. The default scan checks metadata (fast — finds missing
+  /// duplicates, size mismatches, external edits); <paramref name="deep"/> re-checksums
+  /// every byte to also surface silent bit-rot — opt-in because it reads the whole pool.
+  /// </summary>
+  public HealthReport Check(bool deep = false)
+    => new(this._MemberHealth(), deep ? integrity.DetectAll() : integrity.DetectQuick(), media.CountUnderDuplicated(), 0, Corrected: false, DeepScan: deep);
 
   /// <summary>
-  /// Full check with correction: repairs bit-rot from good copies, accepts/records external
-  /// edits, quarantines conflicts (scrub), then restores every file to its duplication level
-  /// (missing primaries promoted, missing shadows recreated). SMART/temperature are reported
-  /// for alerting — hardware faults cannot be auto-fixed, only surfaced.
+  /// Full check with correction (always deep): repairs bit-rot from good copies, re-syncs
+  /// stale copies, accepts/records external edits, quarantines conflicts (scrub), then
+  /// restores every file to its duplication level (missing primaries promoted, missing
+  /// shadows recreated). SMART/temperature are reported for alerting — hardware faults
+  /// cannot be auto-fixed, only surfaced.
   /// </summary>
   public HealthReport CheckAndCorrect(Action<string>? invalidateCaches = null) {
     var issues = integrity.ScrubAll(invalidateCaches);
@@ -57,7 +64,7 @@ public sealed class HealthService(
     foreach (var member in this._MemberHealth().Where(m => m.Smart.Health is DiskHealth.Warning or DiskHealth.Failing))
       DriveBender.Logger($"[Alert]Device '{member.Member}' health {member.Smart.Health}: {member.Smart.Detail} (temp {member.Smart.TemperatureCelsius}°C, reallocated {member.Smart.ReallocatedSectors})");
 
-    return new(this._MemberHealth(), issues, underDuplicatedAfter, restore.CopiesCreated, Corrected: true);
+    return new(this._MemberHealth(), issues, underDuplicatedAfter, restore.CopiesCreated, Corrected: true, DeepScan: true);
   }
 
 }

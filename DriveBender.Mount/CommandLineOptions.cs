@@ -89,12 +89,15 @@ public sealed class PoolRepairManifestOptions {
   public string Pool { get; set; } = "";
 }
 
-[Verb("pool-health", HelpText = "Check pool health (SMART, temperature, bit-rot, missing copies); --fix corrects what it can.")]
+[Verb("pool-health", HelpText = "Check pool health (SMART, temperature, missing copies, inconsistent files); --deep also re-checksums everything for bit-rot; --fix corrects what it can.")]
 public sealed class PoolHealthOptions {
   [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
   public string Pool { get; set; } = "";
 
-  [Option("fix", HelpText = "Repair bit-rot from good copies, resolve conflicts, and restore missing shadows/primaries.")]
+  [Option("deep", HelpText = "Re-checksum every file to detect silent bit-rot (reads all pool data — can take a long time).")]
+  public bool Deep { get; set; }
+
+  [Option("fix", HelpText = "Repair bit-rot from good copies, re-sync stale copies, resolve conflicts, and restore missing shadows/primaries (always deep).")]
   public bool Fix { get; set; }
 
   [Option("json", HelpText = "Print the report as JSON (used by the manager's transient worker).")]

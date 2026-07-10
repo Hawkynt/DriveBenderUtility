@@ -402,13 +402,22 @@ for you, so web and desktop are identical.
 ### 5. Health & media maintenance
 
 ```bash
-dbmount pool health MyPool               # SMART, temperature, bit-rot, missing copies
-dbmount pool health MyPool --fix         # repair bit-rot, resolve conflicts, restore duplication
+dbmount pool health MyPool               # metadata scan: SMART, missing copies, inconsistent files — never changes anything
+dbmount pool health MyPool --deep        # + re-checksum every file to find silent bit-rot (reads all data, can take long)
+dbmount pool health MyPool --fix         # repair bit-rot, re-sync stale copies, resolve conflicts, restore duplication
 dbmount pool restore MyPool              # bring every file back to its duplication level
 
 dbmount pool remove-media MyPool --member "E:\"                 # scatter its data, then drop it
 dbmount pool replace-media MyPool --old "D:\" --new "K:\newdisk"  # migrate to a replacement disk
 ```
+
+A mounted pool also **heals itself**: losing a member degrades redundancy, not
+availability — reads fail over to surviving copies and writes keep flowing (ack
+on what is reachable; opt out with `resilience.acceptDegradedWrites: false`).
+Deletes and renames a missing member sleeps through are tombstoned and replayed
+on its return, stale content re-syncs to the newest write, and missing copies
+are recreated in the background until the pool is back at full duplication — no
+manual repair needed.
 
 Run `dbmount --help` (or `dbmount <verb> --help`) for the full option list.
 
@@ -428,8 +437,10 @@ common knobs:
     "minCopiesBeforeAck": 2               // durable copies required before a write is acknowledged
   },
   "resilience": {
-    "onMemberLoss": "retain-metadata"     // keep showing metadata when a drive is pulled,
+    "onMemberLoss": "retain-metadata",    // keep showing metadata when a drive is pulled,
                                           //   or "discard-inaccessible" to drop unreachable entries
+    "acceptDegradedWrites": true          // keep writing on the reachable copies when a member is
+                                          //   missing (owed copies heal on return); false = refuse
   },
   "trash": { "enabled": true, "retention": "7d" },   // recoverable deletes
   "folders": {

@@ -428,22 +428,25 @@ function infoModal(title, bodyNode, wide) {
   return modal;
 }
 
-// Problem scan: runs the health check (optionally correcting) and shows the full report —
-// under-duplicated files, integrity issues (bit-rot, conflicts, external edits), device SMART.
-async function healthDialog(pool, fix) {
+// Problem scan: runs the health check and shows the full report — under-duplicated files,
+// integrity issues (stale copies, conflicts, external edits), device SMART. The default scan
+// checks metadata only (fast, never changes anything); the DEEP scan re-checksums every file
+// to also surface silent bit-rot (reads all pool data — can take a long time); FIX repairs.
+async function healthDialog(pool, fix, deep) {
   const body = el("div");
-  body.innerHTML = `<p class="hint">${fix ? "Scanning and repairing" : "Scanning"} <b>${pool.name}</b> —
+  body.innerHTML = `<p class="hint">${fix ? "Scanning and repairing" : deep ? "Deep-scanning (re-checksumming every file — this can take a long time)" : "Scanning"} <b>${pool.name}</b> —
     checking duplication levels, integrity and device health…</p>`;
-  infoModal(fix ? "Fix problems" : "Pool problem scan", body);
+  infoModal(fix ? "Fix problems" : deep ? "Deep scan (bit-rot)" : "Pool problem scan", body);
 
-  const j = await post("/api/health?pool=" + pool.id + (fix ? "&fix=true" : ""));
+  const j = await post("/api/health?pool=" + pool.id + (fix ? "&fix=true" : "") + (deep && !fix ? "&deep=true" : ""));
   if (!j.ok) { body.innerHTML = `<p class="hint">Scan failed: ${j.error || "unknown error"}</p>`; return; }
   const r = j.result;
   const smartBadge = h => h === "Healthy" ? '<span class="badge ok">healthy</span>'
     : h === "Failing" ? '<span class="badge bad">FAILING</span>'
     : h === "Warning" ? '<span class="badge warn">warning</span>' : '<span class="badge info">unknown</span>';
   body.innerHTML = `
-    <p>${r.healthy ? '<span class="badge ok">no problems found</span>' : '<span class="badge warn">attention needed</span>'}</p>
+    <p>${r.healthy ? '<span class="badge ok">no problems found</span>' : '<span class="badge warn">attention needed</span>'}
+       ${r.deep ? '<span class="badge info">deep scan — every byte verified</span>' : '<span class="badge info">metadata scan</span>'}</p>
     <div class="report-row"><span>Files below their duplication level</span><b>${r.underDuplicatedFiles}</b></div>
     ${r.corrected ? `<div class="report-row"><span>Copies repaired / created</span><b>${r.copiesRepaired}</b></div>` : ""}
     ${r.issues && r.issues.length ? `<label>Integrity issues</label><div class="issues">${r.issues.map(i =>
@@ -451,11 +454,22 @@ async function healthDialog(pool, fix) {
     <label>Device health (SMART)</label>
     <div class="issues">${(r.members || []).map(mm =>
       `<div>${smartBadge(mm.health)} <b>${mm.name}</b>${mm.model ? " · " + mm.model : ""}${mm.temperatureC != null ? " · " + mm.temperatureC + "°C" : ""}${mm.reallocatedSectors ? " · " + mm.reallocatedSectors + " reallocated sectors" : ""}${mm.detail ? `<br><span class="rsn">${mm.detail}</span>` : ""}</div>`).join("")}</div>
-    ${!r.healthy && !fix ? `<p class="hint">The quick scan counts problems without changing anything. <b>Fix</b> runs the deep pass: it re-checksums every file, repairs bit-rot from a good copy, resolves conflicts and recreates missing copies.</p>` : ""}`;
-  if (!r.healthy && !fix) {
-    const fixBtn = el("button", "primary", "Fix problems now");
-    fixBtn.onclick = () => { closeModal(); healthDialog(pool, true); };
-    body.appendChild(fixBtn);
+    ${!fix && !r.deep ? `<p class="hint">This scan checks metadata only and never changes anything — missing duplicates, inconsistent file sizes and external edits show up here. Silent bit-rot needs the <b>deep scan</b>, which re-reads and re-checksums every file (it can take a long time on a large pool).</p>` : ""}
+    ${!fix && !r.healthy ? `<p class="hint"><b>Fix</b> repairs what was found: bit-rot from a good copy, stale copies re-synced, conflicts preserved, missing copies recreated.</p>` : ""}`;
+  if (!fix) {
+    const row = el("div", "modal-actions");
+    if (!r.deep) {
+      const deepBtn = el("button", "", "Deep scan (bit-rot)");
+      deepBtn.onclick = () => { closeModal(); healthDialog(pool, false, true); };
+      row.appendChild(deepBtn);
+    }
+    if (!r.healthy) {
+      const fixBtn = el("button", "primary", "Fix problems now");
+      fixBtn.onclick = () => { closeModal(); healthDialog(pool, true); };
+      row.appendChild(fixBtn);
+    }
+    if (row.childNodes.length)
+      body.appendChild(row);
   }
 }
 

@@ -35,13 +35,13 @@ internal static class PoolOpsCommand {
     return (pool, online, Math.Max(1, config.Duplication ?? 1), config.Placement?.ShadowNeverSamePhysical == false);
   }
 
-  /// <summary>Runs the health scan (optionally correcting) and returns the structured report — shared by the CLI verb and the daemon's API.</summary>
-  public static HealthReport RunHealth(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, string poolNameOrId, bool fix) {
+  /// <summary>Runs the health scan (optionally deep / correcting) and returns the structured report — shared by the CLI verb and the daemon's API.</summary>
+  public static HealthReport RunHealth(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, string poolNameOrId, bool fix, bool deep = false) {
     var (_, online, duplication, allowSamePhysical) = _Open(host, provider, remoteResolver, poolNameOrId);
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
     var service = new HealthService(ios, new SmartctlMonitor(), new IntegrityService(ios), new MediaLifecycle(ios, journal, duplication, allowSamePhysical));
-    return fix ? service.CheckAndCorrect() : service.Check();
+    return fix ? service.CheckAndCorrect() : service.Check(deep);
   }
 
   /// <summary>The wire shape shared by the daemon relay, the pool process and the transient worker.</summary>
@@ -49,6 +49,7 @@ internal static class PoolOpsCommand {
     ok = true,
     healthy = report.Healthy,
     corrected = report.Corrected,
+    deep = report.DeepScan,
     underDuplicatedFiles = report.UnderDuplicatedFiles,
     copiesRepaired = report.CopiesRepaired,
     issues = report.IntegrityIssues.Select(i => new { kind = i.Kind.ToString(), path = i.Path, message = i.Message }),
@@ -63,13 +64,13 @@ internal static class PoolOpsCommand {
   });
 
   public static int Health(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, PoolHealthOptions options) {
-    var report = RunHealth(host, provider, remoteResolver, options.Pool, options.Fix);
+    var report = RunHealth(host, provider, remoteResolver, options.Pool, options.Fix, options.Deep);
     if (options.Json) {
       Console.WriteLine(HealthReportJson(report));
       return report.Healthy ? 0 : 1;
     }
 
-    Console.WriteLine($"Pool '{options.Pool}' — {(report.Healthy ? "healthy" : "attention needed")}");
+    Console.WriteLine($"Pool '{options.Pool}' — {(report.Healthy ? "healthy" : "attention needed")}{(report.DeepScan ? " (deep scan)" : "")}");
     Console.WriteLine($"  Under-duplicated files: {report.UnderDuplicatedFiles}");
     if (report.Corrected)
       Console.WriteLine($"  Copies repaired/created: {report.CopiesRepaired}");

@@ -135,6 +135,48 @@ public class HealthServiceTests {
   }
 
   [Test]
+  [Category("HappyPath")]
+  public void Check_GivenBitRot_WhenDefaultScan_ThenNotSeenButDeepScanFindsItWithoutRepairing() {
+    this._v1.Seed("rot.bin", false, [5, 5, 5]);
+    this._v2.Seed("rot.bin", true, [5, 5, 5]);
+    var integrity = new IntegrityService([this._v1, this._v2, this._v3]);
+    integrity.RecordWholeFile(this._v1, "rot.bin", false, [5, 5, 5]);
+    integrity.RecordWholeFile(this._v2, "rot.bin", true, [5, 5, 5]);
+    integrity.SaveAll();
+    this._v1.CorruptSilently("rot.bin", false, c => c[0] = 99); // size/mtime unchanged — invisible to metadata
+
+    var media = new MediaLifecycle([this._v1, this._v2, this._v3], this._journal, 2);
+    var health = new HealthService([this._v1, this._v2, this._v3], this._smart, integrity, media);
+
+    var quick = health.Check();
+    quick.DeepScan.Should().BeFalse();
+    quick.IntegrityIssues.Should().BeEmpty("bit-rot with unchanged metadata is only findable by re-checksumming — that is the deep scan's job");
+
+    var deep = health.Check(deep: true);
+    deep.DeepScan.Should().BeTrue();
+    deep.IntegrityIssues.Should().ContainSingle(i => i.Kind == IntegrityIssueKind.BitRotDetected && i.Path == "rot.bin");
+    deep.Healthy.Should().BeFalse();
+    this._v1.GetContent("rot.bin", false)![0].Should().Be(99, "a health CHECK never mutates the pool — only fix repairs");
+
+    var fixedReport = health.CheckAndCorrect();
+    fixedReport.IntegrityIssues.Should().Contain(i => i.Kind == IntegrityIssueKind.BitRotRepaired);
+    this._v1.GetContent("rot.bin", false).Should().Equal(new byte[] { 5, 5, 5 }, "fix repaired the rot from the checksum-verified copy");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Check_GivenSizeMismatchAcrossCopies_WhenDefaultScan_ThenInconsistencyFound() {
+    // an inconsistent file (copies deviate in size) must show up in the CHEAP scan already
+    this._v1.Seed("f.bin", false, [1, 2, 3]);
+    this._v2.Seed("f.bin", true, [1, 2]);
+
+    var report = this._Health(2).Check();
+
+    report.IntegrityIssues.Should().NotBeEmpty("copies of different length are inconsistent — no deep scan needed to see that");
+    this._v2.GetContent("f.bin", true).Should().Equal(new byte[] { 1, 2 }, "the check reported without touching anything");
+  }
+
+  [Test]
   [Category("EdgeCase")]
   public void Check_GivenFailingDrive_WhenChecked_ThenSurfacedAsUnhealthy() {
     this._v1.Seed("f.bin", false, [1]);

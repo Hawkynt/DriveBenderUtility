@@ -200,9 +200,9 @@ internal static class MountCommand {
       var allowSamePhysical = config.Placement?.ShadowNeverSamePhysical == false;
       var media = new MediaLifecycle(ios, fs.Journal, duplication, allowSamePhysical);
       switch (op) {
-        case "health" or "fix": {
+        case "health" or "health-deep" or "fix": {
           var service = new HealthService(ios, new SmartctlMonitor(), fs.Integrity, media);
-          var report = op == "fix" ? service.CheckAndCorrect() : service.Check();
+          var report = op == "fix" ? service.CheckAndCorrect() : service.Check(deep: op == "health-deep");
           json = PoolOpsCommand.HealthReportJson(report);
           break;
         }

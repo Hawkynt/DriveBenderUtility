@@ -474,12 +474,15 @@ internal sealed class ServeCommand(
     return document.RootElement.Clone();
   });
 
-  /// <summary>Runs the problem scan (optionally correcting) — relayed to the pool's process or a transient worker.</summary>
+  /// <summary>Runs the problem scan (optionally deep or correcting) — relayed to the pool's process or a transient worker.</summary>
   private object _RunHealth(HttpListenerRequest request) {
     var poolRef = this._RequirePool(request);
     var fix = request.QueryString["fix"] == "true";
-    return this._PoolOp(poolRef, fix ? "fix" : "health",
-      fix ? ["pool-health", poolRef, "--fix", "--json"] : ["pool-health", poolRef, "--json"]);
+    var deep = request.QueryString["deep"] == "true";
+    return this._PoolOp(poolRef, fix ? "fix" : deep ? "health-deep" : "health",
+      fix ? ["pool-health", poolRef, "--fix", "--json"]
+      : deep ? ["pool-health", poolRef, "--deep", "--json"]
+      : ["pool-health", poolRef, "--json"]);
   }
 
   private object _RunRestore(HttpListenerRequest request) {
