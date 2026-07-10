@@ -81,4 +81,21 @@ public class WriteBufferCoherenceTests {
     new MetadataKey(pool, "A/B.txt", MetadataKind.Stat).Should().Be(new MetadataKey(pool, "a/b.txt", MetadataKind.Stat));
     new MetadataKey(pool, "A/B.txt", MetadataKind.Stat).Should().NotBe(new MetadataKey(pool, "a/b.txt", MetadataKind.Placement));
   }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Journal_GivenLocalPlusWholeFileRemote_WhenAppended_ThenOnlyTheDurableLocalMemberHoldsIt() {
+    // a whole-file remote (no DurableFlush) must NOT carry the journal — appending would
+    // re-upload the whole growing file per intent and throttle the pool to WAN speed
+    var local = new TestSupport.FakeVolumeIO(Guid.NewGuid(), "local", "PHYS-L", capacity: 1L << 20);
+    var remote = new TestSupport.FakeVolumeIO(Guid.NewGuid(), "remote", "UNC-R", capacity: 1L << 20) {
+      Caps = BackendCaps.RandomRead | BackendCaps.List | BackendCaps.Delete, // FTP-ish: no DurableFlush, no RandomWrite
+    };
+    var journal = new Journal(new MemberJournalStore([local, remote]));
+
+    journal.LogIntent(JournalOp.Write, "f.bin", offset: 0, length: 4);
+
+    local.GetContent(MemberJournalStore.JournalPath, false).Should().NotBeNull("the durable local member holds the WAL");
+    remote.GetContent(MemberJournalStore.JournalPath, false).Should().BeNull("the whole-file remote is never journalled to");
+  }
 }

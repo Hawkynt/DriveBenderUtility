@@ -217,7 +217,24 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
   public string PhysicalVolumeId { get; } = physicalVolumeId;
   public string RootPath => this._rootPath;
 
-  public bool IsOnline => Directory.Exists(this._rootPath);
+  // IsOnline is queried on the hot path (ResolveCopies filters every copy by it, per VFS op). A
+  // Directory.Exists on a UNC member whose host is down blocks for the SMB timeout — seconds —
+  // each call, so cache the probe for a short window (loss is still noticed within ~1s).
+  private long _onlineProbedTicks = long.MinValue;
+  private bool _onlineCached;
+  private const long _ONLINE_TTL_MS = 1000;
+
+  public bool IsOnline {
+    get {
+      var now = Environment.TickCount64;
+      if (now - this._onlineProbedTicks < _ONLINE_TTL_MS)
+        return this._onlineCached;
+
+      this._onlineCached = Directory.Exists(this._rootPath);
+      this._onlineProbedTicks = now;
+      return this._onlineCached;
+    }
+  }
 
   public BackendCaps Caps =>
     BackendCaps.RandomRead

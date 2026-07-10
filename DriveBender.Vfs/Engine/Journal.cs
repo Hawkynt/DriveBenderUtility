@@ -61,12 +61,27 @@ public interface IJournalStore {
 /// Journal store mirrored on every online member under .drivebenderutility/journal.jsonl
 /// (a self-contained sidecar the original product ignores, SAFE-COMPAT). Reads take the
 /// union of all copies so any single surviving member suffices.
+///
+/// The journal lives ONLY on members that can hold it cheaply and durably — those with
+/// random-write AND a durable flush (local/UNC disks). A whole-file remote (FTP/WebDAV/cloud)
+/// has no positional append: appending would re-download and re-upload the ENTIRE, ever-growing
+/// journal per intent, throttling the whole pool to WAN speed and never compacting. Such members
+/// are skipped; the WAL still lives redundantly on every real disk (SAFE-WAL). Only when NO
+/// member is journal-capable (an all-remote pool) does it fall back to writing everywhere.
 /// </summary>
 public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJournalStore {
 
   public const string JournalPath = PoolPaths.UtilityFolderName + "/journal.jsonl";
 
-  private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
+  private static bool _JournalCapable(IVolumeIO m)
+    => (m.Caps & BackendCaps.RandomWrite) != 0 && (m.Caps & BackendCaps.DurableFlush) != 0;
+
+  private IEnumerable<IVolumeIO> _Online {
+    get {
+      var capable = members.Where(m => m.IsOnline && _JournalCapable(m)).ToArray();
+      return capable.Length > 0 ? capable : members.Where(m => m.IsOnline);
+    }
+  }
 
   public void Append(string line) {
     var wrote = false;
