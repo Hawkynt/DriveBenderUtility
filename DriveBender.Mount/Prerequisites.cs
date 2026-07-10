@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 
 namespace DivisonM.Mount;
@@ -66,6 +67,14 @@ internal static class Prerequisites {
       return (false, "Could not download the WinFsp installer.\n" + dlError
         + "\nInstall it manually from https://winfsp.dev and retry.");
 
+    // NEVER run an unverified installer elevated: verify the downloaded MSI carries a valid
+    // Authenticode signature (rejects a tampered or swapped file) before msiexec touches it.
+    if (!_VerifyAuthenticode(msi, out var sigError)) {
+      try { File.Delete(msi); } catch { /* best effort */ }
+      return (false, "Refusing to run the downloaded WinFsp installer — its digital signature could not be verified.\n"
+        + sigError + "\nInstall it manually from https://winfsp.dev instead.");
+    }
+
     var runasVerb = IsElevated ? null : "runas";
     if (!_TryRunShell("msiexec", $"/i \"{msi}\" /passive /norestart", runasVerb, out var output))
       return (false, "The WinFsp installer did not complete (the elevation prompt may have been declined).\n" + output
@@ -127,7 +136,10 @@ internal static class Prerequisites {
         return false;
       }
 
-      var target = Path.Combine(Path.GetTempPath(), Path.GetFileName(new Uri(url).LocalPath));
+      // download into a FRESH private directory, not the shared temp root: the predictable
+      // shared path let another local process swap the file between download and elevated launch
+      var dir = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), "dbwinfsp-" + Guid.NewGuid().ToString("N")));
+      var target = Path.Combine(dir.FullName, Path.GetFileName(new Uri(url).LocalPath));
       using (var response = http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult()) {
         response.EnsureSuccessStatusCode();
         using var input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
@@ -139,6 +151,104 @@ internal static class Prerequisites {
       return true;
     } catch (Exception e) {
       error = e.Message;
+      return false;
+    }
+  }
+
+  private static class Wintrust {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINTRUST_FILE_INFO {
+      public uint cbStruct;
+      [MarshalAs(UnmanagedType.LPWStr)] public string pcwszFilePath;
+      public IntPtr hFile;
+      public IntPtr pgKnownSubject;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINTRUST_DATA {
+      public uint cbStruct;
+      public IntPtr pPolicyCallbackData;
+      public IntPtr pSIPClientData;
+      public uint dwUIChoice;
+      public uint fdwRevocationChecks;
+      public uint dwUnionChoice;
+      public IntPtr pFile;
+      public uint dwStateAction;
+      public IntPtr hWVTStateData;
+      public IntPtr pwszURLReference;
+      public uint dwProvFlags;
+      public uint dwUIContext;
+      public IntPtr pSignatureSettings;
+    }
+
+    [DllImport("wintrust.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    public static extern int WinVerifyTrust(IntPtr hwnd, [MarshalAs(UnmanagedType.LPStruct)] Guid pgActionID, IntPtr pWVTData);
+  }
+
+  /// <summary>
+  /// Verifies the file carries a VALID Authenticode signature that chains to a trusted root
+  /// (via WinVerifyTrust — this detects any tampering of the content, unlike merely reading the
+  /// embedded cert) AND is signed by the expected WinFsp publisher. Returns false with a reason
+  /// otherwise, so an unsigned/tampered/foreign installer is never executed elevated.
+  /// </summary>
+  private static bool _VerifyAuthenticode(string path, out string error) {
+    error = "";
+    var actionGeneric = new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE"); // WINTRUST_ACTION_GENERIC_VERIFY_V2
+    var fileInfo = new Wintrust.WINTRUST_FILE_INFO {
+      cbStruct = (uint)Marshal.SizeOf<Wintrust.WINTRUST_FILE_INFO>(),
+      pcwszFilePath = path,
+    };
+    var pFile = Marshal.AllocHGlobal(Marshal.SizeOf<Wintrust.WINTRUST_FILE_INFO>());
+    var pData = IntPtr.Zero;
+    try {
+      Marshal.StructureToPtr(fileInfo, pFile, false);
+      var data = new Wintrust.WINTRUST_DATA {
+        cbStruct = (uint)Marshal.SizeOf<Wintrust.WINTRUST_DATA>(),
+        dwUIChoice = 2,          // WTD_UI_NONE
+        fdwRevocationChecks = 0, // WTD_REVOKE_NONE (offline-tolerant; chain trust still enforced)
+        dwUnionChoice = 1,       // WTD_CHOICE_FILE
+        pFile = pFile,
+        dwStateAction = 1,       // WTD_STATEACTION_VERIFY
+        dwProvFlags = 0x100,     // WTD_SAFER_FLAG
+      };
+      pData = Marshal.AllocHGlobal(Marshal.SizeOf<Wintrust.WINTRUST_DATA>());
+      Marshal.StructureToPtr(data, pData, false);
+
+      var result = Wintrust.WinVerifyTrust(IntPtr.Zero, actionGeneric, pData);
+
+      // release the WinVerifyTrust state regardless
+      data.dwStateAction = 2; // WTD_STATEACTION_CLOSE
+      Marshal.StructureToPtr(data, pData, true);
+      Wintrust.WinVerifyTrust(IntPtr.Zero, actionGeneric, pData);
+
+      if (result != 0) {
+        error = $"WinVerifyTrust rejected the file (0x{result:X8}) — it is unsigned, tampered, or its certificate does not chain to a trusted root.";
+        return false;
+      }
+    } catch (Exception e) {
+      error = "Signature verification threw: " + e.Message;
+      return false;
+    } finally {
+      Marshal.FreeHGlobal(pFile);
+      if (pData != IntPtr.Zero)
+        Marshal.FreeHGlobal(pData);
+    }
+
+    // the chain is valid; also confirm the signer is WinFsp's publisher, not just any valid cert
+    try {
+      using var cert = new System.Security.Cryptography.X509Certificates.X509Certificate2(
+        System.Security.Cryptography.X509Certificates.X509Certificate.CreateFromSignedFile(path));
+      var subject = cert.Subject;
+      if (subject.IndexOf("WinFsp", StringComparison.OrdinalIgnoreCase) < 0
+          && subject.IndexOf("Navimatics", StringComparison.OrdinalIgnoreCase) < 0) {
+        error = $"The installer is validly signed but by an unexpected publisher: {subject}";
+        return false;
+      }
+
+      DriveBender.Logger($"WinFsp installer signature verified — signer: {subject}");
+      return true;
+    } catch (Exception e) {
+      error = "Could not read the signer certificate: " + e.Message;
       return false;
     }
   }

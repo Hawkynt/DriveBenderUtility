@@ -243,10 +243,21 @@ internal sealed class ServeCommand(
 
   private bool _Authorized(HttpListenerRequest request) {
     var header = request.Headers["Authorization"];
-    if (header != null && header.Equals($"Bearer {this._token}", StringComparison.Ordinal))
+    if (header != null && header.StartsWith("Bearer ", StringComparison.Ordinal) && _FixedTimeEquals(header["Bearer ".Length..], this._token))
       return true;
 
-    return request.QueryString["token"] == this._token;
+    // EventSource cannot set headers, so the SSE/browse URLs still carry the token in the query;
+    // compare in constant time regardless so the token can't be recovered by timing (SEC-API)
+    return _FixedTimeEquals(request.QueryString["token"], this._token);
+  }
+
+  private static bool _FixedTimeEquals(string? provided, string expected) {
+    if (provided == null)
+      return false;
+
+    var a = System.Text.Encoding.UTF8.GetBytes(provided);
+    var b = System.Text.Encoding.UTF8.GetBytes(expected);
+    return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(a, b);
   }
 
   /// <summary>Rebuilds the cached live frame once per second off the client path (never blocks a stream).</summary>

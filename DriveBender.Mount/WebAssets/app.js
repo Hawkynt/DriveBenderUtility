@@ -13,6 +13,14 @@ function fmtBytes(n) {
 }
 function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
 
+// HTML-escape EVERY server-supplied string before it goes into innerHTML: pool/member/file
+// names, activity paths/reasons and health messages are all attacker-controllable (a file in
+// the pool can be named literally "<img onerror=...>"), and this page holds the management
+// token — an unescaped name would be stored XSS with full control of the manager.
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 // coarse relative age (5 s buckets under a minute) — coarse on purpose, so the rendered HTML
 // doesn't change every second and re-trigger the anti-flicker diff
 function ago(stamp) {
@@ -100,7 +108,7 @@ function buildFlowmap(wrap, pool, fast, cap) {
   const H = Math.max(64, 12 + rows * 38);
   const midY = Math.max(4, H / 2 - 22);
   const pos = { entry: { x: 1, y: midY, w: 58, h: 44 }, cache: { x: 89, y: midY, w: 58, h: 44 } };
-  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  // (uses the global esc() — escapes the full set of HTML-significant characters)
   const memberBox = (mm, x, y) => {
     pos[mm.id] = { x, y, w: 86, h: 30 };
     const name = leafName(mm.label || mm.path);
@@ -284,7 +292,7 @@ function credPayload(kind, v) {
 function memberRow(pool, m) {
   const row = el("div", "member");
   row.innerHTML = `<span class="status ${m.online ? "" : "off"}"></span>
-    <span>${m.label || m.path}</span>${m.network ? '<span class="badge info">remote</span>' : ""}`;
+    <span>${esc(m.label || m.path)}</span>${m.network ? '<span class="badge info">remote</span>' : ""}`;
   if (pool.source === "manifest") {
     // live tier reconfiguration: switching the role reflows new writes immediately on a mounted pool
     const sel = el("select", "role-select");
@@ -343,8 +351,8 @@ function patchCard(c, pool) {
   const hist = history.get(pool.id) || [];
 
   const topHtml = `
-    <h2>${pool.name} ${health} ${mountBadge}</h2>
-    <div class="sub">${pool.source} · ${pool.failureDomains} failure domain(s) · <span title="primary placement strategy — change it via the Duplication dialog">⚖ ${pool.placementStrategy || "most-free-space"}</span>${pool.autoLandingZone ? ' · <span title="placement.autoLandingZone: the landing zone follows the measured-fastest drive automatically">🚀 auto-LZ</span>' : ""}</div>
+    <h2>${esc(pool.name)} ${health} ${mountBadge}</h2>
+    <div class="sub">${esc(pool.source)} · ${pool.failureDomains} failure domain(s) · <span title="primary placement strategy — change it via the Duplication dialog">⚖ ${esc(pool.placementStrategy || "most-free-space")}</span>${pool.autoLandingZone ? ' · <span title="placement.autoLandingZone: the landing zone follows the measured-fastest drive automatically">🚀 auto-LZ</span>' : ""}</div>
     <div class="capacity-row">
       ${donut(pool.bytesFree, pool.bytesTotal)}
       <div class="cap-legend">
@@ -376,11 +384,11 @@ function patchCard(c, pool) {
 
   const bottomHtml = `
     <div class="members"></div>
-    ${pool.warnings && pool.warnings.length ? `<div class="warnings">${pool.warnings.map(w => "<div>⚠ " + w + "</div>").join("")}</div>` : ""}
+    ${pool.warnings && pool.warnings.length ? `<div class="warnings">${pool.warnings.map(w => "<div>⚠ " + esc(w) + "</div>").join("")}</div>` : ""}
     ${m ? `<div class="activity">${(m.activity && m.activity.length ? m.activity.slice(0,10).map(a => {
       const icon = ({Read:"📖",Write:"✍️",Drain:"⬇️",Duplicate:"🔁",Rebalance:"⚖️",RemoteTransfer:"☁️",CacheAdmit:"📥",CacheEvict:"📤",Recovery:"🩹",Scrub:"🔬",TrashMove:"🗑️"})[a.kind] || "•";
-      const move = a.from || a.to ? ` <span class="mv">${a.from || "?"} → ${a.to || "?"}</span>` : "";
-      return `<div>${icon} ${a.kind} <b>${a.path||""}</b> ${a.bytes?fmtBytes(a.bytes):""}${move} ${a.reason?`<span class="rsn">${a.reason}</span>`:""} <span class="age">${ago(a.stamp)}</span></div>`;
+      const move = a.from || a.to ? ` <span class="mv">${esc(a.from || "?")} → ${esc(a.to || "?")}</span>` : "";
+      return `<div>${icon} ${esc(a.kind)} <b>${esc(a.path||"")}</b> ${a.bytes?fmtBytes(a.bytes):""}${move} ${a.reason?`<span class="rsn">${esc(a.reason)}</span>`:""} <span class="age">${ago(a.stamp)}</span></div>`;
     }).join("") : '<div class="rsn">no activity yet — reads, writes, drains and duplications appear here live</div>')}</div>` : ""}
     <div class="actions"></div>`;
 
@@ -421,7 +429,7 @@ function infoModal(title, bodyNode, wide) {
   const actions = el("div", "modal-actions");
   const close = el("button", "primary", "Close"); close.onclick = closeModal;
   actions.appendChild(close);
-  modal.append(el("h2", null, title), bodyNode, actions);
+  modal.append(el("h2", null, esc(title)), bodyNode, actions); // titles carry pool/file names — escape
   overlay.appendChild(modal);
   overlay.onclick = e => { if (e.target === overlay) closeModal(); };
   document.getElementById("modal-root").appendChild(overlay);
@@ -434,12 +442,12 @@ function infoModal(title, bodyNode, wide) {
 // to also surface silent bit-rot (reads all pool data — can take a long time); FIX repairs.
 async function healthDialog(pool, fix, deep) {
   const body = el("div");
-  body.innerHTML = `<p class="hint">${fix ? "Scanning and repairing" : deep ? "Deep-scanning (re-checksumming every file — this can take a long time)" : "Scanning"} <b>${pool.name}</b> —
+  body.innerHTML = `<p class="hint">${fix ? "Scanning and repairing" : deep ? "Deep-scanning (re-checksumming every file — this can take a long time)" : "Scanning"} <b>${esc(pool.name)}</b> —
     checking duplication levels, integrity and device health…</p>`;
   infoModal(fix ? "Fix problems" : deep ? "Deep scan (bit-rot)" : "Pool problem scan", body);
 
   const j = await post("/api/health?pool=" + pool.id + (fix ? "&fix=true" : "") + (deep && !fix ? "&deep=true" : ""));
-  if (!j.ok) { body.innerHTML = `<p class="hint">Scan failed: ${j.error || "unknown error"}</p>`; return; }
+  if (!j.ok) { body.innerHTML = `<p class="hint">Scan failed: ${esc(j.error || "unknown error")}</p>`; return; }
   const r = j.result;
   const smartBadge = h => h === "Healthy" ? '<span class="badge ok">healthy</span>'
     : h === "Failing" ? '<span class="badge bad">FAILING</span>'
@@ -450,10 +458,10 @@ async function healthDialog(pool, fix, deep) {
     <div class="report-row"><span>Files below their duplication level</span><b>${r.underDuplicatedFiles}</b></div>
     ${r.corrected ? `<div class="report-row"><span>Copies repaired / created</span><b>${r.copiesRepaired}</b></div>` : ""}
     ${r.issues && r.issues.length ? `<label>Integrity issues</label><div class="issues">${r.issues.map(i =>
-      `<div>⚠ <b>${i.kind}</b> ${i.path}<br><span class="rsn">${i.message}</span></div>`).join("")}</div>` : ""}
+      `<div>⚠ <b>${esc(i.kind)}</b> ${esc(i.path)}<br><span class="rsn">${esc(i.message)}</span></div>`).join("")}</div>` : ""}
     <label>Device health (SMART)</label>
     <div class="issues">${(r.members || []).map(mm =>
-      `<div>${smartBadge(mm.health)} <b>${mm.name}</b>${mm.model ? " · " + mm.model : ""}${mm.temperatureC != null ? " · " + mm.temperatureC + "°C" : ""}${mm.reallocatedSectors ? " · " + mm.reallocatedSectors + " reallocated sectors" : ""}${mm.detail ? `<br><span class="rsn">${mm.detail}</span>` : ""}</div>`).join("")}</div>
+      `<div>${smartBadge(mm.health)} <b>${esc(mm.name)}</b>${mm.model ? " · " + esc(mm.model) : ""}${mm.temperatureC != null ? " · " + mm.temperatureC + "°C" : ""}${mm.reallocatedSectors ? " · " + mm.reallocatedSectors + " reallocated sectors" : ""}${mm.detail ? `<br><span class="rsn">${esc(mm.detail)}</span>` : ""}</div>`).join("")}</div>
     ${!fix && !r.deep ? `<p class="hint">This scan checks metadata only and never changes anything — missing duplicates, inconsistent file sizes and external edits show up here. Silent bit-rot needs the <b>deep scan</b>, which re-reads and re-checksums every file (it can take a long time on a large pool).</p>` : ""}
     ${!fix && !r.healthy ? `<p class="hint"><b>Fix</b> repairs what was found: bit-rot from a good copy, stale copies re-synced, conflicts preserved, missing copies recreated.</p>` : ""}`;
   if (!fix) {
@@ -478,26 +486,26 @@ async function healthDialog(pool, fix, deep) {
 async function browseDialog(pool, path) {
   const body = el("div");
   body.innerHTML = `<p class="hint">Loading…</p>`;
-  infoModal(`Browse — ${pool.name}`, body, true);
+  infoModal(`Browse — ${esc(pool.name)}`, body, true);
   await browseInto(pool, path, body);
 }
 
 async function browseInto(pool, path, body) {
   const j = await fetch(`/api/pool/browse?pool=${pool.id}&path=${encodeURIComponent(path)}&token=${encodeURIComponent(token)}`)
     .then(r => r.json()).catch(e => ({ ok: false, error: String(e) }));
-  if (!j.ok) { body.innerHTML = `<p class="hint">Browse failed: ${j.error || ""}</p>`; return; }
+  if (!j.ok) { body.innerHTML = `<p class="hint">Browse failed: ${esc(j.error || "")}</p>`; return; }
   const r = j.result;
   const leaf = p => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
   const crumbs = r.path ? r.path.split("/") : [];
   body.innerHTML = `
-    <div class="fp-path">🗂 /${r.path || ""}</div>
+    <div class="fp-path">🗂 /${esc(r.path || "")}</div>
     <table class="browse"><thead><tr>
       <th style="text-align:left">Name</th><th>Size</th>
-      ${r.members.map(mm => `<th title="${mm.label}">${leaf(mm.label)}</th>`).join("")}
+      ${r.members.map(mm => `<th title="${esc(mm.label)}">${esc(leaf(mm.label))}</th>`).join("")}
     </tr></thead><tbody>
       ${r.path ? `<tr class="dir up"><td>⬆ ..</td><td></td>${r.members.map(() => "<td></td>").join("")}</tr>` : ""}
-      ${r.entries.map(e => `<tr class="${e.isDirectory ? "dir" : ""}" data-name="${e.name.replace(/"/g, "&quot;")}">
-        <td>${e.isDirectory ? "📁" : "📄"} ${e.name}</td>
+      ${r.entries.map(e => `<tr class="${e.isDirectory ? "dir" : ""}" data-name="${esc(e.name)}">
+        <td>${e.isDirectory ? "📁" : "📄"} ${esc(e.name)}</td>
         <td class="sz">${e.isDirectory ? "" : fmtBytes(e.length)}</td>
         ${e.presence.map(p => `<td class="pm">${p.primary ? "✅" : p.shadow ? "" : "❌"}${p.shadow ? "🔁" : ""}</td>`).join("")}
       </tr>`).join("")}
@@ -767,8 +775,8 @@ async function op(url, body) {
 // pool from the copy it left behind, or take the folder over for the pool we were creating.
 function conflictDialog(conflict, retryUrl, retryBody) {
   const body = el("div");
-  body.innerHTML = `<p>The folder <b>${conflict.path}</b> already belongs to another pool
-    (<code>${conflict.poolId}</code>).${conflict.registered ? " It's already in your pool list." : ""}</p>
+  body.innerHTML = `<p>The folder <b>${esc(conflict.path)}</b> already belongs to another pool
+    (<code>${esc(conflict.poolId)}</code>).${conflict.registered ? " It's already in your pool list." : ""}</p>
     <p>${conflict.restorable
       ? "You can restore that pool from the manifest copy still in the folder, or take the folder over for this pool."
       : "Its manifest copy is gone, so it can't be restored — you can take the folder over for this pool."}</p>`;
@@ -856,7 +864,7 @@ function showModal(title, bodyNode, onOk, okLabel) {
   const err = el("div", "err");
   const overlay = el("div", "overlay");
   const modal = el("div", "modal");
-  modal.appendChild(el("h2", null, title));
+  modal.appendChild(el("h2", null, esc(title))); // titles carry pool/file names — escape
   modal.appendChild(bodyNode);
   modal.appendChild(err);
   const actions = el("div", "modal-actions");
@@ -987,7 +995,7 @@ function folderPicker(onPick) {
     body.querySelector(".fp-manual").value = cur;
     listBox.innerHTML = "";
     if (cur) { const up = el("div", "fp-item", "⬆ .."); up.onclick = () => load(d.parent || ""); listBox.appendChild(up); }
-    (d.dirs || []).forEach(x => { const it = el("div", "fp-item", "📁 " + x.name); it.onclick = () => load(x.path); listBox.appendChild(it); });
+    (d.dirs || []).forEach(x => { const it = el("div", "fp-item", "📁 " + esc(x.name)); it.onclick = () => load(x.path); listBox.appendChild(it); });
     if (cur && !(d.dirs || []).length) listBox.appendChild(el("div", "fp-empty", "(no subfolders)"));
   }
   load("");
