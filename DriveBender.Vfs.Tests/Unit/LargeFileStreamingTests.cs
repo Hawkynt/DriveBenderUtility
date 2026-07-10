@@ -120,4 +120,25 @@ public class LargeFileStreamingTests {
       try { Directory.Delete(root, true); } catch { /* best effort */ }
     }
   }
+
+  [Test]
+  [Category("Exception")]
+  [Platform(Include = "Win", Reason = "drive-qualified path escape is a Windows Path.Combine behaviour")]
+  public void LocalVolumeIO_GivenDriveQualifiedPath_WhenResolved_ThenRefusedNotEscapingRoot() {
+    var root = Path.Combine(Path.GetTempPath(), "dbesc" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try {
+      var io = new LocalVolumeIO(Guid.NewGuid(), "m", root, "PHYS-ESC");
+
+      // a rooted/drive-qualified logical path must NOT resolve to C:\... outside the member root
+      foreach (var escape in new[] { "C:/outside.txt", @"C:\outside.txt", "sub/../../../../Windows/evil.txt" }) {
+        var act = () => io.OpenWrite(escape, false, true);
+        act.Should().Throw<PoolFsException>($"'{escape}' must be refused, never resolved outside the pool root");
+      }
+
+      File.Exists(@"C:\outside.txt").Should().BeFalse("nothing was ever written outside the member root");
+    } finally {
+      try { Directory.Delete(root, true); } catch { /* best effort */ }
+    }
+  }
 }

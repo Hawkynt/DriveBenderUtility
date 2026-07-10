@@ -261,10 +261,27 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
   }
 
   private string _Resolve(string relativePath, bool shadow)
-    => System.IO.Path.Combine(this._rootPath, PoolPaths.ToPhysical(relativePath, shadow).Replace('/', System.IO.Path.DirectorySeparatorChar));
+    => this._Contain(PoolPaths.ToPhysical(relativePath, shadow), relativePath);
 
   private string _ResolveFolder(string relativeFolder, bool shadow)
-    => System.IO.Path.Combine(this._rootPath, PoolPaths.ToPhysicalFolder(relativeFolder, shadow).Replace('/', System.IO.Path.DirectorySeparatorChar));
+    => this._Contain(PoolPaths.ToPhysicalFolder(relativeFolder, shadow), relativeFolder);
+
+  /// <summary>
+  /// Combines a pool-physical path with the member root and PROVES the result stays inside the
+  /// root before any I/O touches it (SEC-PATH). <see cref="PoolPaths.Normalize"/> only strips
+  /// <c>.</c>/<c>..</c>, so a drive-qualified or rooted path (e.g. <c>C:/x</c>, an ADS
+  /// <c>f:stream</c>) would otherwise let <see cref="System.IO.Path.Combine"/> return a location
+  /// OUTSIDE the pool — turning a pool write/delete into a write/delete anywhere on the machine.
+  /// </summary>
+  private string _Contain(string physical, string original) {
+    var combined = System.IO.Path.GetFullPath(System.IO.Path.Combine(this._rootPath, physical.Replace('/', System.IO.Path.DirectorySeparatorChar)));
+    var root = System.IO.Path.TrimEndingDirectorySeparator(this._rootPath);
+    var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+    if (!combined.Equals(root, comparison) && !combined.StartsWith(root + System.IO.Path.DirectorySeparatorChar, comparison))
+      throw new PoolFsException(PoolFsError.InvalidArgument, $"Path escapes the member root: {original}");
+
+    return combined;
+  }
 
   private PoolFsException _Offline() => new(PoolFsError.Offline, $"Member '{this.DisplayName}' ({this._rootPath}) is offline");
 
