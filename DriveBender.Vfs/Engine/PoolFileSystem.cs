@@ -178,6 +178,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._activity.Publish(ActivityKind.Recovery, "", reason: $"member returned: {member.DisplayName}");
     this._degradedAckWarned.Clear();
 
+    // 0) heal its stale journal mirror so a compaction it missed can't resurrect old intents (SAFE-OFFLINE)
+    this._journal.ReconcileMirrors();
+
     // 1) namespace changes it missed apply first (deletes/renames — no ghost resurrection, SAFE-OFFLINE)
     var replayed = this._tombstones.ReplayFor(member, [.. this._members.Select(m => m.Io.MemberId)]);
     if (replayed > 0)
@@ -254,6 +257,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     if (!this._Online.Any())
       throw new PoolFsException(PoolFsError.Offline, "No pool member is online — refusing to mount");
+
+    // heal any stale journal mirror (a member that missed a compaction) BEFORE reading it for
+    // recovery, so a long-completed intent can never be replayed as interrupted (SAFE-OFFLINE)
+    this._journal.ReconcileMirrors();
 
     // recovery before serving: roll forward, reconcile, clean temps (FR-RECOVER)
     var report = new PoolRecovery([.. this._Online], this._journal).Run();

@@ -14,6 +14,14 @@ public sealed record TombstoneRecord {
   [JsonPropertyName("path")] public required string Path { get; init; }
   [JsonPropertyName("target")] public string? TargetPath { get; init; }
   [JsonPropertyName("owed")] public required Guid[] OwedMembers { get; init; }
+
+  // monotonic per-log sequence: a member offline during a prune keeps a stale copy of an
+  // already-applied record; the higher-sequence mirrors are authoritative, so the stale one is
+  // excluded (and overwritten) instead of resurrecting a delete against a recreated file.
+  [JsonPropertyName("seq")] public long Sequence { get; init; }
+
+  // a compaction checkpoint carrying the high-water sequence forward — never applied.
+  [JsonPropertyName("chk")] public bool Checkpoint { get; init; }
 }
 
 /// <summary>
@@ -31,16 +39,27 @@ public sealed class TombstoneLog(IReadOnlyList<IVolumeIO> members) {
   private static readonly JsonSerializerOptions _OPTIONS = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault };
 
   private readonly Lock _lock = new();
+  private long _nextSeq;
+  private bool _loaded;
 
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
+
+  private void _EnsureLoaded() {
+    if (this._loaded)
+      return;
+
+    this._nextSeq = this._ReadPerMember().Select(m => m.maxSeq).DefaultIfEmpty(0).Max();
+    this._loaded = true;
+  }
 
   /// <summary>Records a namespace change the given members missed; throws when it cannot be persisted anywhere (the mutation must then not proceed).</summary>
   public void Record(JournalOp op, string path, string? targetPath, IReadOnlyCollection<Guid> owedMembers) {
     if (owedMembers.Count == 0)
       return;
 
-    var record = new TombstoneRecord { Id = Guid.NewGuid(), Op = op, Path = path, TargetPath = targetPath, OwedMembers = [.. owedMembers] };
     lock (this._lock) {
+      this._EnsureLoaded();
+      var record = new TombstoneRecord { Id = Guid.NewGuid(), Op = op, Path = path, TargetPath = targetPath, OwedMembers = [.. owedMembers], Sequence = ++this._nextSeq };
       var line = JsonSerializer.Serialize(record, _OPTIONS);
       var bytes = Encoding.UTF8.GetBytes(line + "\n");
       var wrote = false;
@@ -153,9 +172,8 @@ public sealed class TombstoneLog(IReadOnlyList<IVolumeIO> members) {
     }
   }
 
-  private List<TombstoneRecord> _ReadAll() {
-    var records = new List<TombstoneRecord>();
-    var seen = new Dictionary<Guid, int>(); // id → index; a rewritten copy (fewer owed) wins over a stale mirror
+  private List<(IVolumeIO member, long maxSeq, List<TombstoneRecord> records)> _ReadPerMember() {
+    var perMember = new List<(IVolumeIO, long, List<TombstoneRecord>)>();
     foreach (var member in this._Online) {
       if (!member.FileExists(LogPath, false))
         continue;
@@ -169,6 +187,8 @@ public sealed class TombstoneLog(IReadOnlyList<IVolumeIO> members) {
         continue;
       }
 
+      var records = new List<TombstoneRecord>();
+      long maxSeq = 0;
       foreach (var line in content.Split('\n')) {
         if (line.Length == 0)
           continue;
@@ -183,29 +203,59 @@ public sealed class TombstoneLog(IReadOnlyList<IVolumeIO> members) {
         if (record == null)
           continue;
 
-        if (seen.TryGetValue(record.Id, out var index)) {
-          if (record.OwedMembers.Length < records[index].OwedMembers.Length)
-            records[index] = record;
-        } else {
-          seen.Add(record.Id, records.Count);
+        if (record.Sequence > maxSeq)
+          maxSeq = record.Sequence;
+        if (!record.Checkpoint)
           records.Add(record);
-        }
       }
+
+      perMember.Add((member, maxSeq, records));
     }
 
-    return records;
+    return perMember;
+  }
+
+  /// <summary>
+  /// The authoritative owed set: only the FRESHEST mirrors (highest sequence). A member offline
+  /// during a prune keeps a stale copy of an already-applied record at a lower sequence — that
+  /// copy is excluded here (and overwritten by the next rewrite), so it can never re-apply a
+  /// delete against a since-recreated file (SAFE-OFFLINE).
+  /// </summary>
+  private List<TombstoneRecord> _ReadAll() {
+    var perMember = this._ReadPerMember();
+    if (perMember.Count == 0)
+      return [];
+
+    var globalMax = perMember.Max(m => m.maxSeq);
+    var byId = new Dictionary<Guid, TombstoneRecord>();
+    foreach (var (_, maxSeq, records) in perMember.Where(m => m.maxSeq == globalMax))
+      foreach (var record in records)
+        if (!byId.TryGetValue(record.Id, out var existing) || record.OwedMembers.Length < existing.OwedMembers.Length)
+          byId[record.Id] = record;
+
+    return [.. byId.Values.OrderBy(r => r.Sequence)];
   }
 
   private void _Rewrite(IReadOnlyList<TombstoneRecord> records) {
-    var content = string.Concat(records.Select(r => JsonSerializer.Serialize(r, _OPTIONS) + "\n"));
-    var bytes = Encoding.UTF8.GetBytes(content);
+    this._EnsureLoaded();
+
+    // nothing owed and no log anywhere → a pool that never deleted/renamed offline; do not
+    // materialise an empty sidecar just to hold a checkpoint
+    if (records.Count == 0 && !this._Online.Any(m => m.FileExists(LogPath, false)))
+      return;
+
+    // a checkpoint carries the high-water sequence forward so a pruned (possibly empty) log still
+    // out-ranks a stale mirror; without it, an emptied authoritative log would look older
+    var checkpoint = new TombstoneRecord { Id = Guid.Empty, Op = JournalOp.Delete, Path = "", OwedMembers = [], Sequence = this._nextSeq, Checkpoint = true };
+    var lines = new List<string> { JsonSerializer.Serialize(checkpoint, _OPTIONS) };
+    lines.AddRange(records.Select(r => JsonSerializer.Serialize(r, _OPTIONS)));
+    var bytes = Encoding.UTF8.GetBytes(string.Concat(lines.Select(l => l + "\n")));
+
     foreach (var member in this._Online) {
       try {
-        if (bytes.Length == 0 && !member.FileExists(LogPath, false))
-          continue; // nothing owed and nothing on disk — do not create an empty sidecar
-
         var temp = LogPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
         using (var stream = member.OpenWrite(temp, false, true)) {
+          stream.SetLength(0); // never inherit a stale temp's tail (SAFE-ATOMIC)
           stream.Write(bytes, 0, bytes.Length);
           stream.Flush();
         }

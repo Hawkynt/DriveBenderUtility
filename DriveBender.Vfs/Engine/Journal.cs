@@ -32,6 +32,11 @@ public sealed record JournalRecord {
   [JsonPropertyName("length")] public long Length { get; init; }
   [JsonPropertyName("member")] public Guid MemberId { get; init; }
   [JsonPropertyName("done")] public bool Completed { get; init; }
+
+  // a compaction checkpoint: carries the high-water sequence forward so a compacted (empty of
+  // real work) journal still proves how current it is — a stale mirror on a returning member
+  // can then be told apart from a genuinely interrupted op. Never an intent to replay.
+  [JsonPropertyName("chk")] public bool Checkpoint { get; init; }
 }
 
 /// <summary>Durable storage for journal lines; mirrored across members so no single member loss destroys it.</summary>
@@ -43,6 +48,13 @@ public interface IJournalStore {
 
   /// <summary>Atomically replaces the journal content (checkpoint compaction).</summary>
   void Rewrite(IEnumerable<string> lines);
+
+  /// <summary>
+  /// Overwrites any stale journal mirror (a member that was offline during a compaction) with
+  /// the freshest one, so its old, already-completed intents can never be replayed as if
+  /// interrupted (SAFE-OFFLINE). No-op for stores that are not member-mirrored.
+  /// </summary>
+  void ReconcileMirrors() { }
 }
 
 /// <summary>
@@ -75,9 +87,32 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
       throw new PoolFsException(PoolFsError.IoError, "Journal intent could not be persisted on any member — refusing the mutation (SAFE-WAL)");
   }
 
+  /// <summary>
+  /// The union of the FRESHEST journal mirrors only. Each member's file carries its high-water
+  /// sequence (in its records, incl. compaction checkpoints); a member that was offline during
+  /// a compaction has a lower high-water, so its stale copy — which may hold a long-completed
+  /// intent whose completion record was compacted away elsewhere — is excluded. Without this a
+  /// returning member's orphan "Delete F" would be replayed against a since-recreated F.
+  /// </summary>
   public IEnumerable<string> ReadAll() {
-    var lines = new List<string>();
+    var perMember = this._ReadPerMember();
+    if (perMember.Count == 0)
+      return [];
+
+    var globalMax = perMember.Max(m => m.maxSeq);
     var seen = new HashSet<string>(StringComparer.Ordinal);
+    var lines = new List<string>();
+    foreach (var (_, memberMax, memberLines) in perMember)
+      if (memberMax == globalMax)
+        foreach (var line in memberLines)
+          if (seen.Add(line))
+            lines.Add(line);
+
+    return lines;
+  }
+
+  private List<(IVolumeIO member, long maxSeq, List<string> lines)> _ReadPerMember() {
+    var perMember = new List<(IVolumeIO, long, List<string>)>();
     foreach (var member in this._Online) {
       if (!member.FileExists(JournalPath, false))
         continue;
@@ -91,29 +126,77 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
         continue;
       }
 
-      foreach (var line in content.Split('\n'))
-        if (line.Length > 0 && seen.Add(line))
-          lines.Add(line);
+      var lines = new List<string>();
+      long maxSeq = 0;
+      foreach (var line in content.Split('\n')) {
+        if (line.Length == 0)
+          continue;
+
+        lines.Add(line);
+        var seq = _SeqOf(line);
+        if (seq > maxSeq)
+          maxSeq = seq;
+      }
+
+      perMember.Add((member, maxSeq, lines));
     }
 
-    return lines;
+    return perMember;
+  }
+
+  /// <summary>Cheap extraction of the "seq" field without a full JSON parse (called per line at mount).</summary>
+  private static long _SeqOf(string line) {
+    const string key = "\"seq\":";
+    var start = line.IndexOf(key, StringComparison.Ordinal);
+    if (start < 0)
+      return 0;
+
+    start += key.Length;
+    var end = start;
+    while (end < line.Length && (char.IsDigit(line[end]) || line[end] == '-'))
+      ++end;
+
+    return long.TryParse(line.AsSpan(start, end - start), out var value) ? value : 0;
+  }
+
+  public void ReconcileMirrors() {
+    var perMember = this._ReadPerMember();
+    if (perMember.Count == 0)
+      return;
+
+    var globalMax = perMember.Max(m => m.maxSeq);
+    var authoritative = perMember.First(m => m.maxSeq == globalMax).lines;
+    var authoritativeSet = new HashSet<string>(authoritative, StringComparer.Ordinal);
+
+    // any member whose journal is not already exactly the authoritative set gets overwritten —
+    // a returning member's stale intents are wiped so they can never resurface (SAFE-OFFLINE)
+    foreach (var (member, maxSeq, lines) in perMember) {
+      if (maxSeq == globalMax && lines.Count == authoritativeSet.Count && lines.All(authoritativeSet.Contains))
+        continue;
+
+      this._RewriteOne(member, authoritative);
+    }
   }
 
   public void Rewrite(IEnumerable<string> lines) {
-    var content = string.Concat(lines.Select(l => l + "\n"));
-    var bytes = Encoding.UTF8.GetBytes(content);
-    foreach (var member in this._Online) {
-      try {
-        var temp = JournalPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
-        using (var stream = member.OpenWrite(temp, false, true)) {
-          stream.Write(bytes, 0, bytes.Length);
-          stream.Flush();
-        }
+    var snapshot = lines.ToArray();
+    foreach (var member in this._Online)
+      this._RewriteOne(member, snapshot);
+  }
 
-        member.AtomicReplace(temp, JournalPath, false);
-      } catch (PoolFsException e) {
-        DriveBender.Logger($"[Warning]Journal rewrite failed on '{member.DisplayName}': {e.Message}");
+  private void _RewriteOne(IVolumeIO member, IReadOnlyCollection<string> lines) {
+    var bytes = Encoding.UTF8.GetBytes(string.Concat(lines.Select(l => l + "\n")));
+    try {
+      var temp = JournalPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+      using (var stream = member.OpenWrite(temp, false, true)) {
+        stream.SetLength(0); // never inherit a stale temp's tail (SAFE-ATOMIC)
+        stream.Write(bytes, 0, bytes.Length);
+        stream.Flush();
       }
+
+      member.AtomicReplace(temp, JournalPath, false);
+    } catch (PoolFsException e) {
+      DriveBender.Logger($"[Warning]Journal rewrite failed on '{member.DisplayName}': {e.Message}");
     }
   }
 
@@ -145,11 +228,13 @@ public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
     if (this._loaded)
       return;
 
-    var all = this.ReadAll();
+    // the RAW read (checkpoints included) so the high-water sequence survives a full compaction —
+    // otherwise _nextSequence would reset to 0 and reuse sequence numbers (SAFE-OFFLINE)
+    var all = this._ReadRaw();
     this._nextSequence = all.Select(r => r.Sequence).DefaultIfEmpty(0).Max();
     var completed = all.Where(r => r.Completed).Select(r => r.Sequence).ToHashSet();
     foreach (var record in all)
-      if (!record.Completed && !completed.Contains(record.Sequence))
+      if (!record.Completed && !record.Checkpoint && !completed.Contains(record.Sequence))
         this._open.Add(record.Sequence);
     this._loaded = true;
   }
@@ -181,23 +266,48 @@ public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
 
       // compaction keeps the at-rest journal down to its open entries — but AMORTIZED: a large
       // sequential copy quiesces after every chunk, and rewriting the journal on each of those
-      // starves the data path (the disk ends up writing journals instead of the file)
+      // starves the data path (the disk ends up writing journals instead of the file). A
+      // checkpoint line always survives so the high-water sequence is never lost (SAFE-OFFLINE).
       var now = this._clock();
       if (this._open.Count == 0 && now - this._lastCompactUtc >= _COMPACT_MIN_INTERVAL) {
-        store.Rewrite([]);
+        store.Rewrite(this._CheckpointLines());
         this._completedSinceCompact = 0;
         this._lastCompactUtc = now;
       } else if (this._completedSinceCompact >= _COMPACT_THRESHOLD) {
-        store.Rewrite(this.ReadAll()
-          .Where(r => !r.Completed && this._open.Contains(r.Sequence))
-          .Select(r => JsonSerializer.Serialize(r, _OPTIONS)));
+        store.Rewrite([
+          .. this._CheckpointLines(),
+          .. this.ReadAll()
+            .Where(r => !r.Completed && !r.Checkpoint && this._open.Contains(r.Sequence))
+            .Select(r => JsonSerializer.Serialize(r, _OPTIONS)),
+        ]);
         this._completedSinceCompact = 0;
         this._lastCompactUtc = now;
       }
     }
   }
 
-  public IReadOnlyList<JournalRecord> ReadAll() {
+  /// <summary>
+  /// The checkpoint prefix for a compaction: a single record carrying the current high-water
+  /// sequence so mirror freshness stays comparable — but nothing at all until a sequence has
+  /// ever been allocated (a never-written pool keeps an empty journal, occupying no space).
+  /// </summary>
+  private string[] _CheckpointLines()
+    => this._nextSequence == 0
+      ? []
+      : [JsonSerializer.Serialize(new JournalRecord { Sequence = this._nextSequence, Op = JournalOp.Create, Completed = true, Checkpoint = true }, _OPTIONS)];
+
+  /// <summary>Overwrites any stale journal mirror with the freshest one (call on mount and on member return, SAFE-OFFLINE).</summary>
+  public void ReconcileMirrors() {
+    lock (this._lock) {
+      this._EnsureLoaded();
+      store.ReconcileMirrors();
+    }
+  }
+
+  /// <summary>Every real record (compaction checkpoints hidden — they are internal high-water bookkeeping, not operations).</summary>
+  public IReadOnlyList<JournalRecord> ReadAll() => [.. this._ReadRaw().Where(r => !r.Checkpoint)];
+
+  private List<JournalRecord> _ReadRaw() {
     var records = new List<JournalRecord>();
     foreach (var line in store.ReadAll()) {
       try {
@@ -225,11 +335,11 @@ public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
     return [.. intents.Where(i => !completed.Contains(i.Sequence)).OrderBy(i => i.Sequence)];
   }
 
-  /// <summary>Compacts the journal after successful recovery: completed history is dropped.</summary>
+  /// <summary>Compacts the journal after successful recovery: completed history is dropped, the high-water checkpoint kept.</summary>
   public void Checkpoint() {
     lock (this._lock) {
       this._EnsureLoaded();
-      store.Rewrite([]);
+      store.Rewrite(this._CheckpointLines());
     }
   }
 
