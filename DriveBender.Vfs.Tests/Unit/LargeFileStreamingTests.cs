@@ -141,4 +141,25 @@ public class LargeFileStreamingTests {
       try { Directory.Delete(root, true); } catch { /* best effort */ }
     }
   }
+
+  [Test]
+  [Category("EdgeCase")]
+  [Platform(Include = "Win", Reason = "trailing-dot / reserved-name normalisation is a Win32 behaviour")]
+  public void LocalVolumeIO_GivenTrailingDotAndPlainName_WhenWritten_ThenTheyStayDistinctFiles() {
+    var root = Path.Combine(Path.GetTempPath(), "dbdot" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try {
+      var io = new LocalVolumeIO(Guid.NewGuid(), "m", root, "PHYS-DOT");
+
+      // 'report' and 'report.' are DIFFERENT logical files; without the \\?\ prefix Win32 strips
+      // the trailing dot and they collapse onto one physical file, silently overwriting
+      using (var a = io.OpenWrite("report", false, true)) { a.Write([1], 0, 1); a.Flush(); }
+      using (var b = io.OpenWrite("report.", false, true)) { b.Write([2, 2], 0, 2); b.Flush(); }
+
+      io.Stat("report", false)!.Value.Length.Should().Be(1, "the plain name keeps its own content");
+      io.Stat("report.", false)!.Value.Length.Should().Be(2, "the trailing-dot name is a distinct file, not a collapse of 'report'");
+    } finally {
+      try { Directory.Delete(root, true); } catch { /* best effort */ }
+    }
+  }
 }

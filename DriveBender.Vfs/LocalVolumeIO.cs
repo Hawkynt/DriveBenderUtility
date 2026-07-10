@@ -274,13 +274,40 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
   /// OUTSIDE the pool — turning a pool write/delete into a write/delete anywhere on the machine.
   /// </summary>
   private string _Contain(string physical, string original) {
-    var combined = System.IO.Path.GetFullPath(System.IO.Path.Combine(this._rootPath, physical.Replace('/', System.IO.Path.DirectorySeparatorChar)));
-    var root = System.IO.Path.TrimEndingDirectorySeparator(this._rootPath);
-    var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-    if (!combined.Equals(root, comparison) && !combined.StartsWith(root + System.IO.Path.DirectorySeparatorChar, comparison))
+    var relative = physical.Replace('/', System.IO.Path.DirectorySeparatorChar);
+
+    // a pool-relative path must never be rooted/drive-qualified ('C:\x', '\x'); Path.Combine would
+    // otherwise return the rooted path and escape the member root entirely (SEC-PATH)
+    if (System.IO.Path.IsPathRooted(relative))
       throw new PoolFsException(PoolFsError.InvalidArgument, $"Path escapes the member root: {original}");
 
-    return combined;
+    // join WITHOUT GetFullPath so trailing dots/spaces survive (GetFullPath strips them, collapsing
+    // 'report.' onto 'report'); the extended-length form preserves them literally at the Win32 layer
+    var joined = System.IO.Path.Combine(this._rootPath, relative);
+
+    // containment is checked on a fully-normalised copy (belt-and-suspenders over Normalize's ../. strip)
+    var root = System.IO.Path.TrimEndingDirectorySeparator(this._rootPath);
+    var normalized = System.IO.Path.GetFullPath(joined);
+    var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+    if (!normalized.Equals(root, comparison) && !normalized.StartsWith(root + System.IO.Path.DirectorySeparatorChar, comparison))
+      throw new PoolFsException(PoolFsError.InvalidArgument, $"Path escapes the member root: {original}");
+
+    return _Extended(joined);
+  }
+
+  /// <summary>
+  /// Prefixes an absolute Windows path with the extended-length form (\\?\ or \\?\UNC\) so Win32
+  /// treats it LITERALLY: names past 260 chars work, and reserved device names (CON, NUL, AUX) and
+  /// trailing dots/spaces stay distinct instead of being normalised away — otherwise 'report.' and
+  /// 'report' collapse onto one physical file and silently overwrite each other (SAFE-BIGNAME).
+  /// </summary>
+  private static string _Extended(string fullPath) {
+    if (!OperatingSystem.IsWindows() || fullPath.StartsWith(@"\\?\", StringComparison.Ordinal))
+      return fullPath;
+
+    return fullPath.StartsWith(@"\\", StringComparison.Ordinal)
+      ? @"\\?\UNC\" + fullPath[2..] // \\server\share → \\?\UNC\server\share
+      : @"\\?\" + fullPath;
   }
 
   private PoolFsException _Offline() => new(PoolFsError.Offline, $"Member '{this.DisplayName}' ({this._rootPath}) is offline");
