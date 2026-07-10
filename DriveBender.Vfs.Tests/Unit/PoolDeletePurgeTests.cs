@@ -59,6 +59,23 @@ public class PoolDeletePurgeTests {
   }
 
   [Test]
+  [Category("Exception")]
+  public void Delete_GivenPathNowOwnedByAnotherPool_WhenPurged_ThenForeignDataIsNotWiped() {
+    var manifest = this._CreatePoolWithData();
+
+    // simulate: B: was reassigned and B:\pool now holds a DIFFERENT pool's member (its marker)
+    this._host.AddFile(ManifestStore.MarkerPathFor(@"B:\pool"),
+      ManifestSerializer.WriteMarker(new() { PoolId = Guid.NewGuid(), MemberId = Guid.NewGuid(), Name = "StrangerPool" }));
+
+    this._lifecycle.Delete(manifest, purgeData: true);
+
+    this._host.TryGetFileContent(@"B:\pool\movie.mkv").Should().Be("big",
+      "purge must never wipe a path whose marker identifies a different pool (reassigned drive letter)");
+    this._host.TryGetFileContent(@"A:\pool\movie.mkv").Should().BeNull("the genuine member is still purged");
+    this._host.FileExists(this._store.RegistryPathFor(manifest.PoolId)).Should().BeFalse("the registry entry still clears");
+  }
+
+  [Test]
   [Category("EdgeCase")]
   public void Delete_GivenMissingMemberFolder_WhenDeleted_ThenSkipsGracefully() {
     var manifest = this._lifecycle.Create("P", [new(@"A:\pool")], force: true);

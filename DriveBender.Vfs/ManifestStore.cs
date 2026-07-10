@@ -36,6 +36,15 @@ public sealed class ManifestStore(IHostEnvironment host) {
       if (!host.DirectoryExists(path))
         continue;
 
+      // never stamp our identity onto a folder another pool already claims: a reassigned drive
+      // letter or re-pointed UNC could aim member.Path at a DIFFERENT pool's member, and
+      // overwriting its marker would silently absorb (and later let us purge) foreign data.
+      var existingMarker = this.TryLoadMarker(path);
+      if (existingMarker != null && existingMarker.PoolId != persisted.PoolId) {
+        DriveBender.Logger($"[Warning]Refusing to mirror pool '{persisted.Name}' onto '{path}' — it already belongs to another pool ({existingMarker.PoolId})");
+        continue;
+      }
+
       try {
         host.CreateDirectory(_UtilityDir(path));
         host.WriteAllTextAtomic(MirrorPathFor(path), json);

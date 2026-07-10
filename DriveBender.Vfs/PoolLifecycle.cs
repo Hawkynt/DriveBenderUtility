@@ -164,8 +164,12 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     if (manifest.Members.Count == 1)
       throw new ManifestException($"Cannot remove the last member of pool '{manifest.Name}'");
 
-    if (host.DirectoryExists(member.Path))
+    // only strip OUR sidecars: a reassigned path could point at another pool's member, and
+    // removing its marker/mirror would destroy that pool's identity + redundancy (SAFE-PHYS)
+    if (host.DirectoryExists(member.Path) && this._MarkerBelongsToPool(member.Path, manifest.PoolId))
       store.RemoveMemberSidecars(member.Path);
+    else if (host.DirectoryExists(member.Path))
+      DriveBender.Logger($"[Warning]Leaving sidecars on '{member.Path}' — its marker does not identify pool '{manifest.Name}' (path may now point elsewhere)");
 
     DriveBender.Logger($"Removing member '{member.Path}' from pool '{manifest.Name}' (data stays in place)");
     return store.Save(manifest with { Members = [.. manifest.Members.Where(m => m.MemberId != memberId)] });
@@ -182,13 +186,25 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
       if (!host.DirectoryExists(member.Path))
         continue;
 
+      // CRITICAL: a member's Path is only a hint (a drive letter can be reassigned, a UNC
+      // re-pointed). Never destroy data at a path unless its marker proves it is THIS pool's
+      // member — otherwise a purge could recursively wipe an unrelated disk (SAFE-PHYS).
+      if (!this._MarkerBelongsToPool(member.Path, manifest.PoolId)) {
+        DriveBender.Logger($"[Warning]Skipping '{member.Path}' — its marker does not identify pool '{manifest.Name}'; refusing to touch data at an unverified path");
+        continue;
+      }
+
       if (purgeData) {
-        // wipe the pool's on-disk content under this member (files + shadow/duplication folders)
+        // wipe the pool's on-disk content under this member (files + shadow/duplication folders,
+        // incl. root-level FOLDER.DUPLICATE.$DRIVEBENDER which IS pool data, not a foreign sidecar)
         foreach (var file in host.EnumerateFiles(member.Path, "*"))
           host.DeleteFile(file);
-        foreach (var dir in host.EnumerateDirectories(member.Path))
-          if (!PoolPaths.IsHiddenName(Path.GetFileName(dir)!))
-            host.DeleteDirectory(dir, recursive: true);
+        foreach (var dir in host.EnumerateDirectories(member.Path)) {
+          var name = Path.GetFileName(dir)!;
+          if (name.Equals(PoolPaths.UtilityFolderName, StringComparison.OrdinalIgnoreCase))
+            continue; // removed explicitly below (marker/trash/mirror live here)
+          host.DeleteDirectory(dir, recursive: true);
+        }
       }
 
       store.RemoveMemberSidecars(member.Path);
@@ -198,6 +214,23 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
 
     store.DeleteRegistryEntry(manifest.PoolId);
     DriveBender.Logger($"{(purgeData ? "Purged" : "Deleted")} pool '{manifest.Name}' ({manifest.PoolId}){(purgeData ? " — data wiped" : " — data preserved")}");
+  }
+
+  /// <summary>
+  /// Proves a folder is genuinely this pool's member before any destructive action touches it.
+  /// A sidecar (marker OR mirror) that names a DIFFERENT pool blocks the action outright — even
+  /// if the other sidecar happens to match — because a reassigned drive letter or re-pointed UNC
+  /// carries the stranger pool's full sidecar set. At least one sidecar must positively name us.
+  /// </summary>
+  private bool _MarkerBelongsToPool(string memberPath, Guid poolId) {
+    var marker = store.TryLoadMarker(memberPath);
+    var mirror = store.TryLoadMemberMirror(memberPath);
+    if (marker != null && marker.PoolId != poolId)
+      return false;
+    if (mirror != null && mirror.PoolId != poolId)
+      return false;
+
+    return marker?.PoolId == poolId || mirror?.PoolId == poolId;
   }
 
   public string Export(PoolManifest manifest) => ManifestSerializer.Write(manifest);
