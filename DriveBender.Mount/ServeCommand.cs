@@ -64,11 +64,22 @@ internal sealed class ServeCommand(
     while (!stop.IsSet) {
       using var listener = new HttpListener();
       listener.Prefixes.Add(prefix);
+      // also accept the 'localhost' hostname so a browser typing http://localhost:<port> works, not
+      // only http://127.0.0.1 — HTTP.sys matches by Host header, and the two are distinct prefixes.
+      // Binding localhost can need a URL ACL on some setups, so it is best-effort: fall back to
+      // 127.0.0.1-only rather than failing to start.
+      var localhostPrefix = $"http://localhost:{options.Port}/";
+      listener.Prefixes.Add(localhostPrefix);
       try {
         listener.Start();
-      } catch (HttpListenerException e) {
-        Console.Error.WriteLine($"Could not bind {prefix}: {e.Message}");
-        return 1;
+      } catch (HttpListenerException) {
+        listener.Prefixes.Remove(localhostPrefix);
+        try {
+          listener.Start();
+        } catch (HttpListenerException e) {
+          Console.Error.WriteLine($"Could not bind {prefix}: {e.Message}");
+          return 1;
+        }
       }
 
       if (!announced) {
@@ -124,6 +135,13 @@ internal sealed class ServeCommand(
     try {
       var request = context.Request;
       var path = request.Url?.AbsolutePath ?? "/";
+
+      // when a valid token arrives in the URL/header (the initial tokenised page load), drop a
+      // session cookie: thereafter same-origin fetches AND the EventSource stream (which cannot set
+      // headers) authenticate via the cookie, so a browser can bookmark/reopen the plain URL and the
+      // token no longer has to ride in every request URL (SEC-API). HttpOnly keeps it out of JS.
+      if (this._TokenInHeaderOrQuery(request))
+        context.Response.AppendHeader("Set-Cookie", $"db_token={this._token}; Path=/; HttpOnly; SameSite=Strict");
 
       // static assets are public; everything under /api requires the token
       if (path.StartsWith("/api", StringComparison.Ordinal) && !this._Authorized(request)) {
@@ -241,14 +259,23 @@ internal sealed class ServeCommand(
     }
   }
 
-  private bool _Authorized(HttpListenerRequest request) {
+  private bool _TokenInHeaderOrQuery(HttpListenerRequest request) {
     var header = request.Headers["Authorization"];
     if (header != null && header.StartsWith("Bearer ", StringComparison.Ordinal) && _FixedTimeEquals(header["Bearer ".Length..], this._token))
       return true;
 
-    // EventSource cannot set headers, so the SSE/browse URLs still carry the token in the query;
-    // compare in constant time regardless so the token can't be recovered by timing (SEC-API)
     return _FixedTimeEquals(request.QueryString["token"], this._token);
+  }
+
+  private bool _Authorized(HttpListenerRequest request) {
+    // header or query (the bootstrap), OR the session cookie set on the first tokenised request so
+    // the browser stays authenticated across reopens and on the header-less SSE stream. All compared
+    // in constant time so the token can't be recovered by timing (SEC-API).
+    if (this._TokenInHeaderOrQuery(request))
+      return true;
+
+    var cookie = request.Cookies["db_token"]?.Value;
+    return _FixedTimeEquals(cookie, this._token);
   }
 
   private static bool _FixedTimeEquals(string? provided, string expected) {

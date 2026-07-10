@@ -37,10 +37,19 @@ internal static class Program {
       return 1;
     }
 
-    _port = _FreeLoopbackPort();
-    var url = _LaunchDaemon(dbmount);
+    // pick a free loopback port and launch the daemon; if the port was taken in the race between
+    // probing it and the daemon binding it (e.g. a SECOND desktop-app instance grabbed it), retry
+    // on a fresh port a few times so multiple instances always come up cleanly.
+    string? url = null;
+    for (var attempt = 0; attempt < 5 && url == null; ++attempt) {
+      _port = _FreeLoopbackPort();
+      url = _LaunchDaemon(dbmount);
+      if (url == null)
+        _Stop(); // clean up the failed child before retrying on a new port
+    }
+
     if (url == null) {
-      Console.Error.WriteLine("The management daemon did not report a URL in time.");
+      Console.Error.WriteLine("The management daemon did not report a URL in time (all port attempts failed).");
       _Stop();
       return 2;
     }
