@@ -68,6 +68,18 @@ public sealed class PoolProvider(IHostEnvironment host, ManifestStore store, IEn
   }
 
   public DriveBender.IMountPoint Open(PoolRef pool, out PoolHealth health) {
+    // reconcile registry vs. member mirrors BEFORE serving: the discovery source read the registry,
+    // which may be a stale restore-from-backup while a member mirror holds the newer truth (a member
+    // added/removed, duplication raised on another machine). Highest version wins, and stale copies
+    // are refreshed — otherwise the stale registry would be served AND re-saved over the newer
+    // mirrors (SAFE-MANIFEST). Virtual (scan-synthesized) pools have no mirrors to reconcile.
+    if (!pool.Manifest.IsVirtual
+        && store.Reconcile(pool.PoolId, pool.Manifest.Members.Select(m => m.Path)) is { } winner
+        && winner.Version > pool.Manifest.Version) {
+      DriveBender.Logger($"Reconciled pool '{pool.Name}': using manifest version {winner.Version} (registry was {pool.Manifest.Version})");
+      pool = new PoolRef(winner.PoolId, winner.Name, winner.IsVirtual, winner);
+    }
+
     var resolver = new MemberResolver(host, store, searchPaths, remoteResolver);
     var members = resolver.ResolveAll(pool.Manifest);
     health = this._ComputeHealth(pool, members);

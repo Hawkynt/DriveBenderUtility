@@ -45,6 +45,15 @@ public sealed class ManifestStore(IHostEnvironment host) {
         continue;
       }
 
+      // never clobber a NEWER mirror with an older manifest (a caller that loaded a stale registry):
+      // highest-version-wins is the redundancy invariant — mount reconciles first, this is the net
+      // (SAFE-MANIFEST). A same-pool mirror at a higher version means we started from stale data.
+      var existingMirror = this.TryLoadMemberMirror(path);
+      if (existingMirror != null && existingMirror.PoolId == persisted.PoolId && existingMirror.Version >= persisted.Version) {
+        DriveBender.Logger($"[Warning]Not overwriting the manifest mirror on '{path}' — it is at version {existingMirror.Version}, newer than this save ({persisted.Version}); reconcile first");
+        continue;
+      }
+
       try {
         host.CreateDirectory(_UtilityDir(path));
         host.WriteAllTextAtomic(MirrorPathFor(path), json);

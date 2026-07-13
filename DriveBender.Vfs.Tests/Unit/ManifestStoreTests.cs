@@ -50,6 +50,38 @@ public class ManifestStoreTests {
   }
 
   [Test]
+  [Category("Exception")]
+  public void Save_GivenAStaleManifestAndNewerMirror_WhenSaved_ThenNewerMirrorIsNotClobbered() {
+    // establish a mirror at a high version on member A
+    var v1 = this._store.Save(this._manifest);          // version 1
+    for (var i = 0; i < 8; ++i) v1 = this._store.Save(v1); // mirror on A: now version 9
+
+    // a caller with a STALE copy (version 2) tries to save — must NOT overwrite the newer mirror
+    var stale = this._manifest with { Version = 1, Name = "StaleEdit" }; // Save will bump to 2
+    this._store.Save(stale);
+
+    var mirrorOnA = this._store.TryLoadMemberMirror(@"A:\")!;
+    mirrorOnA.Version.Should().Be(9, "a save from a stale manifest must never clobber a newer mirror (SAFE-MANIFEST)");
+    mirrorOnA.Name.Should().NotBe("StaleEdit");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Reconcile_GivenStaleRegistryAndNewerMirror_WhenReconciled_ThenNewerWinsAndRefreshes() {
+    var persisted = this._store.Save(this._manifest);      // v1 everywhere
+    for (var i = 0; i < 4; ++i) persisted = this._store.Save(persisted); // v5 everywhere
+
+    // simulate a stale registry (restore-from-backup at v2) while mirrors stay at v5
+    this._host.WriteAllTextAtomic(this._store.RegistryPathFor(_poolId),
+      ManifestSerializer.Write(this._manifest with { Version = 2, Name = "OldName" }));
+
+    var winner = this._store.Reconcile(_poolId, [@"A:\", @"B:\test"]);
+
+    winner!.Version.Should().Be(5, "the newest copy (the mirrors) wins over the stale registry");
+    this._store.TryLoadRegistry(_poolId)!.Version.Should().Be(5, "the stale registry was refreshed to the winner");
+  }
+
+  [Test]
   [Category("EdgeCase")]
   public void Save_GivenOfflineMember_WhenSaved_ThenOtherCopiesStillWritten() {
     this._host.SetVolumeOnline(@"B:\", false);
