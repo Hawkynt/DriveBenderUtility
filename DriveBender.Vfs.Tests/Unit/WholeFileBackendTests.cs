@@ -55,6 +55,41 @@ public class WholeFileVolumeIOTests {
     this._ReadAll("docs/hello.txt", false).Should().Equal(1, 2, 3, 4);
   }
 
+  /// <summary>Counts how often the underlying store is actually fetched, to prove the object cache coalesces per-block reads.</summary>
+  private sealed class CountingStore(IWholeFileStore inner) : IWholeFileStore {
+    public int Downloads;
+    public void Connect() => inner.Connect();
+    public bool Probe() => inner.Probe();
+    public byte[] Download(string p) { ++this.Downloads; return inner.Download(p); }
+    public void Upload(string p, byte[] c) => inner.Upload(p, c);
+    public void DeleteFile(string p) => inner.DeleteFile(p);
+    public StoreMeta? Stat(string p) => inner.Stat(p);
+    public void CreateFolder(string p) => inner.CreateFolder(p);
+    public void DeleteFolder(string p) => inner.DeleteFolder(p);
+    public IEnumerable<StoreEntry> List(string p) => inner.List(p);
+    public void Dispose() => inner.Dispose();
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void OpenRead_GivenManyBlockReadsOfOneFile_WhenRead_ThenObjectDownloadedOnce() {
+    var counting = new CountingStore(new DirectoryStore(this._root));
+    using var volume = new WholeFileVolumeIO(Guid.NewGuid(), "wf", "REMOTE", counting);
+    using (var w = volume.OpenWrite("big.bin", false, true)) { w.Write(new byte[64 * 1024], 0, 64 * 1024); w.Flush(); }
+    counting.Downloads = 0;
+
+    // the engine opens a fresh read stream per block — this must NOT re-download the whole object each time
+    for (var i = 0; i < 20; ++i)
+      using (var r = volume.OpenRead("big.bin", false)) { var b = new byte[16]; _ = r.Read(b, 0, b.Length); }
+
+    counting.Downloads.Should().Be(1, "the object cache serves 20 block reads from a single download (O(n²)→O(n))");
+
+    // a write invalidates the cache so a later read sees the new content, not a stale copy
+    using (var w = volume.OpenWrite("big.bin", false, false)) { w.SetLength(0); w.Write([9, 9], 0, 2); w.Flush(); }
+    using (var r = volume.OpenRead("big.bin", false)) { var b = new byte[2]; _ = r.Read(b, 0, 2); b.Should().Equal(9, 9); }
+    counting.Downloads.Should().BeGreaterThan(1, "the write invalidated the cached object so the next read re-fetched");
+  }
+
   [Test]
   [Category("HappyPath")]
   public void WriteRead_GivenShadowCopy_WhenRoundTripped_ThenLandsInShadowContainer() {

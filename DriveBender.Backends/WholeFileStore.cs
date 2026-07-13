@@ -66,6 +66,66 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   private bool _lastProbeResult;
   private bool _connected;
 
+  // The engine reads a file BLOCK BY BLOCK, and each block miss otherwise re-downloads the WHOLE
+  // object (a cold 1 GiB cloud read in 128 KiB blocks would move ~8000× the file). A small bounded
+  // LRU of recently-downloaded objects collapses that burst back to one download per file (O(n²)→
+  // O(n)). Bounded in RAM: objects over the per-object cap are not cached (they degrade to today's
+  // behaviour, and such huge files belong on a local member anyway); a short TTL bounds staleness
+  // from out-of-band changes, and every write invalidates its own entry.
+  private const long _READ_CACHE_OBJECT_CAP = 128L * 1024 * 1024;
+  private const long _READ_CACHE_BUDGET = 256L * 1024 * 1024;
+  private static readonly TimeSpan _READ_CACHE_TTL = TimeSpan.FromSeconds(30);
+
+  private readonly Lock _readCacheLock = new();
+  private readonly LinkedList<string> _readCacheOrder = new();
+  private readonly Dictionary<string, (byte[] content, DateTime at, LinkedListNode<string> node)> _readCache = new(StringComparer.OrdinalIgnoreCase);
+  private long _readCacheBytes;
+
+  private byte[] _CachedDownload(string physical) {
+    lock (this._readCacheLock) {
+      if (this._readCache.TryGetValue(physical, out var hit) && this._clock() - hit.at < _READ_CACHE_TTL) {
+        this._readCacheOrder.Remove(hit.node);
+        this._readCacheOrder.AddFirst(hit.node);
+        return hit.content;
+      }
+    }
+
+    var content = store.Download(physical); // the network fetch happens OUTSIDE the lock
+    lock (this._readCacheLock) {
+      this._InvalidateReadCacheLocked(physical);
+      if (content.LongLength <= _READ_CACHE_OBJECT_CAP) {
+        var node = new LinkedListNode<string>(physical);
+        this._readCacheOrder.AddFirst(node);
+        this._readCache[physical] = (content, this._clock(), node);
+        this._readCacheBytes += content.Length;
+        while (this._readCacheBytes > _READ_CACHE_BUDGET && this._readCacheOrder.Last is { } lru)
+          this._InvalidateReadCacheLocked(lru.Value);
+      }
+    }
+
+    return content;
+  }
+
+  private void _InvalidateReadCache(string physical) {
+    lock (this._readCacheLock)
+      this._InvalidateReadCacheLocked(physical);
+  }
+
+  private void _InvalidateReadCacheLocked(string physical) {
+    if (this._readCache.Remove(physical, out var entry)) {
+      this._readCacheOrder.Remove(entry.node);
+      this._readCacheBytes -= entry.content.Length;
+    }
+  }
+
+  private void _ClearReadCache() {
+    lock (this._readCacheLock) {
+      this._readCache.Clear();
+      this._readCacheOrder.Clear();
+      this._readCacheBytes = 0;
+    }
+  }
+
   public Guid MemberId { get; } = memberId;
   public string DisplayName { get; } = displayName;
   public string PhysicalVolumeId { get; } = physicalVolumeId;
@@ -134,12 +194,14 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   private static string _Folder(string relativeFolder, bool shadow) => PoolPaths.ToPhysicalFolder(relativeFolder, shadow);
 
   public Stream OpenRead(string relativePath, bool shadow) => this._Guard<Stream>(() => {
-    // whole-file staging (FR-REMOTE-READ): buffer the object so the engine can seek
+    // whole-file staging (FR-REMOTE-READ): buffer the object so the engine can seek. The bounded
+    // object cache serves the engine's per-block reads of one file from a SINGLE download; the
+    // read-only MemoryStream shares the cached array (never mutated) so concurrent readers are safe.
     var physical = _File(relativePath, shadow);
     if (store.Stat(physical) is not { IsFolder: false })
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
 
-    return new MemoryStream(store.Download(physical), writable: false);
+    return new MemoryStream(this._CachedDownload(physical), writable: false);
   });
 
   public Stream OpenWrite(string relativePath, bool shadow, bool create) => this._Guard<Stream>(() => {
@@ -152,12 +214,16 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
       this._EnsureFolderRecursive(PoolPaths.GetParent(physical));
 
     // read-modify-write staging: existing content preloads so positional writes compose;
-    // a brand-new file starts dirty so even an empty create uploads on flush
-    var initial = exists ? store.Download(physical) : [];
+    // a brand-new file starts dirty so even an empty create uploads on flush (the cache copy is
+    // safe: UploadOnFlushStream copies it into its own buffer before mutating)
+    var initial = exists ? this._CachedDownload(physical) : [];
     return new UploadOnFlushStream(this, physical, initial, startDirty: !exists);
   });
 
-  private void _Upload(string physical, byte[] content) => this._Guard(() => store.Upload(physical, content));
+  private void _Upload(string physical, byte[] content) => this._Guard(() => {
+    store.Upload(physical, content);
+    this._InvalidateReadCache(physical); // the object changed — drop any stale cached copy
+  });
 
   /// <summary>Staging stream: mutations happen in memory; Flush uploads the whole object (whole-file model, §6.1).</summary>
   private sealed class UploadOnFlushStream : MemoryStream {
@@ -224,6 +290,7 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     var content = store.Download(physical);
     Array.Resize(ref content, (int)length); // guarded above — no silent wrap
     store.Upload(physical, content);
+    this._InvalidateReadCache(physical);
   });
 
   public void Delete(string relativePath, bool shadow) => this._Guard(() => {
@@ -232,6 +299,7 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
 
     store.DeleteFile(physical);
+    this._InvalidateReadCache(physical);
   });
 
   public void EnsureFolder(string relativeFolder, bool shadow)
@@ -275,6 +343,7 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     this._EnsureFolderRecursive(toPhysical);
     this._MoveTree(fromPhysical, toPhysical);
     store.DeleteFolder(fromPhysical);
+    this._ClearReadCache(); // a whole subtree moved — drop any cached objects under the old prefix
   });
 
   private void _MoveTree(string fromPhysical, string toPhysical) {
