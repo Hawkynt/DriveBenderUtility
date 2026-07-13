@@ -70,6 +70,50 @@ public class WholeFileVolumeIOTests {
     public void Dispose() => inner.Dispose();
   }
 
+  /// <summary>A non-thread-safe store (default ThreadSafe=false) that trips if two calls overlap — models a single FTP/SFTP control channel.</summary>
+  private sealed class ConcurrencyProbeStore(IWholeFileStore inner) : IWholeFileStore {
+    private int _active;
+    public volatile bool Overlapped;
+    private T _Serial<T>(Func<T> op) {
+      if (Interlocked.Increment(ref this._active) != 1) this.Overlapped = true;
+      try { Thread.Sleep(1); return op(); }
+      finally { Interlocked.Decrement(ref this._active); }
+    }
+    private void _Serial(Action op) => this._Serial<object?>(() => { op(); return null; });
+    public void Connect() => this._Serial(inner.Connect);
+    public bool Probe() => this._Serial(inner.Probe);
+    public byte[] Download(string p) => this._Serial(() => inner.Download(p));
+    public void Upload(string p, byte[] c) => this._Serial(() => inner.Upload(p, c));
+    public void DeleteFile(string p) => this._Serial(() => inner.DeleteFile(p));
+    public StoreMeta? Stat(string p) => this._Serial(() => inner.Stat(p));
+    public void CreateFolder(string p) => this._Serial(() => inner.CreateFolder(p));
+    public void DeleteFolder(string p) => this._Serial(() => inner.DeleteFolder(p));
+    public IEnumerable<StoreEntry> List(string p) => this._Serial(() => inner.List(p).ToArray());
+    public void Dispose() => inner.Dispose();
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void ConcurrentOps_GivenNonThreadSafeStore_WhenHammered_ThenCallsAreSerialized() {
+    var probe = new ConcurrencyProbeStore(new DirectoryStore(this._root));
+    using var volume = new WholeFileVolumeIO(Guid.NewGuid(), "wf", "REMOTE", probe);
+    for (var i = 0; i < 8; ++i)
+      using (var w = volume.OpenWrite($"f{i}.bin", false, true)) { w.Write([(byte)i], 0, 1); w.Flush(); }
+
+    // parallel reads/stats/writes across files — a non-thread-safe store must NOT see overlapping calls
+    Parallel.For(0, 64, i => {
+      try {
+        switch (i % 3) {
+          case 0: using (var r = volume.OpenRead($"f{i % 8}.bin", false)) { r.ReadByte(); } break;
+          case 1: _ = volume.Stat($"f{i % 8}.bin", false); break;
+          default: using (var w = volume.OpenWrite($"f{i % 8}.bin", false, false)) { w.SetLength(0); w.Write([9], 0, 1); w.Flush(); } break;
+        }
+      } catch (PoolFsException) { /* races on the same file's existence are fine; we only assert non-overlap */ }
+    });
+
+    probe.Overlapped.Should().BeFalse("the engine serializes a non-thread-safe backend so its single connection is never corrupted");
+  }
+
   [Test]
   [Category("EdgeCase")]
   public void OpenRead_GivenManyBlockReadsOfOneFile_WhenRead_ThenObjectDownloadedOnce() {

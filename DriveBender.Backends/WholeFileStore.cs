@@ -38,6 +38,15 @@ public interface IWholeFileStore : IDisposable {
 
   IEnumerable<StoreEntry> List(string physicalFolder);
 
+  /// <summary>
+  /// True when concurrent calls are safe. Default FALSE (correctness first): single-connection
+  /// protocols like FTP and SFTP have ONE control channel, so the engine's parallel prefetch /
+  /// mirror-split reads would interleave commands and corrupt the session. A store that is safe
+  /// for concurrent use (independent requests, e.g. a local directory or an HTTP-per-request SDK)
+  /// overrides this to true so it is not needlessly serialized.
+  /// </summary>
+  bool ThreadSafe => false;
+
 }
 
 /// <summary>
@@ -61,18 +70,23 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   /// </summary>
   internal const long MaxFileSize = int.MaxValue;
 
+  // serialize a non-thread-safe store (FTP/SFTP: one control channel) so the engine's parallel
+  // prefetch / mirror-split reads never interleave commands and corrupt the session; a store that
+  // declares itself thread-safe is used directly (no lock overhead)
+  private readonly IWholeFileStore _store = store.ThreadSafe ? store : new SerializingWholeFileStore(store);
+
   private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
   private DateTime _lastProbeUtc = DateTime.MinValue;
   private bool _lastProbeResult;
   private bool _connected;
 
   // The engine reads a file BLOCK BY BLOCK, and each block miss otherwise re-downloads the WHOLE
-  // object (a cold 1 GiB cloud read in 128 KiB blocks would move ~8000× the file). A small bounded
-  // LRU of recently-downloaded objects collapses that burst back to one download per file (O(n²)→
-  // O(n)). Bounded in RAM: objects over the per-object cap are not cached (they degrade to today's
-  // behaviour, and such huge files belong on a local member anyway); a short TTL bounds staleness
-  // from out-of-band changes, and every write invalidates its own entry.
-  private const long _READ_CACHE_OBJECT_CAP = 128L * 1024 * 1024;
+  // object (a cold 1 GiB cloud read in 128 KiB blocks would move ~8000× the file). A bounded LRU of
+  // recently-downloaded objects collapses that burst back to ONE download per file (O(n²)→O(n)).
+  // Small objects share a budget; one over-budget object is allowed to occupy the cache alone so a
+  // large sequential read still reuses a single download (bounded to one big object at a time —
+  // whole-object remotes already refuse files past int.MaxValue). A short TTL bounds staleness from
+  // out-of-band changes, and every write invalidates its own entry.
   private const long _READ_CACHE_BUDGET = 256L * 1024 * 1024;
   private static readonly TimeSpan _READ_CACHE_TTL = TimeSpan.FromSeconds(30);
 
@@ -90,17 +104,17 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
       }
     }
 
-    var content = store.Download(physical); // the network fetch happens OUTSIDE the lock
+    var content = this._store.Download(physical); // the network fetch happens OUTSIDE the lock
     lock (this._readCacheLock) {
       this._InvalidateReadCacheLocked(physical);
-      if (content.LongLength <= _READ_CACHE_OBJECT_CAP) {
-        var node = new LinkedListNode<string>(physical);
-        this._readCacheOrder.AddFirst(node);
-        this._readCache[physical] = (content, this._clock(), node);
-        this._readCacheBytes += content.Length;
-        while (this._readCacheBytes > _READ_CACHE_BUDGET && this._readCacheOrder.Last is { } lru)
-          this._InvalidateReadCacheLocked(lru.Value);
-      }
+      var node = new LinkedListNode<string>(physical);
+      this._readCacheOrder.AddFirst(node);
+      this._readCache[physical] = (content, this._clock(), node);
+      this._readCacheBytes += content.Length;
+      // evict LRU while over budget, but always keep at least the just-added entry so ONE large
+      // object can be held alone (a big sequential read reuses its single download)
+      while (this._readCacheBytes > _READ_CACHE_BUDGET && this._readCacheOrder.Count > 1)
+        this._InvalidateReadCacheLocked(this._readCacheOrder.Last!.Value);
     }
 
     return content;
@@ -148,7 +162,7 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
       this._lastProbeUtc = now;
       try {
         this._EnsureConnected();
-        this._lastProbeResult = store.Probe();
+        this._lastProbeResult = this._store.Probe();
       } catch (Exception) {
         this._lastProbeResult = false;
       }
@@ -161,7 +175,7 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     if (this._connected)
       return;
 
-    store.Connect();
+    this._store.Connect();
     this._connected = true;
   }
 
@@ -198,7 +212,7 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     // object cache serves the engine's per-block reads of one file from a SINGLE download; the
     // read-only MemoryStream shares the cached array (never mutated) so concurrent readers are safe.
     var physical = _File(relativePath, shadow);
-    if (store.Stat(physical) is not { IsFolder: false })
+    if (this._store.Stat(physical) is not { IsFolder: false })
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
 
     return new MemoryStream(this._CachedDownload(physical), writable: false);
@@ -206,7 +220,7 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
 
   public Stream OpenWrite(string relativePath, bool shadow, bool create) => this._Guard<Stream>(() => {
     var physical = _File(relativePath, shadow);
-    var exists = store.Stat(physical) is { IsFolder: false };
+    var exists = this._store.Stat(physical) is { IsFolder: false };
     if (!exists && !create)
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
 
@@ -221,7 +235,7 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   });
 
   private void _Upload(string physical, byte[] content) => this._Guard(() => {
-    store.Upload(physical, content);
+    this._store.Upload(physical, content);
     this._InvalidateReadCache(physical); // the object changed — drop any stale cached copy
   });
 
@@ -287,18 +301,18 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
       throw new PoolFsException(PoolFsError.NoSpace, $"Length {length} exceeds the {MaxFileSize} byte whole-object limit of '{this.DisplayName}'");
 
     var physical = _File(relativePath, shadow);
-    var content = store.Download(physical);
+    var content = this._store.Download(physical);
     Array.Resize(ref content, (int)length); // guarded above — no silent wrap
-    store.Upload(physical, content);
+    this._store.Upload(physical, content);
     this._InvalidateReadCache(physical);
   });
 
   public void Delete(string relativePath, bool shadow) => this._Guard(() => {
     var physical = _File(relativePath, shadow);
-    if (store.Stat(physical) is not { IsFolder: false })
+    if (this._store.Stat(physical) is not { IsFolder: false })
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
 
-    store.DeleteFile(physical);
+    this._store.DeleteFile(physical);
     this._InvalidateReadCache(physical);
   });
 
@@ -306,22 +320,22 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     => this._Guard(() => this._EnsureFolderRecursive(_Folder(relativeFolder, shadow)));
 
   private void _EnsureFolderRecursive(string physicalFolder) {
-    if (physicalFolder.Length == 0 || store.Stat(physicalFolder) is { IsFolder: true })
+    if (physicalFolder.Length == 0 || this._store.Stat(physicalFolder) is { IsFolder: true })
       return;
 
     this._EnsureFolderRecursive(PoolPaths.GetParent(physicalFolder));
-    store.CreateFolder(physicalFolder);
+    this._store.CreateFolder(physicalFolder);
   }
 
   public void DeleteFolder(string relativeFolder, bool shadow) => this._Guard(() => {
     var physical = _Folder(relativeFolder, shadow);
-    if (store.Stat(physical) is not { IsFolder: true })
+    if (this._store.Stat(physical) is not { IsFolder: true })
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {relativeFolder}");
 
-    if (store.List(physical).Any())
+    if (this._store.List(physical).Any())
       throw new PoolFsException(PoolFsError.NotEmpty, $"Folder not empty: {relativeFolder}");
 
-    store.DeleteFolder(physical);
+    this._store.DeleteFolder(physical);
   });
 
   /// <summary>No trusted atomic rename on these backends: the engine publishes via <c>WholeFilePublisher</c>'s put-and-verify path instead (FR-CAP-ADAPT).</summary>
@@ -335,45 +349,45 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   public void RenameFolder(string fromRelativeFolder, string toRelativeFolder) => this._Guard(() => {
     var fromPhysical = _Folder(fromRelativeFolder, false);
     var toPhysical = _Folder(toRelativeFolder, false);
-    if (store.Stat(fromPhysical) is not { IsFolder: true })
+    if (this._store.Stat(fromPhysical) is not { IsFolder: true })
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {fromRelativeFolder}");
-    if (store.Stat(toPhysical) != null)
+    if (this._store.Stat(toPhysical) != null)
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toRelativeFolder}");
 
     this._EnsureFolderRecursive(toPhysical);
     this._MoveTree(fromPhysical, toPhysical);
-    store.DeleteFolder(fromPhysical);
+    this._store.DeleteFolder(fromPhysical);
     this._ClearReadCache(); // a whole subtree moved — drop any cached objects under the old prefix
   });
 
   private void _MoveTree(string fromPhysical, string toPhysical) {
-    foreach (var entry in store.List(fromPhysical).ToArray()) {
+    foreach (var entry in this._store.List(fromPhysical).ToArray()) {
       var source = $"{fromPhysical}/{entry.Name}";
       var target = $"{toPhysical}/{entry.Name}";
       if (entry.IsFolder) {
-        store.CreateFolder(target);
+        this._store.CreateFolder(target);
         this._MoveTree(source, target);
-        store.DeleteFolder(source);
+        this._store.DeleteFolder(source);
       } else {
-        store.Upload(target, store.Download(source));
-        store.DeleteFile(source);
+        this._store.Upload(target, this._store.Download(source));
+        this._store.DeleteFile(source);
       }
     }
   }
 
   public FileMeta? Stat(string relativePath, bool shadow) => this._Guard<FileMeta?>(() => {
-    var meta = store.Stat(_File(relativePath, shadow));
+    var meta = this._store.Stat(_File(relativePath, shadow));
     return meta == null
       ? null
       : new FileMeta(meta.Length, meta.CreatedUtc, meta.ModifiedUtc, meta.IsFolder ? FileAttributes.Directory : FileAttributes.Normal);
   });
 
   public bool FileExists(string relativePath, bool shadow)
-    => this._TryQuery(() => store.Stat(_File(relativePath, shadow)) is { IsFolder: false });
+    => this._TryQuery(() => this._store.Stat(_File(relativePath, shadow)) is { IsFolder: false });
 
   public bool FolderExists(string relativeFolder, bool shadow) {
     var physical = _Folder(relativeFolder, shadow);
-    return physical.Length == 0 ? this.IsOnline : this._TryQuery(() => store.Stat(physical) is { IsFolder: true });
+    return physical.Length == 0 ? this.IsOnline : this._TryQuery(() => this._store.Stat(physical) is { IsFolder: true });
   }
 
   private bool _TryQuery(Func<bool> query) {
@@ -387,10 +401,10 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
 
   public IEnumerable<VolumeEntry> List(string relativeFolder, bool shadow) {
     var physical = _Folder(relativeFolder, shadow);
-    if (physical.Length > 0 && this._Guard(() => store.Stat(physical)) is not { IsFolder: true })
+    if (physical.Length > 0 && this._Guard(() => this._store.Stat(physical)) is not { IsFolder: true })
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {relativeFolder}");
 
-    foreach (var entry in this._Guard(() => store.List(physical).ToArray()))
+    foreach (var entry in this._Guard(() => this._store.List(physical).ToArray()))
       yield return new(entry.Name, entry.IsFolder, entry.Length, entry.ModifiedUtc);
   }
 
@@ -398,8 +412,35 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   public void SetTimestamps(string relativePath, bool shadow, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc)
     => throw new PoolFsException(PoolFsError.NotSupported, $"Backend '{this.DisplayName}' cannot set timestamps");
 
-  public void Dispose() => store.Dispose();
+  public void Dispose() => this._store.Dispose();
 
+}
+
+/// <summary>
+/// <summary>
+/// Serializes every call to a non-thread-safe store under one lock, so the engine's concurrent
+/// prefetch / mirror-split reads (and any background op) never interleave protocol commands on a
+/// single-connection backend (FTP/SFTP). Correctness over throughput — but the object read cache
+/// already collapses a file's per-block reads to one download, so the real contention is low.
+/// </summary>
+internal sealed class SerializingWholeFileStore(IWholeFileStore inner) : IWholeFileStore {
+  private readonly Lock _lock = new();
+
+  public bool ThreadSafe => true; // it IS now — this wrapper provides the safety
+
+  public void Connect() { lock (this._lock) inner.Connect(); }
+  public bool Probe() { lock (this._lock) return inner.Probe(); }
+  public byte[] Download(string p) { lock (this._lock) return inner.Download(p); }
+  public void Upload(string p, byte[] c) { lock (this._lock) inner.Upload(p, c); }
+  public void DeleteFile(string p) { lock (this._lock) inner.DeleteFile(p); }
+  public StoreMeta? Stat(string p) { lock (this._lock) return inner.Stat(p); }
+  public void CreateFolder(string p) { lock (this._lock) inner.CreateFolder(p); }
+  public void DeleteFolder(string p) { lock (this._lock) inner.DeleteFolder(p); }
+
+  // materialise inside the lock — the enumerable must not be lazily walked after the lock releases
+  public IEnumerable<StoreEntry> List(string p) { lock (this._lock) return inner.List(p).ToArray(); }
+
+  public void Dispose() { lock (this._lock) inner.Dispose(); }
 }
 
 /// <summary>
@@ -409,6 +450,8 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
 public sealed class DirectoryStore(string rootPath) : IWholeFileStore {
 
   private string _Map(string physicalPath) => Path.Combine(rootPath, physicalPath.Replace('/', Path.DirectorySeparatorChar));
+
+  public bool ThreadSafe => true; // independent File/Directory ops — safe under concurrent use
 
   public void Connect() {
   }
