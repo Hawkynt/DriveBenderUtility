@@ -456,11 +456,27 @@ internal sealed class ServeCommand(
       ? v.GetString()
       : null;
 
+  private int _openStreams;
+  private const int _MAX_STREAMS = 64;
+
   private void _Stream(HttpListenerContext context) {
+    // bound concurrent SSE streams: each runs on its own thread and a client that stops reading
+    // (TCP zero-window) parks that thread on a blocking Flush indefinitely, so an unbounded number
+    // of stuck tabs would leak threads/memory. 64 is ample for real browser+desktop use.
+    if (Interlocked.Increment(ref this._openStreams) > _MAX_STREAMS) {
+      Interlocked.Decrement(ref this._openStreams);
+      try { context.Response.StatusCode = 503; context.Response.Close(); } catch { }
+      return;
+    }
+
     context.Response.ContentType = "text/event-stream";
     context.Response.Headers.Add("Cache-Control", "no-cache");
     context.Response.SendChunked = true;
     try {
+      // a stuck client should not park this thread forever — set a write timeout where the stream
+      // supports one (best effort: HttpListener's stream may not, in which case the cap is the bound)
+      try { context.Response.OutputStream.WriteTimeout = 15_000; } catch (InvalidOperationException) { }
+
       using var writer = new StreamWriter(context.Response.OutputStream, new UTF8Encoding(false));
       writer.Write("retry: 1000\n\n"); // reconnect within 1s if the daemon restarts (stable URL)
       writer.Flush();
@@ -484,6 +500,8 @@ internal sealed class ServeCommand(
       }
     } catch (Exception) {
       // response already torn down; nothing to clean up
+    } finally {
+      Interlocked.Decrement(ref this._openStreams);
     }
   }
 

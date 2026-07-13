@@ -70,6 +70,25 @@ public sealed class MountRegistry(IHostEnvironment host) {
   private string _ErrorPath(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.error");
   private string _ReloadPath(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.reload");
 
+  /// <summary>
+  /// Acquires the pool's exclusive cross-process MOUNT lock, held for the mount's whole lifetime
+  /// (returns null when another process already holds it). The registry entry check is racy — two
+  /// managers can both pass it and launch two mount processes over one member set, and two engines
+  /// over one set corrupt each other. This OS-level file lock (FileShare.None) is the real guard;
+  /// DeleteOnClose releases it even if the mount process crashes.
+  /// </summary>
+  public IDisposable? TryAcquireMountLock(Guid poolId) {
+    this._EnsureSecureDir();
+    var path = Path.Combine(this._Directory, $"{poolId:D}.mountlock");
+    try {
+      return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.DeleteOnClose);
+    } catch (IOException) {
+      return null; // another mount process holds it
+    } catch (UnauthorizedAccessException) {
+      return null;
+    }
+  }
+
   public void Register(MountEntry entry) {
     this._EnsureSecureDir();
     host.WriteAllTextAtomic(this._EntryPath(entry.PoolId), JsonSerializer.Serialize(entry, new JsonSerializerOptions { WriteIndented = true }));

@@ -101,6 +101,20 @@ public class MediaLifecycleTests {
   }
 
   [Test]
+  [Category("Exception")]
+  public void Replace_GivenOfflineOldMember_WhenReplaced_ThenRefusedSoDataIsNotAbandoned() {
+    this._v1.Seed("docs/x.txt", false, _Bytes(1, 1));
+    var replacement = new FakeVolumeIO(Guid.NewGuid(), "new", "PHYS-NEW", capacity: 1L << 20);
+    this._v1.IsOnline = false; // the disk we are replacing died
+
+    var act = () => this._Lifecycle(1, this._v1, this._v2).Replace(this._v1.MemberId, replacement);
+
+    act.Should().Throw<PoolFsException>("replacing from an unreadable member would migrate 0 files and silently abandon its data")
+      .Which.Error.Should().Be(PoolFsError.Offline);
+    replacement.FilePaths.Should().NotContain(p => p == "docs/x.txt", "nothing was migrated from the dead member");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public void RestorePool_GivenMissingShadows_WhenRestored_ThenDuplicationReestablished() {
     this._v1.Seed("f.bin", false, _Bytes(9, 9, 9)); // only a primary, D wants 2

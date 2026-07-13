@@ -140,13 +140,11 @@ internal static class MountCommand {
       fs.ReloadConfig(config);
       fs.UpdateMemberRoles(manifest.Members.ToDictionary(m => m.MemberId, m => m.Role)); // tier changes act on new writes immediately
 
-      var duplication = Math.Max(1, config.Duplication ?? 1);
-      if (duplication >= 2) {
-        var allowSamePhysical = config.Placement?.ShadowNeverSamePhysical == false;
-        var report = new MediaLifecycle(ios, fs.Journal, duplication, allowSamePhysical).RestorePool();
-        if (report.CopiesCreated > 0)
-          DriveBender.Logger($"Live reload: created {report.CopiesCreated} owed cop(ies) to reach duplication level {duplication}");
-      }
+      // raising the duplication level owes new copies — hand that to the background heal job
+      // (it converges incrementally via the scheduler) instead of a blocking RestorePool that
+      // would freeze the pump for the whole restore on a large pool
+      if (Math.Max(1, config.Duplication ?? 1) >= 2)
+        fs.RequestHeal();
 
       return config;
     } catch (Exception e) {
@@ -223,6 +221,12 @@ internal static class MountCommand {
   }
 
   private static int _MountPlatform(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, PoolConfig config, string target, string label, MountRegistry registry, MountOptions options) {
+    // exclusive cross-process guard: two engines over one member set race and corrupt each other,
+    // and the registry-entry check alone is TOCTOU-racy. Held for the mount's whole lifetime.
+    using var mountLock = registry.TryAcquireMountLock(pool.PoolId);
+    if (mountLock == null)
+      return _Fail(registry, pool.PoolId, "This pool is already mounted by another process — unmount it first.", 1);
+
 #if WINDOWS
     // WinFsp preferred (richer semantics); Dokan (LGPL) as the no-extra-install fallback (§4.1)
     IDisposable mountHost;
@@ -251,7 +255,12 @@ internal static class MountCommand {
       var currentConfig = config;
       var advisor = new AutoTierAdvisor();
       var tick = 0L;
-      using var pump = new Timer(_ => {
+      // NON-REENTRANT: the timer is armed for a single shot and re-armed at the END of each tick,
+      // so a slow tick (a live reload, a big metrics publish) can never overlap the next one —
+      // System.Threading.Timer's periodic mode fires on a new thread-pool thread regardless, which
+      // would run Pump()/metrics/reload concurrently and race the engine.
+      Timer? pump = null;
+      pump = new Timer(_ => {
         // an unhandled exception in a Timer callback kills the process — the background pump
         // must never take the driver-event loop down with it (process-isolation hardening)
         try {
@@ -269,8 +278,12 @@ internal static class MountCommand {
             stop.Set();
         } catch (Exception e) {
           DriveBender.Logger($"[Warning]background pump tick failed: {e.Message}");
+        } finally {
+          if (!stop.IsSet)
+            try { pump?.Change(TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan); } catch (ObjectDisposedException) { }
         }
-      }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+      }, null, TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan);
+      using var pumpHandle = pump;
 
       Console.WriteLine($"Pool mounted at '{target}'. Press Ctrl+C or run 'dbmount unmount {target}' to unmount.");
       Console.CancelKeyPress += (_, e) => {

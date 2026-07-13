@@ -163,6 +163,12 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
     var old = members.FirstOrDefault(m => m.MemberId == oldMemberId)
               ?? throw new PoolFsException(PoolFsError.NotFound, $"No member {oldMemberId} in the pool");
 
+    // NEVER replace from a member we cannot read: _WalkMember swallows per-folder errors, so an
+    // offline/dying source would migrate ZERO files, "succeed", and let the caller drop it from the
+    // manifest — silently abandoning all its data. Refuse instead so the data is not lost (SAFE-DUP).
+    if (!old.IsOnline)
+      throw new PoolFsException(PoolFsError.Offline, $"Cannot replace '{old.DisplayName}' — it is offline; its data would be abandoned. Bring it online, or use restore/remove-media which rebuild from surviving copies.");
+
     var moved = 0;
     foreach (var (path, shadow) in this._WalkMember(old).ToArray()) {
       var sequence = journal.LogIntent(JournalOp.Rebalance, path, memberId: replacement.MemberId);
