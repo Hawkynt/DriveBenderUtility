@@ -300,8 +300,24 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
 
   public override void Cleanup(object fileNode, object fileDesc, string fileName, uint flags) {
     var descriptor = (FileDescriptor)fileDesc;
-    if ((flags & CleanupDelete) == 0)
+    if ((flags & CleanupDelete) == 0) {
+      // CLEANUP is WinFsp's "the application has closed its last handle"; CLOSE is "the kernel
+      // finally released the file object", which the FSD may defer for a long time — often until
+      // unmount. Publication of a staged file (temp -> final, FR-STAGED-WRITE) hangs off the
+      // engine's Close, so hanging it off WinFsp's Close left every newly written file sitting on
+      // disk as `*.TEMP.$DRIVEBENDER`: invisible to every other tool, and swept as an incomplete
+      // write by the next mount's recovery. Flushing here publishes at the moment the user
+      // considers the file written, without dropping the handle — the kernel can still send
+      // cached writes against it afterwards, and Close still does the real teardown.
+      if (!descriptor.IsDirectory && descriptor.Handle != NodeHandle.Invalid)
+        try {
+          pool.Flush(descriptor.Handle);
+        } catch (PoolFsException e) {
+          DriveBender.Logger($"[Warning]flush of '{descriptor.Path}' on cleanup failed: {e.Message}");
+        }
+
       return;
+    }
 
     try {
       if (descriptor.IsDirectory)
@@ -346,8 +362,16 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
         return false;
       }
 
+      // Resume AFTER the marker by name order, not by locating the marker entry itself. The
+      // marker names the last entry already delivered, and the caller may well have DELETED it
+      // before asking for more — which is exactly what a recursive delete does. Searching for it
+      // then failed to find it, SkipWhile consumed the entire listing, and enumeration ended
+      // early: every remaining file was silently skipped, so `rmdir /s` (and Explorer, and any
+      // enumerate-then-delete tool) removed some files, missed the rest, and then failed to
+      // remove the directory as "not empty". ReadDirectory orders by name with the same
+      // comparer, so a name comparison resumes at exactly the right place either way.
       if (marker != null)
-        entries = entries.SkipWhile(e => !e.Name.Equals(marker, StringComparison.OrdinalIgnoreCase)).Skip(1);
+        entries = entries.Where(e => string.Compare(e.Name, marker, StringComparison.OrdinalIgnoreCase) > 0);
 
       context = enumerator = entries.GetEnumerator();
     }
@@ -407,6 +431,27 @@ public sealed class WinFspMountHost : IDisposable {
     }
   }
 
+  /// <summary>
+  /// WinFsp's mount-point grammar has no trailing separator: a drive letter is <c>X:</c>, and a
+  /// directory is a path that does not end in one. A drive is conventionally CONFIGURED as
+  /// <c>X:\</c> — that is what the manifest holds and what the CLI takes — and WinFsp rejects it
+  /// with STATUS_OBJECT_NAME_INVALID (0xC0000033).
+  ///
+  /// That rejection used to be fatal in the literal sense: <c>winfsp.net</c> does not check the
+  /// mount point before use, so it called <c>FspFileSystemSetMountPointEx</c> on a filesystem it
+  /// had never created and the process died with an access violation (0xC0000005) — no error, no
+  /// log line, no mount, on every Windows machine. <c>*</c> is passed through: it means "pick any
+  /// free drive letter".
+  /// </summary>
+  internal static string ToWinFspMountPoint(string target) {
+    var trimmed = target.Trim();
+    if (trimmed.Length == 0 || trimmed == "*")
+      return trimmed;
+
+    var stripped = trimmed.TrimEnd('\\', '/');
+    return stripped.Length == 0 ? trimmed : stripped;
+  }
+
   public void Mount(IPoolFileSystem pool, string target, string volumeLabel, bool readOnly) {
     pool.Mount(new(target, readOnly, volumeLabel));
 
@@ -425,14 +470,29 @@ public sealed class WinFspMountHost : IDisposable {
       VolumeSerialNumber = 0,
     };
 
-    var status = this._host.Mount(target);
+    var mountPoint = ToWinFspMountPoint(target);
+
+    // Ask WinFsp whether it will accept the mount point BEFORE handing it over. winfsp.net does
+    // not validate, and an unacceptable one takes the whole process down with an access violation
+    // rather than returning a status — so this is the difference between a clear message and a
+    // crash with nothing to go on.
+    var preflight = this._host.Preflight(mountPoint);
+    if (preflight < 0) {
+      this._host = null;
+      pool.Unmount();
+      throw new PoolFsException(PoolFsError.InvalidArgument,
+        $"WinFsp will not accept '{mountPoint}' as a mount point (NTSTATUS 0x{preflight:X8}). "
+        + "A drive letter must be free and written as 'X:'; a directory target must exist and be empty.");
+    }
+
+    var status = this._host.Mount(mountPoint);
     if (status < 0) {
       this._host = null;
       pool.Unmount();
-      throw new PoolFsException(PoolFsError.IoError, $"WinFsp mount at '{target}' failed with NTSTATUS 0x{status:X8}");
+      throw new PoolFsException(PoolFsError.IoError, $"WinFsp mount at '{mountPoint}' failed with NTSTATUS 0x{status:X8}");
     }
 
-    DriveBender.Logger($"Mounted pool as '{target}' via WinFsp");
+    DriveBender.Logger($"Mounted pool as '{mountPoint}' via WinFsp");
   }
 
   public void Unmount() {
