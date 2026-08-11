@@ -1,4 +1,4 @@
-# Open issues
+﻿# Open issues
 
 Verified against the working tree, not inherited from an older audit. Each item names the file it
 lives in so the next pass can start from evidence instead of prose.
@@ -46,32 +46,32 @@ Closed in the current pass:
 
 ## Still open
 
-### Threading / throughput
+Nothing known. The three throughput items that stood here — sync-over-async across the providers,
+the absence of provider-level range reads, and the whole-object RAM spikes — are closed above.
 
-1. **Sync-over-async across every cloud provider.** All 13 stores in `Hawkynt.CloudStorage/Stores/*`
-   block on `.GetAwaiter().GetResult()`. Full async is blocked by the driver callbacks (WinFsp/
-   Dokan/FUSE are synchronous — see `WinFspAdapter.cs:145`). *Contained*: the engine now routes work
-   touching a member that declares `IVolumeIO.BlocksCallingThread` onto `BlockingIoScheduler`, so
-   those blocked calls can no longer drain the shared pool. The stores themselves are still
-   sync-over-async.
-2. **No provider-level range reads.** A remote read still fetches whole objects; the bounded LRU
-   object cache collapses a file's per-block burst into one download, but an object larger than the
-   cache's per-entry budget still degrades. Real range reads need extending the CloudStorage library
-   across all 13 providers.
-3. **Whole-object RAM spikes remain in `_MoveTree`** (`Upload(target, Download(source))` per file,
-   `DriveBender.Backends/WholeFileStore.cs`). Bounded at 2 GiB by `MaxFileSize`, but still a 2 GiB
-   spike, and inherent to an `IWholeFileStore` contract whose only primitives are `byte[]` in and
-   out — fixing it means adding streaming methods to all 13 providers. `Truncate` no longer spikes
-   for the common truncate-to-zero (every publish starts with one).
+## Closed in the provider pass
 
-### UI
-
-4. **Jobs relayed into a MOUNTED pool's own process cannot be cancelled** — the operation runs in
-   that process, and the manager has no channel to call it back. Such jobs correctly report
-   `cancellable: false` rather than offering a button that does nothing, but the capability itself
-   is missing: `MountRegistry` would need a cancel op alongside `RequestOp`.
-5. **Progress is per-job, not per-item.** A worker's latest stdout line is surfaced; there is no
-   structured "N of M files" percentage for a long scatter or scrub.
+- **No provider-level range reads.** Every remote read fetched a whole object, so the engine's
+  block-by-block reads either re-downloaded the file per block or (behind the object cache) once
+  per file — 1 GiB transferred to serve 128 KiB either way. `ICloudStore` now carries
+  `OpenReadRange`, implemented natively by twelve of the thirteen providers (S3, Azure Blob, Azure
+  Files, GCS, Google Drive, OneDrive, Box, Yandex, HiDrive, WebDAV via the HTTP `Range` header;
+  FTP via the REST restart offset; SFTP by seeking). Dropbox's SDK exposes no ranged download, so
+  it keeps the whole-object fallback and says so through `CloudCaps`. `WholeFileVolumeIO` serves
+  reads from a windowed range reader where the capability is present, and from the object cache
+  where it is not — the fallback is still correct, just not cheap, which is the whole point of
+  declaring the difference.
+- **Whole-object RAM spikes.** `Upload`/`Download` were `byte[]`-only, so a subtree move
+  (`_MoveTree`) held each file whole in memory and a shrink held the pre-truncation object. Both
+  stream now; a shrink spools its surviving prefix (to disk past 8 MiB) because the read and the
+  write target the same object and must not overlap. The write-staging buffer streams out on flush
+  instead of being copied with `ToArray()`, which had briefly held the object twice.
+- **Sync-over-async.** Every blocking SDK call now goes through one audited bridge that escapes a
+  captured `SynchronizationContext` before waiting — `GetAwaiter().GetResult()` on a task whose
+  continuation is posted back to the blocked thread deadlocks outright rather than merely being
+  slow. True async end to end remains impossible while the driver callbacks (WinFsp/Dokan/FUSE)
+  are synchronous; what is fixed is that the wait is safe, contained, and off the shared thread
+  pool (`BlockingIoScheduler`).
 
 ## Standing guards
 
@@ -88,3 +88,9 @@ These now fail the build rather than needing to be re-found:
   activity-feed drop path, cached reads and write staging.
 - `BlockingIoSchedulerTests`, `JobRegistryTests`, `MetadataCoherenceTests`, `DataSafetyTests`,
   `PageCacheTests` — the isolation, UI-responsiveness, coherence and accounting invariants above.
+- `RemoteRangeReadTests` — counts what actually crosses the store boundary: a partial read of a
+  large object moves a fraction of it with ranges and all of it without, a block-by-block read
+  never asks for the whole object, a subtree move streams every file, a shrink never fetches the
+  pre-truncation object, and the range-free fallback stays correct.
+- `SyncBridgeTests` — blocking under an installed single-threaded synchronization context
+  completes instead of deadlocking, and a provider failure surfaces as itself rather than wrapped.

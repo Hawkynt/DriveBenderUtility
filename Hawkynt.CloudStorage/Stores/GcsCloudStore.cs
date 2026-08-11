@@ -1,4 +1,4 @@
-using Google;
+﻿using Google;
 using Google.Apis.Auth.OAuth2;
 using Google.Cloud.Storage.V1;
 using Hawkynt.CloudStorage;
@@ -31,6 +31,13 @@ public sealed class GcsCloudStore : ICloudStore {
     }
   }
 
+  /// <summary>
+  /// GCS serves a real ranged GET, so a block read transfers its block. It writes downloads INTO
+  /// a stream rather than handing one back, so a whole-object read is still materialised —
+  /// StreamingDownload is deliberately not claimed.
+  /// </summary>
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload;
+
   public byte[] Download(string physicalPath) {
     try {
       using var buffer = new MemoryStream();
@@ -41,8 +48,30 @@ public sealed class GcsCloudStore : ICloudStore {
     }
   }
 
+  public Stream OpenReadRange(string physicalPath, long offset, long count) {
+    if (count <= 0)
+      return EmptyStream.Instance;
+
+    try {
+      // only the range crosses the wire; buffering it is bounded by the block size the caller asked for
+      var buffer = new MemoryStream();
+      this._client.DownloadObject(this._bucket, ObjectKeys.File(this._rootPrefix, physicalPath), buffer,
+        new DownloadObjectOptions { Range = new(offset, offset + count - 1) });
+      buffer.Position = 0;
+      return buffer;
+    } catch (GoogleApiException e) when (e.HttpStatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable) {
+      return EmptyStream.Instance; // at or past the end
+    } catch (GoogleApiException e) when (e.HttpStatusCode == System.Net.HttpStatusCode.NotFound) {
+      throw new CloudStorageException(CloudStorageError.NotFound, $"Object not found: {physicalPath}", e);
+    }
+  }
+
   public void Upload(string physicalPath, byte[] content)
     => this._client.UploadObject(this._bucket, ObjectKeys.File(this._rootPrefix, physicalPath), null, new MemoryStream(content));
+
+  /// <summary>Streams the body straight to GCS — a multi-gigabyte object is never held in memory.</summary>
+  public void Upload(string physicalPath, Stream content, long length = -1)
+    => this._client.UploadObject(this._bucket, ObjectKeys.File(this._rootPrefix, physicalPath), null, content);
 
   public void DeleteFile(string physicalPath) {
     try {

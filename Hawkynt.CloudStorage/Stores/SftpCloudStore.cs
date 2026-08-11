@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using Hawkynt.CloudStorage;
 using Renci.SshNet;
 using Renci.SshNet.Common;
@@ -44,15 +44,47 @@ public sealed class SftpCloudStore : ICloudStore {
     }
   }
 
+  /// <summary>
+  /// SFTP is a random-access protocol: a remote file opens as a seekable stream, so a range read
+  /// is a seek and a bounded read rather than a transfer of everything before it.
+  /// </summary>
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload | CloudCaps.StreamingDownload;
+
   public byte[] Download(string physicalPath) {
     using var buffer = new MemoryStream();
     this._client.DownloadFile(this._Map(physicalPath), buffer);
     return buffer.ToArray();
   }
 
+  public Stream OpenRead(string physicalPath) {
+    this.Connect();
+    return this._client.OpenRead(this._Map(physicalPath));
+  }
+
+  public Stream OpenReadRange(string physicalPath, long offset, long count) {
+    if (count <= 0)
+      return EmptyStream.Instance;
+
+    this.Connect();
+    var stream = this._client.OpenRead(this._Map(physicalPath));
+    if (offset >= stream.Length) {
+      stream.Dispose();
+      return EmptyStream.Instance; // at or past the end — nothing to read, as on a local file
+    }
+
+    stream.Seek(offset, SeekOrigin.Begin);
+    return new WindowStream(stream, 0, Math.Min(count, stream.Length - offset));
+  }
+
   public void Upload(string physicalPath, byte[] content) {
     using var stream = new MemoryStream(content);
     this._client.UploadFile(stream, this._Map(physicalPath), canOverride: true);
+  }
+
+  /// <summary>Streams the body up — a multi-gigabyte file is never held in memory as a byte[].</summary>
+  public void Upload(string physicalPath, Stream content, long length = -1) {
+    this.Connect();
+    this._client.UploadFile(content, this._Map(physicalPath), canOverride: true);
   }
 
   public void DeleteFile(string physicalPath) => this._client.DeleteFile(this._Map(physicalPath));

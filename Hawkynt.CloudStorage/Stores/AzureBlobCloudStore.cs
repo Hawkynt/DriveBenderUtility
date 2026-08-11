@@ -1,4 +1,4 @@
-using Azure;
+﻿using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Hawkynt.CloudStorage;
@@ -16,6 +16,8 @@ public sealed class AzureBlobCloudStore : ICloudStore {
     this._container = new BlobContainerClient(connectionString, container);
     this._rootPrefix = rootPrefix;
   }
+
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload | CloudCaps.StreamingDownload;
 
   public void Connect() {
   }
@@ -36,8 +38,36 @@ public sealed class AzureBlobCloudStore : ICloudStore {
     }
   }
 
+  public Stream OpenRead(string physicalPath) => this._Download(physicalPath, range: default);
+
+  /// <summary>
+  /// A real ranged GET (the Azure Range header): only the requested bytes cross the wire, so a
+  /// block-by-block read of a large blob costs its own size rather than its size squared.
+  /// </summary>
+  public Stream OpenReadRange(string physicalPath, long offset, long count)
+    => count <= 0 ? EmptyStream.Instance : this._Download(physicalPath, new HttpRange(offset, count));
+
+  private Stream _Download(string physicalPath, HttpRange range) {
+    try {
+      var download = this._container
+        .GetBlobClient(ObjectKeys.File(this._rootPrefix, physicalPath))
+        .DownloadStreaming(new BlobDownloadOptions { Range = range })
+        .Value;
+
+      return new OwnedStream(download.Content, download, download.Details.ContentLength);
+    } catch (RequestFailedException e) when (e.Status == 416) {
+      return EmptyStream.Instance; // range starts at or past the end — nothing to read
+    } catch (RequestFailedException e) when (e.Status == 404) {
+      throw new CloudStorageException(CloudStorageError.NotFound, $"Blob not found: {physicalPath}", e);
+    }
+  }
+
   public void Upload(string physicalPath, byte[] content)
     => this._container.GetBlobClient(ObjectKeys.File(this._rootPrefix, physicalPath)).Upload(new BinaryData(content), overwrite: true);
+
+  /// <summary>Streams the body straight to the blob — a multi-gigabyte object is never held in memory.</summary>
+  public void Upload(string physicalPath, Stream content, long length = -1)
+    => this._container.GetBlobClient(ObjectKeys.File(this._rootPrefix, physicalPath)).Upload(content, overwrite: true);
 
   public void DeleteFile(string physicalPath)
     => this._container.GetBlobClient(ObjectKeys.File(this._rootPrefix, physicalPath)).DeleteIfExists();

@@ -1,4 +1,4 @@
-using Hawkynt.CloudStorage.OAuth;
+﻿using Hawkynt.CloudStorage.OAuth;
 using Microsoft.Graph;
 using Microsoft.Graph.Models;
 using Microsoft.Graph.Models.ODataErrors;
@@ -41,7 +41,7 @@ public sealed class OneDriveCloudStore : ICloudStore {
         return this._driveId;
 
       if (string.IsNullOrEmpty(this._driveId) || this._driveId is "me" or "root") {
-        var drive = this._client.Me.Drive.GetAsync().GetAwaiter().GetResult()
+        var drive = SyncBridge.Run(() => this._client.Me.Drive.GetAsync())
                     ?? throw new CloudStorageException(CloudStorageError.NotFound, "No default OneDrive for this account");
         this._driveId = drive.Id ?? throw new CloudStorageException(CloudStorageError.NotFound, "Default OneDrive has no id");
       }
@@ -60,7 +60,7 @@ public sealed class OneDriveCloudStore : ICloudStore {
 
   public bool Probe() {
     try {
-      this._client.Drives[this._Drive].Items["root"].GetAsync().GetAwaiter().GetResult();
+      SyncBridge.Run(() => this._client.Drives[this._Drive].Items["root"].GetAsync());
       return true;
     } catch (Exception) {
       return false;
@@ -69,28 +69,53 @@ public sealed class OneDriveCloudStore : ICloudStore {
 
   private DriveItem? _TryGetItem(string path) {
     try {
-      return this._client.Drives[this._Drive].Items[this._ItemId(path)].GetAsync().GetAwaiter().GetResult();
+      return SyncBridge.Run(() => this._client.Drives[this._Drive].Items[this._ItemId(path)].GetAsync());
     } catch (ODataError e) when (e.ResponseStatusCode == 404) {
       return null;
     }
   }
 
-  public byte[] Download(string path) {
-    var stream = this._client.Drives[this._Drive].Items[this._ItemId(path)].Content.GetAsync().GetAwaiter().GetResult()
-                 ?? throw new CloudStorageException(CloudStorageError.NotFound, $"File not found: {path}");
+  /// <summary>
+  /// Graph serves item content over plain HTTP and honours a Range header on it, so a block read
+  /// transfers its block rather than the whole item.
+  /// </summary>
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload | CloudCaps.StreamingDownload;
 
-    using (stream) {
-      using var buffer = new MemoryStream();
-      stream.CopyTo(buffer);
-      return buffer.ToArray();
-    }
+  public byte[] Download(string path) {
+    using var stream = this.OpenRead(path);
+    using var buffer = new MemoryStream();
+    stream.CopyTo(buffer);
+    return buffer.ToArray();
   }
 
-  public void Upload(string path, byte[] content)
-    => this._client.Drives[this._Drive].Items[this._ItemId(path)].Content.PutAsync(new MemoryStream(content)).GetAwaiter().GetResult();
+  public Stream OpenRead(string path)
+    => SyncBridge.Run(() => this._client.Drives[this._Drive].Items[this._ItemId(path)].Content.GetAsync())
+       ?? throw new CloudStorageException(CloudStorageError.NotFound, $"File not found: {path}");
+
+  public Stream OpenReadRange(string path, long offset, long count) {
+    if (count <= 0)
+      return EmptyStream.Instance;
+
+    var stream = SyncBridge.Run(() => this._client.Drives[this._Drive].Items[this._ItemId(path)].Content
+                   .GetAsync(request => request.Headers.Add("Range", $"bytes={offset}-{offset + count - 1}")))
+                 ?? throw new CloudStorageException(CloudStorageError.NotFound, $"File not found: {path}");
+
+    // a service that ignored the header sends the whole item; bound it here so the caller always
+    // gets exactly the window it asked for
+    return new WindowStream(stream, 0, count);
+  }
+
+  public void Upload(string path, byte[] content) {
+    using var buffer = new MemoryStream(content, false);
+    this.Upload(path, buffer, content.LongLength);
+  }
+
+  /// <summary>Streams the body up — a large file is never held in memory as a byte[].</summary>
+  public void Upload(string path, Stream content, long length = -1)
+    => SyncBridge.Run(() => this._client.Drives[this._Drive].Items[this._ItemId(path)].Content.PutAsync(content));
 
   public void DeleteFile(string path)
-    => this._client.Drives[this._Drive].Items[this._ItemId(path)].DeleteAsync().GetAwaiter().GetResult();
+    => SyncBridge.Run(() => this._client.Drives[this._Drive].Items[this._ItemId(path)].DeleteAsync());
 
   public CloudMeta? Stat(string path) {
     var item = this._TryGetItem(path);
@@ -104,17 +129,17 @@ public sealed class OneDriveCloudStore : ICloudStore {
   public void CreateFolder(string path) {
     var name = CloudPath.GetName(path);
     var parent = CloudPath.GetParent(path);
-    this._client.Drives[this._Drive].Items[this._ItemId(parent)].Children.PostAsync(new DriveItem {
+    SyncBridge.Run(() => this._client.Drives[this._Drive].Items[this._ItemId(parent)].Children.PostAsync(new DriveItem {
       Name = name,
       Folder = new Folder(),
-    }).GetAwaiter().GetResult();
+    }));
   }
 
   public void DeleteFolder(string path)
-    => this._client.Drives[this._Drive].Items[this._ItemId(path)].DeleteAsync().GetAwaiter().GetResult();
+    => SyncBridge.Run(() => this._client.Drives[this._Drive].Items[this._ItemId(path)].DeleteAsync());
 
   public IEnumerable<CloudEntry> List(string folder) {
-    var page = this._client.Drives[this._Drive].Items[this._ItemId(folder)].Children.GetAsync().GetAwaiter().GetResult();
+    var page = SyncBridge.Run(() => this._client.Drives[this._Drive].Items[this._ItemId(folder)].Children.GetAsync());
     while (page != null) {
       foreach (var item in page.Value ?? [])
         yield return new(item.Name ?? "", item.Folder != null, item.Size ?? 0, item.LastModifiedDateTime?.UtcDateTime ?? DateTime.MinValue);
@@ -122,8 +147,8 @@ public sealed class OneDriveCloudStore : ICloudStore {
       if (page.OdataNextLink == null)
         break;
 
-      page = this._client.Drives[this._Drive].Items[this._ItemId(folder)].Children
-        .WithUrl(page.OdataNextLink).GetAsync().GetAwaiter().GetResult();
+      page = SyncBridge.Run(() => this._client.Drives[this._Drive].Items[this._ItemId(folder)].Children
+        .WithUrl(page.OdataNextLink).GetAsync());
     }
   }
 

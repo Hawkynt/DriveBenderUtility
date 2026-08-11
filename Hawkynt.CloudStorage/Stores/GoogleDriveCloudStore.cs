@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using Google.Apis.Auth.OAuth2;
 using Google.Apis.Http;
 using Google.Apis.Services;
@@ -107,6 +107,13 @@ public sealed class GoogleDriveCloudStore : ICloudStore {
     return parentId == null ? null : this._FindChild(parentId, CloudPath.GetName(path), foldersOnly: false);
   }
 
+  /// <summary>
+  /// The Drive client downloads INTO a stream rather than handing one back, so a whole-object
+  /// read is still materialised; what it does support is a ranged media download, which is the
+  /// part that matters for block reads.
+  /// </summary>
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload;
+
   public byte[] Download(string path) {
     var file = this._ResolveFile(path)
                ?? throw new CloudStorageException(CloudStorageError.NotFound, $"File not found: {path}");
@@ -114,6 +121,24 @@ public sealed class GoogleDriveCloudStore : ICloudStore {
     using var buffer = new MemoryStream();
     this._service.Files.Get(file.Id).Download(buffer);
     return buffer.ToArray();
+  }
+
+  public Stream OpenReadRange(string path, long offset, long count) {
+    if (count <= 0)
+      return EmptyStream.Instance;
+
+    var file = this._ResolveFile(path)
+               ?? throw new CloudStorageException(CloudStorageError.NotFound, $"File not found: {path}");
+
+    // only the range crosses the wire; buffering it is bounded by the block size asked for
+    var buffer = new MemoryStream();
+    var progress = this._service.Files.Get(file.Id)
+      .DownloadRange(buffer, new System.Net.Http.Headers.RangeHeaderValue(offset, offset + count - 1));
+    if (progress.Status == Google.Apis.Download.DownloadStatus.Failed)
+      return EmptyStream.Instance; // a range at or past the end is not an error, it is nothing
+
+    buffer.Position = 0;
+    return buffer;
   }
 
   public void Upload(string path, byte[] content) {

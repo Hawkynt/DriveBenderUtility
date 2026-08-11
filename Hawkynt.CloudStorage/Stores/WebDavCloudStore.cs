@@ -1,4 +1,4 @@
-using Hawkynt.CloudStorage.OAuth;
+﻿using Hawkynt.CloudStorage.OAuth;
 using WebDav;
 
 namespace Hawkynt.CloudStorage.Stores;
@@ -50,37 +50,70 @@ public sealed class WebDavCloudStore : ICloudStore {
 
   public bool Probe() {
     try {
-      return this._client.Propfind(this._Resource(""), new() { ApplyTo = ApplyTo.Propfind.ResourceOnly }).GetAwaiter().GetResult().IsSuccessful;
+      return SyncBridge.Run(() => this._client.Propfind(this._Resource(""), new() { ApplyTo = ApplyTo.Propfind.ResourceOnly })).IsSuccessful;
     } catch (Exception) {
       return false;
     }
   }
 
-  public byte[] Download(string path) {
-    var response = this._client.GetRawFile(this._Resource(path)).GetAwaiter().GetResult();
-    if (!response.IsSuccessful)
-      throw _FromStatus(response.StatusCode, $"GET {path}");
+  /// <summary>
+  /// WebDAV is HTTP, so a GET carrying a Range header returns just that window (RFC 9110); a
+  /// server that ignores it answers with the whole body, which is still correct and is bounded
+  /// locally. Uploads go straight from the caller's stream.
+  /// </summary>
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload | CloudCaps.StreamingDownload;
 
-    using var stream = response.Stream;
+  public byte[] Download(string path) {
+    using var stream = this.OpenRead(path);
     using var buffer = new MemoryStream();
     stream.CopyTo(buffer);
     return buffer.ToArray();
   }
 
+  public Stream OpenRead(string path) {
+    var response = SyncBridge.Run(() => this._client.GetRawFile(this._Resource(path)));
+    if (!response.IsSuccessful)
+      throw _FromStatus(response.StatusCode, $"GET {path}");
+
+    return new OwnedStream(response.Stream, response, -1);
+  }
+
+  public Stream OpenReadRange(string path, long offset, long count) {
+    if (count <= 0)
+      return EmptyStream.Instance;
+
+    var response = SyncBridge.Run(() => this._client
+      .GetRawFile(this._Resource(path), new() { Headers = [new("Range", $"bytes={offset}-{offset + count - 1}")] }));
+    if (response.StatusCode == 416)
+      return EmptyStream.Instance; // at or past the end
+    if (!response.IsSuccessful)
+      throw _FromStatus(response.StatusCode, $"GET {path}");
+
+    // 200 rather than 206 means the server ignored the range and is sending everything; the
+    // window is cut out here so the caller always gets exactly what it asked for
+    return new OwnedStream(response.StatusCode == 206 ? response.Stream : new WindowStream(response.Stream, offset, count), response, count);
+  }
+
   public void Upload(string path, byte[] content) {
-    var response = this._client.PutFile(this._Resource(path), new MemoryStream(content)).GetAwaiter().GetResult();
+    using var buffer = new MemoryStream(content, false);
+    this.Upload(path, buffer, content.LongLength);
+  }
+
+  /// <summary>Streams the body up — a large file is never held in memory as a byte[].</summary>
+  public void Upload(string path, Stream content, long length = -1) {
+    var response = SyncBridge.Run(() => this._client.PutFile(this._Resource(path), content));
     if (!response.IsSuccessful)
       throw _FromStatus(response.StatusCode, $"PUT {path}");
   }
 
   public void DeleteFile(string path) {
-    var response = this._client.Delete(this._Resource(path)).GetAwaiter().GetResult();
+    var response = SyncBridge.Run(() => this._client.Delete(this._Resource(path)));
     if (!response.IsSuccessful)
       throw _FromStatus(response.StatusCode, $"DELETE {path}");
   }
 
   public CloudMeta? Stat(string path) {
-    var response = this._client.Propfind(this._Resource(path), new() { ApplyTo = ApplyTo.Propfind.ResourceOnly }).GetAwaiter().GetResult();
+    var response = SyncBridge.Run(() => this._client.Propfind(this._Resource(path), new() { ApplyTo = ApplyTo.Propfind.ResourceOnly }));
     if (response.StatusCode == 404)
       return null;
     if (!response.IsSuccessful)
@@ -95,19 +128,19 @@ public sealed class WebDavCloudStore : ICloudStore {
   }
 
   public void CreateFolder(string path) {
-    var response = this._client.Mkcol(this._Resource(path)).GetAwaiter().GetResult();
+    var response = SyncBridge.Run(() => this._client.Mkcol(this._Resource(path)));
     if (!response.IsSuccessful && response.StatusCode != 405 /* already exists */)
       throw _FromStatus(response.StatusCode, $"MKCOL {path}");
   }
 
   public void DeleteFolder(string path) {
-    var response = this._client.Delete(this._Resource(path)).GetAwaiter().GetResult();
+    var response = SyncBridge.Run(() => this._client.Delete(this._Resource(path)));
     if (!response.IsSuccessful)
       throw _FromStatus(response.StatusCode, $"DELETE {path}");
   }
 
   public IEnumerable<CloudEntry> List(string folder) {
-    var response = this._client.Propfind(this._Resource(folder), new() { ApplyTo = ApplyTo.Propfind.ResourceAndChildren }).GetAwaiter().GetResult();
+    var response = SyncBridge.Run(() => this._client.Propfind(this._Resource(folder), new() { ApplyTo = ApplyTo.Propfind.ResourceAndChildren }));
     if (response.StatusCode == 404)
       throw new CloudStorageException(CloudStorageError.NotFound, $"Folder not found: {folder}");
     if (!response.IsSuccessful)

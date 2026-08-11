@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Hawkynt.CloudStorage.OAuth;
 
 namespace Hawkynt.CloudStorage.Stores;
@@ -42,18 +42,40 @@ public sealed class HiDriveCloudStore(IAccessTokenProvider tokens, string rootPa
     }
   }
 
+  /// <summary>
+  /// Ranged and streaming transfers ride the provider's plain HTTP surface, so a block read costs
+  /// its block rather than the whole object, and a large upload is sent from a stream rather than
+  /// materialised in memory first.
+  /// </summary>
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload | CloudCaps.StreamingDownload;
+
   public byte[] Download(string path)
     => this._rest.GetBytes($"file?path={_Encode(this._Remote(path))}", $"download {path}");
 
+  public Stream OpenRead(string path)
+    => this._rest.GetStream($"file?path={_Encode(this._Remote(path))}", $"download {path}");
+
+  public Stream OpenReadRange(string path, long offset, long count)
+    => this._rest.GetRange($"file?path={_Encode(this._Remote(path))}", offset, count, $"download {path}");
+
   public void Upload(string path, byte[] content) {
+    using var buffer = new MemoryStream(content, false);
+    this.Upload(path, buffer, content.LongLength);
+  }
+
+  public void Upload(string path, Stream content, long length = -1) {
     var remote = this._Remote(path);
+    var body = new StreamContent(content);
+    if (length >= 0)
+      body.Headers.ContentLength = length;
+
     if (this.Stat(path) is { IsFolder: false }) {
-      this._rest.Send(HttpMethod.Put, $"file?path={_Encode(remote)}", $"upload {path}", new ByteArrayContent(content));
+      this._rest.Send(HttpMethod.Put, $"file?path={_Encode(remote)}", $"upload {path}", body);
       return;
     }
 
     var parent = CloudPath.GetParent(remote.TrimStart('/'));
-    this._rest.Send(HttpMethod.Post, $"file?dir=%2F{_Encode(parent)}&name={_Encode(CloudPath.GetName(remote))}", $"upload {path}", new ByteArrayContent(content));
+    this._rest.Send(HttpMethod.Post, $"file?dir=%2F{_Encode(parent)}&name={_Encode(CloudPath.GetName(remote))}", $"upload {path}", body);
   }
 
   public void DeleteFile(string path)

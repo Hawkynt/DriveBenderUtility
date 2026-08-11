@@ -41,7 +41,9 @@ public sealed class OAuth2TokenProvider(
       if (string.IsNullOrEmpty(this._cached.RefreshToken))
         throw new CloudStorageException(CloudStorageError.AccessDenied, $"OAuth token for '{accountKey}' expired and no refresh token is available; run the login flow again");
 
-      var refreshed = client.RefreshAsync(config, this._cached.RefreshToken).GetAwaiter().GetResult();
+      // routed through the bridge like every other blocking SDK call: this one runs while a lock
+      // is held, so a context-capture deadlock here would wedge every request for this account
+      var refreshed = SyncBridge.Run(() => client.RefreshAsync(config, this._cached.RefreshToken));
       store.Save(accountKey, refreshed);
       this._cached = refreshed;
       return refreshed.AccessToken;

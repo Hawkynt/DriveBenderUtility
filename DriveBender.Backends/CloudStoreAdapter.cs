@@ -16,9 +16,35 @@ public sealed class CloudStoreAdapter(ICloudStore store) : IWholeFileStore {
 
   public bool Probe() => store.Probe();
 
+  /// <summary>
+  /// Provider capabilities pass straight through: the engine decides between a ranged block read
+  /// and a whole-object strategy on the strength of what the actual provider supports, so the
+  /// flags must not be flattened here.
+  /// </summary>
+  public StoreCaps Caps {
+    get {
+      var caps = store.Caps;
+      var mapped = StoreCaps.None;
+      if ((caps & CloudCaps.RangeRead) != 0)
+        mapped |= StoreCaps.RangeRead;
+      if ((caps & CloudCaps.StreamingUpload) != 0)
+        mapped |= StoreCaps.StreamingUpload;
+      if ((caps & CloudCaps.StreamingDownload) != 0)
+        mapped |= StoreCaps.StreamingDownload;
+
+      return mapped;
+    }
+  }
+
   public byte[] Download(string physicalPath) => store.Download(physicalPath);
 
   public void Upload(string physicalPath, byte[] content) => store.Upload(physicalPath, content);
+
+  public Stream OpenRead(string physicalPath) => store.OpenRead(physicalPath);
+
+  public Stream OpenReadRange(string physicalPath, long offset, long count) => store.OpenReadRange(physicalPath, offset, count);
+
+  public void Upload(string physicalPath, Stream content, long length = -1) => store.Upload(physicalPath, content, length);
 
   public void DeleteFile(string physicalPath) => store.DeleteFile(physicalPath);
 

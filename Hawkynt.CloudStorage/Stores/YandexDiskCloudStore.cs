@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text.Json;
 using Hawkynt.CloudStorage.OAuth;
 
@@ -47,14 +47,36 @@ public sealed class YandexDiskCloudStore(IAccessTokenProvider tokens, string roo
     }
   }
 
-  public byte[] Download(string path) {
-    var link = this._rest.GetJson(_Resource(this._Remote(path), "/download"), $"download {path}");
-    return this._rest.GetBytes(link.GetProperty("href").GetString()!, $"download {path}");
-  }
+  /// <summary>
+  /// Ranged and streaming transfers ride the provider's plain HTTP surface, so a block read costs
+  /// its block rather than the whole object, and a large upload is sent from a stream rather than
+  /// materialised in memory first.
+  /// </summary>
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload | CloudCaps.StreamingDownload;
+
+  /// <summary>Yandex issues a short-lived signed href per transfer; the range/stream request goes to that.</summary>
+  private string _DownloadHref(string path)
+    => this._rest.GetJson(_Resource(this._Remote(path), "/download"), $"download {path}").GetProperty("href").GetString()!;
+
+  public byte[] Download(string path) => this._rest.GetBytes(this._DownloadHref(path), $"download {path}");
+
+  public Stream OpenRead(string path) => this._rest.GetStream(this._DownloadHref(path), $"download {path}");
+
+  public Stream OpenReadRange(string path, long offset, long count)
+    => count <= 0 ? EmptyStream.Instance : this._rest.GetRange(this._DownloadHref(path), offset, count, $"download {path}");
 
   public void Upload(string path, byte[] content) {
+    using var buffer = new MemoryStream(content, false);
+    this.Upload(path, buffer, content.LongLength);
+  }
+
+  public void Upload(string path, Stream content, long length = -1) {
     var link = this._rest.GetJson($"{_Resource(this._Remote(path), "/upload")}&overwrite=true", $"upload {path}");
-    this._rest.Send(HttpMethod.Put, link.GetProperty("href").GetString()!, $"upload {path}", new ByteArrayContent(content));
+    var body = new StreamContent(content);
+    if (length >= 0)
+      body.Headers.ContentLength = length;
+
+    this._rest.Send(HttpMethod.Put, link.GetProperty("href").GetString()!, $"upload {path}", body);
   }
 
   public void DeleteFile(string path)

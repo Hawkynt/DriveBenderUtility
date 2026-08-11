@@ -1,9 +1,24 @@
-using DivisonM.Vfs;
+﻿using DivisonM.Vfs;
 using Hawkynt.CloudStorage;
 
 namespace DivisonM.Backends;
 
 public readonly record struct StoreEntry(string Name, bool IsFolder, long Length, DateTime ModifiedUtc);
+
+/// <summary>What a remote store can do natively, as opposed to what the interface's defaults emulate.</summary>
+[Flags]
+public enum StoreCaps {
+  None = 0,
+
+  /// <summary>Serves a byte range without transferring the whole object.</summary>
+  RangeRead = 1 << 0,
+
+  /// <summary>Consumes an upload from a stream, so a large file is never materialised in memory.</summary>
+  StreamingUpload = 1 << 1,
+
+  /// <summary>Hands back a readable stream rather than a completed array.</summary>
+  StreamingDownload = 1 << 2,
+}
 
 public sealed record StoreMeta(bool IsFolder, long Length, DateTime CreatedUtc, DateTime ModifiedUtc);
 
@@ -25,6 +40,36 @@ public interface IWholeFileStore : IDisposable {
 
   /// <summary>Uploads the whole object, overwriting; parent folders are guaranteed to exist beforehand.</summary>
   void Upload(string physicalPath, byte[] content);
+
+  /// <summary>
+  /// What the underlying provider does NATIVELY. Every operation below works on every store —
+  /// the defaults emulate them with whole-object transfers — so this is about cost, not
+  /// capability, and the engine uses it to choose a read strategy.
+  /// </summary>
+  StoreCaps Caps => StoreCaps.None;
+
+  /// <summary>Opens the object for reading; the default materialises it first.</summary>
+  Stream OpenRead(string physicalPath) => new MemoryStream(this.Download(physicalPath), false);
+
+  /// <summary>
+  /// Reads a byte range. With <see cref="StoreCaps.RangeRead"/> this is a real ranged request and
+  /// costs the range; without it the whole object moves and is sliced, which is precisely the
+  /// difference the capability exists to express.
+  /// </summary>
+  Stream OpenReadRange(string physicalPath, long offset, long count) {
+    var whole = this.Download(physicalPath);
+    if (offset >= whole.LongLength || count <= 0)
+      return new MemoryStream([], false);
+
+    return new MemoryStream(whole, (int)offset, (int)Math.Min(count, whole.LongLength - offset), false);
+  }
+
+  /// <summary>Uploads from a stream; the default buffers it whole, which is what <see cref="StoreCaps.StreamingUpload"/> avoids.</summary>
+  void Upload(string physicalPath, Stream content, long length = -1) {
+    using var buffer = length is > 0 and <= int.MaxValue ? new MemoryStream((int)length) : new MemoryStream();
+    content.CopyTo(buffer);
+    this.Upload(physicalPath, buffer.ToArray());
+  }
 
   void DeleteFile(string physicalPath);
 
@@ -51,8 +96,10 @@ public interface IWholeFileStore : IDisposable {
 
 /// <summary>
 /// Adapts any <see cref="IWholeFileStore"/> into a whole-file <see cref="IVolumeIO"/>
-/// member (§6.1): reads buffer the object so the engine can seek, writes stage in memory
-/// and upload on flush (read-modify-write for positional writes). The capability set
+/// member (§6.1). Reads go through provider RANGE requests where the store supports them, so
+/// the engine's block-by-block reads transfer their blocks and nothing more; where it does not,
+/// they fall back to buffering the whole object behind a bounded cache. Writes stage in memory
+/// and stream out on flush (read-modify-write for positional writes). The capability set
 /// carries neither <see cref="BackendCaps.AtomicRename"/> nor
 /// <see cref="BackendCaps.DurableFlush"/>, so the engine journals around the gaps and
 /// never counts such a member toward the ack quorum (FR-CAP-ADAPT, SAFE-REMOTE).
@@ -96,9 +143,11 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   private readonly Lock _connectLock = new();
   private volatile bool _connected;
 
-  // The engine reads a file BLOCK BY BLOCK, and each block miss otherwise re-downloads the WHOLE
-  // object (a cold 1 GiB cloud read in 128 KiB blocks would move ~8000× the file). A bounded LRU of
-  // recently-downloaded objects collapses that burst back to ONE download per file (O(n²)→O(n)).
+  // The FALLBACK read path, for a provider that cannot serve ranges. The engine reads a file BLOCK
+  // BY BLOCK, and without ranges each block miss re-downloads the WHOLE object (a cold 1 GiB read
+  // in 128 KiB blocks would move ~8000× the file). A bounded LRU of recently-downloaded objects
+  // collapses that burst back to ONE download per file (O(n²)→O(n)) — still a whole-object
+  // transfer to serve one block, which is exactly what StoreCaps.RangeRead avoids.
   // Small objects share a budget; one over-budget object is allowed to occupy the cache alone so a
   // large sequential read still reuses a single download (bounded to one big object at a time —
   // whole-object remotes already refuse files past int.MaxValue). A short TTL bounds staleness from
@@ -262,15 +311,104 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   private static string _Folder(string relativeFolder, bool shadow) => PoolPaths.ToPhysicalFolder(relativeFolder, shadow);
 
   public Stream OpenRead(string relativePath, bool shadow) => this._Guard<Stream>(() => {
-    // whole-file staging (FR-REMOTE-READ): buffer the object so the engine can seek. The bounded
-    // object cache serves the engine's per-block reads of one file from a SINGLE download; the
-    // read-only MemoryStream shares the cached array (never mutated) so concurrent readers are safe.
     var physical = _File(relativePath, shadow);
-    if (this._store.Stat(physical) is not { IsFolder: false })
+    if (this._store.Stat(physical) is not { IsFolder: false, Length: var size })
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
+
+    // A provider that serves ranges gets a windowed reader: the engine reads a file block by
+    // block, so it fetches those blocks and nothing else. Without ranges the only way to answer a
+    // block is to move the whole object, and the bounded object cache is what stops that being
+    // once PER BLOCK — but it still means a 2 GiB read to serve 128 KiB, which is why a member
+    // whose provider lacks ranges belongs on whole-file work rather than random reads.
+    if ((this._store.Caps & StoreCaps.RangeRead) != 0)
+      return new RangeReadStream(this, physical, size);
 
     return new MemoryStream(this._CachedDownload(physical), writable: false);
   });
+
+  /// <summary>
+  /// A seekable read over a remote object, served by RANGE requests rather than by downloading it.
+  ///
+  /// Requests are rounded out to a window so a run of sequential block reads costs one request per
+  /// window instead of one per block, and the window is reused while the caller reads forward
+  /// through it. Only the window is ever in memory, so object size is bounded by the service, not
+  /// by RAM — the point of the whole exercise.
+  /// </summary>
+  private sealed class RangeReadStream(WholeFileVolumeIO owner, string physical, long length) : Stream {
+
+    /// <summary>Large enough to amortise a round trip over many engine blocks, small enough to stay off the LOH.</summary>
+    private const int _WINDOW = 512 * 1024;
+
+    private byte[] _window = [];
+    private long _windowStart = -1;
+    private int _windowLength;
+    private long _position;
+
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => false;
+    public override long Length => length;
+
+    public override long Position {
+      get => this._position;
+      set => this._position = value;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => this._position = origin switch {
+      SeekOrigin.Begin => offset,
+      SeekOrigin.Current => this._position + offset,
+      SeekOrigin.End => length + offset,
+      _ => throw new ArgumentOutOfRangeException(nameof(origin)),
+    };
+
+    public override int Read(byte[] buffer, int offset, int count) => this.Read(buffer.AsSpan(offset, count));
+
+    public override int Read(Span<byte> buffer) {
+      if (this._position >= length || buffer.Length == 0)
+        return 0;
+
+      var wanted = (int)Math.Min(buffer.Length, length - this._position);
+      if (!this._InWindow(this._position))
+        this._FillWindow(this._position);
+
+      var offsetInWindow = (int)(this._position - this._windowStart);
+      var available = Math.Min(wanted, this._windowLength - offsetInWindow);
+      if (available <= 0)
+        return 0; // the service returned short — the caller sees a short read, as it would locally
+
+      this._window.AsSpan(offsetInWindow, available).CopyTo(buffer);
+      this._position += available;
+      return available;
+    }
+
+    private bool _InWindow(long position)
+      => this._windowStart >= 0 && position >= this._windowStart && position < this._windowStart + this._windowLength;
+
+    private void _FillWindow(long from) {
+      var count = (int)Math.Min(_WINDOW, length - from);
+      using var range = owner._Guard(() => owner._store.OpenReadRange(physical, from, count));
+      if (this._window.Length < count)
+        this._window = new byte[count];
+
+      var filled = 0;
+      while (filled < count) {
+        var read = range.Read(this._window, filled, count - filled);
+        if (read <= 0)
+          break;
+
+        filled += read;
+      }
+
+      this._windowStart = from;
+      this._windowLength = filled;
+    }
+
+    public override void Flush() {
+    }
+
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+  }
 
   public Stream OpenWrite(string relativePath, bool shadow, bool create) => this._Guard<Stream>(() => {
     var physical = _File(relativePath, shadow);
@@ -292,6 +430,11 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   private void _Upload(string physical, byte[] content) => this._Guard(() => {
     this._store.Upload(physical, content);
     this._InvalidateReadCache(physical); // the object changed — drop any stale cached copy
+  });
+
+  private void _UploadStream(string physical, Stream content, long length) => this._Guard(() => {
+    this._store.Upload(physical, content, length);
+    this._InvalidateReadCache(physical);
   });
 
   /// <summary>
@@ -410,7 +553,10 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
       if (!this._dirty)
         return;
 
-      this._owner._Upload(this._physical, this.ToArray());
+      // stream out of the staging buffer rather than ToArray(): copying it would briefly hold the
+      // object TWICE, and a provider that streams uploads never needs the array at all
+      this.Position = 0;
+      this._owner._UploadStream(this._physical, this, this.Length);
       this._dirty = false;
     }
 
@@ -438,11 +584,43 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
       return;
     }
 
-    var content = this._store.Download(physical);
-    Array.Resize(ref content, (int)length); // guarded above — no silent wrap
-    this._store.Upload(physical, content);
+    // Shrink reads the surviving prefix and writes it back to the SAME object, so the two cannot
+    // overlap — on a local-filesystem store that is a sharing violation outright, and on a remote
+    // one it is a read racing its own overwrite. The prefix is spooled first: with ranges only
+    // the kept bytes cross the wire, and the spool keeps RAM bounded regardless of object size,
+    // where the previous version held the WHOLE pre-truncation object in memory.
+    Stream spooled;
+    using (var prefix = this._store.OpenReadRange(physical, 0, length))
+      spooled = _Spool(prefix, length); // the read is CLOSED before the write opens
+
+    using (spooled)
+      this._store.Upload(physical, spooled, length);
+
     this._InvalidateReadCache(physical);
   });
+
+  /// <summary>Above this, a spool goes to disk rather than to memory.</summary>
+  private const int _SPOOL_TO_DISK_ABOVE = 8 * 1024 * 1024;
+
+  /// <summary>
+  /// Materialises a stream so it can be handed to a writer targeting the same object. Small
+  /// payloads stay in memory; larger ones spool to a temp file that deletes itself on close, so
+  /// the cost is bounded by disk rather than by RAM.
+  /// </summary>
+  private static Stream _Spool(Stream source, long length) {
+    if (length <= _SPOOL_TO_DISK_ABOVE) {
+      var buffer = new MemoryStream((int)Math.Max(0, length));
+      source.CopyTo(buffer);
+      buffer.Position = 0;
+      return buffer;
+    }
+
+    var temp = new FileStream(Path.Combine(Path.GetTempPath(), $"dbspool-{Guid.NewGuid():N}.tmp"),
+      FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1 << 16, FileOptions.DeleteOnClose);
+    source.CopyTo(temp);
+    temp.Position = 0;
+    return temp;
+  }
 
   public void Delete(string relativePath, bool shadow) => this._Guard(() => {
     var physical = _File(relativePath, shadow);
@@ -506,7 +684,12 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
         this._MoveTree(source, target);
         this._store.DeleteFolder(source);
       } else {
-        this._store.Upload(target, this._store.Download(source));
+        // streamed, not buffered: `Upload(target, Download(source))` held the entire object in
+        // memory for every file in the subtree — up to the 2 GiB whole-object cap each — for a
+        // move that never needs to see the bytes at all
+        using (var content = this._store.OpenRead(source))
+          this._store.Upload(target, content, entry.Length);
+
         this._store.DeleteFile(source);
       }
     }
@@ -599,6 +782,9 @@ public sealed class DirectoryStore(string rootPath) : IWholeFileStore {
 
   public bool ThreadSafe => true; // independent File/Directory ops — safe under concurrent use
 
+  /// <summary>A real filesystem does all of this natively — seek for a range, stream for transfer.</summary>
+  public StoreCaps Caps => StoreCaps.RangeRead | StoreCaps.StreamingUpload | StoreCaps.StreamingDownload;
+
   public void Connect() {
   }
 
@@ -606,10 +792,73 @@ public sealed class DirectoryStore(string rootPath) : IWholeFileStore {
 
   public byte[] Download(string physicalPath) => File.ReadAllBytes(this._Map(physicalPath));
 
+  public Stream OpenRead(string physicalPath) => File.OpenRead(this._Map(physicalPath));
+
+  public Stream OpenReadRange(string physicalPath, long offset, long count) {
+    if (count <= 0)
+      return new MemoryStream([], false);
+
+    var stream = File.OpenRead(this._Map(physicalPath));
+    if (offset >= stream.Length) {
+      stream.Dispose();
+      return new MemoryStream([], false);
+    }
+
+    stream.Seek(offset, SeekOrigin.Begin);
+    return new BoundedFileStream(stream, Math.Min(count, stream.Length - offset));
+  }
+
+  /// <summary>Stops a seeked file stream at the end of the requested window.</summary>
+  private sealed class BoundedFileStream(Stream inner, long count) : Stream {
+
+    private long _delivered;
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => count;
+
+    public override long Position {
+      get => this._delivered;
+      set => throw new NotSupportedException();
+    }
+
+    public override int Read(byte[] buffer, int offset, int readCount) {
+      var allowed = (int)Math.Min(readCount, count - this._delivered);
+      if (allowed <= 0)
+        return 0;
+
+      var read = inner.Read(buffer, offset, allowed);
+      this._delivered += read;
+      return read;
+    }
+
+    public override void Flush() {
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int writeCount) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing) {
+      if (disposing)
+        inner.Dispose();
+
+      base.Dispose(disposing);
+    }
+  }
+
   public void Upload(string physicalPath, byte[] content) {
     var target = this._Map(physicalPath);
     Directory.CreateDirectory(Path.GetDirectoryName(target)!);
     File.WriteAllBytes(target, content);
+  }
+
+  public void Upload(string physicalPath, Stream content, long length = -1) {
+    var target = this._Map(physicalPath);
+    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+    using var file = File.Create(target);
+    content.CopyTo(file);
   }
 
   public void DeleteFile(string physicalPath) => File.Delete(this._Map(physicalPath));

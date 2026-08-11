@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -86,36 +86,57 @@ public sealed class BoxCloudStore : ICloudStore {
     }
   }
 
-  public byte[] Download(string path) {
+  /// <summary>
+  /// Box serves file content over plain HTTP, so a ranged GET fetches only the bytes asked for
+  /// and an upload can be streamed from the caller instead of buffered in memory first.
+  /// </summary>
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload | CloudCaps.StreamingDownload;
+
+  /// <summary>The content URL of an existing file, or a NotFound failure — Box addresses by id, not path.</summary>
+  private string _ContentUrl(string path) {
     var entry = this._ResolveEntry(path);
     if (entry is not { } found || found.GetProperty("type").GetString() != "file")
       throw new CloudStorageException(CloudStorageError.NotFound, $"File not found: {path}");
 
-    return this._rest.GetBytes($"files/{found.GetProperty("id").GetString()}/content", $"download {path}");
+    return $"files/{found.GetProperty("id").GetString()}/content";
   }
 
+  public byte[] Download(string path) => this._rest.GetBytes(this._ContentUrl(path), $"download {path}");
+
+  public Stream OpenRead(string path) => this._rest.GetStream(this._ContentUrl(path), $"download {path}");
+
+  public Stream OpenReadRange(string path, long offset, long count)
+    => count <= 0 ? EmptyStream.Instance : this._rest.GetRange(this._ContentUrl(path), offset, count, $"download {path}");
+
   public void Upload(string path, byte[] content) {
+    using var buffer = new MemoryStream(content, false);
+    this.Upload(path, buffer, content.LongLength);
+  }
+
+  public void Upload(string path, Stream content, long length = -1) {
     var existing = this._ResolveEntry(path);
     if (existing is { } found && found.GetProperty("type").GetString() == "file") {
       var id = found.GetProperty("id").GetString();
-      this._rest.SendJson(HttpMethod.Post, $"https://upload.box.com/api/2.0/files/{id}/content", $"upload {path}", _UploadBody(CloudPath.GetName(path), null, content));
+      this._rest.SendJson(HttpMethod.Post, $"https://upload.box.com/api/2.0/files/{id}/content", $"upload {path}", _UploadBody(CloudPath.GetName(path), null, content, length));
       return;
     }
 
     var parentId = this._ResolveFolderId(CloudPath.GetParent(path))
                    ?? throw new CloudStorageException(CloudStorageError.NotFound, $"Parent folder missing for: {path}");
-    this._rest.SendJson(HttpMethod.Post, "https://upload.box.com/api/2.0/files/content", $"upload {path}", _UploadBody(CloudPath.GetName(path), parentId, content));
+    this._rest.SendJson(HttpMethod.Post, "https://upload.box.com/api/2.0/files/content", $"upload {path}", _UploadBody(CloudPath.GetName(path), parentId, content, length));
   }
 
-  private static MultipartFormDataContent _UploadBody(string name, string? parentId, byte[] content) {
+  private static MultipartFormDataContent _UploadBody(string name, string? parentId, Stream content, long length) {
     var attributes = parentId == null
       ? $"{{\"name\":{JsonSerializer.Serialize(name)}}}"
       : $"{{\"name\":{JsonSerializer.Serialize(name)},\"parent\":{{\"id\":\"{parentId}\"}}}}";
     var body = new MultipartFormDataContent {
       { new StringContent(attributes, Encoding.UTF8), "attributes" },
     };
-    var file = new ByteArrayContent(content);
+    var file = new StreamContent(content);
     file.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+    if (length >= 0)
+      file.Headers.ContentLength = length;
     body.Add(file, "file", name);
     return body;
   }

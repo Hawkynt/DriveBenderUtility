@@ -1,4 +1,4 @@
-using Dropbox.Api;
+﻿using Dropbox.Api;
 using Dropbox.Api.Files;
 using Hawkynt.CloudStorage.OAuth;
 
@@ -30,31 +30,53 @@ public sealed class DropboxCloudStore : ICloudStore {
 
   public bool Probe() {
     try {
-      this._client.Files.ListFolderAsync(this._Map(""), limit: 1).GetAwaiter().GetResult();
+      SyncBridge.Run(() => this._client.Files.ListFolderAsync(this._Map(""), limit: 1));
       return true;
     } catch (Exception) {
       return false;
     }
   }
 
+  /// <summary>
+  /// The Dropbox SDK exposes downloads and uploads as streams, but its download argument carries
+  /// no byte range — a ranged read would mean bypassing the SDK for raw HTTP against the content
+  /// endpoint, so RangeRead is deliberately NOT claimed and the interface's whole-object fallback
+  /// stands. Callers use the capability to keep a Dropbox member on whole-file strategies.
+  /// </summary>
+  public CloudCaps Caps => CloudCaps.StreamingUpload | CloudCaps.StreamingDownload;
+
   public byte[] Download(string path) {
+    using var stream = this.OpenRead(path);
+    using var buffer = new MemoryStream();
+    stream.CopyTo(buffer);
+    return buffer.ToArray();
+  }
+
+  public Stream OpenRead(string path) {
     try {
-      using var response = this._client.Files.DownloadAsync(this._Map(path)).GetAwaiter().GetResult();
-      return response.GetContentAsByteArrayAsync().GetAwaiter().GetResult();
+      var response = SyncBridge.Run(() => this._client.Files.DownloadAsync(this._Map(path)));
+      // the response owns the HTTP connection; it must outlive the stream handed back
+      return new OwnedStream(SyncBridge.Run(() => response.GetContentAsStreamAsync()), response, response.Response.Size >= 0 ? (long)response.Response.Size : -1);
     } catch (ApiException<DownloadError> e) when (e.ErrorResponse.IsPath) {
       throw new CloudStorageException(CloudStorageError.NotFound, $"File not found: {path}", e);
     }
   }
 
-  public void Upload(string path, byte[] content)
-    => this._client.Files.UploadAsync(this._Map(path), WriteMode.Overwrite.Instance, body: new MemoryStream(content)).GetAwaiter().GetResult();
+  public void Upload(string path, byte[] content) {
+    using var buffer = new MemoryStream(content, false);
+    this.Upload(path, buffer, content.LongLength);
+  }
+
+  /// <summary>Streams the body up — a large file is never held in memory as a byte[].</summary>
+  public void Upload(string path, Stream content, long length = -1)
+    => SyncBridge.Run(() => this._client.Files.UploadAsync(this._Map(path), WriteMode.Overwrite.Instance, body: content));
 
   public void DeleteFile(string path)
-    => this._client.Files.DeleteV2Async(this._Map(path)).GetAwaiter().GetResult();
+    => SyncBridge.Run(() => this._client.Files.DeleteV2Async(this._Map(path)));
 
   public CloudMeta? Stat(string path) {
     try {
-      var metadata = this._client.Files.GetMetadataAsync(this._Map(path)).GetAwaiter().GetResult();
+      var metadata = SyncBridge.Run(() => this._client.Files.GetMetadataAsync(this._Map(path)));
       if (metadata.IsFolder)
         return new(true, 0, DateTime.MinValue, DateTime.MinValue);
 
@@ -66,13 +88,13 @@ public sealed class DropboxCloudStore : ICloudStore {
   }
 
   public void CreateFolder(string path)
-    => this._client.Files.CreateFolderV2Async(this._Map(path)).GetAwaiter().GetResult();
+    => SyncBridge.Run(() => this._client.Files.CreateFolderV2Async(this._Map(path)));
 
   public void DeleteFolder(string path)
-    => this._client.Files.DeleteV2Async(this._Map(path)).GetAwaiter().GetResult();
+    => SyncBridge.Run(() => this._client.Files.DeleteV2Async(this._Map(path)));
 
   public IEnumerable<CloudEntry> List(string folder) {
-    var result = this._client.Files.ListFolderAsync(this._Map(folder)).GetAwaiter().GetResult();
+    var result = SyncBridge.Run(() => this._client.Files.ListFolderAsync(this._Map(folder)));
     while (true) {
       foreach (var entry in result.Entries) {
         if (entry.IsFile) {
@@ -85,7 +107,7 @@ public sealed class DropboxCloudStore : ICloudStore {
       if (!result.HasMore)
         break;
 
-      result = this._client.Files.ListFolderContinueAsync(result.Cursor).GetAwaiter().GetResult();
+      result = SyncBridge.Run(() => this._client.Files.ListFolderContinueAsync(result.Cursor));
     }
   }
 

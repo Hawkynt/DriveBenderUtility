@@ -1,4 +1,4 @@
-using Azure;
+﻿using Azure;
 using Azure.Storage.Files.Shares;
 using Azure.Storage.Files.Shares.Models;
 using Hawkynt.CloudStorage;
@@ -31,6 +31,11 @@ public sealed class AzureFileCloudStore : ICloudStore {
     return directory.GetFileClient(mapped[(slash + 1)..]);
   }
 
+  /// <summary>Azure Files caps a single UploadRange at 4 MiB, so a streamed body is sent in chunks of that size.</summary>
+  private const int _UPLOAD_CHUNK = 4 * 1024 * 1024;
+
+  public CloudCaps Caps => CloudCaps.RangeRead | CloudCaps.StreamingUpload | CloudCaps.StreamingDownload;
+
   public void Connect() {
   }
 
@@ -43,11 +48,24 @@ public sealed class AzureFileCloudStore : ICloudStore {
   }
 
   public byte[] Download(string physicalPath) {
+    using var stream = this.OpenRead(physicalPath);
+    using var buffer = new MemoryStream();
+    stream.CopyTo(buffer);
+    return buffer.ToArray();
+  }
+
+  public Stream OpenRead(string physicalPath) => this._Download(physicalPath, range: default);
+
+  /// <summary>A real ranged read: only the requested bytes cross the wire.</summary>
+  public Stream OpenReadRange(string physicalPath, long offset, long count)
+    => count <= 0 ? EmptyStream.Instance : this._Download(physicalPath, new HttpRange(offset, count));
+
+  private Stream _Download(string physicalPath, HttpRange range) {
     try {
-      using var download = this._File(physicalPath).Download().Value;
-      using var buffer = new MemoryStream();
-      download.Content.CopyTo(buffer);
-      return buffer.ToArray();
+      var download = this._File(physicalPath).Download(new ShareFileDownloadOptions { Range = range }).Value;
+      return new OwnedStream(download.Content, download, download.ContentLength);
+    } catch (RequestFailedException e) when (e.Status == 416) {
+      return EmptyStream.Instance; // range starts at or past the end
     } catch (RequestFailedException e) when (e.Status == 404) {
       throw new CloudStorageException(CloudStorageError.NotFound, $"File not found: {physicalPath}", e);
     }
@@ -58,6 +76,46 @@ public sealed class AzureFileCloudStore : ICloudStore {
     file.Create(content.Length);
     if (content.Length > 0)
       file.UploadRange(new HttpRange(0, content.Length), new MemoryStream(content));
+  }
+
+  /// <summary>
+  /// Streams the body up in 4 MiB ranges — the object never exists in memory as a whole. Azure
+  /// Files needs the final size up front, so a caller that cannot state the length is served by
+  /// the buffering default instead of guessing and creating a file of the wrong size.
+  /// </summary>
+  public void Upload(string physicalPath, Stream content, long length = -1) {
+    if (length < 0) {
+      using var buffer = new MemoryStream();
+      content.CopyTo(buffer);
+      this.Upload(physicalPath, buffer.ToArray());
+      return;
+    }
+
+    var file = this._File(physicalPath);
+    file.Create(length);
+    if (length == 0)
+      return;
+
+    var chunk = new byte[(int)Math.Min(_UPLOAD_CHUNK, length)];
+    long position = 0;
+    while (position < length) {
+      var wanted = (int)Math.Min(chunk.Length, length - position);
+      var filled = 0;
+      while (filled < wanted) {
+        var read = content.Read(chunk, filled, wanted - filled);
+        if (read <= 0)
+          break;
+
+        filled += read;
+      }
+
+      if (filled == 0)
+        throw new CloudStorageException(CloudStorageError.IoError, $"Upload of '{physicalPath}' ended after {position} of {length} bytes");
+
+      using var window = new MemoryStream(chunk, 0, filled, false);
+      file.UploadRange(new HttpRange(position, filled), window);
+      position += filled;
+    }
   }
 
   public void DeleteFile(string physicalPath) => this._File(physicalPath).DeleteIfExists();
