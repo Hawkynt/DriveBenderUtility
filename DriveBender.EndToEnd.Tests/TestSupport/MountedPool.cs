@@ -130,16 +130,51 @@ public sealed class MountedPool : IDisposable {
       + $"on {DbMount.Platform}.{Environment.NewLine}{this.MountLog}");
   }
 
-  /// <summary>Readiness means the OS can actually enumerate it, not merely that a path exists.</summary>
+  /// <summary>
+  /// Readiness means the OS can enumerate the pool — not merely that a path exists.
+  ///
+  /// On Linux the mountpoint is a DIRECTORY WE CREATED, so it exists, is enumerable and is
+  /// writable well before FUSE attaches anything to it. A readiness check that only looks for the
+  /// path therefore passes immediately, and every subsequent write lands in the plain directory
+  /// underneath the mount: the data reads back perfectly (it is a real file on the host
+  /// filesystem) while no pool member ever sees it. That is precisely the "written data never
+  /// reaches the members" failure this suite reported — a defect in the harness, not the product,
+  /// and intermittent exactly as a race between the test and the mount would be. So on Linux the
+  /// mountpoint must actually BE a mount before the pool counts as ready.
+  /// </summary>
   private bool _IsUsable() {
     try {
       if (!Directory.Exists(this.MountPath))
+        return false;
+
+      if (!OperatingSystem.IsWindows() && !_IsMountPoint(this.MountPath))
         return false;
 
       Directory.EnumerateFileSystemEntries(this.MountPath).Take(1).ToArray();
       return true;
     } catch (Exception) {
       return false; // still coming up
+    }
+  }
+
+  /// <summary>True when the kernel reports something mounted at this exact path.</summary>
+  private static bool _IsMountPoint(string path) {
+    try {
+      var resolved = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+      foreach (var line in File.ReadLines("/proc/mounts")) {
+        // fields: source target fstype options ... — the target is octal-escaped
+        var fields = line.Split(' ');
+        if (fields.Length < 2)
+          continue;
+
+        var target = fields[1].Replace("\\040", " ").Replace("\\011", "\t").Replace("\\012", "\n").Replace("\\134", "\\");
+        if (string.Equals(Path.TrimEndingDirectorySeparator(target), resolved, StringComparison.Ordinal))
+          return true;
+      }
+
+      return false;
+    } catch (Exception) {
+      return false;
     }
   }
 

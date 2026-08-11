@@ -25,6 +25,13 @@ Closed in the current pass:
   incomplete write by the next mount. Staged publication hung off WinFsp's `Close`, but `Cleanup`
   is "the application closed its last handle" while `Close` is "the kernel released the file
   object", which the FSD defers — often to unmount. A non-delete cleanup now flushes.
+- **The end-to-end harness raced the Linux mount.** On Linux the mountpoint is a directory the
+  harness creates, so it exists and is writable before FUSE attaches to it; a readiness check that
+  only looked for the path passed immediately and the test then wrote into the plain directory
+  UNDERNEATH the mount. The data read back perfectly and no member ever saw it, which is exactly
+  the "written data never reaches the members" failure this file previously recorded as a product
+  defect. It was the harness. Readiness now requires the kernel to report a mount at that path.
+
 - **A recursive delete skipped files and then failed as "not empty".** Directory enumeration
   resumed by SEARCHING for the marker entry, which the caller had just deleted, so the whole
   listing was consumed and enumeration ended early. Resumption is by name order now.
@@ -69,15 +76,7 @@ after each pass, not a state to reach.
    alongside `RequestOp`.
 2. **Progress is per-job, not per-item.** The worker's latest stdout line is surfaced; there is no
    structured "N of M files" for a long scatter or scrub.
-3. **Linux publication may be timing-dependent — UNCONFIRMED.** The Linux driver tier failed twice
-   with a written file reaching no member at all (not even a staged `*.TEMP.$DRIVEBENDER`) and
-   then passed, with nothing in the intervening change set touching Linux code. Publication on
-   Linux rides FUSE `flush` (synchronous on `close(2)`) and `release` (asynchronous); if the
-   per-open handle does not round-trip through `fuse_file_info`, `flush` becomes a no-op and
-   publication falls back to the deferred `release`, which would be exactly this intermittent.
-   Not yet reproduced deliberately. Until it is, treat green Linux runs as evidence and not as
-   proof — the Windows equivalent of this bug (below) was real and total.
-4. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
+3. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
    Not reproduced end to end; flagged because it is the sibling of a bug that was proven real, and
