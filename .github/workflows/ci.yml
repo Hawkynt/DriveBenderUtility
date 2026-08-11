@@ -235,3 +235,49 @@ jobs:
         with:
           name: e2e-linux-results
           path: '**/TestResults/*.trx'
+
+  # ---------------------------------------------------------------------------
+  # The end-to-end coverage matrix is DERIVED from the two jobs above and committed
+  # back, so docs/EndToEndCoverage.md always reflects the last real run on real
+  # drivers. A hand-kept table drifts the moment a scenario is added or starts
+  # failing, and then quietly misleads about what is actually covered.
+  # ---------------------------------------------------------------------------
+  e2e-matrix:
+    name: End-to-end coverage matrix
+    runs-on: ubuntu-latest
+    needs: [e2e-windows, e2e-linux]
+    if: always() && github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: e2e-windows-results
+          path: results/windows
+        continue-on-error: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: e2e-linux-results
+          path: results/linux
+        continue-on-error: true
+
+      - name: Regenerate the coverage matrix
+        shell: pwsh
+        run: ./.github/workflows/scripts/e2e-matrix.ps1 -WindowsTrx results/windows -LinuxTrx results/linux -Output docs/EndToEndCoverage.md
+
+      - name: Commit it when it changed
+        run: |
+          if git diff --quiet -- docs/EndToEndCoverage.md; then
+            echo "coverage matrix unchanged"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/EndToEndCoverage.md
+          git commit -m "* end-to-end coverage matrix regenerated from the latest run on both targets"
+          git push

@@ -99,7 +99,15 @@ after each pass, not a state to reach.
    writing pool scaffolding to the path the disk used to occupy. On a real machine that is data
    landing on whatever filesystem hosted the mount point instead of on the disk — worth deciding
    deliberately rather than by accident.
-5. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
+5. **The landing-zone drainer does not appear to move data down.** A file written to a pool with a
+   landing-zone member is still absent from the capacity member two minutes later, with the
+   background pump running, so the fast tier is never freed either. Not yet distinguished between
+   "the drainer never ran" and "the landing role was not applied to the member by `pool-create -l`"
+   — both are worth checking before assuming which. Tiering is otherwise TRANSPARENT, which is the
+   part that matters most: a file stays readable and writable throughout, verified by
+   `TieringEndToEndTests.Tiering_WhileTheMoverIsRelocatingFiles_...` with six threads rewriting
+   while the mover works.
+6. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
    Not reproduced end to end; flagged because it is the sibling of a bug that was proven real, and
