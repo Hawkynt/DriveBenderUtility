@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Regenerates docs/EndToEndCoverage.md from the end-to-end .trx results of both targets.
 
@@ -8,8 +8,10 @@
   moment a test is added or starts failing, and then quietly misleads. This runs in CI after both
   end-to-end jobs, so the committed document always reflects the last real run on real drivers.
 
-  A test's description comes from its [Description] attribute; without one the row falls back to
-  the test's own name, which the Given/When/Then convention already makes readable.
+  A test's description comes from its [Description] attribute, read from the SOURCE rather than the
+  .trx — the trx logger records outcomes and drops descriptions entirely. Without one the row falls
+  back to the test's own name, which the Given/When/Then convention already makes readable. An
+  [Ignore] reason is carried into the row too, so a held-back scenario says why.
 
 .PARAMETER WindowsTrx
   Path to (or a directory containing) the Windows end-to-end .trx.
@@ -69,6 +71,47 @@ function Read-Results([string] $path) {
   return $results
 }
 
+# The .trx carries outcomes and nothing else — no [Description], whatever the logger's schema
+# suggests — so the prose for each row is read from the tests themselves. That is the better source
+# anyway: it is where the author wrote it, and it survives a run that never produced a .trx.
+function Read-Annotations([string] $sourceRoot) {
+  $annotations = @{}
+  if (-not (Test-Path $sourceRoot)) { return $annotations }
+
+  foreach ($file in Get-ChildItem -Path $sourceRoot -Filter *.cs -Recurse) {
+    $text = Get-Content -LiteralPath $file.FullName -Raw
+
+    foreach ($match in [regex]::Matches($text, 'public\s+void\s+(\w+)\s*\(')) {
+      $name = $match.Groups[1].Value
+      $start = [Math]::Max(0, $match.Index - 2000)
+      $preamble = $text.Substring($start, $match.Index - $start)
+
+      # only the attributes of THIS method: everything after the previous method's closing brace
+      $lastEnd = $preamble.LastIndexOf('}')
+      if ($lastEnd -ge 0) { $preamble = $preamble.Substring($lastEnd + 1) }
+
+      $description = ([regex]::Match($preamble, '\[Description\(\s*(?<text>"(?:[^"\\]|\\.)*"(?:\s*\+\s*"(?:[^"\\]|\\.)*")*)\s*\)\]')).Groups['text'].Value
+      $ignore = ([regex]::Match($preamble, '\[Ignore\(\s*(?<text>"(?:[^"\\]|\\.)*"(?:\s*\+\s*"(?:[^"\\]|\\.)*")*)\s*[,)]')).Groups['text'].Value
+
+      if ($description -or $ignore) {
+        $annotations[$name] = [pscustomobject]@{
+          Description = Join-Literal $description
+          Ignore      = Join-Literal $ignore
+        }
+      }
+    }
+  }
+
+  return $annotations
+}
+
+# turns a C# literal, possibly a chain of "a" + "b", into its text
+function Join-Literal([string] $literal) {
+  if (-not $literal) { return '' }
+  $joined = -join ([regex]::Matches($literal, '"((?:[^"\\]|\\.)*)"') | ForEach-Object { $_.Groups[1].Value })
+  return ($joined -replace '\\"', '"' -replace '\\\\', '\')
+}
+
 function Format-Outcome($result) {
   if (-not $result) { return 'not run' }
   switch ($result.Outcome) {
@@ -88,6 +131,7 @@ function Humanise([string] $name) {
   return $spaced.Substring(0, 1).ToUpper() + $spaced.Substring(1)
 }
 
+$annotations = Read-Annotations (Join-Path $PSScriptRoot '../../../DriveBender.EndToEnd.Tests')
 $windows = Read-Results $WindowsTrx
 $linux = Read-Results $LinuxTrx
 
@@ -101,7 +145,17 @@ $rows = foreach ($name in $names) {
   $w = $windows[$name]
   $l = $linux[$name]
   $meta = if ($w) { $w } else { $l }
-  $description = if ($meta.Description) { $meta.Description } else { Humanise $name }
+  $annotation = $annotations[$name]
+
+  $description = if ($annotation -and $annotation.Description) { $annotation.Description }
+                 elseif ($meta.Description) { $meta.Description }
+                 else { Humanise $name }
+
+  # a held-back scenario is only honest if the reason travels with it — a bare "skipped" reads as
+  # "not applicable here" when it often means "this is a known defect we have not fixed"
+  if ($annotation -and $annotation.Ignore) {
+    $description = "$description _(held back: $($annotation.Ignore))_"
+  }
 
   [pscustomobject]@{
     Area        = $meta.Class -replace 'EndToEndTests$', ''

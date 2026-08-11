@@ -385,9 +385,50 @@ public sealed class MountedPool : IDisposable {
 
     this._mountProcess.WaitForExit(5000);
     this._mountProcess.Dispose();
+    this._StartMount();
+  }
 
-    var target = OperatingSystem.IsWindows() ? this.MountPath : this.MountPath;
-    this._mountProcess = DbMount.Start(["mount", "--manifest", this.PoolName, "-t", target, "--foreground"],
+  /// <summary>
+  /// Cuts the power: kills the mount outright — no unmount, no flush, no shutdown hook — and brings
+  /// the pool back up on the same members, exactly as a machine that lost power mid-write does.
+  ///
+  /// This is the boundary that decides whether "we never lose data" is true. A clean unmount can
+  /// paper over almost anything by flushing on the way out; only a kill shows what was actually
+  /// DURABLE at the moment the lights went off.
+  /// </summary>
+  public void CrashAndRemount() {
+    DbMount.KillTree(this._mountProcess);
+    this._mountProcess.WaitForExit(15_000);
+    this._mountProcess.Dispose();
+
+    // a FUSE mount whose server was killed leaves a stale entry the kernel still routes at; the
+    // lazy unmount detaches it so the same mountpoint can be used again
+    if (!OperatingSystem.IsWindows())
+      foreach (var (file, arguments) in new[] {
+                 ("fusermount3", new[] { "-u", "-z" }),
+                 ("fusermount", ["-u", "-z"]),
+                 ("umount", ["-l"]),
+               }) {
+        if (!_IsMountPoint(this.MountPath))
+          break;
+
+        try {
+          var startInfo = new ProcessStartInfo { FileName = file, UseShellExecute = false, CreateNoWindow = true };
+          foreach (var argument in arguments)
+            startInfo.ArgumentList.Add(argument);
+
+          startInfo.ArgumentList.Add(this.MountPath);
+          Process.Start(startInfo)?.WaitForExit(15_000);
+        } catch (Exception) {
+          // that tool is not installed; try the next
+        }
+      }
+
+    this._StartMount();
+  }
+
+  private void _StartMount() {
+    this._mountProcess = DbMount.Start(["mount", "--manifest", this.PoolName, "-t", this.MountPath, "--foreground"],
       out var stdout, out var stderr);
     this._stdout = stdout;
     this._stderr = stderr;
