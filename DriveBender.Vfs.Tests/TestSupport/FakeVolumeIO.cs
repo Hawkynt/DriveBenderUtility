@@ -1,4 +1,4 @@
-using DivisonM.Vfs;
+﻿using DivisonM.Vfs;
 
 namespace DivisonM.Vfs.Tests.TestSupport;
 
@@ -185,6 +185,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public Stream OpenRead(string relativePath, bool shadow) {
+    this._Before(VolumeOp.OpenRead, relativePath);
     lock (this._lock) {
       this._Check(VolumeOp.OpenRead);
       var physical = PoolPaths.ToPhysical(relativePath, shadow);
@@ -215,6 +216,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public void Truncate(string relativePath, bool shadow, long length) {
+    this._Before(VolumeOp.Truncate, relativePath);
     lock (this._lock) {
       this._Check(VolumeOp.Truncate);
       var file = this._files.GetValueOrDefault(PoolPaths.ToPhysical(relativePath, shadow))
@@ -228,6 +230,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public void Delete(string relativePath, bool shadow) {
+    this._Before(VolumeOp.Delete, relativePath);
     lock (this._lock) {
       this._Check(VolumeOp.Delete);
       if (!this._files.Remove(PoolPaths.ToPhysical(relativePath, shadow)))
@@ -236,6 +239,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public void EnsureFolder(string relativeFolder, bool shadow) {
+    this._Before(VolumeOp.EnsureFolder, relativeFolder);
     lock (this._lock) {
       this._Check(VolumeOp.EnsureFolder);
       var physical = PoolPaths.ToPhysicalFolder(relativeFolder, shadow);
@@ -245,6 +249,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public void DeleteFolder(string relativeFolder, bool shadow) {
+    this._Before(VolumeOp.DeleteFolder, relativeFolder);
     lock (this._lock) {
       this._Check(VolumeOp.DeleteFolder);
       var physical = PoolPaths.ToPhysicalFolder(relativeFolder, shadow);
@@ -287,6 +292,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public void AtomicReplace(string tempRelative, string finalRelative, bool shadow) {
+    this._Before(VolumeOp.AtomicReplace, finalRelative);
     lock (this._lock) {
       this._Check(VolumeOp.AtomicReplace);
       if ((this.Caps & BackendCaps.AtomicRename) == 0)
