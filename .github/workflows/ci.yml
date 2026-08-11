@@ -138,11 +138,18 @@ jobs:
         shell: bash
         env:
           DBE2E_REQUIRE_DRIVER: '1'
-          DBMOUNT_EXE: DriveBender.Mount/bin/Release/net10.0-windows/dbmount.exe
+          DBMOUNT_EXE: ${{ github.workspace }}/DriveBender.Mount/bin/Release/net10.0-windows/dbmount.exe
         run: >
           dotnet test DriveBender.EndToEnd.Tests/DriveBender.EndToEnd.Tests.csproj
           --configuration Release --no-build
           --logger "trx;LogFileName=e2e-windows.trx"
+
+      # logs and artifacts need repository credentials; annotations do not, so the actual
+      # assertion is published where anyone can read it
+      - name: Publish failures as annotations
+        if: failure()
+        shell: pwsh
+        run: ./.github/workflows/scripts/trx-annotations.ps1 -Path DriveBender.EndToEnd.Tests
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -186,11 +193,18 @@ jobs:
       - name: End-to-end tests
         env:
           DBE2E_REQUIRE_DRIVER: '1'
-          DBMOUNT_EXE: DriveBender.Mount/bin/Release/net10.0/dbmount
+          DBMOUNT_EXE: ${{ github.workspace }}/DriveBender.Mount/bin/Release/net10.0/dbmount
         run: >
           dotnet test DriveBender.EndToEnd.Tests/DriveBender.EndToEnd.Tests.csproj
           --configuration Release --no-build
           --logger "trx;LogFileName=e2e-linux.trx"
+
+      # logs and artifacts need repository credentials; annotations do not, so the actual
+      # assertion is published where anyone can read it
+      - name: Publish failures as annotations
+        if: failure()
+        shell: pwsh
+        run: ./.github/workflows/scripts/trx-annotations.ps1 -Path DriveBender.EndToEnd.Tests
 
       - uses: actions/upload-artifact@v4
         if: always()

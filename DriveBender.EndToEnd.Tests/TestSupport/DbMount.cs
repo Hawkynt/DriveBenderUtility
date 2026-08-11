@@ -32,25 +32,46 @@ public static class DbMount {
   /// discover the right flavour under the mount project's output.
   /// </summary>
   private static string _Resolve() {
-    if (Environment.GetEnvironmentVariable("DBMOUNT_EXE") is { Length: > 0 } configured) {
-      if (!File.Exists(configured))
-        throw new FileNotFoundException($"DBMOUNT_EXE points at '{configured}', which does not exist");
-
-      return configured;
-    }
-
     var name = OperatingSystem.IsWindows() ? "dbmount.exe" : "dbmount";
     var flavour = OperatingSystem.IsWindows() ? "net10.0-windows" : "net10.0";
+    var tried = new List<string>();
+
+    // A configured path may be RELATIVE — CI naturally writes it relative to the repository root,
+    // while `dotnet test` runs with the test assembly's output directory as the working directory,
+    // so resolving it against the CWD silently fails. Try the obvious bases rather than making the
+    // caller know which one applies.
+    if (Environment.GetEnvironmentVariable("DBMOUNT_EXE") is { Length: > 0 } configured) {
+      foreach (var candidate in _Bases().Select(b => Path.GetFullPath(Path.Combine(b, configured))).Prepend(configured)) {
+        tried.Add(candidate);
+        if (File.Exists(candidate))
+          return candidate;
+      }
+
+      throw new FileNotFoundException(
+        $"DBMOUNT_EXE is '{configured}', which resolved to nothing that exists. Tried:{Environment.NewLine}"
+        + string.Join(Environment.NewLine, tried.Select(t => "  " + t)));
+    }
 
     // walk up from the test assembly to the repository root, then into the mount project's output
-    for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory != null; directory = directory.Parent) {
-      var candidate = Path.Combine(directory.FullName, "DriveBender.Mount", "bin", "Release", flavour, name);
+    foreach (var root in _Bases()) {
+      var candidate = Path.Combine(root, "DriveBender.Mount", "bin", "Release", flavour, name);
+      tried.Add(candidate);
       if (File.Exists(candidate))
         return candidate;
     }
 
     throw new FileNotFoundException(
-      $"Could not find '{name}' for '{flavour}'. Build the solution in Release, or set DBMOUNT_EXE to the binary under test.");
+      $"Could not find '{name}' for '{flavour}' on {Platform}. Build the solution in Release, or set "
+      + $"DBMOUNT_EXE to the binary under test. Tried:{Environment.NewLine}"
+      + string.Join(Environment.NewLine, tried.Select(t => "  " + t)));
+  }
+
+  /// <summary>Every plausible base a relative path could be meant against, nearest first.</summary>
+  private static IEnumerable<string> _Bases() {
+    yield return Directory.GetCurrentDirectory();
+
+    for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory != null; directory = directory.Parent)
+      yield return directory.FullName;
   }
 
   /// <summary>Runs a verb to completion and captures both pipes concurrently (reading one to the end first deadlocks).</summary>
