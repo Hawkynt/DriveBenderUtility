@@ -99,6 +99,13 @@ public sealed class BlockingIoScheduler : TaskScheduler, IDisposable {
         if (task == null)
           return; // idle too long: retire and give the stack back
 
+        // This worker is about to become busy — possibly for a whole WAN round trip. Growth was
+        // only ever driven by new arrivals, so if the last item to be queued happened to find this
+        // worker idle, nothing else was started and the remaining work sat behind it with the pool
+        // below its cap. Check again from the side that knows it is no longer available.
+        if (this._queue.Count > 0)
+          this._EnsureWorker();
+
         this.TryExecuteTask(task);
       }
     } finally {
