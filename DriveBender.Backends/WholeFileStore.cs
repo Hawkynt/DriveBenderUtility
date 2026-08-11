@@ -169,6 +169,13 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   /// <summary>Placement sentinel: a remote capacity tier is assumed to have room; real limits surface as NoSpace on upload.</summary>
   public long BytesFree => long.MaxValue / 2;
 
+  /// <summary>
+  /// Every operation here is a network round trip on the calling thread — the provider SDKs are
+  /// driven sync-over-async because the driver callbacks (WinFsp/Dokan/FUSE) are synchronous. The
+  /// engine uses this to keep such work off the shared thread pool (see BlockingIoScheduler).
+  /// </summary>
+  public bool BlocksCallingThread => true;
+
   public bool IsOnline {
     get {
       var now = this._clock();
@@ -420,6 +427,17 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
       throw new PoolFsException(PoolFsError.NoSpace, $"Length {length} exceeds the {MaxFileSize} byte whole-object limit of '{this.DisplayName}'");
 
     var physical = _File(relativePath, shadow);
+
+    // truncating to nothing keeps nothing, so downloading the object first is pure waste — and
+    // this is the COMMON case: every whole-file publish opens the target and does SetLength(0)
+    // before streaming, so a heal or drain onto a remote used to pull the entire old object over
+    // the wire, into RAM, purely to discard it
+    if (length == 0) {
+      this._store.Upload(physical, []);
+      this._InvalidateReadCache(physical);
+      return;
+    }
+
     var content = this._store.Download(physical);
     Array.Resize(ref content, (int)length); // guarded above — no silent wrap
     this._store.Upload(physical, content);

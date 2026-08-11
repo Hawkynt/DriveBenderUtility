@@ -1010,6 +1010,42 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private static int[] _IdentityOrder(int count)
     => count < _identityOrders.Length ? _identityOrders[count] : [.. Enumerable.Range(0, count)];
 
+  /// <summary>
+  /// Parallel options for work spread across <paramref name="copies"/>. When any copy parks its
+  /// caller for a network round trip the work is routed onto the engine's own bounded threads, so
+  /// a slow remote can never drain the shared thread pool and stall the rest of the process.
+  /// </summary>
+  private static ParallelOptions _ParallelOver(IReadOnlyList<PhysicalCopy> copies, int maxParallel) {
+    var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxParallel) };
+    for (var index = 0; index < copies.Count; ++index)
+      if (copies[index].Volume.BlocksCallingThread) {
+        options.TaskScheduler = BlockingIoScheduler.Shared;
+        break;
+      }
+
+    return options;
+  }
+
+  /// <summary>
+  /// Runs <paramref name="body"/> over [0, count) — INLINE when there is nothing to parallelise.
+  /// Parallel.For pays for a partitioner, task scheduling and a join even for a single item, and
+  /// the write path lands here on every write: with the common minCopiesBeforeAck of 1 the ack
+  /// set is exactly one copy, so that whole apparatus was set up to schedule one call.
+  /// </summary>
+  private static void _ForEachIndex(int count, ParallelOptions options, Action<int> body) {
+    if (count <= 0)
+      return;
+
+    if (count == 1 || options.MaxDegreeOfParallelism == 1) {
+      for (var index = 0; index < count; ++index)
+        body(index);
+
+      return;
+    }
+
+    Parallel.For(0, count, options, body);
+  }
+
   /// <summary>Bytes block <paramref name="blockIndex"/> must contain for a file of <paramref name="fileLength"/> bytes; 0 means "unknown, accept anything".</summary>
   private static int _ExpectedBlockLength(long fileLength, long blockIndex, int blockSize)
     => fileLength <= 0 ? 0 : (int)Math.Clamp(fileLength - blockIndex * blockSize, 0, blockSize);
@@ -1027,7 +1063,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       if (missing.Count > 1)
         try {
-          Parallel.ForEach(missing, new ParallelOptions { MaxDegreeOfParallelism = copies.Count },
+          Parallel.ForEach(missing, _ParallelOver(copies, copies.Count),
             blockIndex => this._LoadBlock(dataPath, copies, blockIndex, mirrorSplit: true,
               expectedLength: _ExpectedBlockLength(fileLength, blockIndex, blockSize)));
         } catch (AggregateException e) when (e.InnerExceptions.OfType<PoolFsException>().FirstOrDefault() is { } inner) {
@@ -1193,7 +1229,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // filling the cache while a slow one finishes its block, so once the slow block arrives a burst
     // of already-ready blocks hands over at once
     try {
-      Parallel.ForEach(missing, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, copies.Count) },
+      Parallel.ForEach(missing, _ParallelOver(copies, copies.Count),
         blockIndex => this._LoadBlock(path, copies, blockIndex, mirrorSplit: copies.Count > 1, guardEpoch: epoch,
           expectedLength: _ExpectedBlockLength(expectedFileLength, blockIndex, blockSize)));
     } catch (Exception) {
@@ -1342,7 +1378,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _WriteAckQuorum(IReadOnlyList<PhysicalCopy> copies, int requiredCopies, string path, byte[] bytes, long offset, bool[] appliedFlags) {
     var target = Math.Min(requiredCopies, copies.Count);
     var errors = new Exception?[copies.Count];
-    Parallel.For(0, target, i => {
+    _ForEachIndex(target, _ParallelOver(copies, target), i => {
       try {
         this._WriteOneCopy(copies[i], path, bytes, offset);
         appliedFlags[i] = true;
@@ -1376,7 +1412,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   /// <summary>Best-effort application to every copy not yet holding the block; true = all copies have it now.</summary>
   private bool _TryWriteRemaining(IReadOnlyList<PhysicalCopy> copies, bool[] appliedFlags, string path, byte[] bytes, long offset) {
-    Parallel.For(0, copies.Count, i => {
+    // count the copies that actually still owe the block: parallelising over the whole copy list
+    // scheduled a task per copy even when all but one were already applied
+    var pending = 0;
+    for (var i = 0; i < copies.Count; ++i)
+      if (!appliedFlags[i])
+        ++pending;
+
+    _ForEachIndex(copies.Count, _ParallelOver(copies, pending), i => {
       if (appliedFlags[i])
         return;
 

@@ -31,6 +31,18 @@ public interface IVolumeIO {
   long BytesTotal { get; }
   BackendCaps Caps { get; }
 
+  /// <summary>
+  /// True when an operation on this member PARKS the calling thread for a network round trip.
+  /// Every cloud provider behind the whole-file backend is sync-over-async (the driver callbacks
+  /// are synchronous, so the engine cannot be async end to end), which means each in-flight
+  /// remote read holds a thread for its whole latency. Run on the shared thread pool, a handful
+  /// of concurrent reads against a slow remote park enough pool threads to stall unrelated work
+  /// in the same process — including the management daemon that has to stay responsive. The
+  /// engine routes work touching such a member onto its own bounded threads instead.
+  /// Local and UNC members answer false: their blocking is the OS cache and a disk queue.
+  /// </summary>
+  bool BlocksCallingThread => false;
+
   Stream OpenRead(string relativePath, bool shadow);
 
   /// <summary>Opens for positional writes; the returned stream's Flush is a durability barrier where <see cref="BackendCaps.DurableFlush"/> is declared.</summary>
