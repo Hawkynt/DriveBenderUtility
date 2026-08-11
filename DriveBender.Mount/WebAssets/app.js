@@ -1,4 +1,4 @@
-"use strict";
+﻿"use strict";
 // Dependency-free live dashboard: SSE feed → animated meters, sparklines, tier topology.
 const token = new URLSearchParams(location.search).get("token") || "";
 const auth = { headers: { Authorization: "Bearer " + token } };
@@ -307,8 +307,18 @@ function memberRow(pool, m) {
     row.appendChild(el("span", "role", m.role));
   const scatter = el("button", "small danger", "remove");
   scatter.title = "Scatter this member's data to the others, then remove it";
-  scatter.onclick = () => confirm(`Remove member "${m.label || m.path}"? Its data is scattered to the other members first.`)
-    && op(`/api/pool/remove-member?pool=${pool.id}&member=${encodeURIComponent(m.id)}`);
+  scatter.onclick = async () => {
+    // scattering moves every byte the member holds onto the survivors — as long as the data
+    // takes, so it runs as a cancellable job with live progress rather than a 30-minute request
+    if (!confirm(`Remove member "${m.label || m.path}"? Its data is scattered to the other members first.`))
+      return;
+
+    const j = await runJobWithProgress("Removing storage",
+      `Scattering ${m.label || m.path} onto the remaining members…`,
+      await post(`/api/pool/remove-member?pool=${pool.id}&member=${encodeURIComponent(m.id)}`));
+    if (!j.ok)
+      alert("Failed: " + (j.error || ""));
+  };
   row.appendChild(scatter);
 
   // fill level: how full this storage's volume is (used vs free)
@@ -426,7 +436,17 @@ function patchCard(c, pool) {
   if (pool.source === "manifest")
     add("Forget", "", () => confirm(`Remove "${pool.name}" from this machine's list? Data and on-disk markers are kept — the pool can be restored or re-imported later.`) && op("/api/pool/forget?pool=" + pool.id));
   add("Delete", "danger", () => confirm(`Delete pool "${pool.name}"? The manifest is removed; your files are kept on disk.`) && op("/api/pool/delete?pool=" + pool.id));
-  add("Purge", "danger", () => prompt(`PURGE wipes all data in "${pool.name}". Type the pool name to confirm:`) === pool.name && op("/api/pool/purge?pool=" + pool.id));
+  add("Purge", "danger", async () => {
+    // purge erases every member's data — as long as the array is large, so it runs as a
+    // cancellable job instead of holding the request (and the browser) open for all of it
+    if (prompt(`PURGE wipes all data in "${pool.name}". Type the pool name to confirm:`) !== pool.name)
+      return;
+
+    const j = await runJobWithProgress("Purging pool", `Erasing all data in ${pool.name}…`,
+      await post("/api/pool/purge?pool=" + pool.id));
+    if (!j.ok)
+      alert("Failed: " + (j.error || ""));
+  });
 }
 
 // modal with just a Close button (reports, browsers)
@@ -788,8 +808,58 @@ async function awaitJob(started, onTick) {
       return j; // the job expired or the daemon forgot it — surface the error
     if (j.result.state === "done")
       return j.result.completed;
+    // onTick gets the worker's own latest line as well as the elapsed time, so a long operation
+    // reports what it is DOING rather than only that it is still going
     if (onTick)
-      onTick(j.result.runningSeconds || 0);
+      onTick(j.result.runningSeconds || 0, j.result.progress || "", j.result.cancelling === true);
+  }
+}
+
+async function cancelJob(id) {
+  return await post("/api/job/cancel?id=" + encodeURIComponent(id));
+}
+
+// Runs a long operation with a live modal: elapsed time, the worker's own progress line, and a
+// Cancel that actually stops it (the work runs out of process, so cancelling kills that process
+// rather than the manager). Returns the operation's normal envelope.
+async function runJobWithProgress(title, what, started) {
+  if (!started.ok || !started.result || !started.result.jobId)
+    return started; // ran inline or failed outright
+
+  const body = el("div");
+  const line = el("p", "hint", what);
+  const detail = el("p", "hint", "Starting…");
+  body.append(line, detail);
+
+  const overlay = el("div", "overlay");
+  const modal = el("div", "modal");
+  const actions = el("div", "modal-actions");
+  // only offer Cancel where stopping is actually possible: a system installer part-way through,
+  // or an operation handed to the pool's own mount process, cannot be called back — and a button
+  // that silently does nothing is worse than no button
+  if (started.result.cancellable !== false) {
+    const cancel = el("button", "danger", "Cancel");
+    cancel.onclick = async () => {
+      cancel.disabled = true;
+      cancel.textContent = "Cancelling…";
+      const c = await cancelJob(started.result.jobId);
+      if (!c.ok) { cancel.textContent = "Cancel"; cancel.disabled = false; alert(c.error || "could not cancel"); }
+    };
+    actions.appendChild(cancel);
+  } else
+    actions.appendChild(el("span", "hint", "This operation cannot be stopped once it has started."));
+  modal.append(el("h2", null, esc(title)), body, actions);
+  overlay.appendChild(modal);
+  document.getElementById("modal-root").appendChild(overlay);
+
+  try {
+    return await awaitJob(started, (secs, progress, cancelling) => {
+      detail.textContent = cancelling
+        ? `Cancelling — ${secs}s elapsed…`
+        : (progress ? `${progress} (${secs}s)` : `Still working — ${secs}s elapsed.`);
+    });
+  } finally {
+    closeModal();
   }
 }
 
@@ -845,9 +915,11 @@ async function installDriver() {
   const banner = document.getElementById("prereq");
   if (banner) banner.textContent = "Installing driver… (accept any prompt that appears)";
   try {
-    const r = await fetch("/api/prereqs/install", { method: "POST", headers: { ...auth.headers } });
-    const j = await r.json().catch(() => ({ ok: r.ok }));
-    alert(j.ok ? (j.result || "Installed.") : "Install failed: " + (j.error || r.status));
+    // downloading, signature-verifying and running the installer takes minutes — a job, so the
+    // page stays live and the progress is visible
+    const j = await runJobWithProgress("Installing driver", "Downloading and verifying the installer…",
+      await post("/api/prereqs/install"));
+    alert(j.ok ? (j.result || "Installed.") : "Install failed: " + (j.error || ""));
   } catch (e) { alert("Install failed: " + e); }
   checkPrereqs();
 }

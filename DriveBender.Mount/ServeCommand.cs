@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -178,6 +178,9 @@ internal sealed class ServeCommand(
         case "/api/job":
           this._WriteJson(context, this._JobStatus(request));
           break;
+        case "/api/job/cancel" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._CancelJob(request));
+          break;
 
         case "/api/restore" when request.HttpMethod == "POST":
           this._WriteJson(context, this._RunRestore(request));
@@ -207,13 +210,15 @@ internal sealed class ServeCommand(
           this._WriteJson(context, _PrereqPayload(Prerequisites.Check()));
           break;
         case "/api/prereqs/install" when request.HttpMethod == "POST":
-          this._WriteJson(context, _Guard(() => {
+          // downloads an installer, verifies its signature and runs msiexec — minutes, not
+          // milliseconds, and it used to hold the request open for all of it
+          this._WriteJson(context, this._StartUnstoppableJob("install-prereq", () => _Guard(() => {
             var (ok, message) = Prerequisites.Install();
             if (!ok)
               throw new ManifestException(message);
 
             return message;
-          }));
+          })));
           break;
         case "/api/pool/mount" when request.HttpMethod == "POST":
           this._WriteJson(context, this._Mount(request));
@@ -233,11 +238,11 @@ internal sealed class ServeCommand(
           }));
           break;
         case "/api/pool/remove-member" when request.HttpMethod == "POST":
-          this._WriteJson(context, _Guard(() => this._MediaOp(this._RequirePool(request),
+          this._WriteJson(context, _Guard(() => this._MediaOpJob("remove-media", this._RequirePool(request),
             ["pool-remove-media", this._RequirePool(request), "--member", request.QueryString["member"] ?? ""])));
           break;
         case "/api/pool/replace-media" when request.HttpMethod == "POST":
-          this._WriteJson(context, _Guard(() => this._MediaOp(this._RequirePool(request),
+          this._WriteJson(context, _Guard(() => this._MediaOpJob("replace-media", this._RequirePool(request),
             ["pool-replace-media", this._RequirePool(request), "--old", request.QueryString["old"] ?? "", "--new", request.QueryString["new"] ?? ""])));
           break;
         case "/api/pool/delete" when request.HttpMethod == "POST":
@@ -328,6 +333,9 @@ internal sealed class ServeCommand(
   private object _BuildFrame() {
     var mounted = mountRegistry.List().ToDictionary(m => m.PoolId);
     return new {
+      // running jobs ride the live feed every client already has open, so a long operation shows
+      // real progress without each tab polling for it — and survives a page reload mid-run
+      jobs = this._RunningJobs(),
       pools = this._Discovery().Select(d => {
         var (pool, health, discoveredSpace) = d;
         var snapshot = mounted.ContainsKey(pool.PoolId) ? this._metrics.TryRead(pool.PoolId) : null;
@@ -511,63 +519,64 @@ internal sealed class ServeCommand(
 
   #region long-running operations as jobs (NFR-UI-LIVE)
 
-  /// <summary>One long-running operation the UI started and can poll for.</summary>
-  private sealed class JobEntry {
-    public required string Kind { get; init; }
-    public required DateTime StartedUtc { get; init; }
-    public DateTime? FinishedUtc;
-    public object? Result;   // the _Guard envelope once complete
-  }
+  private readonly JobRegistry _jobs = new();
 
-  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, JobEntry> _jobs = new();
+  /// <summary>Starts work that CANNOT be stopped once begun (a system installer, or an operation handed to the pool's own process).</summary>
+  private object _StartUnstoppableJob(string kind, Func<object> work, string pool = "")
+    => this._StartJob(kind, (_, _) => work(), pool, cancellable: false);
 
-  /// <summary>Finished jobs are kept briefly so a reloaded page can still collect its result.</summary>
-  private static readonly TimeSpan _JOB_RETENTION = TimeSpan.FromMinutes(15);
-
-  /// <summary>
-  /// Starts a long operation on its OWN thread and hands the caller a ticket immediately.
-  /// A deep scan or a restore can run for many minutes; executing it inline held the browser's
-  /// request (and a daemon thread) open for the entire time, so the tab showed a dead spinner,
-  /// any proxy or client timeout threw the result away, and nothing could be cancelled or
-  /// reopened. The UI now polls /api/job and survives a reload mid-scan.
-  /// </summary>
-  private object _StartJob(string kind, Func<object> work) {
-    this._PruneJobs();
-    var id = Guid.NewGuid().ToString("N");
-    var entry = new JobEntry { Kind = kind, StartedUtc = DateTime.UtcNow };
-    this._jobs[id] = entry;
-
-    new Thread(() => {
-      object envelope;
-      try {
-        envelope = work();
-      } catch (Exception e) {
-        envelope = new { ok = false, error = e.Message };
-      }
-
-      entry.Result = envelope;
-      entry.FinishedUtc = DateTime.UtcNow; // set LAST — readers treat it as the completion fence
-    }) { IsBackground = true, Name = $"job-{kind}" }.Start();
-
-    return new { ok = true, result = new { jobId = id, kind, state = "running" } };
+  private object _StartJob(string kind, Func<CancellationToken, Action<string>, object> work, string pool = "", bool cancellable = true) {
+    var job = this._jobs.Start(kind, pool, work, cancellable);
+    return new { ok = true, result = new { jobId = job.Id, kind, state = "running", job.Cancellable } };
   }
 
   private object _JobStatus(HttpListenerRequest request) {
-    var id = request.QueryString["id"] ?? "";
-    if (!this._jobs.TryGetValue(id, out var entry))
+    if (this._jobs.Find(request.QueryString["id"] ?? "") is not { } job)
       return new { ok = false, error = "unknown or expired job" };
 
-    if (entry.FinishedUtc == null)
-      return new { ok = true, result = new { jobId = id, entry.Kind, state = "running", runningSeconds = (int)(DateTime.UtcNow - entry.StartedUtc).TotalSeconds } };
+    if (!job.IsFinished)
+      return new {
+        ok = true,
+        result = new {
+          jobId = job.Id,
+          job.Kind,
+          state = "running",
+          runningSeconds = (int)(DateTime.UtcNow - job.StartedUtc).TotalSeconds,
+          job.Progress,
+          job.Cancellable,
+          cancelling = job.IsCancelling,
+        },
+      };
 
-    return new { ok = true, result = new { jobId = id, entry.Kind, state = "done", completed = entry.Result } };
+    return new { ok = true, result = new { jobId = job.Id, job.Kind, state = "done", completed = job.Result } };
   }
 
-  private void _PruneJobs() {
-    var cutoff = DateTime.UtcNow - _JOB_RETENTION;
-    foreach (var (id, entry) in this._jobs)
-      if (entry.FinishedUtc is { } finished && finished < cutoff)
-        this._jobs.TryRemove(id, out _);
+  /// <summary>
+  /// Asks a running job to stop. The work runs in its own PROCESS, so cancellation kills that
+  /// process tree — an operation the user started must be stoppable without taking the manager
+  /// (or the pool) down with it.
+  /// </summary>
+  private object _CancelJob(HttpListenerRequest request) => this._jobs.Cancel(request.QueryString["id"] ?? "") switch {
+    JobRegistry.CancelResult.Cancelling => new { ok = true, result = "cancelling" },
+    JobRegistry.CancelResult.AlreadyFinished => new { ok = true, result = "already finished" },
+    JobRegistry.CancelResult.NotCancellable => _Failure("this operation cannot be stopped once it has started"),
+    _ => _Failure("unknown or expired job"),
+  };
+
+  private static object _Failure(string error) => new { ok = false, error };
+
+  /// <summary>Running jobs, for the live frame — so progress rides the SSE stream every client already has open.</summary>
+  private object[] _RunningJobs() {
+    var now = DateTime.UtcNow;
+    return [.. this._jobs.Running().Select(job => (object)new {
+      jobId = job.Id,
+      job.Kind,
+      job.Pool,
+      runningSeconds = (int)(now - job.StartedUtc).TotalSeconds,
+      job.Progress,
+      job.Cancellable,
+      cancelling = job.IsCancelling,
+    })];
   }
 
   #endregion
@@ -577,16 +586,19 @@ internal sealed class ServeCommand(
   /// executes the operation in its own process via the op channel; an unmounted pool gets a
   /// TRANSIENT worker process. Either way, a manager reload cannot kill pool work.
   /// </summary>
-  private object _PoolOp(string poolRef, string op, string[] workerArgs) => _Guard(() => {
+  private object _PoolOp(string poolRef, string op, string[] workerArgs,
+    CancellationToken cancellation = default, Action<string>? progress = null) => _Guard(() => {
     var pool = this._Discover(poolRef);
     string? json;
     if (mountRegistry.Find(pool.PoolId.ToString()) != null) {
+      // relayed to the pool's OWN process: it owns the engine, so it runs to completion there
       var id = Guid.NewGuid().ToString("N");
       mountRegistry.RequestOp(pool.PoolId, id, op);
       json = mountRegistry.WaitOpResult(pool.PoolId, id, TimeSpan.FromMinutes(30))
              ?? throw new ManifestException("the pool's process did not answer — check the mount");
     } else {
-      json = _RunWorker(workerArgs)
+      // a transient worker is ours to kill, so this path honours cancellation and reports progress
+      json = _RunWorker(workerArgs, cancellation, progress)
              ?? throw new ManifestException("the worker process failed — check the daemon log");
     }
 
@@ -613,13 +625,17 @@ internal sealed class ServeCommand(
       : ["pool-health", poolRef, "--json"];
 
     return fix || deep
-      ? this._StartJob(op, () => this._PoolOp(poolRef, op, args))
+      // a scan relayed into a MOUNTED pool's own process cannot be called back from here; one
+      // running in a transient worker can be killed, so only that one offers Cancel
+      ? this._StartJob(op, (cancellation, progress) => this._PoolOp(poolRef, op, args, cancellation, progress),
+        poolRef, cancellable: mountRegistry.Find(this._Discover(poolRef).PoolId.ToString()) == null)
       : this._PoolOp(poolRef, op, args);
   }
 
   private object _RunRestore(HttpListenerRequest request) {
     var poolRef = this._RequirePool(request);
-    return this._StartJob("restore", () => this._PoolOp(poolRef, "restore", ["pool-restore", poolRef, "--json"]));
+    return this._StartJob("restore", (cancellation, progress) => this._PoolOp(poolRef, "restore", ["pool-restore", poolRef, "--json"], cancellation, progress),
+      poolRef, cancellable: mountRegistry.Find(this._Discover(poolRef).PoolId.ToString()) == null);
   }
 
   /// <summary>
@@ -627,21 +643,30 @@ internal sealed class ServeCommand(
   /// manager — and never concurrently with the pool's own engine: a mounted pool must be
   /// unmounted first (two engines over one member set would race).
   /// </summary>
-  private object _MediaOp(string poolRef, string[] workerArgs) {
+  /// <summary>
+  /// Media surgery becomes a JOB. Scattering a member's files across the survivors moves every
+  /// byte it holds, so this runs for as long as the data takes — it held the browser's request
+  /// (and a daemon thread) open for up to thirty minutes, showing a dead spinner that any proxy
+  /// or client timeout would throw away, and which nothing could cancel or reopen.
+  /// </summary>
+  private object _MediaOpJob(string kind, string poolRef, string[] workerArgs) {
     var pool = this._Discover(poolRef);
     if (mountRegistry.Find(pool.PoolId.ToString()) != null)
       throw new ManifestException("unmount the pool first — media operations rearrange the members' files and must not race the live mount");
 
-    var output = _RunWorkerText(workerArgs, out var exitCode);
-    if (exitCode != 0)
-      throw new ManifestException(output.Length > 0 ? output : "the media operation failed — check the daemon log");
+    return this._StartJob(kind, (cancellation, progress) => _Guard(() => {
+      var output = _RunWorkerText(workerArgs, out var exitCode, cancellation, progress);
+      cancellation.ThrowIfCancellationRequested();
+      if (exitCode != 0)
+        throw new ManifestException(output.Length > 0 ? output : "the media operation failed — check the daemon log");
 
-    return "ok";
+      return "ok";
+    }), pool.PoolId.ToString());
   }
 
   /// <summary>Spawns a short-lived dbmount worker and returns its full output + exit code.</summary>
-  private static string _RunWorkerText(string[] args, out int exitCode) {
-    _RunWorkerCore(args, out exitCode, out var stdout, out var stderr);
+  private static string _RunWorkerText(string[] args, out int exitCode, CancellationToken cancellation = default, Action<string>? progress = null) {
+    _RunWorkerCore(args, out exitCode, out var stdout, out var stderr, cancellation, progress);
     return (stderr.Trim().Length > 0 ? stderr : stdout).Trim();
   }
 
@@ -654,7 +679,8 @@ internal sealed class ServeCommand(
   /// daemon thread parks until the timeout. A worker that overruns the timeout is killed rather
   /// than left running with its exit code read off a live process.
   /// </summary>
-  private static bool _RunWorkerCore(string[] args, out int exitCode, out string stdout, out string stderr) {
+  private static bool _RunWorkerCore(string[] args, out int exitCode, out string stdout, out string stderr,
+    CancellationToken cancellation = default, Action<string>? progress = null) {
     exitCode = -1;
     stdout = stderr = "";
 
@@ -679,8 +705,25 @@ internal sealed class ServeCommand(
       if (worker == null)
         return false;
 
-      var outTask = worker.StandardOutput.ReadToEndAsync();
+      // stdout is read LINE BY LINE when a progress sink is attached, so the UI can show what the
+      // worker is doing rather than a spinner; both pipes are still drained concurrently, because
+      // reading one to the end before touching the other deadlocks the moment the worker fills
+      // the other's ~4 KiB buffer
+      var outTask = progress == null
+        ? worker.StandardOutput.ReadToEndAsync()
+        : _DrainWithProgress(worker.StandardOutput, progress);
       var errTask = worker.StandardError.ReadToEndAsync();
+
+      // cancellation kills the worker's whole process tree: the operation runs OUT of process
+      // precisely so that stopping it cannot take the manager down with it
+      using var killOnCancel = cancellation.Register(() => {
+        try {
+          worker.Kill(entireProcessTree: true);
+        } catch (Exception) {
+          // already gone
+        }
+      });
+
       if (!worker.WaitForExit(_WORKER_TIMEOUT_MS)) {
         DriveBender.Logger($"[Warning]worker '{(args.Length > 0 ? args[0] : "?")}' exceeded its time budget — killing it");
         try {
@@ -692,6 +735,7 @@ internal sealed class ServeCommand(
 
       stdout = outTask.GetAwaiter().GetResult();
       stderr = errTask.GetAwaiter().GetResult();
+      cancellation.ThrowIfCancellationRequested();
       worker.WaitForExit(); // the streams are drained; this only reaps the exit code
       exitCode = worker.ExitCode;
       return true;
@@ -702,10 +746,23 @@ internal sealed class ServeCommand(
     }
   }
 
+  /// <summary>Reads the worker's stdout line by line, reporting each non-JSON line as progress, and returns the whole text.</summary>
+  private static async Task<string> _DrainWithProgress(StreamReader output, Action<string> progress) {
+    var all = new StringBuilder();
+    while (await output.ReadLineAsync() is { } line) {
+      all.Append(line).Append('\n');
+      var trimmed = line.Trim();
+      if (trimmed.Length > 0 && !trimmed.StartsWith('{'))
+        progress(trimmed); // the JSON result line is the answer, not progress
+    }
+
+    return all.ToString();
+  }
+
   /// <summary>Spawns a short-lived dbmount worker and returns the JSON line it printed (null on failure).</summary>
-  private static string? _RunWorker(string[] args)
+  private static string? _RunWorker(string[] args, CancellationToken cancellation = default, Action<string>? progress = null)
     // the JSON result is the last line that looks like an object
-    => _RunWorkerCore(args, out _, out var stdout, out _)
+    => _RunWorkerCore(args, out _, out var stdout, out _, cancellation, progress)
       ? stdout.Split('\n').Select(l => l.Trim()).LastOrDefault(l => l.StartsWith('{'))
       : null;
 
@@ -893,8 +950,20 @@ internal sealed class ServeCommand(
     if (mountRegistry.Find(pool.PoolId.ToString()) != null)
       throw new ManifestException("unmount the pool before deleting it");
 
-    lifecycle.Delete(pool.Manifest, purgeData: purge);
-    return purge ? "purged" : "deleted";
+    // dropping the manifest is a metadata edit and stays inline; a PURGE recursively erases every
+    // member's data and runs for as long as the array is large, so it becomes a job rather than
+    // holding the request open for it
+    if (!purge) {
+      lifecycle.Delete(pool.Manifest, purgeData: false);
+      return "deleted";
+    }
+
+    // a purge that has begun erasing members cannot be meaningfully un-begun — stopping half way
+    // would leave the pool in a state neither deleted nor intact, so it is deliberately unstoppable
+    return this._StartUnstoppableJob("purge", () => _Guard(() => {
+      lifecycle.Delete(pool.Manifest, purgeData: true);
+      return "purged";
+    }), pool.PoolId.ToString());
   });
 
   private object _CredentialSet(HttpListenerRequest request) => _Guard(() => {

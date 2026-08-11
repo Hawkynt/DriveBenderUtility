@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
@@ -15,6 +15,10 @@
     <ProjectReference Include="..\DriveBender.Vfs\DriveBender.Vfs.csproj" />
     <ProjectReference Include="..\DriveBender.Backends\DriveBender.Backends.csproj" />
     <ProjectReference Include="..\Hawkynt.CloudStorage\Hawkynt.CloudStorage.csproj" />
+    <!-- the mount daemon's job registry is engine-adjacent and headless: the UI-responsiveness
+         guarantees (a long operation never holds a request open, and can be cancelled) are
+         asserted here rather than only by inspection -->
+    <ProjectReference Include="..\DriveBender.Mount\DriveBender.Mount.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
