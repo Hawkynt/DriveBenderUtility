@@ -60,24 +60,32 @@ public sealed class MountedPool : IDisposable {
   /// Creates a two-member pool under a fresh temp root and mounts it.
   /// </summary>
   /// <param name="poolDefaults">JSON for the manifest's "defaults" block, or null for the built-ins.</param>
-  public static MountedPool Create(int members = 2, string? poolDefaults = null) {
+  /// <param name="landingZones">How many of the members form the fast tier, taken from the front.</param>
+  public static MountedPool Create(int members = 2, string? poolDefaults = null, int landingZones = 0) {
     DriverPrerequisite.RequireAvailable();
 
     var poolName = "e2e" + Guid.NewGuid().ToString("N")[..10];
     var root = Path.Combine(Path.GetTempPath(), "dbe2e-" + Guid.NewGuid().ToString("N"));
+    // Each member is reached through a REPARSE POINT (a junction on Windows, a symlink on Linux)
+    // pointing at the real storage beside it. That is what makes a member genuinely ejectable:
+    // removing the link detaches the storage without touching the files behind it, so a disk can
+    // be pulled from under LIVE I/O — which renaming the directory cannot do, because Windows
+    // refuses to rename a directory that has open files beneath it. Junctions need no privileges.
     var memberPaths = new List<string>();
     for (var i = 0; i < members; ++i) {
+      var storage = Path.Combine(root, $"store{i}");
       var member = Path.Combine(root, $"m{i}");
-      Directory.CreateDirectory(member);
+      Directory.CreateDirectory(storage);
+      _Link(member, storage);
       memberPaths.Add(member);
     }
 
     var (target, path, createdDirectory) = _ChooseMountTarget(root);
 
     var arguments = new List<string> { "pool-create", "-n", poolName };
-    foreach (var member in memberPaths) {
-      arguments.Add("-m");
-      arguments.Add(member);
+    for (var i = 0; i < memberPaths.Count; ++i) {
+      arguments.Add(i < landingZones ? "-l" : "-m"); // the front members form the fast tier
+      arguments.Add(memberPaths[i]);
     }
 
     try {
@@ -100,6 +108,12 @@ public sealed class MountedPool : IDisposable {
       throw;
     }
   }
+
+  /// <summary>
+  /// A TIERED pool: member 0 is a landing zone (the SSD in a real deployment), member 1 is
+  /// capacity. New data lands on the fast tier and the drainer moves it down (FR-LZ-DRAIN).
+  /// </summary>
+  public static MountedPool CreateTiered() => Create(members: 2, landingZones: 1);
 
   /// <summary>
   /// Windows mounts at a drive letter (no elevation needed — only installing the driver is);
@@ -277,33 +291,56 @@ public sealed class MountedPool : IDisposable {
 
   private readonly Dictionary<string, string> _ejected = new(StringComparer.OrdinalIgnoreCase);
 
+  /// <summary>Creates a directory reparse point — a junction on Windows, a symlink elsewhere.</summary>
+  private static void _Link(string link, string target) {
+    if (!OperatingSystem.IsWindows()) {
+      Directory.CreateSymbolicLink(link, target);
+      return;
+    }
+
+    // mklink /J makes a junction, which needs no privileges; Directory.CreateSymbolicLink would
+    // make a symlink, which on Windows requires elevation or Developer Mode
+    var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo {
+      FileName = "cmd.exe",
+      UseShellExecute = false,
+      CreateNoWindow = true,
+      RedirectStandardOutput = true,
+      RedirectStandardError = true,
+      ArgumentList = { "/c", "mklink", "/J", link, target },
+    })!;
+
+    process.WaitForExit(30_000);
+    if (process.ExitCode != 0 || !Directory.Exists(link))
+      throw new InvalidOperationException($"Could not create a junction '{link}' -> '{target}'");
+  }
+
+  /// <summary>Removes the link itself, leaving the storage behind it untouched.</summary>
+  private static void _Unlink(string link) {
+    try {
+      Directory.Delete(link); // on a reparse point this removes the LINK, never its target
+    } catch (IOException) {
+      File.Delete(link); // a symlink-to-directory may present as a file
+    }
+  }
+
   /// <summary>
-  /// Takes a member off the machine, the way pulling a disk or dropping a share does: its root
-  /// directory stops existing, which is exactly what <c>LocalVolumeIO.IsOnline</c> probes for.
+  /// Takes a member off the machine, the way pulling a disk or dropping a share does: the path
+  /// stops existing, which is exactly what <c>LocalVolumeIO.IsOnline</c> probes for.
   ///
-  /// Retried, because the engine POOLS open handles into the member and only lets them go after a
-  /// short idle period — a rename over a directory with live handles is refused on Windows. That
-  /// wait is part of the scenario, not an obstacle to it: a real disk cannot be yanked out from
-  /// under an open handle either.
+  /// Detaching the LINK rather than moving the directory is what lets this happen while I/O is in
+  /// flight: the files the engine holds open live behind the link, and Windows resolves a reparse
+  /// point at open time, so removing it neither requires those handles to close nor disturbs
+  /// them — exactly like yanking a disk whose files something still has open.
   /// </summary>
-  public void Eject(int memberIndex, TimeSpan? timeout = null) {
+  public void Eject(int memberIndex) {
     var member = this.MemberPaths[memberIndex];
-    var parked = member + ".ejected";
-    var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(30));
+    _Unlink(member);
+    this._ejected[member] = Path.Combine(this.Root, $"store{memberIndex}");
 
-    while (true)
-      try {
-        Directory.Move(member, parked);
-        this._ejected[member] = parked;
-
-        // the engine probes reachability on a ~1s cache, so an operation issued in the very next
-        // millisecond can still be routed at the member that just vanished. Loss is documented as
-        // noticed "within about a second"; the scenarios are about behaviour AFTER that.
-        Thread.Sleep(2500);
-        return;
-      } catch (IOException) when (DateTime.UtcNow < deadline) {
-        Thread.Sleep(250); // pooled handles are still holding it
-      }
+    // the engine probes reachability on a ~1s cache, so an operation issued in the very next
+    // millisecond can still be routed at the member that just vanished. Loss is documented as
+    // noticed "within about a second"; the scenarios are about behaviour AFTER that.
+    Thread.Sleep(2500);
   }
 
   /// <summary>
@@ -317,19 +354,22 @@ public sealed class MountedPool : IDisposable {
   /// </summary>
   public void Restore(int memberIndex, TimeSpan? timeout = null) {
     var member = this.MemberPaths[memberIndex];
-    if (!this._ejected.TryGetValue(member, out var parked))
+    if (!this._ejected.TryGetValue(member, out var storage))
       return;
 
     var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(30));
     while (true)
       try {
+        // the engine RECREATES a missing member's root while it is away, so a real directory can
+        // be sitting where the link belongs; that scaffolding is discarded, because a disk coming
+        // back brings its OWN contents
         if (Directory.Exists(member))
-          Directory.Delete(member, recursive: true); // scaffolding written while the disk was out
+          Directory.Delete(member, recursive: true);
 
-        Directory.Move(parked, member);
+        _Link(member, storage);
         this._ejected.Remove(member);
         return;
-      } catch (IOException) when (DateTime.UtcNow < deadline) {
+      } catch (Exception) when (DateTime.UtcNow < deadline) {
         Thread.Sleep(250);
       }
   }
@@ -391,9 +431,10 @@ public sealed class MountedPool : IDisposable {
       DbMount.KillTree(this._mountProcess);
     }
 
-    foreach (var (member, parked) in this._ejected.ToArray())
+    foreach (var (member, storage) in this._ejected.ToArray())
       try {
-        Directory.Move(parked, member); // put the storage back so the tree can be removed
+        if (!Directory.Exists(member))
+          _Link(member, storage); // reattach so the whole tree can be removed
       } catch (Exception) {
         // best effort
       }
