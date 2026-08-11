@@ -81,7 +81,7 @@ jobs:
       # logs and artifacts need repository credentials; annotations do not, so the failing
       # assertion is readable by anyone looking at the run
       - name: Publish failures as annotations
-        if: failure()
+        if: always()
         shell: pwsh
         run: ./.github/workflows/scripts/trx-annotations.ps1 -Path .
 
@@ -171,7 +171,7 @@ jobs:
       # logs and artifacts need repository credentials; annotations do not, so the actual
       # assertion is published where anyone can read it
       - name: Publish failures as annotations
-        if: failure()
+        if: always()
         shell: pwsh
         run: ./.github/workflows/scripts/trx-annotations.ps1 -Path DriveBender.EndToEnd.Tests
 
@@ -226,7 +226,7 @@ jobs:
       # logs and artifacts need repository credentials; annotations do not, so the actual
       # assertion is published where anyone can read it
       - name: Publish failures as annotations
-        if: failure()
+        if: always()
         shell: pwsh
         run: ./.github/workflows/scripts/trx-annotations.ps1 -Path DriveBender.EndToEnd.Tests
 

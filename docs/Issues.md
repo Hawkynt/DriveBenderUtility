@@ -56,22 +56,40 @@ after each pass, not a state to reach.
    alongside `RequestOp`.
 2. **Progress is per-job, not per-item.** The worker's latest stdout line is surfaced; there is no
    structured "N of M files" for a long scatter or scrub.
-3. **A WinFsp version mismatch crashes the mount process instead of being reported.** With a
-   native runtime whose major.minor does not match the pinned `winfsp.net` binding, `dbmount
-   mount` dies with an access violation (0xC0000005) inside
-   `Fsp.Interop.Api.FspFileSystemSetMountPointEx` rather than saying what is wrong. Confirmed by
-   a twenty-line minimal `winfsp.net` program containing none of this project's code, so the
-   binding is what crashes — but note that `winfsp.net` **2.2** refuses a mismatched runtime
-   cleanly (`TypeLoadException: incorrect dll version`) where the pinned **2.1.25156** does not.
+3. **Mounting on Windows via WinFsp crashes the process — BLOCKING.** `dbmount mount` dies with
+   an access violation (0xC0000005) inside `Fsp.Interop.Api.FspFileSystemSetMountPointEx` before
+   the mount is usable, so no Windows user can mount a pool.
 
-   Mounting itself is FINE on a correctly-provisioned machine: with WinFsp v2.1 installed — the
-   version `Prerequisites._WINFSP_TAG` installs — the whole driver tier passes on a clean
-   `windows-latest` runner. The defect is the failure mode, not the feature: a user whose WinFsp
-   was upgraded or partially installed gets a process crash and no explanation.
-   `WinFspMountHost.IsWinFspAvailable` makes this worse by falling back to an on-disk probe when
+   Evidence: reproduced on a developer machine and on clean `windows-latest` runners with WinFsp
+   **v2.1 installed from the official MSI** — the exact version `Prerequisites._WINFSP_TAG`
+   installs and the pinned `winfsp.net` 2.1.25156 binding requires, so it is not a version
+   mismatch. Reproduced on .NET 8 and .NET 10 alike, and by a twenty-line minimal `winfsp.net`
+   filesystem containing none of this project's code — so `WinFspAdapter` is not at fault. The
+   native DLL exports the symbol and `FileSystemHost.Version()` answers 2.1, so it is neither a
+   missing export nor a failed load. `winfsp.net` **2.2** refuses a mismatched runtime cleanly
+   (`TypeLoadException: incorrect dll version`) where 2.1.25156 crashes, but 2.2 is an unreleased
+   beta and would require shipping a beta native runtime.
+
+   Next steps: establish whether ANY winfsp.net version mounts against a matched native runtime;
+   if not, move the Windows path onto Dokan, which is already a dependency and already has an
+   adapter. Separately, `WinFspMountHost.IsWinFspAvailable` falls back to an on-disk probe when
    the managed binding will not initialise, so the product reports the driver as present and then
-   crashes. It should verify the binding is actually usable and name the mismatch.
-4. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
+   crashes — it should verify the binding is usable and refuse with an explanation.
+
+   *A note on how this was nearly missed:* one CI run appeared to show the driver tier passing.
+   It had not — the step was `continue-on-error`, which leaves the JOB green, so the
+   `if: failure()` annotation step never ran and the failure was invisible. The annotation steps
+   are `if: always()` now. A conclusion drawn from an absence of evidence was wrong twice over.
+4. **Written data never reaches the members on Linux — BLOCKING, and a data-loss risk.** Through a
+   FUSE mount, `File.WriteAllBytes` followed by `File.ReadAllBytes` returns the correct bytes, but
+   after thirty seconds the member folders contain only
+   `.drivebenderutility/{journal.jsonl,member.json,pool.json}` — no data file, and not even a
+   staged `*.TEMP.$DRIVEBENDER`. The content is therefore live only inside the mount process:
+   acknowledged to the application and absent from every disk it is supposed to be on. Everything
+   else in the Linux driver tier passes, so the mount itself works; it is publication that does
+   not happen. Caught by `DriverEndToEndTests.WriteReadDelete_...ReachesEveryMember`, whose failure
+   message now lists what is actually on the members.
+5. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
    Not reproduced end to end; flagged because it is the sibling of a bug that was proven real, and
