@@ -220,7 +220,13 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
   // IsOnline is queried on the hot path (ResolveCopies filters every copy by it, per VFS op). A
   // Directory.Exists on a UNC member whose host is down blocks for the SMB timeout — seconds —
   // each call, so cache the probe for a short window (loss is still noticed within ~1s).
-  private long _onlineProbedTicks = long.MinValue;
+  // The sentinel must sit one full TTL BELOW zero, because Environment.TickCount64 starts at zero
+  // at boot and only grows. long.MinValue looks like the obvious "never probed" marker and is the
+  // opposite: `now - long.MinValue` OVERFLOWS to a large negative value, which reads as "probed a
+  // moment ago". So the first query returned the default `false` and never recorded a probe — the
+  // member stayed offline forever. Mount refuses when no member is online, which made every mount
+  // of a local pool fail with "No pool member is online" however plainly the directories existed.
+  private long _onlineProbedTicks = -_ONLINE_TTL_MS - 1;
   private bool _onlineCached;
   private const long _ONLINE_TTL_MS = 1000;
 
