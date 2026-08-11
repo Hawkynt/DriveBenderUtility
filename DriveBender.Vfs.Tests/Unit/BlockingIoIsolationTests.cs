@@ -46,13 +46,15 @@ public class BlockingIoSchedulerTests {
       Interlocked.Increment(ref completed);
     }, CancellationToken.None, TaskCreationOptions.None, scheduler)).ToArray();
 
-    // let the cap fill, then prove it did not grow past it however much work is queued
+    // Wait on PEAK, not on the in-flight count: a worker increments the count before it publishes
+    // the new peak, so sampling on the count reads the peak one update too early.
     var spin = new SpinWait();
     var deadline = DateTime.UtcNow.AddSeconds(10);
-    while (Volatile.Read(ref concurrent) < cap && DateTime.UtcNow < deadline)
+    while (Volatile.Read(ref peak) < cap && DateTime.UtcNow < deadline)
       spin.SpinOnce();
 
-    Volatile.Read(ref peak).Should().Be(cap, "a stalled remote must never grow past the scheduler's cap");
+    Volatile.Read(ref peak).Should().Be(cap,
+      "the scheduler must reach its cap and never grow past it, however much work is queued behind a stalled remote");
     scheduler.LiveThreads.Should().BeLessThanOrEqualTo(cap);
 
     release.Set();
@@ -62,16 +64,24 @@ public class BlockingIoSchedulerTests {
 
   [Test]
   [Category("EdgeCase")]
-  public void Scheduler_GivenBlockingWork_ThenTheSharedThreadPoolIsLeftAlone() {
-    // the property that matters: parking N remote calls must not consume N thread-pool threads
+  public void Scheduler_GivenBlockingWork_ThenItRunsOnTheEnginesOwnThreadsAndNotThePool() {
+    // The property that matters: a parked remote call must not be holding a THREAD-POOL thread.
+    // Asserted by thread identity rather than by ThreadPool.GetAvailableThreads — that counter is
+    // process-global and moves with whatever else happens to be running, which makes it a source
+    // of CI flakes rather than of evidence.
     const int blocking = 12;
     using var scheduler = new BlockingIoScheduler(4);
     using var release = new ManualResetEventSlim(false);
 
-    ThreadPool.GetAvailableThreads(out var availableBefore, out _);
-
+    var onPoolThread = 0;
+    var ranOn = new System.Collections.Concurrent.ConcurrentDictionary<int, string>();
     var parked = 0;
+
     var tasks = Enumerable.Range(0, blocking).Select(_ => Task.Factory.StartNew(() => {
+      if (Thread.CurrentThread.IsThreadPoolThread)
+        Interlocked.Increment(ref onPoolThread);
+
+      ranOn.TryAdd(Environment.CurrentManagedThreadId, Thread.CurrentThread.Name ?? "(unnamed)");
       Interlocked.Increment(ref parked);
       release.Wait(TimeSpan.FromSeconds(10));
     }, CancellationToken.None, TaskCreationOptions.None, scheduler)).ToArray();
@@ -81,14 +91,12 @@ public class BlockingIoSchedulerTests {
     while (Volatile.Read(ref parked) < 4 && DateTime.UtcNow < deadline)
       spin.SpinOnce();
 
-    ThreadPool.GetAvailableThreads(out var availableDuring, out _);
     release.Set();
     Task.WaitAll(tasks, TimeSpan.FromSeconds(30)).Should().BeTrue();
 
-    // a couple of threads of noise is normal on a shared runner; consuming one per blocked call
-    // is what this must never do
-    (availableBefore - availableDuring).Should().BeLessThan(4,
-      "blocking remote I/O consumed shared thread-pool threads — it must run on the engine's own threads");
+    onPoolThread.Should().Be(0, "blocking remote I/O ran on shared thread-pool threads — it must run on the engine's own");
+    ranOn.Values.Should().OnlyContain(name => name == "db-blocking-io", "every blocking call must land on a dedicated worker");
+    ranOn.Should().HaveCountLessThanOrEqualTo(4, "and on no more of them than the cap allows");
   }
 
   [Test]
