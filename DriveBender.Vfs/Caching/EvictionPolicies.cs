@@ -19,6 +19,17 @@ public interface ICacheEvictionPolicy<TKey> where TKey : class {
   void Remove(TKey key);
 
   int Count { get; }
+
+  /// <summary>
+  /// Forgets every entry (a whole-pool invalidation). Draining through <see cref="SelectVictim"/>
+  /// is correct for any policy by construction; an implementation with a cheaper reset may
+  /// override it.
+  /// </summary>
+  void Clear() {
+    while (this.SelectVictim() != null) {
+      // drain
+    }
+  }
 }
 
 public static class EvictionPolicyFactory {

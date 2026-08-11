@@ -1,4 +1,4 @@
-using DivisonM.Vfs;
+﻿using DivisonM.Vfs;
 using DivisonM.Vfs.Caching;
 using FluentAssertions;
 using NUnit.Framework;
@@ -11,6 +11,62 @@ public class PageCacheTests {
 
   private static readonly Guid _poolA = Guid.Parse("aaaaaaaa-0000-0000-0000-000000000001");
   private static readonly Guid _poolB = Guid.Parse("bbbbbbbb-0000-0000-0000-000000000002");
+
+  [Test]
+  [Category("EdgeCase")]
+  public void PutIfCurrent_GivenTheWholePoolWasInvalidated_ThenALateBackgroundPutIsStillRejected() {
+    // A prefetch captures the epoch BEFORE it reads a block off disk and hands it back with
+    // PutIfCurrent, so a write that landed meanwhile rejects the now-stale bytes. Dropping the
+    // pool's cache used to REPLACE the shard, which restarted the epoch at zero — so a prefetch
+    // holding the captured epoch zero was accepted afterwards, putting back exactly the
+    // pre-invalidation block the epoch exists to reject.
+    var cache = new PageCache(EvictionPolicy.Lru, 8);
+    cache.SetBudget(4096);
+    var key = new PageKey(_poolA, "prefetched.bin", 0);
+
+    var captured = cache.EpochOf(_poolA); // what a background load would have recorded
+    cache.Put(key, [1, 2, 3, 4]);
+    cache.InvalidatePool(_poolA);
+
+    cache.PutIfCurrent(key, [9, 9, 9, 9], captured);
+
+    cache.TryGet(key, out _).Should().BeFalse("a load that began before the invalidation must not repopulate the cache after it");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void PageCache_GivenConcurrentPoolsHammeringIt_ThenAccountingStaysExactAndNothingDeadlocks() {
+    // pools hold independent locks so they never contend; the risk that buys is accounting drift
+    // and lock-ordering, so both are asserted directly
+    var cache = new PageCache(EvictionPolicy.Lru, 64);
+    cache.SetBudget(64 * 500);
+
+    const int workers = 8;
+    const int rounds = 4000;
+    var pools = new[] { _poolA, _poolB };
+    var threads = Enumerable.Range(0, workers).Select(worker => new Thread(() => {
+      var pool = pools[worker % pools.Length];
+      for (var round = 0; round < rounds; ++round) {
+        var key = new PageKey(pool, $"f{round % 50}.bin", round % 20);
+        cache.Put(key, new byte[64]);
+        cache.TryGet(key, out _);
+        if (round % 32 == 0)
+          cache.InvalidatePath(pool, $"f{round % 50}.bin");
+        if (round % 512 == 0)
+          cache.InvalidatePool(pool);
+      }
+    }) { IsBackground = true, Name = $"cache-{worker}" }).ToArray();
+
+    foreach (var thread in threads)
+      thread.Start();
+    foreach (var thread in threads)
+      thread.Join(TimeSpan.FromMinutes(1)).Should().BeTrue("no cache operation may deadlock");
+
+    var perPool = pools.Sum(pool => cache.GetStatistics(pool).Bytes);
+    cache.TotalBytes.Should().Be(perPool, "the global byte total must stay exactly the sum of the pools' occupancy");
+    cache.TotalBytes.Should().BeLessThanOrEqualTo(cache.BudgetBytes, "eviction must keep the cache inside its budget");
+    cache.TotalBytes.Should().BeGreaterThanOrEqualTo(0, "accounting must never go negative");
+  }
 
   [Test]
   [Category("HappyPath")]
