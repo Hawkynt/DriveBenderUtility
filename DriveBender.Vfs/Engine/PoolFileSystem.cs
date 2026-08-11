@@ -365,6 +365,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void SetAttributes(string path, FileMetaPatch patch) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
+    using var lease = this._handles.AcquireWrite(normalized); // copies must not move under the stamp
     var dataName = this._DataName(normalized);
     var copies = this._placement.ResolveCopies(dataName);
     if (copies.Count == 0)
@@ -480,12 +481,18 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (!this._ParentExists(normalized))
       throw new PoolFsException(PoolFsError.NotFound, $"Parent folder not found: {path}");
 
+    // exclusive so two concurrent creates of one path cannot both take the "new file" branch
+    // and race the staged-temp lifecycle; disposal is idempotent, so the early return below
+    // may release it before calling back into a lock-taking public method
+    using var lease = this._handles.AcquireWrite(normalized);
+
     var existing = this._placement.ResolveCopies(normalized);
     if (existing.Count > 0) {
       if ((flags & CreateFlags.Exclusive) != 0)
         throw new PoolFsException(PoolFsError.Exists, $"File already exists: {path}");
 
       var handleForExisting = this._handles.Open(normalized, AccessMode.ReadWrite).Handle;
+      lease.Dispose(); // SetLength re-takes this very lock through the handle (NoRecursion)
       if ((flags & CreateFlags.Truncate) != 0)
         this.SetLength(handleForExisting, 0);
 
@@ -569,9 +576,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (sameFile && fromNormalized.Equals(toNormalized, StringComparison.Ordinal))
       return; // pure no-op
 
+    // exclusive on BOTH endpoints for the whole rename, acquired in a deterministic ordinal
+    // order so two renames in opposite directions can never deadlock. A case-only rename maps
+    // to ONE state (the table is case-insensitive) and therefore takes a single lease.
+    var takeFirst = string.CompareOrdinal(fromNormalized, toNormalized) <= 0 ? fromNormalized : toNormalized;
+    var takeSecond = takeFirst == fromNormalized ? toNormalized : fromNormalized;
+    using var leaseFirst = this._handles.AcquireWrite(takeFirst);
+    using var leaseSecond = sameFile ? null : this._handles.AcquireWrite(takeSecond);
+
     // renaming a file that is still being written publishes it first (temp → final), then renames
     if (this._staging.ContainsKey(fromNormalized))
-      this._PublishStaged(fromNormalized);
+      this._PublishStagedLocked(fromNormalized);
 
     var copies = this._placement.ResolveCopies(fromNormalized);
     if (copies.Count == 0) {
@@ -593,7 +608,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (targetCopies.Count > 0 && (flags & RenameFlags.ReplaceExisting) == 0)
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {to}");
 
-    this.FlushPath(fromNormalized); // pending mutations land under the old name first
+    this._FlushPathLocked(fromNormalized); // pending mutations land under the old name first
 
     this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
@@ -670,6 +685,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void Unlink(string path) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
+
+    // exclusive for the whole delete: a background flush/heal must not be mid-way through
+    // rewriting copies we are about to remove, and a reader must not observe a half-deleted set
+    using var lease = this._handles.AcquireWrite(normalized);
 
     // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
     if (this._staging.TryRemove(normalized, out var createSequence)) {
@@ -1017,6 +1036,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (offset < 0)
       throw new PoolFsException(PoolFsError.InvalidArgument, "Negative offset");
 
+    // a private array the driver's span is copied into ONCE: it is handed to the copies, then
+    // (if owed) to the write buffer, which takes ownership of it rather than cloning again
     var bytes = data.ToArray();
     open.File.Lock.EnterWriteLock();
     try {
@@ -1211,7 +1232,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (string.Equals(dirty, path, StringComparison.OrdinalIgnoreCase))
         continue;
 
-      this.FlushPath(dirty); // blocking the writer IS the throttle
+      // the caller already holds THIS path's write lock; a second writer throttling in the
+      // opposite direction would deadlock on a blocking acquire, so a path we cannot take
+      // immediately is simply skipped — the next candidate frees budget just as well
+      using (var lease = this._handles.TryAcquireWrite(dirty, TimeSpan.FromMilliseconds(50))) {
+        if (lease == null)
+          continue;
+
+        this._FlushPathLocked(dirty); // blocking the writer IS the throttle
+      }
+
       if (this._writeBuffer.StageWrite(path, offset, bytes, sequence, durableCopies))
         return true;
     }
@@ -1258,7 +1288,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     open.File.Lock.EnterWriteLock();
     try {
       var path = open.File.Path;
-      this.FlushPath(path); // pending buffered writes apply before the truncate so ordering stays linear
+      // already holding this file's lock through the handle — the locked core, never the
+      // lease-taking shell, which would recurse on a NoRecursion lock
+      this._FlushPathLocked(path); // pending buffered writes apply before the truncate so ordering stays linear
       var dataPath = this._DataName(path);
       var copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
@@ -1280,12 +1312,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void Flush(NodeHandle handle) {
     this._RequireMounted();
     var open = this._handles.Get(handle);
-    this.FlushPath(open.File.Path); // fsync is an absolute durability barrier in every mode (SAFE-FSYNC)
+
+    // one lease covers both steps: a publish that raced the flush could otherwise rename the
+    // temp away between them and strand the just-flushed blocks
+    using var lease = this._handles.AcquireWrite(open.File.Path);
+    var path = lease.File.Path;
+    this._FlushPathLocked(path); // fsync is an absolute durability barrier in every mode (SAFE-FSYNC)
 
     // fsync promises the data survives a crash — a staged file publishes NOW (temp → final);
     // without it the temp would be swept on recovery and the promised data lost
-    if (this._staging.ContainsKey(open.File.Path))
-      this._PublishStaged(open.File.Path);
+    if (this._staging.ContainsKey(path))
+      this._PublishStagedLocked(path);
   }
 
   /// <summary>
@@ -1294,6 +1331,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// </summary>
   public void FlushPath(string path) {
     var normalized = PoolPaths.Normalize(path);
+    // the owed-copy drain+apply must be ATOMIC against the read/write path: without this lease
+    // the buffer could be drained (so the overlay stops covering the owed bytes) while a
+    // concurrent read is routed to the copy that has not received them yet — serving pre-write
+    // content — or an older op could land after a newer foreground write (SAFE-NOLOSS)
+    using var lease = this._handles.AcquireWrite(normalized);
+    this._FlushPathLocked(normalized);
+  }
+
+  /// <summary>The flush itself; the caller holds this path's write lease (or its handle lock).</summary>
+  private void _FlushPathLocked(string normalized) {
     var drained = this._writeBuffer.Drain(normalized);
     if (drained == null)
       return;
@@ -1347,6 +1394,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       foreach (var path in this._WalkFiles(landing)) {
         if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
           continue; // only clean, closed files move (the balancer rule of §6.10 applies here too)
+
+        // the checks above are TOCTOU on their own — hold the path exclusively for the whole
+        // copy-and-free sequence so a foreground write cannot land between the re-validation
+        // and the landing delete (SAFE-NOLOSS). A file a foreground op owns right now is
+        // skipped rather than waited on: the drainer must never stall the pump.
+        using var lease = this._handles.TryAcquireWrite(path, TimeSpan.Zero);
+        if (lease == null)
+          continue;
+
+        if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
+          continue; // re-checked under the lease
 
         var copies = this._placement.ResolveCopies(path);
         var holders = copies.Select(c => c.Volume).ToArray();
@@ -1473,6 +1531,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized))
       return;
 
+    // hold the path for the whole promote/copy sequence: the guards above are a TOCTOU check,
+    // so without the lease a file that goes active right after them would be republished from a
+    // stale source over acknowledged data (SAFE-NOLOSS). Never wait — a busy file heals later.
+    using var lease = this._handles.TryAcquireWrite(normalized, TimeSpan.Zero);
+    if (lease == null)
+      return;
+
+    if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized))
+      return; // re-checked under the lease
+
     var copies = this._placement.ResolveCopies(normalized);
     if (copies.Count == 0)
       return;
@@ -1593,10 +1661,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// ran, the file never looked fully written on any physical disk.
   /// </summary>
   private void _PublishStaged(string normalized) {
+    using var lease = this._handles.AcquireWrite(normalized);
+    this._PublishStagedLocked(normalized);
+  }
+
+  /// <summary>The publication itself; the caller holds this path's write lease.</summary>
+  private void _PublishStagedLocked(string normalized) {
     if (!this._staging.ContainsKey(normalized))
       return;
 
-    this.FlushPath(normalized); // owed blocks land in the temp physical first (mapping still active)
+    this._FlushPathLocked(normalized); // owed blocks land in the temp physical first (mapping still active)
     if (!this._staging.TryRemove(normalized, out var createSequence))
       return; // another thread published concurrently
 

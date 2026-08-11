@@ -232,6 +232,49 @@ public class FuzzTests {
   }
 
   [Test]
+  [Category("EdgeCase")]
+  public void Read_GivenOneCopyLaggingBehind_WhenBlocksRouteToIt_ThenTheFullCopyServesInstead() {
+    // End-to-end guard (SAFE-NOLOSS): a member that missed writes while offline comes back
+    // SHORT — its copy still exists, so mirror-split routing sends blocks to it. Today the
+    // mount-time OOB QuickScan (FR-OOB-MOUNT) repairs the copy before it can serve anything;
+    // this test pins the OUTCOME, not that mechanism, so a change that starts routing reads to
+    // a lagging copy — or that weakens the mount scan — fails here instead of silently
+    // truncating a read.
+    var content = new byte[4096];
+    new Random(11).NextBytes(content);
+    var handle = this._fs.Create("lagging.bin", NodeKind.File, CreateFlags.None);
+    this._fs.Write(handle, content, 0, WriteMode.Normal);
+    this._fs.Close(handle);
+
+    var shadowSide = this._v2.GetContent("lagging.bin", true) != null ? this._v2 : this._v1;
+    shadowSide.GetContent("lagging.bin", true).Should().NotBeNull("duplication 2 placed a shadow copy");
+
+    // rewind the shadow to a stale, truncated state — exactly what a member that slept through
+    // the last writes looks like before the heal job reaches it
+    shadowSide.Seed("lagging.bin", true, content.AsSpan(0, 512).ToArray());
+
+    var fresh = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)],
+      new("lag" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "64", MetadataEntries = 1000, MetadataTtl = "1m" }),
+      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "io": { "mirrorReadSplitThreshold": "256" } }"""));
+    fresh.Mount(new(@"X:\"));
+
+    var read = fresh.Open("lagging.bin", AccessMode.Read, ShareMode.Read);
+    var buffer = new byte[content.Length];
+    var got = 0;
+    while (got < buffer.Length) {
+      var step = fresh.Read(read, buffer.AsSpan(got), got);
+      if (step <= 0)
+        break;
+
+      got += step;
+    }
+
+    fresh.Close(read);
+    got.Should().Be(content.Length, "every block must be served by the copy that holds it");
+    buffer.Should().Equal(content, "a lagging copy must never truncate or corrupt what a read returns");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public void Read_GivenLargeMirroredRead_WhenSplitAcrossCopies_ThenBothMembersServeAndContentIsExact() {
     var content = new byte[8192];
