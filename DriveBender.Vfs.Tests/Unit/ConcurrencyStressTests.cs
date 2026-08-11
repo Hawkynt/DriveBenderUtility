@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using DivisonM.Vfs.Caching;
 using DivisonM.Vfs.Engine;
 using DivisonM.Vfs.Tests.TestSupport;
@@ -273,7 +273,17 @@ public class ConcurrencyStressTests {
           for (var round = 0; round < rounds; ++round) {
             var version = 1 + lane * rounds + round; // every writer owns a disjoint version range
             breadcrumbs.At(worker, $"write {paths[file]} v{version}");
+            var readsBefore = Volatile.Read(ref readsChecked);
             this._WriteVersion(paths[file], file, version, length);
+
+            // Wait for a reader to get in before moving on. Without this the writers can run to
+            // completion before the readers are ever scheduled — on a loaded machine that is the
+            // NORMAL outcome — and every read then observes the settled final version, so the test
+            // passes having raced nothing. The wait is bounded so a starved reader cannot hang it.
+            var spin = new SpinWait();
+            var deadline = DateTime.UtcNow.AddMilliseconds(250);
+            while (Volatile.Read(ref readsChecked) == readsBefore && DateTime.UtcNow < deadline)
+              spin.SpinOnce();
           }
         } finally {
           Interlocked.Decrement(ref writersActive);

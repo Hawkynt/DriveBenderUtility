@@ -1,4 +1,4 @@
-using DivisonM.Vfs.Caching;
+﻿using DivisonM.Vfs.Caching;
 
 namespace DivisonM.Vfs.Engine;
 
@@ -907,9 +907,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (offset < 0)
       throw new PoolFsException(PoolFsError.InvalidArgument, "Negative offset");
 
-    open.File.Lock.EnterReadLock();
+    // Locked BY PATH, not by the state captured when the handle was opened: a replacing rename
+    // repoints a path at a different state, and a handle that kept locking its original one would
+    // exclude nobody — two writers on one path through two locks, which reads back as a torn file.
+    // The lease resolves whichever state the path means right now (SAFE-COHERE).
+    using var lease = this._handles.AcquireRead(open.File.Path);
     try {
-      var path = open.File.Path;
+      var path = lease.File.Path;
       var dataPath = this._DataName(path); // a staging file reads from its temp physical
       var copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
@@ -935,9 +939,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       if (this._readAheadEnabled) {
         ReadAheadState? state;
-        lock (open.File.ReadAhead) {
-          if (!open.File.ReadAhead.TryGetValue(handle.Value, out state))
-            open.File.ReadAhead.Add(handle.Value, state = new(this._readAheadMin, this._readAheadMax, this._readAheadAdaptive));
+        lock (lease.File.ReadAhead) {
+          if (!lease.File.ReadAhead.TryGetValue(handle.Value, out state))
+            lease.File.ReadAhead.Add(handle.Value, state = new(this._readAheadMin, this._readAheadMax, this._readAheadAdaptive));
         }
 
         long prefetchBytes;
@@ -962,7 +966,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       return count;
     } finally {
-      open.File.Lock.ExitReadLock();
+      // the lease's own dispose releases the lock
     }
   }
 
@@ -1248,9 +1252,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // a private array the driver's span is copied into ONCE: it is handed to the copies, then
     // (if owed) to the write buffer, which takes ownership of it rather than cloning again
     var bytes = data.ToArray();
-    open.File.Lock.EnterWriteLock();
+    using var lease = this._handles.AcquireWrite(open.File.Path); // by PATH — see Read
     try {
-      var path = open.File.Path;
+      var path = lease.File.Path;
       var dataPath = this._DataName(path); // a staging file writes into its temp physical
       IReadOnlyList<PhysicalCopy> copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
@@ -1353,7 +1357,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._cache.Metadata.InvalidatePath(this._poolId, path);
       return bytes.Length;
     } finally {
-      open.File.Lock.ExitWriteLock();
+      // the lease's own dispose releases the lock
     }
   }
 
@@ -1501,9 +1505,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (length < 0)
       throw new PoolFsException(PoolFsError.InvalidArgument, "Negative length");
 
-    open.File.Lock.EnterWriteLock();
+    using var lease = this._handles.AcquireWrite(open.File.Path); // by PATH — see Read
     try {
-      var path = open.File.Path;
+      var path = lease.File.Path;
       // already holding this file's lock through the handle — the locked core, never the
       // lease-taking shell, which would recurse on a NoRecursion lock
       this._FlushPathLocked(path); // pending buffered writes apply before the truncate so ordering stays linear
@@ -1521,7 +1525,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._cache.Pages.InvalidatePath(this._poolId, dataPath);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
     } finally {
-      open.File.Lock.ExitWriteLock();
+      // the lease's own dispose releases the lock
     }
   }
 

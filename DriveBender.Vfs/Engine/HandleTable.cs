@@ -85,36 +85,74 @@ public sealed class HandleTable {
   public PathLease? TryAcquireWrite(string normalizedPath, TimeSpan timeout)
     => this._Acquire(normalizedPath, write: true, timeout);
 
+  /// <summary>
+  /// Locks the state that is CANONICAL for the path — the one <see cref="_files"/> maps it to at
+  /// the moment the lock is held, re-checked after acquiring.
+  ///
+  /// The re-check is load-bearing. A replacing rename repoints a path at a different state, so a
+  /// caller that resolved the state, then waited for its lock, can wake up holding a state the
+  /// path no longer refers to. Two threads would then be "locking the same path" through two
+  /// different locks and excluding nothing — which shows up as a torn read, one block from each
+  /// writer. Losing the race just means going round again against the new state.
+  /// </summary>
   private PathLease? _Acquire(string normalizedPath, bool write, TimeSpan timeout) {
-    FileState file;
-    lock (this._lock) {
-      if (!this._files.TryGetValue(normalizedPath, out var existing))
-        this._files.Add(normalizedPath, existing = new(normalizedPath));
+    var deadline = timeout == Timeout.InfiniteTimeSpan ? DateTime.MaxValue : DateTime.UtcNow + timeout;
+    while (true) {
+      FileState file;
+      lock (this._lock) {
+        if (!this._files.TryGetValue(normalizedPath, out var existing))
+          this._files.Add(normalizedPath, existing = new(normalizedPath));
 
-      file = existing;
-      ++file.RefCount; // pin the state so it survives until the lease is released
-    }
+        file = existing;
+        ++file.RefCount; // pin the state so it survives until the lease is released
+      }
 
-    // NEVER block on the file lock while holding the table lock — Open/Close would stall
-    bool taken;
-    try {
-      taken = write ? file.Lock.TryEnterWriteLock(timeout) : file.Lock.TryEnterReadLock(timeout);
-    } catch {
+      // NEVER block on the file lock while holding the table lock — Open/Close would stall.
+      // A zero timeout is a legitimate "try once, do not wait" (the drainer and heal use it to
+      // skip a busy file rather than stall the pump), so it still makes the attempt.
+      var remaining = timeout == Timeout.InfiniteTimeSpan ? Timeout.InfiniteTimeSpan : deadline - DateTime.UtcNow;
+      if (remaining != Timeout.InfiniteTimeSpan && remaining < TimeSpan.Zero)
+        remaining = TimeSpan.Zero;
+
+      bool taken;
+      try {
+        taken = write ? file.Lock.TryEnterWriteLock(remaining) : file.Lock.TryEnterReadLock(remaining);
+      } catch {
+        this._ReleaseState(file);
+        throw;
+      }
+
+      if (!taken) {
+        this._ReleaseState(file);
+        return null;
+      }
+
+      lock (this._lock)
+        if (this._files.TryGetValue(normalizedPath, out var current) && ReferenceEquals(current, file))
+          return new(this, file, write); // still the path's state — the lease is meaningful
+
+      // superseded while we waited: release and resolve again
+      if (write)
+        file.Lock.ExitWriteLock();
+      else
+        file.Lock.ExitReadLock();
+
       this._ReleaseState(file);
-      throw;
+      if (deadline != DateTime.MaxValue && DateTime.UtcNow >= deadline)
+        return null;
     }
-
-    if (taken)
-      return new(this, file, write);
-
-    this._ReleaseState(file);
-    return null;
   }
 
+  /// <summary>
+  /// Drops a pin, unkeying the state only when it is still the one registered for its path. A
+  /// replacing rename can leave a state whose Path names an entry that now belongs to a DIFFERENT
+  /// state; removing that blindly evicted the live entry and let a second state be created for the
+  /// same path — the mutual exclusion is only as good as the one-state-per-path invariant.
+  /// </summary>
   internal void _ReleaseState(FileState file) {
     lock (this._lock)
-      if (--file.RefCount == 0)
-        this._files.Remove(file.Path); // Path follows renames, so this always unkeys the right entry
+      if (--file.RefCount == 0 && this._files.TryGetValue(file.Path, out var current) && ReferenceEquals(current, file))
+        this._files.Remove(file.Path);
   }
 
   public OpenHandle Open(string normalizedPath, AccessMode access) {
@@ -148,8 +186,8 @@ public sealed class HandleTable {
       lock (open.File.ReadAhead)
         open.File.ReadAhead.Remove(handle.Value);
       --open.File.HandleCount;
-      if (--open.File.RefCount == 0)
-        this._files.Remove(open.File.Path);
+      if (--open.File.RefCount == 0 && this._files.TryGetValue(open.File.Path, out var current) && ReferenceEquals(current, open.File))
+        this._files.Remove(open.File.Path); // only ever unkey OUR OWN entry (see _ReleaseState)
     }
   }
 
@@ -163,7 +201,15 @@ public sealed class HandleTable {
       return this._files.TryGetValue(normalizedPath, out var file) && file.HandleCount > 0;
   }
 
-  /// <summary>Follows an open file across a rename so existing handles stay valid.</summary>
+  /// <summary>
+  /// Follows an open file across a rename so existing handles stay valid.
+  ///
+  /// CONTRACT: the caller must hold an EXCLUSIVE lease on BOTH endpoints for the whole rename
+  /// (see <see cref="PoolFileSystem.Rename"/>, which orders them so opposing renames cannot
+  /// deadlock). This repoints a path at a different state, and a replacing rename displaces the
+  /// state that was there; without the leases, a thread could be mid-operation on either side and
+  /// the one-state-per-path invariant — the thing every per-file lock rests on — would not hold.
+  /// </summary>
   public void RenamePath(string fromNormalized, string toNormalized) {
     lock (this._lock) {
       if (!this._files.Remove(fromNormalized, out var file))
