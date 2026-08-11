@@ -114,6 +114,22 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
           file.Current = (byte[])file.Persisted.Clone();
   }
 
+  /// <summary>
+  /// Fires at the start of an operation, BEFORE the volume lock is taken, so a test can run
+  /// engine work from inside it and force a precise interleaving. Deliberately NOT invoked
+  /// under <see cref="_lock"/>: a hook that called back into the engine would otherwise
+  /// deadlock against the very volume it is suspending.
+  /// </summary>
+  public Action<VolumeOp, string>? BeforeOperation { get; set; }
+
+  /// <summary>As <see cref="BeforeOperation"/>, but fired once the operation's answer is captured
+  /// and the lock released — the window in which a caller still believes a stale observation.</summary>
+  public Action<VolumeOp, string>? AfterOperation { get; set; }
+
+  private void _Before(VolumeOp op, string relativePath) => this.BeforeOperation?.Invoke(op, relativePath);
+
+  private void _After(VolumeOp op, string relativePath) => this.AfterOperation?.Invoke(op, relativePath);
+
   /// <summary>Fault gate; the caller holds <see cref="_lock"/>.</summary>
   private void _Check(VolumeOp op) {
     if (!this._online)
@@ -180,6 +196,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public Stream OpenWrite(string relativePath, bool shadow, bool create) {
+    this._Before(VolumeOp.OpenWrite, relativePath);
     lock (this._lock) {
       this._Check(VolumeOp.OpenWrite);
       var physical = PoolPaths.ToPhysical(relativePath, shadow);
@@ -289,17 +306,22 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public FileMeta? Stat(string relativePath, bool shadow) {
+    this._Before(VolumeOp.Stat, relativePath);
+    FileMeta? result;
     lock (this._lock) {
       this._Check(VolumeOp.Stat);
       var physical = PoolPaths.ToPhysical(relativePath, shadow);
-      if (this._files.TryGetValue(physical, out var file))
-        return new(file.Current.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, FileAttributes.Normal);
-
-      if (this._folders.Contains(physical))
-        return new(0, _now, _now, FileAttributes.Directory);
-
-      return null;
+      result = this._files.TryGetValue(physical, out var file)
+        ? new(file.Current.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, FileAttributes.Normal)
+        : this._folders.Contains(physical)
+          ? new FileMeta(0, _now, _now, FileAttributes.Directory)
+          : null;
     }
+
+    // fired with the answer already captured but not yet returned: a test can run engine work
+    // here to prove the CALLER re-validates instead of trusting a now-stale observation
+    this._After(VolumeOp.Stat, relativePath);
+    return result;
   }
 
   public bool FileExists(string relativePath, bool shadow) {

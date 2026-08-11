@@ -320,6 +320,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public FileMeta GetAttributes(string path) {
     this._RequireMounted();
     var normalized = PoolPaths.Normalize(path);
+
+    // A file's logical length comes from TWO reads — the durable stat of a physical copy plus
+    // the write buffer's overlay of the bytes still owed to the others — and they must be
+    // atomic against a flush. FlushPath moves bytes from the overlay onto the copies while
+    // holding this path's write lease; a caller that took the pre-flush stat (the lagging copy,
+    // still short) and then the post-flush overlay (now empty) reports a length SHORTER than an
+    // acknowledged write, and caches it for the whole metadata TTL (SAFE-COHERE, SAFE-NOLOSS).
+    // A shared lease costs a lock pair and keeps concurrent readers concurrent.
+    using var lease = this._handles.AcquireRead(normalized);
+    return this._GetAttributesLocked(normalized, path);
+  }
+
+  /// <summary>The stat itself; the caller holds at least a shared lease on the path.</summary>
+  private FileMeta _GetAttributesLocked(string normalized, string path) {
     var key = new MetadataKey(this._poolId, normalized, MetadataKind.Stat);
     if (this._cache.Metadata.TryGet<FileMeta>(key, out var cached))
       return this._OverlayMeta(normalized, cached);
@@ -349,11 +363,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (normalized.Length == 0)
       return new(0, DateTime.MinValue, DateTime.MinValue, FileAttributes.Directory);
 
-    // logical size = one copy's size, never the sum of copies (FR-STAT)
+    // logical size = one copy's size, never the sum of copies (FR-STAT). Statted with failover:
+    // trusting copies[0] alone meant a single dying storage failed the whole stat even though
+    // every other copy was readable.
     var dataName = this._DataName(normalized);
     var copies = this._placement.ResolveCopies(dataName);
     if (copies.Count > 0)
-      return copies[0].Volume.Stat(dataName, copies[0].Shadow);
+      return _StatAnyCopy(copies, dataName);
 
     foreach (var member in this._Online)
       if (member.FolderExists(normalized, false))
@@ -386,6 +402,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     var entries = new Dictionary<string, DirEntry>(StringComparer.OrdinalIgnoreCase);
     var folderSeen = normalized.Length == 0;
+
+    // Captured BEFORE the members are enumerated. A listing takes each entry's length from
+    // whichever member enumerates it first — which may be the copy still lagging behind an
+    // acknowledged write — and never consulted the write buffer, so a file with owed bytes
+    // listed at its stale on-disk size. Every path that is dirty NOW is re-stated under its
+    // own lease below; a path clean at this point has no owed bytes to miss, and one that goes
+    // dirty later is a write concurrent with the listing, where any snapshot is legal.
+    var dirtyAtStart = this._writeBuffer.DirtyPaths;
 
     foreach (var member in this._Online) {
       if (!member.FolderExists(normalized, false))
@@ -449,6 +473,25 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     if (!folderSeen)
       throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {path}");
+
+    // owed bytes made visible: each still-dirty child is re-stated with its lease held, so the
+    // durable length and the overlay are read atomically against a flush (SAFE-COHERE)
+    var childPrefix = normalized.Length == 0 ? "" : normalized + "/";
+    foreach (var dirty in dirtyAtStart) {
+      if (!dirty.StartsWith(childPrefix, StringComparison.OrdinalIgnoreCase))
+        continue;
+
+      var name = dirty[childPrefix.Length..];
+      if (name.Length == 0 || name.IndexOf('/') >= 0 || !entries.TryGetValue(name, out var listed) || listed.Kind != NodeKind.File)
+        continue;
+
+      using var lease = this._handles.AcquireRead(dirty);
+      var durable = this._StatUncached(dirty);
+      if (durable is not { } meta)
+        continue;
+
+      entries[name] = listed with { Length = this._writeBuffer.OverlayLength(dirty, meta.Length) };
+    }
 
     IReadOnlyList<DirEntry> result = [.. entries.Values.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase)];
     this._cache.Metadata.Put(key, result);
