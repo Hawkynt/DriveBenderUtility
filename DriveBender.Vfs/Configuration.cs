@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -423,19 +423,67 @@ public static class ConfigResolver {
     return DeserializeMerged(merged);
   }
 
+  // ResolveForFolder sits on the WRITE hot path: PoolFileSystem.Write calls it once directly and
+  // once more inside the ack-quorum check, Unlink calls it, and every placement/heal decision
+  // calls it through DuplicationLevelFor. Building the answer serialises the ENTIRE pool config
+  // to JSON, deep-merges each matching override and deserialises the result — hundreds of
+  // allocations for a value that only changes when the configuration does.
+  //
+  // Which overrides match is cheap (glob matching, no allocation); the merge is not. So only the
+  // merge is memoised, keyed by the SET OF MATCHED GLOBS rather than by the folder path: the
+  // number of cached entries is then bounded by how many distinct override combinations the
+  // configuration can produce, not by how many folders the pool contains — a pool with millions
+  // of directories still holds a handful of entries. Keying on the PoolConfig instance means a
+  // live reload (which builds a new instance) drops the old table with it; nothing to invalidate.
+  private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<PoolConfig, string[]> _orderedGlobs = new();
+  private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<PoolConfig, System.Collections.Concurrent.ConcurrentDictionary<ulong, PoolConfig>> _mergedByMatchedGlobs = new();
+
+  /// <summary>Beyond this many override globs the match set no longer fits one bitmask key; such a config resolves uncached.</summary>
+  private const int _MAX_MEMOISED_GLOBS = 64;
+
   /// <summary>Resolves the effective config for one pool-relative folder path, applying all matching "folders" glob overrides (most-specific last).</summary>
   public static PoolConfig ResolveForFolder(PoolConfig effectivePoolConfig, string folderPath) {
     if (effectivePoolConfig.Folders is not { Count: > 0 } folders)
       return effectivePoolConfig;
 
     var normalized = PoolPaths.Normalize(folderPath);
+    var ordered = _orderedGlobs.GetValue(effectivePoolConfig, static config => [.. config.Folders!.Keys.OrderBy(key => key.Length)]);
+    if (ordered.Length > _MAX_MEMOISED_GLOBS)
+      return _MergeMatchingOverrides(effectivePoolConfig, folders, ordered, normalized);
+
+    // the match set is a BITMASK over the fixed, ordered glob list -- an exact key that no folder
+    // name can forge, unlike a delimited string of globs that may themselves contain any character
+    ulong matched = 0;
+    for (var index = 0; index < ordered.Length; ++index)
+      if (GlobMatches(ordered[index], normalized))
+        matched |= 1UL << index;
+
+    if (matched == 0)
+      return effectivePoolConfig; // no override applies -- the common case, and allocation-free
+
+    var memo = _mergedByMatchedGlobs.GetValue(effectivePoolConfig, static _ => new());
+    return memo.GetOrAdd(matched, static (mask, state) => _MergeMatchedOverrides(state.config, state.folders, state.ordered, mask),
+      (config: effectivePoolConfig, folders, ordered));
+  }
+
+  private static PoolConfig _MergeMatchedOverrides(PoolConfig effectivePoolConfig, Dictionary<string, JsonElement> folders, string[] ordered, ulong matched) {
+    var baseNode = JsonSerializer.SerializeToNode(effectivePoolConfig, ManifestSerializer.Options);
+    for (var index = 0; index < ordered.Length; ++index)
+      if ((matched & (1UL << index)) != 0)
+        baseNode = Merge(baseNode, JsonSerializer.SerializeToNode(folders[ordered[index]], ManifestSerializer.Options));
+
+    return DeserializeMerged(baseNode);
+  }
+
+  /// <summary>The uncached path, for a configuration with more override globs than fit one bitmask.</summary>
+  private static PoolConfig _MergeMatchingOverrides(PoolConfig effectivePoolConfig, Dictionary<string, JsonElement> folders, string[] ordered, string normalized) {
     var baseNode = JsonSerializer.SerializeToNode(effectivePoolConfig, ManifestSerializer.Options);
     var applied = false;
-    foreach (var (glob, overrideElement) in folders.OrderBy(pair => pair.Key.Length)) {
+    foreach (var glob in ordered) {
       if (!GlobMatches(glob, normalized))
         continue;
 
-      baseNode = Merge(baseNode, JsonSerializer.SerializeToNode(overrideElement, ManifestSerializer.Options));
+      baseNode = Merge(baseNode, JsonSerializer.SerializeToNode(folders[glob], ManifestSerializer.Options));
       applied = true;
     }
 
@@ -458,8 +506,28 @@ public static class ConfigResolver {
     }
   }
 
+  // Translating a glob to a regex costs a StringBuilder, a Regex.Escape allocation PER CHARACTER
+  // and a fresh pattern string -- and GlobMatches is called for every override glob on every
+  // folder resolution, which is on the write path. The globs come from configuration, so there
+  // are only ever a handful of distinct ones: the compiled matcher is cached per glob and the
+  // translation happens once. Bounded, because the method is public and callers are not.
+  private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.Text.RegularExpressions.Regex> _globMatchers = new(StringComparer.Ordinal);
+
+  private const int _MAX_CACHED_GLOB_MATCHERS = 1024;
+
   /// <summary>Glob matching for folder overrides: ** spans segments, * stays within one, ? is a single character.</summary>
   public static bool GlobMatches(string glob, string normalizedPath) {
+    if (_globMatchers.TryGetValue(glob, out var matcher))
+      return matcher.IsMatch(normalizedPath);
+
+    matcher = new(_GlobToPattern(glob), System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    if (_globMatchers.Count < _MAX_CACHED_GLOB_MATCHERS)
+      _globMatchers.TryAdd(glob, matcher);
+
+    return matcher.IsMatch(normalizedPath);
+  }
+
+  private static string _GlobToPattern(string glob) {
     var pattern = new System.Text.StringBuilder("^");
     var globNormalized = glob.Replace('\\', '/').Trim('/');
     for (var i = 0; i < globNormalized.Length; ++i) {
@@ -483,8 +551,7 @@ public static class ConfigResolver {
       }
     }
 
-    pattern.Append('$');
-    return System.Text.RegularExpressions.Regex.IsMatch(normalizedPath, pattern.ToString(), System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    return pattern.Append('$').ToString();
   }
 
 }

@@ -28,9 +28,16 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
   public IReadOnlyList<PhysicalCopy> ResolveCopies(string path) {
     var normalized = PoolPaths.Normalize(path);
     var key = new MetadataKey(poolId, normalized, MetadataKind.Placement);
-    if (metadata.TryGet<IReadOnlyList<PhysicalCopy>>(key, out var cached))
-      // a cached list can outlive a member going offline; only ever hand back reachable copies (§10 SAFE-DEGRADE)
-      return [.. cached.Where(c => c.Volume.IsOnline)];
+    if (metadata.TryGet<IReadOnlyList<PhysicalCopy>>(key, out var cached)) {
+      // A cached list can outlive a member going offline, so only reachable copies are ever handed
+      // back (§10 SAFE-DEGRADE) — but the filtered list is now MATERIALISED only when a member has
+      // actually dropped. Rebuilding an identical list ran on every read, write and stat.
+      for (var index = 0; index < cached.Count; ++index)
+        if (!cached[index].Volume.IsOnline)
+          return [.. cached.Where(c => c.Volume.IsOnline)];
+
+      return cached;
+    }
 
     var copies = new List<PhysicalCopy>();
     foreach (var member in this._Online)

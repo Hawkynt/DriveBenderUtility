@@ -966,6 +966,50 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
+  /// <summary>
+  /// The order in which a block's copies are tried (FR-MIRROR, FR-STRIPE-READY): readiest first,
+  /// rotation as the tiebreak. Run once PER BLOCK — a 1 GiB sequential read is thousands of calls
+  /// — so the LINQ pipeline this replaces (Range → OrderBy → ThenBy → ToArray, an enumerator
+  /// chain plus a sort buffer plus an array, every time) is now: nothing at all when there is one
+  /// copy or no split, and a stable insertion sort over a handful of indices when there is.
+  /// </summary>
+  private int[] _OrderCopiesForBlock(IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit) {
+    var count = copies.Count;
+    if (!mirrorSplit || count <= 1)
+      return _IdentityOrder(count);
+
+    var order = new int[count];
+    var scores = new double[count];
+    var rotation = (int)(blockIndex % count);
+    for (var i = 0; i < count; ++i) {
+      order[i] = (rotation + i) % count; // rotation order first, so a stable sort keeps it as the tiebreak
+      scores[i] = this._LoadScore(copies[order[i]].Volume);
+    }
+
+    // insertion sort: stable by construction, and optimal at the sizes involved (a duplication level)
+    for (var i = 1; i < count; ++i) {
+      var index = order[i];
+      var score = scores[i];
+      var j = i - 1;
+      while (j >= 0 && scores[j] > score) {
+        order[j + 1] = order[j];
+        scores[j + 1] = scores[j];
+        --j;
+      }
+
+      order[j + 1] = index;
+      scores[j + 1] = score;
+    }
+
+    return order;
+  }
+
+  /// <summary>Shared 0,1,2… index arrays for the no-split case, so the common read allocates nothing to order one copy.</summary>
+  private static readonly int[][] _identityOrders = [.. Enumerable.Range(0, 9).Select(n => Enumerable.Range(0, n).ToArray())];
+
+  private static int[] _IdentityOrder(int count)
+    => count < _identityOrders.Length ? _identityOrders[count] : [.. Enumerable.Range(0, count)];
+
   /// <summary>Bytes block <paramref name="blockIndex"/> must contain for a file of <paramref name="fileLength"/> bytes; 0 means "unknown, accept anything".</summary>
   private static int _ExpectedBlockLength(long fileLength, long blockIndex, int blockSize)
     => fileLength <= 0 ? 0 : (int)Math.Clamp(fileLength - blockIndex * blockSize, 0, blockSize);
@@ -1018,11 +1062,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // copy that is READY — least outstanding I/O, then measured latency, plain alternation when
     // idle — so a fast storage serves more blocks than a slow one; when the routed copy fails
     // mid-read (dying disk, vanished member) every other copy is tried before the read may fail
-    var rotation = mirrorSplit && copies.Count > 1 ? (int)(blockIndex % copies.Count) : 0;
-    var order = Enumerable.Range(0, copies.Count)
-      .OrderBy(i => mirrorSplit && copies.Count > 1 ? this._LoadScore(copies[i].Volume) : 0)
-      .ThenBy(i => (i - rotation + copies.Count) % copies.Count)
-      .ToArray();
+    var order = this._OrderCopiesForBlock(copies, blockIndex, mirrorSplit);
     PoolFsException? lastError = null;
     byte[]? bestShort = null;
     string? bestShortMember = null;

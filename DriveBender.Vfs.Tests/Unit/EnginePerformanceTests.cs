@@ -116,6 +116,101 @@ public class EnginePerformanceTests {
     buffer.OverlayLength("owed.bin", 0).Should().Be(total, "every staged op is still tracked");
   }
 
+  [Test]
+  [Category("HappyPath")]
+  public void ResolveForFolder_GivenFolderOverrides_WhenResolvedRepeatedly_ThenTheMergeIsNotRebuiltEveryTime() {
+    // The regression this pins: resolving a folder's effective config serialises the WHOLE pool
+    // config to JSON, deep-merges each matching override and deserialises the result. Write calls
+    // it TWICE (once directly, once inside the ack-quorum check), Unlink once, and every
+    // placement/heal decision once more — so with any "folders" override configured this ran per
+    // operation. The merge depends only on WHICH globs matched, so it is memoised by match set.
+    var config = ConfigResolver.ResolveEffective(null, """
+      {
+        "duplication": 2,
+        "folders": {
+          "media/**": { "duplication": 3 },
+          "scratch/**": { "write": { "policy": "performance", "acceptVolatileAck": true } }
+        }
+      }
+      """);
+
+    ConfigResolver.ResolveForFolder(config, "media/movies").Duplication.Should().Be(3, "the override must still apply");
+    ConfigResolver.ResolveForFolder(config, "plain").Duplication.Should().Be(2, "an unmatched folder keeps the pool default");
+
+    const int resolutions = 2000;
+    var before = GC.GetAllocatedBytesForCurrentThread();
+    for (var i = 0; i < resolutions; ++i) {
+      ConfigResolver.ResolveForFolder(config, "media/movies/season1");
+      ConfigResolver.ResolveForFolder(config, "plain/documents");
+    }
+
+    var perResolution = (GC.GetAllocatedBytesForCurrentThread() - before) / (resolutions * 2);
+    perResolution.Should().BeLessThan(512,
+      $"each folder resolution allocated {perResolution} bytes — the JSON merge is being rebuilt instead of reused");
+
+    // distinct folders sharing a match set must share the memo entry, so the cache is bounded by
+    // configuration complexity and not by how many folders the pool contains
+    ConfigResolver.ResolveForFolder(config, "media/a").Should().BeSameAs(ConfigResolver.ResolveForFolder(config, "media/b"));
+    ConfigResolver.ResolveForFolder(config, "scratch/x").Duplication.Should().Be(2);
+    ConfigResolver.ResolveForFolder(config, "scratch/x").Write!.Policy.Should().Be(WritePolicy.Performance);
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Read_GivenAMirrorSplitOverTwoCopies_WhenBlocksAreRouted_ThenRoutingDoesNotAllocatePerBlock() {
+    // block routing runs PER BLOCK: it used to build a LINQ Range→OrderBy→ThenBy→ToArray pipeline
+    // every time, so a long sequential read allocated an enumerator chain and two arrays per block
+    var v1 = new FakeVolumeIO(Guid.NewGuid(), "v1", "P1", capacity: 1L << 28);
+    var v2 = new FakeVolumeIO(Guid.NewGuid(), "v2", "P2", capacity: 1L << 28);
+    using var fs = new PoolFileSystem(_pool, [new(v1), new(v2)],
+      new("route" + Guid.NewGuid().ToString("N"), new() { Size = "4194304", BlockSize = "512", MetadataEntries = 2000, MetadataTtl = "1m" }),
+      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "readAhead": { "enabled": false } }"""));
+    fs.Mount(new(@"X:\"));
+
+    const int size = 128 * 1024;
+    var content = new byte[size];
+    new Random(7).NextBytes(content);
+    var write = fs.Create("routed.bin", NodeKind.File, CreateFlags.None);
+    fs.Write(write, content, 0, WriteMode.Normal);
+    fs.Close(write);
+
+    var buffer = new byte[size];
+    var handle = fs.Open("routed.bin", AccessMode.Read, ShareMode.Read);
+    _ReadFully(fs, handle, buffer); // warm the cache so the measurement is routing, not I/O
+
+    var before = GC.GetAllocatedBytesForCurrentThread();
+    _ReadFully(fs, handle, buffer);
+    var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+    fs.Close(handle);
+
+    buffer.Should().Equal(content);
+    allocated.Should().BeLessThan(size,
+      $"a fully cached {size}-byte mirrored read allocated {allocated} bytes — block routing is allocating per block");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Publish_GivenTheRateLimitIsSpent_WhenTheIoPathReports_ThenTheDropCostsNoLock() {
+    // every read and write publishes an activity event, and a busy pool spends the per-second
+    // budget immediately — so the DROP path is the hot path, and it used to take a process-wide
+    // lock just to decide the event was not wanted
+    var now = new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc);
+    var feed = new ActivityFeed(ringCapacity: 64, maxEventsPerSecond: 10, clock: () => now);
+    for (var i = 0; i < 20; ++i)
+      feed.Publish(ActivityKind.Read, "spend.bin", 4096, reason: "budget");
+
+    feed.DroppedSamples.Should().BeGreaterThan(0, "the budget must actually be spent for this to measure the drop path");
+
+    const int drops = 5000;
+    var before = GC.GetAllocatedBytesForCurrentThread();
+    for (var i = 0; i < drops; ++i)
+      feed.Publish(ActivityKind.Read, "hot.bin", 4096, reason: "user I/O");
+
+    var perDrop = (GC.GetAllocatedBytesForCurrentThread() - before) / drops;
+    perDrop.Should().Be(0, $"a dropped event allocated {perDrop} bytes — it must cost nothing but counters");
+    feed.History.Should().HaveCount(10, "only the events inside the budget are retained");
+  }
+
   private static void _ReadFully(PoolFileSystem fs, NodeHandle handle, byte[] buffer) {
     var read = 0;
     while (read < buffer.Length) {

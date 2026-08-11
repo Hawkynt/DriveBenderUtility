@@ -49,7 +49,7 @@ public sealed class ActivityFeed(int ringCapacity = 512, int maxEventsPerSecond 
   private readonly Queue<ActivityEvent> _ring = new(ringCapacity);
   private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
   private readonly Lock _lock = new();
-  private DateTime _windowStart;
+  private long _windowStartTicks;
   private int _eventsThisWindow;
 
   private long _readBytes;
@@ -60,9 +60,19 @@ public sealed class ActivityFeed(int ringCapacity = 512, int maxEventsPerSecond 
 
   public event Action<ActivityEvent>? EventPublished;
 
-  public long DroppedSamples { get; private set; }
+  public long DroppedSamples => Interlocked.Read(ref this._droppedSamples);
 
-  /// <summary>Publishes an event unless the rate limit says drop — never blocks the I/O path.</summary>
+  private long _droppedSamples;
+
+  /// <summary>
+  /// Publishes an event unless the rate limit says drop — never blocks the I/O path.
+  ///
+  /// EVERY read and write publishes here, so the rate-limit decision is taken WITHOUT the lock:
+  /// once a busy second has spent its budget (the normal state under load — a pool doing
+  /// thousands of I/Os per second against a 200/s feed) the call returns having touched nothing
+  /// but two interlocked counters. Taking the lock first made this one process-wide contention
+  /// point on the hot path of every file operation, purely to decide the event would be dropped.
+  /// </summary>
   public void Publish(ActivityKind kind, string path, long bytes = 0, string? fromMember = null, string? toMember = null, string reason = "") {
     switch (kind) {
       case ActivityKind.Read:
@@ -82,20 +92,22 @@ public sealed class ActivityFeed(int ringCapacity = 512, int maxEventsPerSecond 
         break;
     }
 
-    ActivityEvent? published = null;
+    var now = this._clock();
+
+    // roll the rate window; whichever thread wins the exchange resets the budget, the rest simply
+    // spend against the new one — an event either side of the boundary is not worth a lock
+    var windowStart = Interlocked.Read(ref this._windowStartTicks);
+    if (now.Ticks - windowStart >= TimeSpan.TicksPerSecond
+        && Interlocked.CompareExchange(ref this._windowStartTicks, now.Ticks, windowStart) == windowStart)
+      Interlocked.Exchange(ref this._eventsThisWindow, 0);
+
+    if (Interlocked.Increment(ref this._eventsThisWindow) > maxEventsPerSecond) {
+      Interlocked.Increment(ref this._droppedSamples); // best-effort feed: drop, never block (OPS-EVENTS)
+      return;
+    }
+
+    var published = new ActivityEvent(kind, path, bytes, fromMember, toMember, reason, now);
     lock (this._lock) {
-      var now = this._clock();
-      if (now - this._windowStart >= TimeSpan.FromSeconds(1)) {
-        this._windowStart = now;
-        this._eventsThisWindow = 0;
-      }
-
-      if (++this._eventsThisWindow > maxEventsPerSecond) {
-        ++this.DroppedSamples; // best-effort feed: drop, never block (OPS-EVENTS)
-        return;
-      }
-
-      published = new(kind, path, bytes, fromMember, toMember, reason, now);
       if (this._ring.Count >= ringCapacity)
         this._ring.Dequeue();
 
