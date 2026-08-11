@@ -163,6 +163,38 @@ public sealed class MountedPool : IDisposable {
     return found;
   }
 
+  /// <summary>
+  /// Waits for a file to reach the members' real folders.
+  ///
+  /// A write is acknowledged once the ack quorum is durable, and the remaining copies converge in
+  /// the BACKGROUND — that is the product's design, not a defect. On top of that a FUSE release
+  /// is asynchronous, so the kernel may not have told the engine the handle is closed by the time
+  /// the caller's <c>File.WriteAllBytes</c> has returned. Sampling the members the instant a write
+  /// returns therefore tests the timing of the harness, not the behaviour of the pool.
+  /// </summary>
+  public IReadOnlyList<(string where, byte[] content)> WaitForPhysicalCopies(string relativePath, int atLeast = 1, TimeSpan? timeout = null) {
+    var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(30));
+    var found = this.PhysicalCopies(relativePath);
+    while (found.Count < atLeast && DateTime.UtcNow < deadline) {
+      Thread.Sleep(250);
+      found = this.PhysicalCopies(relativePath);
+    }
+
+    return found;
+  }
+
+  /// <summary>Waits for a file to disappear from every member's real folder.</summary>
+  public IReadOnlyList<(string where, byte[] content)> WaitForNoPhysicalCopies(string relativePath, TimeSpan? timeout = null) {
+    var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(30));
+    var found = this.PhysicalCopies(relativePath);
+    while (found.Count > 0 && DateTime.UtcNow < deadline) {
+      Thread.Sleep(250);
+      found = this.PhysicalCopies(relativePath);
+    }
+
+    return found;
+  }
+
   public void Dispose() {
     if (this._disposed)
       return;

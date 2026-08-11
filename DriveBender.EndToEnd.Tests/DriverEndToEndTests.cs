@@ -56,16 +56,19 @@ public class DriverEndToEndTests {
     File.ReadAllBytes(path).Should().Equal(content, "a file written through the driver must read back byte-identical");
     new FileInfo(path).Length.Should().Be(content.Length);
 
-    // duplication is the product's whole point: the bytes must exist on the members' real folders,
-    // not merely be served back through the same cache that accepted them
-    var copies = this._pool.PhysicalCopies("roundtrip.bin");
-    copies.Should().NotBeEmpty("the file must be present on at least one member's real folder");
+    // Duplication is the product's whole point: the bytes must exist on the members' real folders,
+    // not merely be served back through the same cache that accepted them. Waited for rather than
+    // sampled — the owed copies converge in the background by design, and a FUSE release is
+    // asynchronous, so an immediate check measures the harness rather than the pool.
+    var copies = this._pool.WaitForPhysicalCopies("roundtrip.bin");
+    copies.Should().NotBeEmpty("the file must reach at least one member's real folder");
     foreach (var (where, bytes) in copies)
       bytes.Should().Equal(content, $"the copy at '{where}' must match what was written");
 
     File.Delete(path);
     File.Exists(path).Should().BeFalse();
-    this._pool.PhysicalCopies("roundtrip.bin").Should().BeEmpty("deleting through the driver must remove every physical copy");
+    this._pool.WaitForNoPhysicalCopies("roundtrip.bin")
+      .Should().BeEmpty("deleting through the driver must remove every physical copy");
   }
 
   [Test]
