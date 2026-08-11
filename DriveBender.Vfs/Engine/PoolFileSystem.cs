@@ -782,11 +782,34 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     var sequence = this._journal.LogIntent(JournalOp.Delete, normalized);
 
-    // every primary and shadow copy goes — no orphans remain (FR-DELETE)
-    foreach (var member in this._Online)
-    foreach (var shadow in new[] { false, true })
-      if (member.FileExists(normalized, shadow))
-        member.Delete(normalized, shadow);
+    // Every primary and shadow copy goes — no orphans remain (FR-DELETE). A member that fails
+    // DURING the delete is tombstoned rather than skipped: _RecordTombstoneForOffline above only
+    // covers members already offline when the delete started, so a member that dropped out a
+    // moment later would keep its copy and resurrect the file on its return (SAFE-OFFLINE).
+    var missed = new List<Guid>();
+    var deletedSomewhere = false;
+    var attempted = 0;
+    foreach (var member in this._Online.ToArray()) {
+      ++attempted;
+      try {
+        foreach (var shadow in new[] { false, true })
+          if (member.FileExists(normalized, shadow)) {
+            member.Delete(normalized, shadow);
+            deletedSomewhere = true;
+          }
+      } catch (PoolFsException) {
+        missed.Add(member.MemberId);
+      }
+    }
+
+    // nothing at all could be removed: this is a failed delete, not a degraded one
+    if (attempted > 0 && !deletedSomewhere && missed.Count == attempted)
+      throw new PoolFsException(PoolFsError.IoError, $"No member could delete '{normalized}'");
+
+    if (missed.Count > 0) {
+      this._tombstones.Record(JournalOp.Delete, normalized, null, [.. missed]);
+      DriveBender.Logger($"[Warning]'{normalized}' could not be removed on {missed.Count} member(s) — recorded for replay when they return, so it cannot resurrect");
+    }
 
     this._journal.Complete(sequence, JournalOp.Delete);
     this._integrity.InvalidateFile(normalized);
@@ -892,12 +915,22 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
-      var length = this._writeBuffer.OverlayLength(path, _StatAnyCopy(copies, dataPath)?.Length ?? 0);
+      // the SAME resolved length GetAttributes reports — cross-checked across copies and served
+      // from the metadata cache, so a sequential read no longer pays a stat syscall per call.
+      // Safe to use the locked form: this handle's read lock IS the lock a path lease takes.
+      var length = this._GetAttributesLocked(path, path).Length;
       if (offset >= length)
         return 0; // reads past EOF return 0 bytes (FR-READ)
 
       var count = (int)Math.Min(buffer.Length, length - offset);
-      this._ReadRange(path, dataPath, copies, buffer[..count], offset, count >= this._mirrorSplitThreshold);
+
+      // A block shorter than the file's length says the copy that served it is BEHIND — unless
+      // the write buffer is legitimately holding the rest, in which case a short disk block is
+      // exactly right and the overlay supplies the tail. IsDirty is stable here: a flush takes
+      // this path's write lease and we hold its read lock.
+      var durableExpected = !this._writeBuffer.IsDirty(path);
+      this._ReadRange(path, dataPath, copies, buffer[..count], offset, count >= this._mirrorSplitThreshold,
+        durableExpected ? length : 0);
       this._activity.Publish(ActivityKind.Read, path, count, fromMember: copies[0].Volume.DisplayName, reason: "user I/O");
 
       if (this._readAheadEnabled) {
@@ -917,7 +950,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           var from = offset + count;
           ThreadPool.QueueUserWorkItem(_ => {
             try {
-              this._Prefetch(dataPath, copies, from, prefetchBytes, length);
+              this._Prefetch(dataPath, copies, from, prefetchBytes, length, durableExpected ? length : 0);
             } catch (Exception) {
               // prefetch is strictly best-effort — the foreground read surfaces real errors
             } finally {
@@ -933,7 +966,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
-  private void _ReadRange(string path, string dataPath, IReadOnlyList<PhysicalCopy> copies, Span<byte> buffer, long offset, bool mirrorSplit) {
+  /// <summary>Bytes block <paramref name="blockIndex"/> must contain for a file of <paramref name="fileLength"/> bytes; 0 means "unknown, accept anything".</summary>
+  private static int _ExpectedBlockLength(long fileLength, long blockIndex, int blockSize)
+    => fileLength <= 0 ? 0 : (int)Math.Clamp(fileLength - blockIndex * blockSize, 0, blockSize);
+
+  private void _ReadRange(string path, string dataPath, IReadOnlyList<PhysicalCopy> copies, Span<byte> buffer, long offset, bool mirrorSplit, long fileLength) {
     var blockSize = this._cache.Pages.BlockSize;
 
     // FR-MIRROR: a large read pulls its uncached blocks from MULTIPLE copies CONCURRENTLY — each
@@ -947,7 +984,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (missing.Count > 1)
         try {
           Parallel.ForEach(missing, new ParallelOptions { MaxDegreeOfParallelism = copies.Count },
-            blockIndex => this._LoadBlock(dataPath, copies, blockIndex, mirrorSplit: true));
+            blockIndex => this._LoadBlock(dataPath, copies, blockIndex, mirrorSplit: true,
+              expectedLength: _ExpectedBlockLength(fileLength, blockIndex, blockSize)));
         } catch (AggregateException e) when (e.InnerExceptions.OfType<PoolFsException>().FirstOrDefault() is { } inner) {
           throw inner;
         }
@@ -959,7 +997,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var blockIndex = absolute / blockSize;
       var blockOffset = (int)(absolute % blockSize);
       // the overlay (dirty write buffer) is keyed by the LOGICAL name; disk blocks by the physical one
-      var block = this._writeBuffer.OverlayBlock(path, blockIndex, blockSize, this._LoadBlock(dataPath, copies, blockIndex, mirrorSplit));
+      var loaded = this._LoadBlock(dataPath, copies, blockIndex, mirrorSplit,
+        expectedLength: _ExpectedBlockLength(fileLength, blockIndex, blockSize));
+      var block = this._writeBuffer.OverlayBlock(path, blockIndex, blockSize, loaded);
       var available = Math.Min(buffer.Length - written, block.Length - blockOffset);
       if (available <= 0)
         throw new PoolFsException(PoolFsError.IoError, $"Short read at block {blockIndex} of '{path}'");
@@ -969,7 +1009,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
-  private byte[] _LoadBlock(string path, IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit, long? guardEpoch = null) {
+  private byte[] _LoadBlock(string path, IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit, long? guardEpoch = null, int expectedLength = 0) {
     var key = new PageKey(this._poolId, path, blockIndex);
     if (this._cache.Pages.TryGet(key, out var cached))
       return cached;
@@ -984,6 +1024,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       .ThenBy(i => (i - rotation + copies.Count) % copies.Count)
       .ToArray();
     PoolFsException? lastError = null;
+    byte[]? bestShort = null;
+    string? bestShortMember = null;
     foreach (var index in order) {
       var copy = copies[index];
       byte[] block;
@@ -997,9 +1039,25 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._EndIo(copy.Volume.MemberId);
       }
 
+      // A copy that hits EOF where the file's length says there is more data is BEHIND — it
+      // missed a write while it was away, or a heal has not reached it yet. Serving that block
+      // produces a short read; CACHING it hides the lag behind a cache hit for the whole TTL.
+      // Fail over to another copy instead, and only fall back to the longest short answer when
+      // no copy can do better (SAFE-COHERE).
+      if (expectedLength > 0 && block.Length < expectedLength) {
+        if (bestShort == null || block.Length > bestShort.Length) {
+          bestShort = block;
+          bestShortMember = copy.Volume.DisplayName;
+        }
+
+        lastError = new(PoolFsError.IoError,
+          $"Copy of '{path}' on '{copy.Volume.DisplayName}' ends at block {blockIndex} byte {block.Length}, but the file is {expectedLength} bytes there");
+        continue;
+      }
+
       if (lastError != null)
         this._activity.Publish(ActivityKind.Recovery, path, block.Length, fromMember: copy.Volume.DisplayName,
-          reason: "read failover — a copy failed mid-read, another one served the block");
+          reason: "read failover — a copy was unreadable or behind, another one served the block");
 
       // a lock-free prefetch guards its Put with the epoch it captured before reading, so a write
       // that invalidated the path in the meantime rejects this now-stale block (SAFE-COHERE)
@@ -1010,18 +1068,48 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return block;
     }
 
+    // every copy fell short: the shortfall is real (or every holder is lagging identically).
+    // Hand back the longest answer UNCACHED so the next read re-checks rather than inheriting it.
+    if (bestShort != null) {
+      DriveBender.Logger($"[Warning]Every copy of '{path}' is short at block {blockIndex} — serving the longest ({bestShort.Length} bytes) from '{bestShortMember}' without caching it");
+      this._activity.Publish(ActivityKind.Recovery, path, bestShort.Length, fromMember: bestShortMember,
+        reason: "every copy is behind at this block");
+      return bestShort;
+    }
+
     throw lastError ?? new PoolFsException(PoolFsError.IoError, $"No copy of '{path}' could be read");
   }
 
-  /// <summary>Stat with failover: any surviving copy answers when the first one's storage just died.</summary>
+  /// <summary>
+  /// The authoritative metadata across a file's copies. Taking <c>copies[0]</c> meant the file's
+  /// LENGTH was whatever the first-resolved member happened to hold: a copy that missed a write
+  /// reported the file short, and since every read clamps to that length, the tail was
+  /// unreachable — a silent truncation with no error anywhere. The NEWEST copy by last-write
+  /// time wins, the same rule crash-recovery resync converges every copy on; a tie is broken by
+  /// length so a stat can never hide bytes that demonstrably exist. Unreadable copies are
+  /// skipped, so one dying storage cannot fail a stat the others can answer.
+  /// </summary>
   private static FileMeta? _StatAnyCopy(IReadOnlyList<PhysicalCopy> copies, string path) {
     PoolFsException? lastError = null;
+    FileMeta? best = null;
+    var answered = false;
     foreach (var copy in copies)
       try {
-        return copy.Volume.Stat(path, copy.Shadow);
+        var meta = copy.Volume.Stat(path, copy.Shadow);
+        answered = true;
+        if (meta is not { } candidate)
+          continue;
+
+        if (best is not { } current
+            || candidate.LastWriteTimeUtc > current.LastWriteTimeUtc
+            || (candidate.LastWriteTimeUtc == current.LastWriteTimeUtc && candidate.Length > current.Length))
+          best = candidate;
       } catch (PoolFsException e) {
         lastError = e;
       }
+
+    if (answered)
+      return best;
 
     throw lastError ?? new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
   }
@@ -1045,7 +1133,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     return block;
   }
 
-  private void _Prefetch(string path, IReadOnlyList<PhysicalCopy> copies, long fromOffset, long windowBytes, long fileLength) {
+  /// <param name="expectedFileLength">The DURABLE length used to spot a lagging copy, or 0 when the write buffer holds bytes the disk legitimately lacks.</param>
+  private void _Prefetch(string path, IReadOnlyList<PhysicalCopy> copies, long fromOffset, long windowBytes, long fileLength, long expectedFileLength) {
     var blockSize = this._cache.Pages.BlockSize;
     var lastByte = Math.Min(fileLength, fromOffset + windowBytes) - 1; // never past EOF (FR-RA)
     var missing = new List<long>();
@@ -1065,7 +1154,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // of already-ready blocks hands over at once
     try {
       Parallel.ForEach(missing, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, copies.Count) },
-        blockIndex => this._LoadBlock(path, copies, blockIndex, mirrorSplit: copies.Count > 1, guardEpoch: epoch));
+        blockIndex => this._LoadBlock(path, copies, blockIndex, mirrorSplit: copies.Count > 1, guardEpoch: epoch,
+          expectedLength: _ExpectedBlockLength(expectedFileLength, blockIndex, blockSize)));
     } catch (Exception) {
       // prefetch is best-effort; the foreground read will surface real errors
     }

@@ -62,6 +62,14 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   private static readonly TimeSpan _PROBE_TTL = TimeSpan.FromSeconds(30);
 
   /// <summary>
+  /// How long a NEGATIVE probe is trusted. A healthy member is trusted for the full TTL — there
+  /// is no point re-probing something that just answered. A member believed down is re-checked
+  /// far sooner: writing a member off for thirty seconds because of one dropped packet turns a
+  /// blip into a degraded pool, and every read of its copies goes to another member meanwhile.
+  /// </summary>
+  private static readonly TimeSpan _PROBE_TTL_OFFLINE = TimeSpan.FromSeconds(2);
+
+  /// <summary>
   /// Whole-object backends buffer the entire file in a single <c>byte[]</c>/<c>MemoryStream</c>,
   /// which caps at <see cref="int.MaxValue"/>. Rather than silently truncate a larger file
   /// (an <c>(int)</c> cast wraps), such a member REFUSES it with NoSpace — placement then keeps
@@ -76,9 +84,17 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   private readonly IWholeFileStore _store = store.ThreadSafe ? store : new SerializingWholeFileStore(store);
 
   private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
-  private DateTime _lastProbeUtc = DateTime.MinValue;
-  private bool _lastProbeResult;
-  private bool _connected;
+
+  // Probe state is read from the hot path (ResolveCopies filters every copy by IsOnline) and
+  // written by whichever caller happens to find it expired, so it must be published atomically.
+  // A LOCK here would park every concurrent caller behind one network round trip; instead a
+  // single-prober gate lets one caller refresh while the rest are served the last known answer.
+  private long _lastProbeTicks;
+  private volatile bool _lastProbeResult;
+  private int _probing;
+
+  private readonly Lock _connectLock = new();
+  private volatile bool _connected;
 
   // The engine reads a file BLOCK BY BLOCK, and each block miss otherwise re-downloads the WHOLE
   // object (a cold 1 GiB cloud read in 128 KiB blocks would move ~8000× the file). A bounded LRU of
@@ -156,27 +172,58 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   public bool IsOnline {
     get {
       var now = this._clock();
-      if (now - this._lastProbeUtc < _PROBE_TTL)
+      var lastResult = this._lastProbeResult;
+      if (now.Ticks - Interlocked.Read(ref this._lastProbeTicks) < (lastResult ? _PROBE_TTL : _PROBE_TTL_OFFLINE).Ticks)
+        return lastResult;
+
+      // one prober at a time: the others keep the last answer rather than piling identical
+      // round trips onto a remote that may already be struggling
+      if (Interlocked.Exchange(ref this._probing, 1) != 0)
         return this._lastProbeResult;
 
-      this._lastProbeUtc = now;
       try {
-        this._EnsureConnected();
-        this._lastProbeResult = this._store.Probe();
-      } catch (Exception) {
-        this._lastProbeResult = false;
-      }
+        bool probed;
+        try {
+          this._EnsureConnected();
+          probed = this._store.Probe();
+        } catch (Exception) {
+          probed = false;
+        }
 
-      return this._lastProbeResult;
+        this._lastProbeResult = probed;
+        Interlocked.Exchange(ref this._lastProbeTicks, now.Ticks); // published LAST — readers gate on it
+        return probed;
+      } finally {
+        Interlocked.Exchange(ref this._probing, 0);
+      }
     }
+  }
+
+  /// <summary>
+  /// Records that this member just failed to answer. The result is UNKNOWN, never "absent", so
+  /// the member is reported offline until it proves otherwise — the engine already models an
+  /// unreachable member safely (tombstoned namespace changes, heal on return), whereas it has no
+  /// defence against a reachable member that lies about what it holds. The next call re-probes
+  /// immediately, so a momentary blip costs one operation rather than a whole TTL.
+  /// </summary>
+  private void _MarkUnreachable() {
+    this._lastProbeResult = false;
+    this._connected = false; // the session is probably dead; reconnect before trusting it again
+    Interlocked.Exchange(ref this._lastProbeTicks, 0);
   }
 
   private void _EnsureConnected() {
     if (this._connected)
       return;
 
-    this._store.Connect();
-    this._connected = true;
+    // double-checked: Connect() on a thread-safe store can otherwise run concurrently
+    lock (this._connectLock) {
+      if (this._connected)
+        return;
+
+      this._store.Connect();
+      this._connected = true;
+    }
   }
 
   private T _Guard<T>(Func<T> operation) {
@@ -462,11 +509,20 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     return physical.Length == 0 ? this.IsOnline : this._TryQuery(() => this._store.Stat(physical) is { IsFolder: true });
   }
 
+  /// <summary>
+  /// Answers an existence question, distinguishing "the store said no" from "the store did not
+  /// answer". A definitive absence comes back as a null <c>Stat</c> — NOT as an exception — so
+  /// every exception here is a transport or protocol failure. Reporting that as <c>false</c> was
+  /// actively dangerous: <c>Unlink</c> skips a member whose copy "does not exist", leaving a
+  /// ghost that resurrects on the next mount, and placement concludes a copy is missing and
+  /// heals over a member that in fact holds the newest data.
+  /// </summary>
   private bool _TryQuery(Func<bool> query) {
     try {
       this._EnsureConnected();
       return query();
     } catch (Exception) {
+      this._MarkUnreachable();
       return false;
     }
   }
