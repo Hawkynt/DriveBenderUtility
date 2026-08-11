@@ -175,6 +175,10 @@ internal sealed class ServeCommand(
         case "/api/health" when request.HttpMethod == "POST":
           this._WriteJson(context, this._RunHealth(request));
           break;
+        case "/api/job":
+          this._WriteJson(context, this._JobStatus(request));
+          break;
+
         case "/api/restore" when request.HttpMethod == "POST":
           this._WriteJson(context, this._RunRestore(request));
           break;
@@ -505,6 +509,69 @@ internal sealed class ServeCommand(
     }
   }
 
+  #region long-running operations as jobs (NFR-UI-LIVE)
+
+  /// <summary>One long-running operation the UI started and can poll for.</summary>
+  private sealed class JobEntry {
+    public required string Kind { get; init; }
+    public required DateTime StartedUtc { get; init; }
+    public DateTime? FinishedUtc;
+    public object? Result;   // the _Guard envelope once complete
+  }
+
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, JobEntry> _jobs = new();
+
+  /// <summary>Finished jobs are kept briefly so a reloaded page can still collect its result.</summary>
+  private static readonly TimeSpan _JOB_RETENTION = TimeSpan.FromMinutes(15);
+
+  /// <summary>
+  /// Starts a long operation on its OWN thread and hands the caller a ticket immediately.
+  /// A deep scan or a restore can run for many minutes; executing it inline held the browser's
+  /// request (and a daemon thread) open for the entire time, so the tab showed a dead spinner,
+  /// any proxy or client timeout threw the result away, and nothing could be cancelled or
+  /// reopened. The UI now polls /api/job and survives a reload mid-scan.
+  /// </summary>
+  private object _StartJob(string kind, Func<object> work) {
+    this._PruneJobs();
+    var id = Guid.NewGuid().ToString("N");
+    var entry = new JobEntry { Kind = kind, StartedUtc = DateTime.UtcNow };
+    this._jobs[id] = entry;
+
+    new Thread(() => {
+      object envelope;
+      try {
+        envelope = work();
+      } catch (Exception e) {
+        envelope = new { ok = false, error = e.Message };
+      }
+
+      entry.Result = envelope;
+      entry.FinishedUtc = DateTime.UtcNow; // set LAST — readers treat it as the completion fence
+    }) { IsBackground = true, Name = $"job-{kind}" }.Start();
+
+    return new { ok = true, result = new { jobId = id, kind, state = "running" } };
+  }
+
+  private object _JobStatus(HttpListenerRequest request) {
+    var id = request.QueryString["id"] ?? "";
+    if (!this._jobs.TryGetValue(id, out var entry))
+      return new { ok = false, error = "unknown or expired job" };
+
+    if (entry.FinishedUtc == null)
+      return new { ok = true, result = new { jobId = id, entry.Kind, state = "running", runningSeconds = (int)(DateTime.UtcNow - entry.StartedUtc).TotalSeconds } };
+
+    return new { ok = true, result = new { jobId = id, entry.Kind, state = "done", completed = entry.Result } };
+  }
+
+  private void _PruneJobs() {
+    var cutoff = DateTime.UtcNow - _JOB_RETENTION;
+    foreach (var (id, entry) in this._jobs)
+      if (entry.FinishedUtc is { } finished && finished < cutoff)
+        this._jobs.TryRemove(id, out _);
+  }
+
+  #endregion
+
   /// <summary>
   /// Pool work never runs inside the manager (it is a reload-safe UI shell): a MOUNTED pool
   /// executes the operation in its own process via the op channel; an unmounted pool gets a
@@ -530,20 +597,29 @@ internal sealed class ServeCommand(
     return document.RootElement.Clone();
   });
 
-  /// <summary>Runs the problem scan (optionally deep or correcting) — relayed to the pool's process or a transient worker.</summary>
+  /// <summary>
+  /// Runs the problem scan (optionally deep or correcting) — relayed to the pool's process or a
+  /// transient worker. A deep or correcting pass reads all pool data and can run for many
+  /// minutes, so it becomes a JOB; the quick metadata scan stays inline (it is sub-second and
+  /// the UI would otherwise flicker through a pointless polling round-trip).
+  /// </summary>
   private object _RunHealth(HttpListenerRequest request) {
     var poolRef = this._RequirePool(request);
     var fix = request.QueryString["fix"] == "true";
     var deep = request.QueryString["deep"] == "true";
-    return this._PoolOp(poolRef, fix ? "fix" : deep ? "health-deep" : "health",
-      fix ? ["pool-health", poolRef, "--fix", "--json"]
+    var op = fix ? "fix" : deep ? "health-deep" : "health";
+    string[] args = fix ? ["pool-health", poolRef, "--fix", "--json"]
       : deep ? ["pool-health", poolRef, "--deep", "--json"]
-      : ["pool-health", poolRef, "--json"]);
+      : ["pool-health", poolRef, "--json"];
+
+    return fix || deep
+      ? this._StartJob(op, () => this._PoolOp(poolRef, op, args))
+      : this._PoolOp(poolRef, op, args);
   }
 
   private object _RunRestore(HttpListenerRequest request) {
     var poolRef = this._RequirePool(request);
-    return this._PoolOp(poolRef, "restore", ["pool-restore", poolRef, "--json"]);
+    return this._StartJob("restore", () => this._PoolOp(poolRef, "restore", ["pool-restore", poolRef, "--json"]));
   }
 
   /// <summary>
@@ -565,7 +641,23 @@ internal sealed class ServeCommand(
 
   /// <summary>Spawns a short-lived dbmount worker and returns its full output + exit code.</summary>
   private static string _RunWorkerText(string[] args, out int exitCode) {
+    _RunWorkerCore(args, out exitCode, out var stdout, out var stderr);
+    return (stderr.Trim().Length > 0 ? stderr : stdout).Trim();
+  }
+
+  private const int _WORKER_TIMEOUT_MS = 30 * 60 * 1000;
+
+  /// <summary>
+  /// Runs a short-lived dbmount worker to completion. BOTH pipes are drained CONCURRENTLY:
+  /// reading stdout to the end before touching stderr deadlocks the moment a worker fills the
+  /// stderr pipe (~4 KiB) — it blocks writing while we block reading the other stream, and the
+  /// daemon thread parks until the timeout. A worker that overruns the timeout is killed rather
+  /// than left running with its exit code read off a live process.
+  /// </summary>
+  private static bool _RunWorkerCore(string[] args, out int exitCode, out string stdout, out string stderr) {
     exitCode = -1;
+    stdout = stderr = "";
+
     var entryDll = Assembly.GetEntryAssembly()!.Location;
     var exe = Environment.ProcessPath ?? "dotnet";
     var viaDotnet = exe.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase) || exe.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase);
@@ -585,52 +677,37 @@ internal sealed class ServeCommand(
     try {
       using var worker = System.Diagnostics.Process.Start(start);
       if (worker == null)
-        return "";
+        return false;
 
-      var stdout = worker.StandardOutput.ReadToEnd();
-      var stderr = worker.StandardError.ReadToEnd();
-      worker.WaitForExit(30 * 60 * 1000);
+      var outTask = worker.StandardOutput.ReadToEndAsync();
+      var errTask = worker.StandardError.ReadToEndAsync();
+      if (!worker.WaitForExit(_WORKER_TIMEOUT_MS)) {
+        DriveBender.Logger($"[Warning]worker '{(args.Length > 0 ? args[0] : "?")}' exceeded its time budget — killing it");
+        try {
+          worker.Kill(entireProcessTree: true);
+        } catch (Exception) {
+          // already gone, or we may not signal it — the reads below still unblock on pipe close
+        }
+      }
+
+      stdout = outTask.GetAwaiter().GetResult();
+      stderr = errTask.GetAwaiter().GetResult();
+      worker.WaitForExit(); // the streams are drained; this only reaps the exit code
       exitCode = worker.ExitCode;
-      return (stderr.Trim().Length > 0 ? stderr : stdout).Trim();
+      return true;
     } catch (Exception e) {
       DriveBender.Logger($"[Warning]worker spawn failed: {e.Message}");
-      return e.Message;
+      stderr = e.Message;
+      return false;
     }
   }
 
   /// <summary>Spawns a short-lived dbmount worker and returns the JSON line it printed (null on failure).</summary>
-  private static string? _RunWorker(string[] args) {
-    var entryDll = Assembly.GetEntryAssembly()!.Location;
-    var exe = Environment.ProcessPath ?? "dotnet";
-    var viaDotnet = exe.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase) || exe.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase);
-
-    var start = new System.Diagnostics.ProcessStartInfo {
-      FileName = exe,
-      UseShellExecute = false,
-      CreateNoWindow = true,
-      RedirectStandardOutput = true,
-      RedirectStandardError = true,
-    };
-    if (viaDotnet)
-      start.ArgumentList.Add(entryDll);
-    foreach (var argument in args)
-      start.ArgumentList.Add(argument);
-
-    try {
-      using var worker = System.Diagnostics.Process.Start(start);
-      if (worker == null)
-        return null;
-
-      var stdout = worker.StandardOutput.ReadToEnd();
-      worker.StandardError.ReadToEnd();
-      worker.WaitForExit(30 * 60 * 1000);
-      // the JSON result is the last line that looks like an object
-      return stdout.Split('\n').Select(l => l.Trim()).LastOrDefault(l => l.StartsWith('{'));
-    } catch (Exception e) {
-      DriveBender.Logger($"[Warning]worker spawn failed: {e.Message}");
-      return null;
-    }
-  }
+  private static string? _RunWorker(string[] args)
+    // the JSON result is the last line that looks like an object
+    => _RunWorkerCore(args, out _, out var stdout, out _)
+      ? stdout.Split('\n').Select(l => l.Trim()).LastOrDefault(l => l.StartsWith('{'))
+      : null;
 
   private sealed record CreateBody(string? Name, string? MountTarget, MemberBody[]? Members, bool TakeOver = false);
   private sealed record MemberBody(string Location, string? Role, string? Credential);

@@ -410,7 +410,14 @@ function patchCard(c, pool) {
   add("Browse", "", () => browseDialog(pool, ""));
   add("Health", "", () => healthDialog(pool, false));
   add("Fix", "", () => healthDialog(pool, true));
-  add("Restore", "", async () => { if (await op("/api/restore?pool=" + pool.id)) alert("Restore finished — missing copies were recreated."); });
+  add("Restore", "", async () => {
+    // restore rebuilds every missing copy — minutes on a large pool, so it runs as a job
+    const j = await awaitJob(await post("/api/restore?pool=" + pool.id));
+    if (j.ok)
+      alert("Restore finished — missing copies were recreated.");
+    else
+      alert("Failed: " + (j.error || ""));
+  });
   add("Add member", "", () => addMemberDialog(pool));
   if (pool.source === "manifest")
     add("Duplication", "", () => duplicationDialog(pool));
@@ -442,11 +449,18 @@ function infoModal(title, bodyNode, wide) {
 // to also surface silent bit-rot (reads all pool data — can take a long time); FIX repairs.
 async function healthDialog(pool, fix, deep) {
   const body = el("div");
-  body.innerHTML = `<p class="hint">${fix ? "Scanning and repairing" : deep ? "Deep-scanning (re-checksumming every file — this can take a long time)" : "Scanning"} <b>${esc(pool.name)}</b> —
+  const what = fix ? "Scanning and repairing" : deep ? "Deep-scanning (re-checksumming every file — this can take a long time)" : "Scanning";
+  const progress = el("p", "hint");
+  body.innerHTML = `<p class="hint">${what} <b>${esc(pool.name)}</b> —
     checking duplication levels, integrity and device health…</p>`;
+  body.appendChild(progress);
   infoModal(fix ? "Fix problems" : deep ? "Deep scan (bit-rot)" : "Pool problem scan", body);
 
-  const j = await post("/api/health?pool=" + pool.id + (fix ? "&fix=true" : "") + (deep && !fix ? "&deep=true" : ""));
+  // a deep/fix pass comes back as a job ticket at once — the dialog stays live and reports
+  // elapsed time instead of the browser hanging on one very long request
+  const j = await awaitJob(
+    await post("/api/health?pool=" + pool.id + (fix ? "&fix=true" : "") + (deep && !fix ? "&deep=true" : "")),
+    secs => { progress.textContent = `Still working — ${secs}s elapsed. You can leave this open; the scan runs in the background.`; });
   if (!j.ok) { body.innerHTML = `<p class="hint">Scan failed: ${esc(j.error || "unknown error")}</p>`; return; }
   const r = j.result;
   const smartBadge = h => h === "Healthy" ? '<span class="badge ok">healthy</span>'
@@ -755,6 +769,27 @@ async function post(url, body) {
       if (attempt === 0) { await new Promise(res => setTimeout(res, 1200)); continue; }
       return { ok: false, error: "the manager service is momentarily unavailable — please retry" };
     }
+  }
+}
+
+// A long operation (deep scan, fix, restore) answers immediately with a job ticket instead of
+// holding the request open for its whole run. This polls the job to completion and returns the
+// SAME envelope the operation would have returned inline, so callers stay unchanged. onTick gets
+// the elapsed seconds so a dialog can show that work is still happening rather than a dead spinner.
+async function awaitJob(started, onTick) {
+  if (!started.ok || !started.result || !started.result.jobId)
+    return started; // ran inline (a quick scan) or failed outright — nothing to poll
+
+  const id = started.result.jobId;
+  for (;;) {
+    await new Promise(res => setTimeout(res, 700));
+    const j = await post("/api/job?id=" + encodeURIComponent(id));
+    if (!j.ok)
+      return j; // the job expired or the daemon forgot it — surface the error
+    if (j.result.state === "done")
+      return j.result.completed;
+    if (onTick)
+      onTick(j.result.runningSeconds || 0);
   }
 }
 
