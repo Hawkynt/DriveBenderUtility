@@ -55,14 +55,19 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
       return this._files.TryGetValue(path, out var buffer) ? buffer.State : DirtyState.Clean;
   }
 
-  /// <summary>Stages a mutation; false = write-buffer budget exhausted (backpressure, FR-BACKP).</summary>
+  /// <summary>
+  /// Stages a mutation; false = write-buffer budget exhausted (backpressure, FR-BACKP).
+  /// OWNERSHIP: <paramref name="data"/> is taken over by the buffer and must not be mutated by
+  /// the caller afterwards. The write path already materialises a private array from the
+  /// driver's span, so a defensive clone here would copy every written byte a second time.
+  /// </summary>
   public bool StageWrite(string path, long offset, byte[] data, long journalSequence, int durableCopies) {
     lock (this._lock) {
       if (!cache.TryReserveWrite(data.Length))
         return false;
 
       var buffer = this._Buffer(path, durableCopies);
-      buffer.Ops.Add(new(offset, (byte[])data.Clone(), null, this._clock()));
+      buffer.Ops.Add(new(offset, data, null, this._clock()));
       buffer.ReservedBytes += data.Length;
       if (journalSequence != 0)
         buffer.OpenJournalSequences.Add(journalSequence);

@@ -116,6 +116,57 @@ public class WholeFileVolumeIOTests {
 
   [Test]
   [Category("EdgeCase")]
+  public void Publish_GivenExistingRemoteObject_WhenReplacedWholesale_ThenTheOldObjectIsNeverDownloaded() {
+    // every heal/drain/publish onto a whole-file member goes through WholeFilePublisher, which
+    // opens the target and immediately truncates it. Preloading the existing object for the
+    // read-modify-write buffer meant a FULL download purely to throw the bytes away — on a cloud
+    // member that doubled the WAN cost of every duplication repair.
+    var counting = new CountingStore(new DirectoryStore(this._root));
+    using var volume = new WholeFileVolumeIO(Guid.NewGuid(), "wf", "REMOTE", counting);
+    using (var seed = volume.OpenWrite("doc.bin", false, true)) {
+      seed.Write(new byte[32 * 1024], 0, 32 * 1024);
+      seed.Flush();
+    }
+
+    counting.Downloads = 0;
+    WholeFilePublisher.PublishStream(volume, "doc.bin", false, () => new MemoryStream(new byte[8 * 1024]), 8 * 1024);
+
+    counting.Downloads.Should().Be(0, "a wholesale replacement never needs the bytes it is about to discard");
+    this._ReadAllFrom(volume, "doc.bin", false).Length.Should().Be(8 * 1024, "the new content fully replaced the old object");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void OpenWrite_GivenPositionalWriteOverExistingObject_WhenFlushed_ThenTheOldBytesStillCompose() {
+    // the counterpart to the test above: a PARTIAL write still needs the existing object, so the
+    // lazy load must trigger — dropping it would silently zero-fill everything the write misses
+    var counting = new CountingStore(new DirectoryStore(this._root));
+    using var volume = new WholeFileVolumeIO(Guid.NewGuid(), "wf", "REMOTE", counting);
+    using (var seed = volume.OpenWrite("mix.bin", false, true)) {
+      seed.Write([1, 2, 3, 4, 5, 6, 7, 8], 0, 8);
+      seed.Flush();
+    }
+
+    counting.Downloads = 0;
+    using (var patch = volume.OpenWrite("mix.bin", false, false)) {
+      patch.Seek(4, SeekOrigin.Begin);
+      patch.Write([9, 9], 0, 2);
+      patch.Flush();
+    }
+
+    counting.Downloads.Should().BeGreaterThan(0, "a partial write must fetch what it does not overwrite");
+    this._ReadAllFrom(volume, "mix.bin", false).Should().Equal(1, 2, 3, 4, 9, 9, 7, 8);
+  }
+
+  private byte[] _ReadAllFrom(WholeFileVolumeIO volume, string path, bool shadow) {
+    using var stream = volume.OpenRead(path, shadow);
+    using var buffer = new MemoryStream();
+    stream.CopyTo(buffer);
+    return buffer.ToArray();
+  }
+
+  [Test]
+  [Category("EdgeCase")]
   public void OpenRead_GivenManyBlockReadsOfOneFile_WhenRead_ThenObjectDownloadedOnce() {
     var counting = new CountingStore(new DirectoryStore(this._root));
     using var volume = new WholeFileVolumeIO(Guid.NewGuid(), "wf", "REMOTE", counting);

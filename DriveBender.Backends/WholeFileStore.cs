@@ -227,11 +227,12 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     if (!exists)
       this._EnsureFolderRecursive(PoolPaths.GetParent(physical));
 
-    // read-modify-write staging: existing content preloads so positional writes compose;
-    // a brand-new file starts dirty so even an empty create uploads on flush (the cache copy is
-    // safe: UploadOnFlushStream copies it into its own buffer before mutating)
-    var initial = exists ? this._CachedDownload(physical) : [];
-    return new UploadOnFlushStream(this, physical, initial, startDirty: !exists);
+    // read-modify-write staging: existing content composes with positional writes — but it is
+    // loaded LAZILY. A publish (WholeFilePublisher) opens the object and immediately calls
+    // SetLength(0); eagerly downloading first meant every heal/drain/publish onto an existing
+    // remote file paid a full download purely to throw it away. A brand-new file starts dirty
+    // so even an empty create uploads on flush (the cached array is never mutated in place).
+    return new UploadOnFlushStream(this, physical, exists ? () => this._CachedDownload(physical) : null, startDirty: !exists);
   });
 
   private void _Upload(string physical, byte[] content) => this._Guard(() => {
@@ -239,28 +240,86 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     this._InvalidateReadCache(physical); // the object changed — drop any stale cached copy
   });
 
-  /// <summary>Staging stream: mutations happen in memory; Flush uploads the whole object (whole-file model, §6.1).</summary>
+  /// <summary>
+  /// Staging stream: mutations happen in memory; Flush uploads the whole object (whole-file
+  /// model, §6.1). The existing object is fetched only when an operation could actually observe
+  /// it — a <c>SetLength(0)</c> arriving first (the publish pattern) discards it unread, so no
+  /// download happens at all.
+  /// </summary>
   private sealed class UploadOnFlushStream : MemoryStream {
 
     private readonly WholeFileVolumeIO _owner;
     private readonly string _physical;
+    private Func<byte[]>? _loadInitial; // null once loaded (or once proven unnecessary)
     private bool _dirty;
 
-    public UploadOnFlushStream(WholeFileVolumeIO owner, string physical, byte[] initial, bool startDirty) {
+    public UploadOnFlushStream(WholeFileVolumeIO owner, string physical, Func<byte[]>? loadInitial, bool startDirty) {
       this._owner = owner;
       this._physical = physical;
+      this._loadInitial = loadInitial;
       this._dirty = startDirty;
-      if (initial.Length > 0) {
-        base.Write(initial, 0, initial.Length);
-        this.Position = 0;
+    }
+
+    /// <summary>Pulls the existing object in before anything can observe (or overwrite part of) it.</summary>
+    private void _Materialise() {
+      var load = Interlocked.Exchange(ref this._loadInitial, null);
+      if (load == null)
+        return;
+
+      var initial = load();
+      if (initial.Length == 0)
+        return;
+
+      var position = this.Position;
+      this.Position = 0;
+      base.Write(initial, 0, initial.Length);
+      this.Position = position;
+    }
+
+    public override long Length {
+      get {
+        this._Materialise();
+        return base.Length;
       }
+    }
+
+    public override int Read(byte[] buffer, int offset, int count) {
+      this._Materialise();
+      return base.Read(buffer, offset, count);
+    }
+
+    public override int Read(Span<byte> buffer) {
+      this._Materialise();
+      return base.Read(buffer);
+    }
+
+    public override int ReadByte() {
+      this._Materialise();
+      return base.ReadByte();
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) {
+      if (origin == SeekOrigin.End)
+        this._Materialise(); // relative to the existing length
+
+      return base.Seek(offset, origin);
     }
 
     public override void Write(byte[] buffer, int offset, int count) {
       if (this.Position + count > MaxFileSize)
         throw new PoolFsException(PoolFsError.NoSpace, $"File exceeds the {MaxFileSize} byte whole-object limit of '{this._owner.DisplayName}' — place large files on a local member");
 
+      this._Materialise(); // a partial write composes over the existing bytes
       base.Write(buffer, offset, count);
+      this._dirty = true;
+    }
+
+    public override void Write(ReadOnlySpan<byte> buffer) {
+      if (this.Position + buffer.Length > MaxFileSize)
+        throw new PoolFsException(PoolFsError.NoSpace, $"File exceeds the {MaxFileSize} byte whole-object limit of '{this._owner.DisplayName}' — place large files on a local member");
+
+      this._Materialise();
+      base.Write(buffer);
       this._dirty = true;
     }
 
@@ -268,13 +327,26 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
       if (this.Position + 1 > MaxFileSize)
         throw new PoolFsException(PoolFsError.NoSpace, $"File exceeds the {MaxFileSize} byte whole-object limit of '{this._owner.DisplayName}'");
 
+      this._Materialise();
       base.WriteByte(value);
       this._dirty = true;
+    }
+
+    public override void CopyTo(Stream destination, int bufferSize) {
+      this._Materialise();
+      base.CopyTo(destination, bufferSize);
     }
 
     public override void SetLength(long value) {
       if (value > MaxFileSize)
         throw new PoolFsException(PoolFsError.NoSpace, $"File exceeds the {MaxFileSize} byte whole-object limit of '{this._owner.DisplayName}'");
+
+      // truncating to zero discards the whole object unread — the one case where the download
+      // is provably pointless, and exactly what every publish does first
+      if (value == 0)
+        Interlocked.Exchange(ref this._loadInitial, null);
+      else
+        this._Materialise();
 
       base.SetLength(value);
       this._dirty = true;

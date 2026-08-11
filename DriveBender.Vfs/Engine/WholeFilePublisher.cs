@@ -15,17 +15,27 @@ public static class WholeFilePublisher {
   /// <summary>Copy chunk for streaming publishes — large enough to amortise syscalls, small enough to stay off the LOH per-copy.</summary>
   public const int CopyBufferSize = 1 << 20; // 1 MiB
 
-  /// <summary>Copies <paramref name="source"/> into <paramref name="destination"/> through a fixed buffer and returns the byte count.</summary>
+  /// <summary>
+  /// Copies <paramref name="source"/> into <paramref name="destination"/> through a fixed buffer
+  /// and returns the byte count. The buffer is RENTED, not allocated: at 1 MiB every call would
+  /// otherwise put an array straight on the Large Object Heap, and heal/drain/scrub run this per
+  /// file — a pool-wide heal would churn the LOH once per file for no reason. The buffer is
+  /// transient and never retained, so pooling it is safe.
+  /// </summary>
   public static long CopyCounted(Stream source, Stream destination, int bufferSize = CopyBufferSize) {
-    var buffer = new byte[bufferSize];
-    long total = 0;
-    int read;
-    while ((read = source.Read(buffer, 0, buffer.Length)) > 0) {
-      destination.Write(buffer, 0, read);
-      total += read;
-    }
+    var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+    try {
+      long total = 0;
+      int read;
+      while ((read = source.Read(buffer, 0, bufferSize)) > 0) {
+        destination.Write(buffer, 0, read);
+        total += read;
+      }
 
-    return total;
+      return total;
+    } finally {
+      System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+    }
   }
 
   /// <summary>Publishes a small, already-materialised payload (empty markers, checksum-verified small copies).</summary>

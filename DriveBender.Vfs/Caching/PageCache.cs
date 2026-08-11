@@ -30,15 +30,43 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
   private sealed class PoolShard(EvictionPolicy policy) {
     public readonly ICacheEvictionPolicy<PageKey> Policy = EvictionPolicyFactory.Create<PageKey>(policy);
     public readonly Dictionary<PageKey, byte[]> Blocks = [];
+
+    /// <summary>
+    /// path → its cached block indices. InvalidatePath runs on EVERY mutation, and without
+    /// this index it scanned every block in the pool to find the handful belonging to one
+    /// file — so a write's invalidation cost grew with total cache occupancy rather than with
+    /// the file. Kept in exact step with <see cref="Blocks"/>.
+    /// </summary>
+    public readonly Dictionary<string, HashSet<long>> ByPath = new(StringComparer.OrdinalIgnoreCase);
+
     public long Bytes;
     public long Hits;
     public long Misses;
     public double Weight = 1.0;
     public long Epoch; // bumped on every invalidation — lets a lock-free prefetch reject a stale late Put
+
+    public void Track(PageKey key) {
+      if (!this.ByPath.TryGetValue(key.Path, out var blocks))
+        this.ByPath.Add(key.Path, blocks = []);
+
+      blocks.Add(key.BlockIndex);
+    }
+
+    public void Untrack(PageKey key) {
+      if (this.ByPath.TryGetValue(key.Path, out var blocks) && blocks.Remove(key.BlockIndex) && blocks.Count == 0)
+        this.ByPath.Remove(key.Path);
+    }
   }
 
   private readonly Dictionary<Guid, PoolShard> _shards = [];
   private readonly Lock _lock = new();
+
+  /// <summary>
+  /// Running sum of every shard's bytes. The eviction loop consulted this on each iteration
+  /// and previously re-summed all shards every time — kept incrementally instead so a Put
+  /// that evicts many blocks stays linear in the blocks it evicts.
+  /// </summary>
+  private long _totalBytes;
 
   public int BlockSize { get; } = blockSize;
 
@@ -48,7 +76,7 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
   public long TotalBytes {
     get {
       lock (this._lock)
-        return this._shards.Values.Sum(s => s.Bytes);
+        return this._totalBytes;
     }
   }
 
@@ -116,11 +144,14 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
     var shard = this._Shard(key.PoolId);
     if (shard.Blocks.TryGetValue(key, out var existing)) {
       shard.Bytes += block.Length - existing.Length;
+      this._totalBytes += block.Length - existing.Length;
       shard.Blocks[key] = block;
       shard.Policy.OnAccess(key);
     } else {
       shard.Blocks.Add(key, block);
+      shard.Track(key);
       shard.Bytes += block.Length;
+      this._totalBytes += block.Length;
       shard.Policy.OnInsert(key);
     }
 
@@ -134,9 +165,16 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
         return;
 
       ++shard.Epoch; // any in-flight background load's Put for this pool is now rejected
-      foreach (var key in shard.Blocks.Keys.Where(k => k.Path.Equals(path, StringComparison.OrdinalIgnoreCase)).ToArray()) {
-        shard.Bytes -= shard.Blocks[key].Length;
-        shard.Blocks.Remove(key);
+      if (!shard.ByPath.Remove(path, out var blocks))
+        return; // nothing of this path is cached — O(1), not a scan of the whole shard
+
+      foreach (var blockIndex in blocks) {
+        var key = new PageKey(poolId, path, blockIndex);
+        if (!shard.Blocks.Remove(key, out var block))
+          continue;
+
+        shard.Bytes -= block.Length;
+        this._totalBytes -= block.Length;
         shard.Policy.Remove(key);
       }
     }
@@ -144,8 +182,11 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
 
   public void InvalidatePool(Guid poolId) {
     lock (this._lock) {
-      if (this._shards.TryGetValue(poolId, out var shard))
+      if (this._shards.TryGetValue(poolId, out var shard)) {
         ++shard.Epoch; // preserved across the reset below so late Puts capturing the old epoch are rejected
+        this._totalBytes -= shard.Bytes;
+      }
+
       this._shards.Remove(poolId);
     }
   }
@@ -159,7 +200,7 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
   }
 
   private void _EvictUntilWithinBudget() {
-    while (this._shards.Values.Sum(s => s.Bytes) > this.BudgetBytes) {
+    while (this._totalBytes > this.BudgetBytes) {
       // weighted fair share: evict from the pool most over bytes/weight
       var victimShard = this._shards.Values.Where(s => s.Blocks.Count > 0).MaxBy(s => s.Bytes / s.Weight);
       if (victimShard == null)
@@ -169,8 +210,12 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
       if (victim == null)
         return;
 
-      if (victimShard.Blocks.Remove(victim, out var block))
-        victimShard.Bytes -= block.Length;
+      if (!victimShard.Blocks.Remove(victim, out var block))
+        continue; // the policy named a key the shard no longer holds — drop it and keep going
+
+      victimShard.Untrack(victim);
+      victimShard.Bytes -= block.Length;
+      this._totalBytes -= block.Length;
     }
   }
 

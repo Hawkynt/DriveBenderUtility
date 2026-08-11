@@ -75,6 +75,50 @@ public class PageCacheTests {
     cache.TryGet(new(_poolA, "other.bin", 0), out _).Should().BeTrue();
   }
 
+  [Test]
+  [Category("EdgeCase")]
+  public void InvalidatePath_GivenBlocksAlreadyEvicted_WhenPathMutated_ThenAccountingStaysExact() {
+    // the per-path index that makes invalidation O(blocks-of-the-path) must stay in exact step
+    // with the block map through EVICTION too — a desync would either leak a stale block past
+    // its invalidation (SAFE-COHERE) or corrupt the byte accounting the budget relies on
+    var cache = new PageCache(EvictionPolicy.Lru, 4);
+    cache.SetBudget(4);
+    cache.Put(new(_poolA, "f.bin", 0), [1, 1]);
+    cache.Put(new(_poolA, "f.bin", 1), [2, 2]);
+    cache.Put(new(_poolA, "f.bin", 2), [3, 3]); // evicts block 0
+
+    cache.TryGet(new(_poolA, "f.bin", 0), out _).Should().BeFalse("block 0 was evicted to stay within budget");
+    cache.TotalBytes.Should().Be(4, "eviction must decrement the running total");
+
+    cache.InvalidatePath(_poolA, "f.bin"); // must tolerate index entries for evicted blocks
+
+    cache.TryGet(new(_poolA, "f.bin", 1), out _).Should().BeFalse();
+    cache.TryGet(new(_poolA, "f.bin", 2), out _).Should().BeFalse();
+    cache.TotalBytes.Should().Be(0, "every surviving block of the path is accounted for on the way out");
+    cache.GetStatistics(_poolA).Bytes.Should().Be(0);
+
+    // the path is reusable afterwards — a stale index entry would corrupt the next generation
+    cache.Put(new(_poolA, "f.bin", 0), [9, 9]);
+    cache.TryGet(new(_poolA, "f.bin", 0), out var reborn).Should().BeTrue();
+    reborn.Should().Equal([9, 9]);
+    cache.TotalBytes.Should().Be(2);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void InvalidatePool_GivenCachedBlocks_WhenPoolDropped_ThenTheGlobalTotalFollows() {
+    var cache = new PageCache(EvictionPolicy.Lru, 4);
+    cache.SetBudget(1024);
+    cache.Put(new(_poolA, "a.bin", 0), [1, 1]);
+    cache.Put(new(_poolB, "b.bin", 0), [2, 2, 2]);
+    cache.TotalBytes.Should().Be(5);
+
+    cache.InvalidatePool(_poolA);
+
+    cache.TotalBytes.Should().Be(3, "dropping a pool must remove exactly its own bytes from the shared budget");
+    cache.TryGet(new(_poolB, "b.bin", 0), out _).Should().BeTrue("the other pool is untouched");
+  }
+
 }
 
 [TestFixture]
