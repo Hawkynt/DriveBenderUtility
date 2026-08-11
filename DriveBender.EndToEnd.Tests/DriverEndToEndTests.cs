@@ -61,7 +61,9 @@ public class DriverEndToEndTests {
     // sampled — the owed copies converge in the background by design, and a FUSE release is
     // asynchronous, so an immediate check measures the harness rather than the pool.
     var copies = this._pool.WaitForPhysicalCopies("roundtrip.bin");
-    copies.Should().NotBeEmpty("the file must reach at least one member's real folder");
+    copies.Should().NotBeEmpty(
+      "the file must reach at least one member's real folder. What is actually on the members:"
+      + Environment.NewLine + this._pool.DescribeMembers());
     foreach (var (where, bytes) in copies)
       bytes.Should().Equal(content, $"the copy at '{where}' must match what was written");
 

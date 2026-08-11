@@ -78,6 +78,13 @@ jobs:
           --filter "TestCategory=Performance"
           --logger "trx;LogFileName=perf-tests.trx"
 
+      # logs and artifacts need repository credentials; annotations do not, so the failing
+      # assertion is readable by anyone looking at the run
+      - name: Publish failures as annotations
+        if: failure()
+        shell: pwsh
+        run: ./.github/workflows/scripts/trx-annotations.ps1 -Path .
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -151,8 +158,7 @@ jobs:
         shell: pwsh
         run: DriveBender.EndToEnd.Tests/bin/Release/net10.0/playwright.ps1 install chromium --with-deps
 
-      # The management API and the page must work on Windows: these BLOCK.
-      - name: End-to-end tests (management API + web UI)
+      - name: End-to-end tests
         shell: bash
         env:
           DBE2E_REQUIRE_DRIVER: '1'
@@ -160,25 +166,7 @@ jobs:
         run: >
           dotnet test DriveBender.EndToEnd.Tests/DriveBender.EndToEnd.Tests.csproj
           --configuration Release --no-build
-          --filter "TestCategory=ManagementApi|TestCategory=WebUi"
           --logger "trx;LogFileName=e2e-windows.trx"
-
-      # The driver tier is expected to fail here: mounting via WinFsp crashes the process with an
-      # access violation, reproduced by a minimal winfsp.net program containing none of this
-      # project's code (docs/Issues.md, "Still open" #3). It is allowed to fail so the rest of the
-      # signal stays meaningful -- NOT because the failure is acceptable. Flip this back to
-      # blocking the moment the mount works, and treat a GREEN run here as the fix landing.
-      - name: End-to-end tests (driver - KNOWN BROKEN on Windows, see docs/Issues.md)
-        continue-on-error: true
-        shell: bash
-        env:
-          DBE2E_REQUIRE_DRIVER: '1'
-          DBMOUNT_EXE: ${{ github.workspace }}/DriveBender.Mount/bin/Release/net10.0-windows/dbmount.exe
-        run: >
-          dotnet test DriveBender.EndToEnd.Tests/DriveBender.EndToEnd.Tests.csproj
-          --configuration Release --no-build
-          --filter "TestCategory=Driver"
-          --logger "trx;LogFileName=e2e-windows-driver.trx"
 
       # logs and artifacts need repository credentials; annotations do not, so the actual
       # assertion is published where anyone can read it

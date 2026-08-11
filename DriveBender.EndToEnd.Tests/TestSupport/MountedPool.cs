@@ -145,6 +145,35 @@ public sealed class MountedPool : IDisposable {
 
   public string PathTo(params string[] segments) => Path.Combine([this.MountPath, .. segments]);
 
+  /// <summary>
+  /// Everything actually present on the members, relative to each member root. Without this an
+  /// assertion about a missing copy says only "the collection was empty", which cannot distinguish
+  /// "the engine never wrote it" from "it is there under a name the test did not look for" — a
+  /// staged <c>*.TEMP.$DRIVEBENDER</c> that was never published, say.
+  /// </summary>
+  public string DescribeMembers() {
+    var description = new StringBuilder();
+    foreach (var member in this.MemberPaths) {
+      description.AppendLine($"member '{member}':");
+      try {
+        var entries = Directory.EnumerateFileSystemEntries(member, "*", SearchOption.AllDirectories)
+          .Select(p => Path.GetRelativePath(member, p))
+          .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+          .Take(60)
+          .ToArray();
+
+        if (entries.Length == 0)
+          description.AppendLine("  (empty)");
+        foreach (var entry in entries)
+          description.AppendLine("  " + entry);
+      } catch (Exception e) {
+        description.AppendLine($"  <could not enumerate: {e.Message}>");
+      }
+    }
+
+    return description.ToString();
+  }
+
   /// <summary>The copies of a pool-relative file across every member, primary or shadow container.</summary>
   public IReadOnlyList<(string where, byte[] content)> PhysicalCopies(string relativePath) {
     var found = new List<(string, byte[])>();

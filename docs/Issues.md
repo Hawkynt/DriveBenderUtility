@@ -56,22 +56,21 @@ after each pass, not a state to reach.
    alongside `RequestOp`.
 2. **Progress is per-job, not per-item.** The worker's latest stdout line is surfaced; there is no
    structured "N of M files" for a long scatter or scrub.
-3. **Mounting on Windows via WinFsp crashes the process.** `dbmount mount` dies with an access
-   violation (0xC0000005) inside `Fsp.Interop.Api.FspFileSystemSetMountPointEx`, before the mount
-   is usable. Reproduced on a developer machine AND on a clean `windows-latest` runner, on .NET 8
-   and .NET 10 alike, and — decisively — by a twenty-line minimal `winfsp.net` filesystem that
-   contains none of this project's code, so the fault is in the binding or its pairing with the
-   native runtime rather than in `WinFspAdapter`. The native DLL exports the symbol, and
-   `FileSystemHost.Version()` returns 2.1, so it is not a missing export or a failed load.
-   Note that `winfsp.net` **2.2** refuses a mismatched native runtime cleanly
-   (`TypeLoadException: incorrect dll version`) where **2.1.25156** — the version this project
-   pins, deliberately, because 2.2 is an unreleased beta — crashes instead. Next step is to
-   determine whether a matched 2.1 pair can mount at all, and if not whether Dokan (already a
-   dependency) should become the Windows path.
+3. **A WinFsp version mismatch crashes the mount process instead of being reported.** With a
+   native runtime whose major.minor does not match the pinned `winfsp.net` binding, `dbmount
+   mount` dies with an access violation (0xC0000005) inside
+   `Fsp.Interop.Api.FspFileSystemSetMountPointEx` rather than saying what is wrong. Confirmed by
+   a twenty-line minimal `winfsp.net` program containing none of this project's code, so the
+   binding is what crashes — but note that `winfsp.net` **2.2** refuses a mismatched runtime
+   cleanly (`TypeLoadException: incorrect dll version`) where the pinned **2.1.25156** does not.
 
-   Until then the Windows *driver* tier of the end-to-end suite is expected to fail; the API and
-   UI tiers pass on both targets, and the Linux driver tier passes, so the split in `ci.yml` keeps
-   the rest of the signal meaningful. This is a product defect, not a CI defect.
+   Mounting itself is FINE on a correctly-provisioned machine: with WinFsp v2.1 installed — the
+   version `Prerequisites._WINFSP_TAG` installs — the whole driver tier passes on a clean
+   `windows-latest` runner. The defect is the failure mode, not the feature: a user whose WinFsp
+   was upgraded or partially installed gets a process crash and no explanation.
+   `WinFspMountHost.IsWinFspAvailable` makes this worse by falling back to an on-disk probe when
+   the managed binding will not initialise, so the product reports the driver as present and then
+   crashes. It should verify the binding is actually usable and name the mismatch.
 4. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
