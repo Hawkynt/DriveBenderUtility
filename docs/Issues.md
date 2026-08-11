@@ -46,8 +46,24 @@ Closed in the current pass:
 
 ## Still open
 
-Nothing known. The three throughput items that stood here — sync-over-async across the providers,
-the absence of provider-level range reads, and the whole-object RAM spikes — are closed above.
+An earlier revision of this file claimed "nothing known" here. That was wrong — it dropped the two
+UI items below, which were open then and are open now. "Nothing known" is a claim to be re-earned
+after each pass, not a state to reach.
+
+1. **Jobs relayed into a MOUNTED pool's own process cannot be cancelled.** The operation runs in
+   that process and the manager has no channel to call it back, so such jobs report
+   `cancellable: false` — honest, but the capability is missing. `MountRegistry` needs a cancel op
+   alongside `RequestOp`.
+2. **Progress is per-job, not per-item.** The worker's latest stdout line is surfaced; there is no
+   structured "N of M files" for a long scatter or scrub.
+3. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
+   — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
+   `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
+   Not reproduced end to end; flagged because it is the sibling of a bug that was proven real, and
+   the stress suite races file renames only, which is why it was not caught.
+
+The three throughput items that stood here — sync-over-async across the providers, the absence of
+provider-level range reads, and the whole-object RAM spikes — are closed above.
 
 ## Closed in the provider pass
 
@@ -94,3 +110,9 @@ These now fail the build rather than needing to be re-found:
   pre-truncation object, and the range-free fallback stays correct.
 - `SyncBridgeTests` — blocking under an installed single-threaded synchronization context
   completes instead of deadlocking, and a provider failure surfaces as itself rather than wrapped.
+- **`DriveBender.EndToEnd.Tests`** — the SHIPPED `dbmount` binary, with no project reference to the
+  engine, on both targets in CI: a real pool mounted through WinFsp/Dokan or FUSE and driven
+  through `System.IO`; the management API over HTTP; and the page itself in Chromium. This tier
+  exists because the engine suite drives an in-memory fake and therefore stayed green through
+  `5b67a05`, in which mounting any local pool was impossible. `DBE2E_REQUIRE_DRIVER=1` makes a
+  missing driver a failure, so the suite cannot report green by skipping everything.

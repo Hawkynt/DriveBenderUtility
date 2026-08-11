@@ -83,3 +83,117 @@ jobs:
         with:
           name: test-results
           path: '**/TestResults/*.trx'
+
+  # ---------------------------------------------------------------------------
+  # End-to-end: the SHIPPED binary, on both targets, the way a user meets it.
+  #
+  # The engine suite drives an in-memory fake, so it stays green even when the real
+  # product cannot mount at all -- which is exactly what happened: the member
+  # online-probe was broken for every local pool while 574 unit tests passed. These
+  # jobs install a real filesystem driver, mount a real pool and drive it through the
+  # OS, then serve the management UI and drive it in a real browser.
+  #
+  # DBE2E_REQUIRE_DRIVER=1 turns "no driver, skipping" into a failure: a silently
+  # skipped end-to-end suite is indistinguishable from a passing one.
+  # ---------------------------------------------------------------------------
+  e2e-windows:
+    name: End-to-end (Windows - WinFsp driver + UI)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.x
+            10.x
+
+      - name: Stamp versions
+        shell: bash
+        run: perl .github/workflows/scripts/version.pl --stamp
+
+      - name: Install WinFsp
+        run: choco install winfsp --no-progress --yes
+
+      # A driver whose files are present but whose kernel service is missing reports as
+      # "installed" and then takes the mount process down with an access violation, so
+      # the job proves the service exists before blaming the product for a crash.
+      - name: Verify the driver is registered
+        shell: pwsh
+        run: |
+          $service = Get-Service -Name 'WinFsp*' -ErrorAction SilentlyContinue
+          if (-not $service) { throw 'WinFsp installed no driver service - a mount would crash rather than fail cleanly' }
+          $service | Format-Table -AutoSize
+
+      - name: Build
+        run: dotnet build DriveBender.sln --configuration Release
+
+      - name: Install Chromium for Playwright
+        shell: pwsh
+        run: DriveBender.EndToEnd.Tests/bin/Release/net10.0/playwright.ps1 install chromium --with-deps
+
+      - name: End-to-end tests
+        shell: bash
+        env:
+          DBE2E_REQUIRE_DRIVER: '1'
+          DBMOUNT_EXE: DriveBender.Mount/bin/Release/net10.0-windows/dbmount.exe
+        run: >
+          dotnet test DriveBender.EndToEnd.Tests/DriveBender.EndToEnd.Tests.csproj
+          --configuration Release --no-build
+          --logger "trx;LogFileName=e2e-windows.trx"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-windows-results
+          path: '**/TestResults/*.trx'
+
+  e2e-linux:
+    name: End-to-end (Linux - FUSE driver + UI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.x
+
+      - name: Stamp versions
+        run: perl .github/workflows/scripts/version.pl --stamp
+
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-3
+          # the runner user must be able to open the device, else every mount fails with EPERM
+          sudo chmod 666 /dev/fuse
+          ls -l /dev/fuse
+          fusermount3 --version
+
+      # net47 is Windows-only, so only the portable projects are built here
+      - name: Build
+        run: |
+          dotnet build DriveBender.Mount/DriveBender.Mount.csproj --configuration Release --framework net10.0
+          dotnet build DriveBender.EndToEnd.Tests/DriveBender.EndToEnd.Tests.csproj --configuration Release
+
+      - name: Install Chromium for Playwright
+        run: pwsh DriveBender.EndToEnd.Tests/bin/Release/net10.0/playwright.ps1 install chromium --with-deps
+
+      - name: End-to-end tests
+        env:
+          DBE2E_REQUIRE_DRIVER: '1'
+          DBMOUNT_EXE: DriveBender.Mount/bin/Release/net10.0/dbmount
+        run: >
+          dotnet test DriveBender.EndToEnd.Tests/DriveBender.EndToEnd.Tests.csproj
+          --configuration Release --no-build
+          --logger "trx;LogFileName=e2e-linux.trx"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-linux-results
+          path: '**/TestResults/*.trx'
