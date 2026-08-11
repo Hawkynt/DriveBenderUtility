@@ -238,4 +238,94 @@ public class DurabilityEndToEndTests {
     }
   }
 
+  [Test]
+  [Category("Exception")]
+  [Description("A power cut while a member is also missing: everything the surviving member holds is still served, and the pool comes back rather than refusing to start.")]
+  public void Crash_GivenAMemberIsAlsoMissingAtRestart_ThenTheSurvivingCopyIsStillServed() {
+    using var pool = MountedPool.Create(poolDefaults: MountedPool.DuplicatedOnOneDisk);
+    var expected = new Dictionary<string, byte[]>();
+    for (var file = 0; file < 6; ++file) {
+      var content = _Payload(512 * 1024, 400 + file);
+      File.WriteAllBytes(pool.PathTo($"survivor{file}.bin"), content);
+      expected[$"survivor{file}.bin"] = content;
+      pool.WaitForPhysicalCopies($"survivor{file}.bin", atLeast: 2, TimeSpan.FromMinutes(1));
+    }
+
+    // the two failures that actually happen together: the machine dies AND a disk does not come
+    // back with it. This is the moment redundancy exists for, and also the moment a pool that
+    // refuses to mount without every member turns a survivable incident into an outage.
+    pool.Eject(1);
+    pool.CrashAndRemount();
+
+    foreach (var (name, content) in expected) {
+      File.Exists(pool.PathTo(name)).Should().BeTrue(
+        $"'{name}' has a copy on the member that is still here, so a crash plus one lost disk must not lose it."
+        + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+      File.ReadAllBytes(pool.PathTo(name)).Should().Equal(content, $"'{name}' must be served whole from the surviving copy");
+    }
+
+    // and the disk coming back must not undo any of that
+    pool.Restore(1);
+    foreach (var (name, content) in expected)
+      File.ReadAllBytes(pool.PathTo(name)).Should().Equal(content,
+        $"'{name}' must survive the returning member as well.{Environment.NewLine}{pool.DescribeMembers()}");
+  }
+
+  [Test]
+  [Category("Exception")]
+  [Description("Each member took a write while the other was away: the pool serves one whole version, never a mixture of the two.")]
+  public void Divergence_GivenEachMemberTookAWriteWhileTheOtherWasAway_ThenOneWholeVersionIsServed() {
+    using var pool = MountedPool.Create(poolDefaults: MountedPool.DuplicatedOnOneDisk);
+    const int size = 512 * 1024;
+    var original = _Payload(size, 500);
+    var whileSecondAway = _Payload(size, 501);
+    var whileFirstAway = _Payload(size, 502);
+    var path = pool.PathTo("diverged.bin");
+
+    File.WriteAllBytes(path, original);
+    pool.WaitForPhysicalCopies("diverged.bin", atLeast: 2, TimeSpan.FromMinutes(1));
+
+    // one disk misses a write...
+    pool.Eject(1);
+    File.WriteAllBytes(path, whileSecondAway);
+
+    // ...and it really did miss it. Without this the scenario collapses into three ordinary
+    // overwrites, which any implementation passes while telling us nothing about divergence.
+    pool.CopiesOnDetachedStorage(1, "diverged.bin").Should().NotBeEmpty(
+      "the detached disk still holds its own copy of the file")
+      .And.OnlyContain(copy => copy.SequenceEqual(original),
+        "a disk that is not attached cannot have received the write, so its copy must still be the original");
+
+    pool.Restore(1);
+
+    // ...and then the other one does, so neither copy is a superset of the other
+    pool.Eject(0);
+    File.WriteAllBytes(path, whileFirstAway);
+
+    pool.CopiesOnDetachedStorage(0, "diverged.bin").Should().NotBeEmpty("the other disk holds a copy too")
+      .And.NotContain(copy => copy.SequenceEqual(whileFirstAway),
+        "the write went in while this disk was detached, so it cannot hold the newest version — "
+        + "the two members have genuinely diverged");
+
+    pool.Restore(0);
+
+    MountedPool.WaitUntil(() => false, TimeSpan.FromSeconds(15)); // give heal a chance to converge
+
+    var got = File.ReadAllBytes(path);
+    var candidates = new[] { original, whileSecondAway, whileFirstAway };
+
+    // Split brain is unavoidable once both halves accept writes; what is avoidable is answering
+    // with a FRANKENSTEIN of the two. A user can reason about "I got the older version" and go to
+    // a backup. Nobody can reason about a file that is the first half of one version and the
+    // second half of another, because it still opens, still has the right size, and is wrong.
+    candidates.Any(candidate => candidate.AsSpan().SequenceEqual(got)).Should().BeTrue(
+      $"the pool must answer with one whole version of the file, not a blend of the diverged copies."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+
+    // Deliberately NOT asserting that every physical copy is itself a whole version: heal may be
+    // rewriting one of them at the instant the members are sampled, and a copy caught mid-copy
+    // looks torn without anything being wrong. The promise that matters is the one above, made
+    // through the mount, which is the only thing a user ever sees.
+  }
+
 }

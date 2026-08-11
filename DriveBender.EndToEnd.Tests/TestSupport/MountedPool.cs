@@ -242,17 +242,43 @@ public sealed class MountedPool : IDisposable {
     var found = new List<(string, byte[])>();
     foreach (var member in this.MemberPaths) {
       var primary = Path.Combine(member, relativePath.Replace('/', Path.DirectorySeparatorChar));
-      if (File.Exists(primary))
-        found.Add((primary, File.ReadAllBytes(primary)));
+      if (_TryReadShared(primary, out var primaryContent))
+        found.Add((primary, primaryContent));
 
       // shadow copies live beside their parent in a FOLDER.DUPLICATE.$DRIVEBENDER container
       var parent = Path.GetDirectoryName(primary);
       var shadow = parent == null ? null : Path.Combine(parent, "FOLDER.DUPLICATE.$DRIVEBENDER", Path.GetFileName(primary));
-      if (shadow != null && File.Exists(shadow))
-        found.Add((shadow, File.ReadAllBytes(shadow)));
+      if (shadow != null && _TryReadShared(shadow, out var shadowContent))
+        found.Add((shadow, shadowContent));
     }
 
     return found;
+  }
+
+  /// <summary>
+  /// Reads a member's file the way an observer must: sharing everything.
+  ///
+  /// The engine POOLS open handles into its members, so a copy that is merely idle is still held
+  /// open — and <see cref="File.ReadAllBytes"/> asks for a share mode the engine's handle refuses.
+  /// A test that used it would report "the copy is not there" for a file plainly sitting on disk.
+  /// </summary>
+  private static bool _TryReadShared(string path, out byte[] content) {
+    content = [];
+    try {
+      if (!File.Exists(path))
+        return false;
+
+      using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+        FileShare.ReadWrite | FileShare.Delete, 1 << 16);
+      using var buffer = new MemoryStream();
+      stream.CopyTo(buffer);
+      content = buffer.ToArray();
+      return true;
+    } catch (IOException) {
+      return false;
+    } catch (UnauthorizedAccessException) {
+      return false;
+    }
   }
 
   /// <summary>
@@ -312,6 +338,24 @@ public sealed class MountedPool : IDisposable {
     process.WaitForExit(30_000);
     if (process.ExitCode != 0 || !Directory.Exists(link))
       throw new InvalidOperationException($"Could not create a junction '{link}' -> '{target}'");
+  }
+
+  /// <summary>
+  /// The real storage behind a member, reachable even while the member itself is detached — which
+  /// is how a test can prove a write did NOT reach a disk that was away.
+  /// </summary>
+  public IReadOnlyList<byte[]> CopiesOnDetachedStorage(int memberIndex, string relativePath) {
+    var storage = Path.Combine(this.Root, $"store{memberIndex}");
+    var primary = Path.Combine(storage, relativePath.Replace('/', Path.DirectorySeparatorChar));
+    var parent = Path.GetDirectoryName(primary);
+    var shadow = parent == null ? null : Path.Combine(parent, "FOLDER.DUPLICATE.$DRIVEBENDER", Path.GetFileName(primary));
+
+    var found = new List<byte[]>();
+    foreach (var candidate in new[] { primary, shadow })
+      if (candidate != null && _TryReadShared(candidate, out var content))
+        found.Add(content);
+
+    return found;
   }
 
   /// <summary>Removes the link itself, leaving the storage behind it untouched.</summary>
