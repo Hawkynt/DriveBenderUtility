@@ -142,6 +142,37 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
     }
   }
 
+  /// <summary>
+  /// Replaces the contents of an EXISTING file (FILE_OVERWRITE / FILE_OVERWRITE_IF /
+  /// FILE_SUPERSEDE) — what Windows sends for <c>FileMode.Create</c> and <c>FileMode.Truncate</c>
+  /// on a file that is already there.
+  ///
+  /// Without it WinFsp's default answered STATUS_INVALID_DEVICE_REQUEST, surfacing to the user as
+  /// "Incorrect function" — so saving over an existing file failed for every application that
+  /// does it the normal way: editors, `copy /y`, installers, `File.WriteAllBytes`. Creating a NEW
+  /// file worked, which is why it survived casual use and why a test that tolerated IOException
+  /// on write hid it completely.
+  /// </summary>
+  public override int Overwrite(object fileNode, object fileDesc, uint fileAttributes, bool replaceFileAttributes, ulong allocationSize, out FspFileInfo fileInfo) {
+    fileInfo = default;
+    var descriptor = (FileDescriptor)fileDesc;
+    try {
+      if (descriptor.IsDirectory)
+        return STATUS_FILE_IS_A_DIRECTORY;
+
+      // an overwrite IS a truncation to nothing — the caller supplies the new contents next
+      pool.SetLength(descriptor.Handle, 0);
+      _Fill(pool.GetAttributes(descriptor.Path), out fileInfo);
+      return STATUS_SUCCESS;
+    } catch (PoolFsException e) {
+      return _Translate(e);
+    } catch (Exception e) {
+      // a driver callback must NEVER let an exception escape — that kills the whole mount process
+      DriveBender.Logger($"[Warning]unexpected error in a filesystem callback: {e}");
+      return STATUS_UNEXPECTED_IO_ERROR;
+    }
+  }
+
   public override int Read(object fileNode, object fileDesc, IntPtr buffer, ulong offset, uint length, out uint bytesTransferred) {
     bytesTransferred = 0;
     var descriptor = (FileDescriptor)fileDesc;

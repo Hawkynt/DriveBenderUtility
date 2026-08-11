@@ -17,9 +17,9 @@ public sealed class MountedPool : IDisposable {
   private static readonly TimeSpan _MOUNT_READY_TIMEOUT = TimeSpan.FromSeconds(90);
   private static readonly TimeSpan _UNMOUNT_TIMEOUT = TimeSpan.FromSeconds(60);
 
-  private readonly Process _mountProcess;
-  private readonly StringBuilder _stdout;
-  private readonly StringBuilder _stderr;
+  private Process _mountProcess;
+  private StringBuilder _stdout;
+  private StringBuilder _stderr;
   private readonly string? _mountDirectory; // Linux mountpoint we created and must remove
   private bool _disposed;
 
@@ -46,10 +46,21 @@ public sealed class MountedPool : IDisposable {
                             + $"stderr:{Environment.NewLine}{DbMount.Snapshot(this._stderr)}";
 
   /// <summary>
-  /// Creates a two-member pool under a fresh temp root and mounts it. Duplication defaults apply,
-  /// so both members should converge on every file — which is what the tests check.
+  /// Pool defaults that put a REAL second copy of every file on the second member.
+  ///
+  /// A test machine has one physical disk, and placement refuses by default to put redundant
+  /// copies in one failure domain (SAFE-PHYS) — entirely correct, and it means an unconfigured
+  /// two-member test pool stores each file once. Resilience tests need a survivor, so they opt
+  /// out of the co-location rule explicitly; that is the ONLY thing relaxed here.
   /// </summary>
-  public static MountedPool Create(int members = 2) {
+  public const string DuplicatedOnOneDisk =
+    """{ "duplication": 2, "placement": { "shadowNeverSamePhysical": false } }""";
+
+  /// <summary>
+  /// Creates a two-member pool under a fresh temp root and mounts it.
+  /// </summary>
+  /// <param name="poolDefaults">JSON for the manifest's "defaults" block, or null for the built-ins.</param>
+  public static MountedPool Create(int members = 2, string? poolDefaults = null) {
     DriverPrerequisite.RequireAvailable();
 
     var poolName = "e2e" + Guid.NewGuid().ToString("N")[..10];
@@ -71,7 +82,10 @@ public sealed class MountedPool : IDisposable {
 
     try {
       DbMount.RunExpectingSuccess(_CLI_TIMEOUT, [.. arguments]);
+      if (poolDefaults != null)
+        DbMount.SetPoolDefaults(poolName, poolDefaults);
     } catch {
+      DbMount.ForgetPool(poolName);
       _TryDelete(root);
       throw;
     }
@@ -259,6 +273,102 @@ public sealed class MountedPool : IDisposable {
     return found;
   }
 
+  #region storage that goes away and comes back
+
+  private readonly Dictionary<string, string> _ejected = new(StringComparer.OrdinalIgnoreCase);
+
+  /// <summary>
+  /// Takes a member off the machine, the way pulling a disk or dropping a share does: its root
+  /// directory stops existing, which is exactly what <c>LocalVolumeIO.IsOnline</c> probes for.
+  ///
+  /// Retried, because the engine POOLS open handles into the member and only lets them go after a
+  /// short idle period — a rename over a directory with live handles is refused on Windows. That
+  /// wait is part of the scenario, not an obstacle to it: a real disk cannot be yanked out from
+  /// under an open handle either.
+  /// </summary>
+  public void Eject(int memberIndex, TimeSpan? timeout = null) {
+    var member = this.MemberPaths[memberIndex];
+    var parked = member + ".ejected";
+    var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(30));
+
+    while (true)
+      try {
+        Directory.Move(member, parked);
+        this._ejected[member] = parked;
+
+        // the engine probes reachability on a ~1s cache, so an operation issued in the very next
+        // millisecond can still be routed at the member that just vanished. Loss is documented as
+        // noticed "within about a second"; the scenarios are about behaviour AFTER that.
+        Thread.Sleep(2500);
+        return;
+      } catch (IOException) when (DateTime.UtcNow < deadline) {
+        Thread.Sleep(250); // pooled handles are still holding it
+      }
+  }
+
+  /// <summary>
+  /// Plugs the storage back in, contents and all.
+  ///
+  /// The engine RECREATES a missing member's root while it is away — writing pool scaffolding to
+  /// the path the disk used to be at. On a real machine that is data landing on whatever
+  /// filesystem hosted the mount point rather than on the disk. Whatever it left behind is
+  /// discarded here so the returning disk brings back its OWN contents, which is what a disk
+  /// coming back actually means.
+  /// </summary>
+  public void Restore(int memberIndex, TimeSpan? timeout = null) {
+    var member = this.MemberPaths[memberIndex];
+    if (!this._ejected.TryGetValue(member, out var parked))
+      return;
+
+    var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(30));
+    while (true)
+      try {
+        if (Directory.Exists(member))
+          Directory.Delete(member, recursive: true); // scaffolding written while the disk was out
+
+        Directory.Move(parked, member);
+        this._ejected.Remove(member);
+        return;
+      } catch (IOException) when (DateTime.UtcNow < deadline) {
+        Thread.Sleep(250);
+      }
+  }
+
+  /// <summary>
+  /// Unmounts cleanly and mounts again at the same target — the durability boundary a user
+  /// crosses on every reboot. Anything the pool acknowledged has to be on disk to survive it.
+  /// </summary>
+  public void Remount() {
+    DbMount.Run(_UNMOUNT_TIMEOUT, "unmount", this.PoolName);
+    if (!this._mountProcess.WaitForExit((int)_UNMOUNT_TIMEOUT.TotalMilliseconds))
+      DbMount.KillTree(this._mountProcess);
+
+    this._mountProcess.WaitForExit(5000);
+    this._mountProcess.Dispose();
+
+    var target = OperatingSystem.IsWindows() ? this.MountPath : this.MountPath;
+    this._mountProcess = DbMount.Start(["mount", "--manifest", this.PoolName, "-t", target, "--foreground"],
+      out var stdout, out var stderr);
+    this._stdout = stdout;
+    this._stderr = stderr;
+    this._WaitUntilMounted();
+  }
+
+  /// <summary>Waits for a condition the pool reaches on its own (heal, drain, owed-copy sync).</summary>
+  public static bool WaitUntil(Func<bool> condition, TimeSpan? timeout = null) {
+    var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(60));
+    while (DateTime.UtcNow < deadline) {
+      if (condition())
+        return true;
+
+      Thread.Sleep(250);
+    }
+
+    return condition();
+  }
+
+  #endregion
+
   public void Dispose() {
     if (this._disposed)
       return;
@@ -280,6 +390,13 @@ public sealed class MountedPool : IDisposable {
     } catch (Exception) {
       DbMount.KillTree(this._mountProcess);
     }
+
+    foreach (var (member, parked) in this._ejected.ToArray())
+      try {
+        Directory.Move(parked, member); // put the storage back so the tree can be removed
+      } catch (Exception) {
+        // best effort
+      }
 
     DbMount.ForgetPool(this.PoolName); // no CLI verb deregisters a pool; the registry entry is ours to remove
     this._mountProcess.Dispose();

@@ -1,4 +1,4 @@
-namespace DivisonM.Vfs;
+﻿namespace DivisonM.Vfs;
 
 /// <summary>Capabilities a storage backend declares; the engine adapts to gaps (FR-CAP-ADAPT).</summary>
 [Flags]
@@ -42,6 +42,17 @@ public interface IVolumeIO {
   /// Local and UNC members answer false: their blocking is the OS cache and a disk queue.
   /// </summary>
   bool BlocksCallingThread => false;
+
+  /// <summary>
+  /// Releases anything cached that is no longer in use — pooled OS handles above all.
+  ///
+  /// Called periodically by the background scheduler, because "release it on the next request"
+  /// is not good enough for a resource the OS counts: a pool that goes quiet keeps its members'
+  /// files open indefinitely, and an open handle makes the volume BUSY. The user then cannot
+  /// safely remove the disk, and Windows refuses to eject it, for no reason anyone can see.
+  /// </summary>
+  void ReleaseIdleResources() {
+  }
 
   Stream OpenRead(string relativePath, bool shadow);
 

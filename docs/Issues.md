@@ -76,7 +76,30 @@ after each pass, not a state to reach.
    alongside `RequestOp`.
 2. **Progress is per-job, not per-item.** The worker's latest stdout line is surfaced; there is no
    structured "N of M files" for a long scatter or scrub.
-3. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
+3. **A file replaced by rename keeps serving its OLD content to new readers — Windows.** After
+   `File.Move(source, target, overwrite: true)` succeeds, a reader that opens the target path
+   afresh still gets the pre-replacement bytes. Measured through a real WinFsp mount: six
+   replacements landed and the file settled on version 40, while all 3,200 reads taken during the
+   run returned version 1 — so the replacements were real and every reader missed all of them.
+   Atomic replace-by-rename is the pattern careful software uses precisely to publish a new
+   version safely, so this makes the safe pattern the broken one. Suspect the adapter passing
+   `fileNode = null` on every open, which leaves WinFsp unable to tell "same file" from "different
+   file now at this name" and lets the cached section for the name survive the replace. Pinned by
+   `SharedAccessEndToEndTests.SharedFile_GivenWritersReplacingItByRename_...`, which is `[Ignore]`d
+   with this reason rather than weakened, so the scenario is not lost.
+4. **A returning member is not healed back to its duplication level.** A file written while one
+   member was offline stays single-copy after that member comes back — waited two minutes with the
+   background pump running, through a real mount. The degraded write itself succeeds (SAFE-DEGRADE
+   works) and a file deleted while the member was away correctly does NOT resurrect (tombstone
+   replay works), so the gap is specifically owed-copy heal on member return. Pinned by
+   `MemberLossEndToEndTests.Eject_GivenAMemberIsAway_ThenWritesStillSucceedAndHealWhenItReturns`,
+   `[Ignore]`d with this reason rather than weakened.
+
+   Noticed alongside it: the engine RECREATES a missing member's root directory while it is away,
+   writing pool scaffolding to the path the disk used to occupy. On a real machine that is data
+   landing on whatever filesystem hosted the mount point instead of on the disk — worth deciding
+   deliberately rather than by accident.
+5. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
    Not reproduced end to end; flagged because it is the sibling of a bug that was proven real, and

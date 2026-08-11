@@ -218,7 +218,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       ? DurationSpec.Parse(write?.DeferWindow ?? "5s")
       : TimeSpan.Zero;
     var maxDefer = TimeSpan.FromSeconds(write?.MaxDeferSeconds ?? 30);
-    var jobs = new List<IBackgroundJob> { new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this), new MemberWatchJob(this), new HealJob(this) };
+    var jobs = new List<IBackgroundJob> {
+      new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this), new MemberWatchJob(this), new HealJob(this),
+      new TrimIdleResourcesJob([.. this._members.Select(m => m.Io)]),
+    };
     if (this._config.Trash?.Enabled == true)
       jobs.Add(new TrashMaintenanceJob(this));
 

@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
 namespace DivisonM.Vfs;
@@ -123,6 +123,12 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
       lease.Release(); // pool ref — closes once the last borrower returns it
     }
 
+    /// <summary>Drops every handle idle past the TTL. Safe to call at any time; borrowed handles are untouched.</summary>
+    public void EvictIdleNow() {
+      lock (this._lock)
+        this._EvictIdle();
+    }
+
     private void _EvictIdle() {
       var now = Environment.TickCount64;
       foreach (var (key, lease) in this._leases.Where(kv => now - kv.Value.LastUseTicks > _IDLE_TTL_MS).ToArray())
@@ -241,6 +247,13 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
       return this._onlineCached;
     }
   }
+
+  /// <summary>
+  /// Lets go of pooled OS handles the pool has finished with. Without this they live until the
+  /// NEXT request touches the member — so an idle pool holds its members' files open forever and
+  /// the volume can never be ejected.
+  /// </summary>
+  public void ReleaseIdleResources() => this._pool.EvictIdleNow();
 
   public BackendCaps Caps =>
     BackendCaps.RandomRead

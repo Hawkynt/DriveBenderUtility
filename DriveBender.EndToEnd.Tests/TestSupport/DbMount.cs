@@ -172,6 +172,31 @@ public static class DbMount {
     }
   }
 
+  /// <summary>
+  /// Sets the manifest's <c>defaults</c> block for a pool the CLI just created.
+  ///
+  /// There is no CLI verb for this — the UI does it over the API — and standing up the daemon
+  /// just to configure a fixture would drag the whole management stack into a driver test. The
+  /// registry manifest is a documented JSON file, so it is edited directly, BEFORE the pool is
+  /// mounted and therefore before anything can be reading it.
+  /// </summary>
+  public static void SetPoolDefaults(string poolName, string defaultsJson) {
+    var directory = PoolRegistryDirectory;
+    foreach (var path in Directory.EnumerateFiles(directory, "*.json")) {
+      var text = File.ReadAllText(path);
+      if (!text.Contains($"\"{poolName}\"", StringComparison.Ordinal))
+        continue;
+
+      var manifest = System.Text.Json.Nodes.JsonNode.Parse(text)!.AsObject();
+      manifest["defaults"] = System.Text.Json.Nodes.JsonNode.Parse(defaultsJson);
+      manifest["version"] = (manifest["version"]?.GetValue<int>() ?? 1) + 1; // highest version wins on mount
+      File.WriteAllText(path, manifest.ToJsonString(new() { WriteIndented = true }));
+      return;
+    }
+
+    throw new FileNotFoundException($"No registry manifest for pool '{poolName}' under '{directory}'");
+  }
+
   /// <summary>Removes a test pool's registry entry by name; never throws, cleanup must not fail a run.</summary>
   public static void ForgetPool(string poolName) {
     try {

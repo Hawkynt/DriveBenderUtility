@@ -1,4 +1,4 @@
-namespace DivisonM.Vfs.Engine;
+﻿namespace DivisonM.Vfs.Engine;
 
 /// <summary>A cooperative, resumable background job (CMP-BG). RunOnce does one bounded unit of work.</summary>
 public interface IBackgroundJob {
@@ -85,6 +85,28 @@ public sealed class TrashMaintenanceJob(PoolFileSystem fs) : IBackgroundJob {
   public string Name => "trash-maintenance";
 
   public bool RunOnce() => fs.PurgeTrash() > 0;
+
+}
+
+/// <summary>
+/// Hands back cached OS resources the members are no longer using (CMP-BG). Pooled file handles
+/// are otherwise only reclaimed when the next request arrives, so a pool nobody is using keeps
+/// its members' files open — and an open handle is what makes a volume refuse to be ejected.
+/// </summary>
+public sealed class TrimIdleResourcesJob(IReadOnlyList<IVolumeIO> members) : IBackgroundJob {
+
+  public string Name => "trim-idle-resources";
+
+  public bool RunOnce() {
+    foreach (var member in members)
+      try {
+        member.ReleaseIdleResources();
+      } catch (PoolFsException) {
+        // a member that cannot be asked is a member that is already gone
+      }
+
+    return false; // never counts as work: this must not keep the pump awake
+  }
 
 }
 
