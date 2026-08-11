@@ -16,6 +16,19 @@ robustness pass (`053e9a6`), and the background-job locking pass (`d590351`).
 
 Closed in the current pass:
 
+- **Mounting on Windows was impossible.** WinFsp's mount-point grammar has no trailing separator
+  (`X:`), while the manifest and CLI hold `X:\`; WinFsp rejected it with STATUS_OBJECT_NAME_INVALID
+  and `winfsp.net` then called `FspFileSystemSetMountPointEx` on a filesystem it had never created,
+  killing the process with an access violation and no message. Normalised, with `Preflight`
+  consulted first so a bad mount point is a sentence rather than a crash.
+- **Every newly written file stayed on disk as `*.TEMP.$DRIVEBENDER`** and was swept as an
+  incomplete write by the next mount. Staged publication hung off WinFsp's `Close`, but `Cleanup`
+  is "the application closed its last handle" while `Close` is "the kernel released the file
+  object", which the FSD defers — often to unmount. A non-delete cleanup now flushes.
+- **A recursive delete skipped files and then failed as "not empty".** Directory enumeration
+  resumed by SEARCHING for the marker entry, which the caller had just deleted, so the whole
+  listing was consumed and enumeration ended early. Resumption is by name order now.
+
 - **A read could report an acknowledged write as a 0-byte file — and cache that.**
   `GetAttributes` derived the logical length from two reads (the durable stat of one copy plus the
   write buffer's overlay of the bytes still owed to the others) while holding no lock, so a
@@ -56,40 +69,15 @@ after each pass, not a state to reach.
    alongside `RequestOp`.
 2. **Progress is per-job, not per-item.** The worker's latest stdout line is surfaced; there is no
    structured "N of M files" for a long scatter or scrub.
-3. **Mounting on Windows via WinFsp crashes the process — BLOCKING.** `dbmount mount` dies with
-   an access violation (0xC0000005) inside `Fsp.Interop.Api.FspFileSystemSetMountPointEx` before
-   the mount is usable, so no Windows user can mount a pool.
-
-   Evidence: reproduced on a developer machine and on clean `windows-latest` runners with WinFsp
-   **v2.1 installed from the official MSI** — the exact version `Prerequisites._WINFSP_TAG`
-   installs and the pinned `winfsp.net` 2.1.25156 binding requires, so it is not a version
-   mismatch. Reproduced on .NET 8 and .NET 10 alike, and by a twenty-line minimal `winfsp.net`
-   filesystem containing none of this project's code — so `WinFspAdapter` is not at fault. The
-   native DLL exports the symbol and `FileSystemHost.Version()` answers 2.1, so it is neither a
-   missing export nor a failed load. `winfsp.net` **2.2** refuses a mismatched runtime cleanly
-   (`TypeLoadException: incorrect dll version`) where 2.1.25156 crashes, but 2.2 is an unreleased
-   beta and would require shipping a beta native runtime.
-
-   Next steps: establish whether ANY winfsp.net version mounts against a matched native runtime;
-   if not, move the Windows path onto Dokan, which is already a dependency and already has an
-   adapter. Separately, `WinFspMountHost.IsWinFspAvailable` falls back to an on-disk probe when
-   the managed binding will not initialise, so the product reports the driver as present and then
-   crashes — it should verify the binding is usable and refuse with an explanation.
-
-   *A note on how this was nearly missed:* one CI run appeared to show the driver tier passing.
-   It had not — the step was `continue-on-error`, which leaves the JOB green, so the
-   `if: failure()` annotation step never ran and the failure was invisible. The annotation steps
-   are `if: always()` now. A conclusion drawn from an absence of evidence was wrong twice over.
-4. **Written data never reaches the members on Linux — BLOCKING, and a data-loss risk.** Through a
-   FUSE mount, `File.WriteAllBytes` followed by `File.ReadAllBytes` returns the correct bytes, but
-   after thirty seconds the member folders contain only
-   `.drivebenderutility/{journal.jsonl,member.json,pool.json}` — no data file, and not even a
-   staged `*.TEMP.$DRIVEBENDER`. The content is therefore live only inside the mount process:
-   acknowledged to the application and absent from every disk it is supposed to be on. Everything
-   else in the Linux driver tier passes, so the mount itself works; it is publication that does
-   not happen. Caught by `DriverEndToEndTests.WriteReadDelete_...ReachesEveryMember`, whose failure
-   message now lists what is actually on the members.
-5. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
+3. **Linux publication may be timing-dependent — UNCONFIRMED.** The Linux driver tier failed twice
+   with a written file reaching no member at all (not even a staged `*.TEMP.$DRIVEBENDER`) and
+   then passed, with nothing in the intervening change set touching Linux code. Publication on
+   Linux rides FUSE `flush` (synchronous on `close(2)`) and `release` (asynchronous); if the
+   per-open handle does not round-trip through `fuse_file_info`, `flush` becomes a no-op and
+   publication falls back to the deferred `release`, which would be exactly this intermittent.
+   Not yet reproduced deliberately. Until it is, treat green Linux runs as evidence and not as
+   proof — the Windows equivalent of this bug (below) was real and total.
+4. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
    Not reproduced end to end; flagged because it is the sibling of a bug that was proven real, and
