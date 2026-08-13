@@ -28,7 +28,7 @@
   <!-- Official first-party SDKs only — no wrapper/meta libraries -->
   <ItemGroup>
     <PackageReference Include="FluentFTP" Version="54.2.0" />
-    <PackageReference Include="SSH.NET" Version="2025.1.0" />
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
     <PackageReference Include="WebDav.Client" Version="2.9.0" />
     <PackageReference Include="AWSSDK.S3" Version="4.0.100.1" />
     <PackageReference Include="Azure.Storage.Blobs" Version="12.29.1" />
