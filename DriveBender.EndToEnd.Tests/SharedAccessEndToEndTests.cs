@@ -101,11 +101,12 @@ public class SharedAccessEndToEndTests {
 
   [Test]
   [Category("EdgeCase")]
-  [Ignore("Fails against a REAL defect, not a flaky one: after a file is replaced by rename, "
-          + "readers that open the name afresh keep seeing the OLD content. Measured on Windows: "
-          + "6 replacements landed and the file settled on version 40, while all 3200 reads taken "
-          + "during the run returned version 1. Left in place, and ignored rather than weakened, "
-          + "so the scenario is not lost - see docs/Issues.md 'Still open'.")]
+  [Ignore("A file replaced by rename keeps serving its OLD content to readers that hold the name "
+          + "open. Measured again this pass: 16 replacements landed, all 3,200 reads returned version 1, "
+          + "and the read taken after the workers stopped returned version 60 - so the data is correct on "
+          + "disk and the staleness is tied to concurrent handles, not a permanent failure to invalidate. "
+          + "Setting FspFileInfo.IndexNumber to a real per-file identity was tried and does NOT fix it. "
+          + "See docs/Issues.md.")]
   public void SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeVersion() {
     // The atomic-replace pattern every careful application uses: write a temp, then rename over
     // the target. THAT is the one a filesystem must make tear-free — a plain truncate-and-rewrite

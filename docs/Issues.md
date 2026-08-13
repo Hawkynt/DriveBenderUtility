@@ -121,20 +121,35 @@ after each pass, not a state to reach.
    `SharedAccessEndToEndTests.SharedFile_GivenWritersReplacingItByRename_...`, `[Ignore]`d with
    this reason rather than weakened.
 
-   **Lead, sharpened.** `WinFspAdapter._Fill` never sets `FspFileInfo.IndexNumber`, so every file
-   in the pool reports file id 0. Windows treats IndexNumber as a file's identity, and the cached
-   data section is associated with it; with every file sharing one id the FSD cannot distinguish
-   "this name now holds a different file" from "the same file changed", so the section for the name
-   survives the replace and keeps answering reads. That fits the measurement exactly — it is not a
-   staleness window (`FileInfoTimeout` is 1s and the run was far longer), it is never invalidating.
-   The earlier note blamed `fileNode = null`; that is the same area but the wrong lever.
+   **Ruled out: IndexNumber.** `WinFspAdapter._Fill` never sets `FspFileInfo.IndexNumber`, so
+   every file reports file id 0, and Windows associates a file's cached data section with its
+   IndexNumber — a good story for why the section survives a replacing rename. It was implemented
+   (a real per-file identity from path plus creation time, which stays constant across appends and
+   changes when the name comes to hold a different file) and it does NOT fix this. Reverted rather
+   than carried, because it costs a hash on every `GetFileInfo`, which is a hot path, and bought
+   nothing measurable. Setting it may still be worth doing for its own sake; it is not the lever
+   here.
 
-   The fix is NOT a hash of the path: IndexNumber has to identify the FILE, so it must stay
-   constant while a file is appended to and CHANGE when the name comes to hold a different file. A
-   path hash does the opposite on both counts. It needs a real per-file identity carried in
-   `FileMeta` — the host's own file id (NTFS FileId / inode) for the primary copy is the natural
-   source, though whole-file remotes have no equivalent and would need one assigned. That is a
-   change across `IVolumeIO`, `FileMeta` and both adapters, and is not started.
+   **New evidence, and it narrows things a lot.** Re-measured this pass: 16 replacements landed,
+   all 3,200 reads during the run returned version 1 — and the read taken AFTER the workers stopped
+   returned version 60. So the bytes on disk are correct and the invalidation is not permanently
+   broken; the staleness lasts exactly as long as readers keep the name open. Whatever serves those
+   reads is pinned by an open handle and outlives the rename underneath it. The engine's own
+   **Also ruled out, so the next pass need not re-walk them:**
+   - The engine's `Rename` does invalidate both endpoints, and `_Invalidate` clears placement and
+     the path's cache entry under the same name it caches them — no mismatch there.
+   - The pooled physical handles in `LocalVolumeIO.HandlePool` are not it. `AtomicReplace`
+     invalidates before AND after the swap, and `_Retire` removes the key from the dictionary, so a
+     handle rented before the replace is closed when its borrower returns it rather than re-pooled
+     — a later reader cannot be served the pre-replace file out of the pool.
+
+   What is left is whatever a READER holds across the replace, since the staleness ends the moment
+   the readers stop. `FileState.ReadAhead` is per-handle and survives a rename — `RenamePath`
+   repoints the state rather than retiring it — which makes the read-ahead buffers the most
+   promising remaining candidate.
+
+   It also passes when run ALONE and fails in the full suite, so it is timing-sensitive; a single
+   green run of this scenario means nothing without the whole suite behind it.
 4. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
