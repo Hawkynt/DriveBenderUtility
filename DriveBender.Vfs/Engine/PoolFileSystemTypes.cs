@@ -76,6 +76,18 @@ public interface IPoolFileSystem : IDisposable {
   int Write(NodeHandle handle, ReadOnlySpan<byte> data, long offset, WriteMode mode);
   void SetLength(NodeHandle handle, long length);
   void Flush(NodeHandle handle);
+
+  /// <summary>
+  /// The application has closed its last handle, even if the host driver keeps the handle alive.
+  ///
+  /// Adapters whose driver defers the real close — WinFsp sends CLEANUP now and CLOSE only when
+  /// the kernel releases the file object, often not until unmount — must call this, or every
+  /// written file stays "open" forever and the background drainer and healer skip it for good.
+  /// Adapters that close promptly (FUSE's <c>release</c>) need not: <see cref="Close"/> implies it.
+  /// </summary>
+  void MarkApplicationClosed(NodeHandle handle) {
+  }
+
   void Close(NodeHandle handle);
 
   FsStatistics StatFs();

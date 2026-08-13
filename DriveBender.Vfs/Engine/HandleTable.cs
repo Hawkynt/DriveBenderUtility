@@ -1,4 +1,4 @@
-namespace DivisonM.Vfs.Engine;
+﻿namespace DivisonM.Vfs.Engine;
 
 /// <summary>
 /// Per-file state shared by all handles open on the same path (FR-CONCURRENCY): a
@@ -15,6 +15,18 @@ public sealed class FileState(string normalizedPath) {
   /// <summary>Open handles only — a lease must not make a path look "open" to the drain/heal guards.</summary>
   internal int HandleCount;
 
+  /// <summary>
+  /// Handles the APPLICATION still has open, which is what the drain/heal guards must look at.
+  ///
+  /// On Windows this is deliberately not <see cref="HandleCount"/>. WinFsp sends CLEANUP when the
+  /// application closes its last handle and CLOSE when the kernel finally releases the file
+  /// object, and the FSD defers CLOSE for a long time — often until unmount. Counting kernel file
+  /// objects therefore leaves an ordinary written file looking permanently "in use", so the
+  /// drainer and the healer skip it forever: a file written by a long-running application never
+  /// gets its owed second copy, which is a durability loss (SAFE-DUP) and not merely a delay.
+  /// </summary>
+  internal int AppHandleCount;
+
   /// <summary>Per-handle read-ahead detectors keyed by handle value.</summary>
   internal readonly Dictionary<long, ReadAheadState> ReadAhead = [];
 }
@@ -25,7 +37,10 @@ public sealed class FileState(string normalizedPath) {
 /// </summary>
 public sealed class HandleTable {
 
-  public sealed record OpenHandle(NodeHandle Handle, FileState File, AccessMode Access);
+  public sealed record OpenHandle(NodeHandle Handle, FileState File, AccessMode Access) {
+    /// <summary>Set once the application has closed this handle, so it is decounted exactly once.</summary>
+    internal bool ApplicationClosed;
+  }
 
   /// <summary>
   /// A scoped lock on one path's <see cref="FileState"/> that does NOT require an open
@@ -162,6 +177,7 @@ public sealed class HandleTable {
 
       ++file.RefCount;
       ++file.HandleCount;
+      ++file.AppHandleCount;
       var handle = new NodeHandle(++this._nextHandle);
       var open = new OpenHandle(handle, file, access);
       this._handles.Add(handle.Value, open);
@@ -186,6 +202,11 @@ public sealed class HandleTable {
       lock (open.File.ReadAhead)
         open.File.ReadAhead.Remove(handle.Value);
       --open.File.HandleCount;
+      if (!open.ApplicationClosed) {
+        open.ApplicationClosed = true; // a handle closed without an explicit cleanup still counts
+        --open.File.AppHandleCount;
+      }
+
       if (--open.File.RefCount == 0 && this._files.TryGetValue(open.File.Path, out var current) && ReferenceEquals(current, open.File))
         this._files.Remove(open.File.Path); // only ever unkey OUR OWN entry (see _ReleaseState)
     }
@@ -198,7 +219,30 @@ public sealed class HandleTable {
   /// </summary>
   public bool IsOpen(string normalizedPath) {
     lock (this._lock)
-      return this._files.TryGetValue(normalizedPath, out var file) && file.HandleCount > 0;
+      return this._files.TryGetValue(normalizedPath, out var file) && file.AppHandleCount > 0;
+  }
+
+  /// <summary>
+  /// Records that the APPLICATION has closed this handle, even though the handle itself stays
+  /// valid for whatever the kernel still sends against it (cached writes, a deferred close).
+  ///
+  /// Idempotent: the adapter may send it more than once, and the eventual close must not decount
+  /// the same handle twice.
+  /// </summary>
+  /// <summary>The path a handle refers to, or null when it is already gone.</summary>
+  public string? TryGetPath(NodeHandle handle) {
+    lock (this._lock)
+      return this._handles.TryGetValue(handle.Value, out var open) ? open.File.Path : null;
+  }
+
+  public void MarkApplicationClosed(NodeHandle handle) {
+    lock (this._lock) {
+      if (!this._handles.TryGetValue(handle.Value, out var open) || open.ApplicationClosed)
+        return;
+
+      open.ApplicationClosed = true;
+      --open.File.AppHandleCount;
+    }
   }
 
   /// <summary>

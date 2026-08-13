@@ -67,11 +67,6 @@ public class MemberLossEndToEndTests {
 
   [Test]
   [Category("EdgeCase")]
-  [Ignore("Fails against a real gap, not a flaky one: a file written while a member was away is "
-          + "NOT healed back to its duplication level when that member returns - waited two "
-          + "minutes with the background pump running. The degraded write itself succeeds, and a "
-          + "file deleted while the member was away correctly stays deleted, so tombstone replay "
-          + "works while owed-copy heal does not. See docs/Issues.md 'Still open'.")]
   public void Eject_GivenAMemberIsAway_ThenWritesStillSucceedAndHealWhenItReturns() {
     using var pool = _DuplicatedPool();
     pool.Eject(1);
@@ -157,8 +152,6 @@ public class MemberLossEndToEndTests {
 
   [Test]
   [Category("EdgeCase")]
-  [Ignore("Fails while a member is reattached under live traffic. Related to the un-run owed-copy heal "
-          + "recorded in docs/Issues.md; held back rather than weakened so the scenario is not lost.")]
   public void Eject_GivenAMemberReturnsWhileIoIsInFlight_ThenNothingIsCorruptedOrStalled() {
     using var pool = _DuplicatedPool();
     var content = _Payload(32 * 1024, 5);

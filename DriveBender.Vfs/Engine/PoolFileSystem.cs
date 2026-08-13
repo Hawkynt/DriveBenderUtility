@@ -1867,6 +1867,26 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
+  /// <summary>
+  /// The application has closed its last handle on this file, even though the host filesystem
+  /// driver may keep the handle alive for a while yet (SAFE-DUP).
+  ///
+  /// WinFsp sends CLEANUP at this moment and CLOSE only when the kernel releases the file object,
+  /// which it defers — often until unmount. Until this is recorded, the file still counts as open,
+  /// and the drainer and the healer both skip open files, so a file written by a long-running
+  /// application would never be drained to capacity nor healed back to its duplication level. That
+  /// is a durability loss rather than a delay: the owed second copy is never made while the
+  /// application that wrote the file keeps running.
+  /// </summary>
+  public void MarkApplicationClosed(NodeHandle handle) {
+    this._handles.MarkApplicationClosed(handle);
+
+    // publication hangs off "no application still has it open", which is exactly what just changed
+    var path = this._handles.TryGetPath(handle);
+    if (path != null && this._staging.ContainsKey(path) && !this._handles.IsOpen(path))
+      this._PublishStaged(path);
+  }
+
   public void Close(NodeHandle handle) {
     var open = this._handles.Get(handle);
     var path = open.File.Path;

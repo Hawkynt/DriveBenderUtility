@@ -64,6 +64,41 @@ Closed in the current pass:
 - **Media surgery, purge and driver install ran inline in the HTTP handler** for up to thirty
   minutes. They join the job model, with progress on the SSE frame and cancellation.
 
+
+### Resolved this pass: files written by a long-running application were never drained or healed
+
+One defect, two symptoms, and two wrong diagnoses on the way to it.
+
+**The defect.** `HandleTable.IsOpen` counted kernel file objects. WinFsp sends CLEANUP when the
+application closes its last handle and CLOSE only when the kernel releases the file object, and the
+FSD defers CLOSE for a long time — often until unmount. The drainer and the healer both skip open
+files, on the sound principle that a file someone is actively writing should converge through the
+write path. So an ordinary file, written and closed by a program that keeps running, stayed
+permanently "open": never drained to capacity, and — with duplication on — never given its owed
+second copy. That is a durability loss and not a delay. The window is the lifetime of the writing
+application, which for a service is forever.
+
+`Cleanup` in the WinFsp adapter now tells the engine the application is done
+(`IPoolFileSystem.MarkApplicationClosed`), while the handle stays valid for whatever the kernel
+still sends against it. FUSE's `release` is already a prompt close, so the Linux adapter needs
+nothing; `Close` implies the same thing where no cleanup ever arrives.
+
+**How the diagnosis went wrong.** First it was recorded as "the drainer does not move data down"
+with the landing role itself in doubt — the role was fine. Then, after reproducing the drain
+working five different ways outside the test suite, it was recorded as "the drainer was never
+broken; the suite is at fault". That second claim was also wrong, and worse, because it blamed the
+tests for being right. Every one of those probes wrote from a SHORT-LIVED process (or from Python,
+which behaves the same way here), and process exit forces the file object down — which is exactly
+the condition that hides the bug. The reproducer that finally settled it was a .NET
+`File.WriteAllBytes` from a process that stays alive: never drained, outside the suite, every time.
+The lesson is specific and worth keeping: when a probe disagrees with a test, the probe is a
+hypothesis too, and the difference between them IS the evidence.
+
+Closed by this: the two landing-zone drain scenarios, the owed-copy heal on member return, and the
+member-returns-while-io-is-in-flight scenario — all four were held back and all four now pass. The
+end-to-end suite also dropped from 5m09s to 2m25s, because those tests no longer sit out two-minute
+timeouts.
+
 ## Still open
 
 An earlier revision of this file claimed "nothing known" here. That was wrong — it dropped the two
@@ -87,42 +122,7 @@ after each pass, not a state to reach.
    file now at this name" and lets the cached section for the name survive the replace. Pinned by
    `SharedAccessEndToEndTests.SharedFile_GivenWritersReplacingItByRename_...`, which is `[Ignore]`d
    with this reason rather than weakened, so the scenario is not lost.
-4. **A returning member is not healed back to its duplication level.** A file written while one
-   member was offline stays single-copy after that member comes back — waited two minutes with the
-   background pump running, through a real mount. The degraded write itself succeeds (SAFE-DEGRADE
-   works) and a file deleted while the member was away correctly does NOT resurrect (tombstone
-   replay works), so the gap is specifically owed-copy heal on member return. Pinned by
-   `MemberLossEndToEndTests.Eject_GivenAMemberIsAway_ThenWritesStillSucceedAndHealWhenItReturns`,
-   `[Ignore]`d with this reason rather than weakened.
-
-   Noticed alongside it: the engine RECREATES a missing member's root directory while it is away,
-   writing pool scaffolding to the path the disk used to occupy. On a real machine that is data
-   landing on whatever filesystem hosted the mount point instead of on the disk — worth deciding
-   deliberately rather than by accident.
-5. **The two landing-zone drain scenarios stall in the end-to-end suite only — the drainer itself
-   works.** An earlier revision of this file said "the drainer does not appear to move data down"
-   and left open whether the landing role was even reaching the member. Both halves of that were
-   wrong, and the record is corrected here rather than quietly edited:
-   - `pool-create -l` DOES set `"role": "landing"` in the manifest — verified by reading the
-     written manifest, with forward-slash and backslash paths alike.
-   - Placement DOES put new data on the fast tier — the failing test itself reports "it did land
-     on the fast tier first".
-   - The drainer DOES move it down, in 3-10 seconds, logging
-     `Drained '<file>' from '<landing>' to '<capacity>'`. Reproduced outside the suite four times:
-     plain directories, junction members, a write issued the instant the mount became usable, and
-     a writer process that stays alive for a minute after closing the file.
-
-   Inside the suite the same pool leaves the file on the landing member for two full minutes with
-   the mount process still alive (asserted). So there IS something real here, but it is a property
-   of the harness environment that I have not isolated, not the "drainer never runs" defect
-   previously recorded. The two scenarios stay `[Ignore]`d with that reason. Remaining untested
-   difference: the write comes from the long-lived test host via `File.WriteAllBytes` rather than
-   from a short-lived process.
-
-   Tiering is TRANSPARENT regardless, which is the part that matters most to whoever holds the
-   file: `TieringEndToEndTests.Tiering_WhileTheMoverIsRelocatingFiles_...` keeps six threads
-   rewriting and re-reading while the mover works and sees no failure.
-6. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
+4. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
    Not reproduced end to end; flagged because it is the sibling of a bug that was proven real, and

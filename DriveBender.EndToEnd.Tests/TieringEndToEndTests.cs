@@ -53,11 +53,6 @@ public class TieringEndToEndTests {
   [Test]
   [Category("EdgeCase")]
   [Description("New data lands on the fast tier first, then the drainer moves it down to capacity storage on its own.")]
-  [Ignore("Stalls in this suite only. The drainer itself works: verified outside the suite that "
-          + "pool-create -l sets role=landing, that new data lands on the fast tier, and that it is "
-          + "drained to capacity in 3-10 seconds with a Drained log line - across plain directories, "
-          + "junction members, an immediate write and a long-lived writer. Held back until the harness "
-          + "difference is isolated rather than weakened. See docs/Issues.md.")]
   public void Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity() {
     using var pool = MountedPool.CreateTiered();
     var content = _Payload(4 * 1024 * 1024, 22);
@@ -144,11 +139,6 @@ public class TieringEndToEndTests {
   [Test]
   [Category("EdgeCase")]
   [Description("The fast tier is freed again after a file drains, so a landing zone does not fill up permanently.")]
-  [Ignore("Stalls in this suite only. The drainer itself works: verified outside the suite that "
-          + "pool-create -l sets role=landing, that new data lands on the fast tier, and that it is "
-          + "drained to capacity in 3-10 seconds with a Drained log line - across plain directories, "
-          + "junction members, an immediate write and a long-lived writer. Held back until the harness "
-          + "difference is isolated rather than weakened. See docs/Issues.md.")]
   public void Tiering_GivenAFileHasDrained_ThenTheFastTierIsFreedAgain() {
     using var pool = MountedPool.CreateTiered();
     var content = _Payload(4 * 1024 * 1024, 23);

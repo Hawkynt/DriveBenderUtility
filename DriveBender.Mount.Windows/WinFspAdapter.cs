@@ -343,6 +343,14 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       if (!descriptor.IsDirectory && descriptor.Handle != NodeHandle.Invalid)
         try {
           pool.Flush(descriptor.Handle);
+
+          // Tell the engine the APPLICATION is done with the file, which Close would otherwise only
+          // say once the kernel gets round to it. The engine's background work — the landing-zone
+          // drainer and the owed-copy healer — skips files that are open, so counting the deferred
+          // kernel file object as "open" left an ordinary written file permanently in use: it was
+          // never drained to capacity, and with duplication on it never got its owed second copy
+          // while the writing application kept running. That is a durability loss, not a delay.
+          pool.MarkApplicationClosed(descriptor.Handle);
         } catch (PoolFsException e) {
           DriveBender.Logger($"[Warning]flush of '{descriptor.Path}' on cleanup failed: {e.Message}");
         }
