@@ -206,6 +206,16 @@ public sealed class MountedPool : IDisposable {
     }
   }
 
+  /// <summary>
+  /// Whether the mount child is still running.
+  ///
+  /// Worth asserting explicitly in any test that waits on the pool converging by itself, because
+  /// those tests watch the MEMBER folders rather than the mount: if the mount process dies, nothing
+  /// converges and the wait simply times out, which reads as "the background job is broken" when
+  /// the real answer is "the process that runs it is gone".
+  /// </summary>
+  public bool IsMountAlive => !this._mountProcess.HasExited;
+
   public string PathTo(params string[] segments) => Path.Combine([this.MountPath, .. segments]);
 
   /// <summary>

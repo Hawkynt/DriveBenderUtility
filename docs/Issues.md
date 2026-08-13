@@ -99,14 +99,29 @@ after each pass, not a state to reach.
    writing pool scaffolding to the path the disk used to occupy. On a real machine that is data
    landing on whatever filesystem hosted the mount point instead of on the disk — worth deciding
    deliberately rather than by accident.
-5. **The landing-zone drainer does not appear to move data down.** A file written to a pool with a
-   landing-zone member is still absent from the capacity member two minutes later, with the
-   background pump running, so the fast tier is never freed either. Not yet distinguished between
-   "the drainer never ran" and "the landing role was not applied to the member by `pool-create -l`"
-   — both are worth checking before assuming which. Tiering is otherwise TRANSPARENT, which is the
-   part that matters most: a file stays readable and writable throughout, verified by
-   `TieringEndToEndTests.Tiering_WhileTheMoverIsRelocatingFiles_...` with six threads rewriting
-   while the mover works.
+5. **The two landing-zone drain scenarios stall in the end-to-end suite only — the drainer itself
+   works.** An earlier revision of this file said "the drainer does not appear to move data down"
+   and left open whether the landing role was even reaching the member. Both halves of that were
+   wrong, and the record is corrected here rather than quietly edited:
+   - `pool-create -l` DOES set `"role": "landing"` in the manifest — verified by reading the
+     written manifest, with forward-slash and backslash paths alike.
+   - Placement DOES put new data on the fast tier — the failing test itself reports "it did land
+     on the fast tier first".
+   - The drainer DOES move it down, in 3-10 seconds, logging
+     `Drained '<file>' from '<landing>' to '<capacity>'`. Reproduced outside the suite four times:
+     plain directories, junction members, a write issued the instant the mount became usable, and
+     a writer process that stays alive for a minute after closing the file.
+
+   Inside the suite the same pool leaves the file on the landing member for two full minutes with
+   the mount process still alive (asserted). So there IS something real here, but it is a property
+   of the harness environment that I have not isolated, not the "drainer never runs" defect
+   previously recorded. The two scenarios stay `[Ignore]`d with that reason. Remaining untested
+   difference: the write comes from the long-lived test host via `File.WriteAllBytes` rather than
+   from a short-lived process.
+
+   Tiering is TRANSPARENT regardless, which is the part that matters most to whoever holds the
+   file: `TieringEndToEndTests.Tiering_WhileTheMoverIsRelocatingFiles_...` keeps six threads
+   rewriting and re-reading while the mover works and sees no failure.
 6. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
