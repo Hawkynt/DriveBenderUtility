@@ -222,6 +222,12 @@ public sealed class HandleTable {
       return this._files.TryGetValue(normalizedPath, out var file) && file.AppHandleCount > 0;
   }
 
+  /// <summary>The path a handle refers to, or null when it is already gone.</summary>
+  public string? TryGetPath(NodeHandle handle) {
+    lock (this._lock)
+      return this._handles.TryGetValue(handle.Value, out var open) ? open.File.Path : null;
+  }
+
   /// <summary>
   /// Records that the APPLICATION has closed this handle, even though the handle itself stays
   /// valid for whatever the kernel still sends against it (cached writes, a deferred close).
@@ -229,12 +235,6 @@ public sealed class HandleTable {
   /// Idempotent: the adapter may send it more than once, and the eventual close must not decount
   /// the same handle twice.
   /// </summary>
-  /// <summary>The path a handle refers to, or null when it is already gone.</summary>
-  public string? TryGetPath(NodeHandle handle) {
-    lock (this._lock)
-      return this._handles.TryGetValue(handle.Value, out var open) ? open.File.Path : null;
-  }
-
   public void MarkApplicationClosed(NodeHandle handle) {
     lock (this._lock) {
       if (!this._handles.TryGetValue(handle.Value, out var open) || open.ApplicationClosed)

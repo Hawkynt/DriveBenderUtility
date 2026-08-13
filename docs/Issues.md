@@ -117,11 +117,24 @@ after each pass, not a state to reach.
    replacements landed and the file settled on version 40, while all 3,200 reads taken during the
    run returned version 1 — so the replacements were real and every reader missed all of them.
    Atomic replace-by-rename is the pattern careful software uses precisely to publish a new
-   version safely, so this makes the safe pattern the broken one. Suspect the adapter passing
-   `fileNode = null` on every open, which leaves WinFsp unable to tell "same file" from "different
-   file now at this name" and lets the cached section for the name survive the replace. Pinned by
-   `SharedAccessEndToEndTests.SharedFile_GivenWritersReplacingItByRename_...`, which is `[Ignore]`d
-   with this reason rather than weakened, so the scenario is not lost.
+   version safely, so this makes the safe pattern the broken one. Pinned by
+   `SharedAccessEndToEndTests.SharedFile_GivenWritersReplacingItByRename_...`, `[Ignore]`d with
+   this reason rather than weakened.
+
+   **Lead, sharpened.** `WinFspAdapter._Fill` never sets `FspFileInfo.IndexNumber`, so every file
+   in the pool reports file id 0. Windows treats IndexNumber as a file's identity, and the cached
+   data section is associated with it; with every file sharing one id the FSD cannot distinguish
+   "this name now holds a different file" from "the same file changed", so the section for the name
+   survives the replace and keeps answering reads. That fits the measurement exactly — it is not a
+   staleness window (`FileInfoTimeout` is 1s and the run was far longer), it is never invalidating.
+   The earlier note blamed `fileNode = null`; that is the same area but the wrong lever.
+
+   The fix is NOT a hash of the path: IndexNumber has to identify the FILE, so it must stay
+   constant while a file is appended to and CHANGE when the name comes to hold a different file. A
+   path hash does the opposite on both counts. It needs a real per-file identity carried in
+   `FileMeta` — the host's own file id (NTFS FileId / inode) for the primary copy is the natural
+   source, though whole-file remotes have no equivalent and would need one assigned. That is a
+   change across `IVolumeIO`, `FileMeta` and both adapters, and is not started.
 4. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
    — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
    `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
