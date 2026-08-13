@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [31512619045](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/31512619045).
+Generated from run: [31675594608](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/31675594608).
 
-57 scenarios — 52 passing on at least one target, 2 failing.
+57 scenarios — 56 passing on at least one target, 3 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -21,7 +21,7 @@ Generated from run: [31512619045](https://github.com/Hawkynt/DriveBenderUtility/
 | Boundary | `Sparse_GivenAWriteFarBeyondTheEnd_ThenTheHoleReadsAsZeroes` | Writing far past the end of a file leaves a hole that reads as zeroes, and the bytes written land at the right offset. | pass | pass |
 | Boundary | `Truncate_GivenAFileIsShrunkThenGrown_ThenTheOldContentDoesNotResurface` | A file shrunk and grown again reads as zeroes in the re-exposed region, never the content that used to be there. | pass | pass |
 | Driver | `Append_GivenRepeatedOpens_ThenTheFileGrowsMonotonically` | Given Repeated Opens , then The File Grows Monotonically | pass | pass |
-| Driver | `Concurrency_GivenManyReadersAndWritersThroughTheOs_ThenNoFileIsCorrupted` | Given Many Readers And Writers Through The Os , then No File Is Corrupted | pass | pass |
+| Driver | `Concurrency_GivenManyReadersAndWritersThroughTheOs_ThenNoFileIsCorrupted` | Given Many Readers And Writers Through The Os , then No File Is Corrupted | pass | **FAIL** |
 | Driver | `Directories_GivenATreeCreatedThroughTheOs_ThenItEnumeratesAndRemoves` | Given ATree Created Through The Os , then It Enumerates And Removes | pass | pass |
 | Driver | `FreeSpace_GivenTheMountedVolume_ThenTheOsReportsPlausibleCapacity` | Given The Mounted Volume , then The Os Reports Plausible Capacity | pass | skipped |
 | Driver | `LargeFile_GivenAMultiMegabyteStream_ThenItRoundTripsThroughTheDriver` | Given AMulti Megabyte Stream , then It Round Trips Through The Driver | pass | pass |
@@ -50,9 +50,9 @@ Generated from run: [31512619045](https://github.com/Hawkynt/DriveBenderUtility/
 | MemberLoss | `Capacity_GivenTheMountedPool_ThenTheReportedSizeTracksTheStorageBehindIt` | Given The Mounted Pool , then The Reported Size Tracks The Storage Behind It | pass | skipped |
 | MemberLoss | `Duplication_GivenTheConfiguredPool_ThenEveryFileReallyExistsTwice` | Given The Configured Pool , then Every File Really Exists Twice | pass | pass |
 | MemberLoss | `Eject_GivenAFileIsDeletedWhileAMemberIsAway_ThenItDoesNotResurrectOnItsReturn` | Given AFile Is Deleted While AMember Is Away , then It Does Not Resurrect On Its Return | pass | pass |
-| MemberLoss | `Eject_GivenAMemberIsAway_ThenWritesStillSucceedAndHealWhenItReturns` | Given AMember Is Away , then Writes Still Succeed And Heal , when It Returns _(held back: Fails against a real gap, not a flaky one: a file written while a member was away is NOT healed back to its duplication level when that member returns - waited two minutes with the background pump running. The degraded write itself succeeds, and a file deleted while the member was away correctly stays deleted, so tombstone replay works while owed-copy heal does not. See docs/Issues.md 'Still open'.)_ | skipped | skipped |
+| MemberLoss | `Eject_GivenAMemberIsAway_ThenWritesStillSucceedAndHealWhenItReturns` | Given AMember Is Away , then Writes Still Succeed And Heal , when It Returns | pass | pass |
 | MemberLoss | `Eject_GivenAMemberIsPulled_ThenExistingFilesStayReadableFromTheSurvivor` | Given AMember Is Pulled , then Existing Files Stay Readable From The Survivor | pass | pass |
-| MemberLoss | `Eject_GivenAMemberReturnsWhileIoIsInFlight_ThenNothingIsCorruptedOrStalled` | Given AMember Returns While Io Is In Flight , then Nothing Is Corrupted Or Stalled _(held back: Fails while a member is reattached under live traffic. Related to the un-run owed-copy heal recorded in docs/Issues.md; held back rather than weakened so the scenario is not lost.)_ | skipped | skipped |
+| MemberLoss | `Eject_GivenAMemberReturnsWhileIoIsInFlight_ThenNothingIsCorruptedOrStalled` | Given AMember Returns While Io Is In Flight , then Nothing Is Corrupted Or Stalled | pass | pass |
 | MemberLoss | `Eject_GivenAMemberVanishesDuringAWrite_ThenTheDataThatWasAcknowledgedIsIntact` | Given AMember Vanishes During AWrite , then The Data That Was Acknowledged Is Intact | pass | pass |
 | MemberLoss | `Eject_GivenEveryMemberIsGone_ThenOperationsFailCleanlyInsteadOfHanging` | Given Every Member Is Gone , then Operations Fail Cleanly Instead Of Hanging | pass | pass |
 | SharedAccess | `Durability_GivenAnUnmountAndRemount_ThenEverythingWrittenIsStillThere` | Given An Unmount And Remount , then Everything Written Is Still There | pass | pass |
@@ -62,8 +62,8 @@ Generated from run: [31512619045](https://github.com/Hawkynt/DriveBenderUtility/
 | SharedAccess | `SharedFile_GivenConcurrentReadersOnOneOpenFile_ThenEachSeesTheWholeContent` | Given Concurrent Readers On One Open File , then Each Sees The Whole Content | pass | pass |
 | SharedAccess | `SharedFile_GivenWritersOwningDisjointRegionsOfOneFile_ThenNoRegionIsCorruptedByAnother` | Given Writers Owning Disjoint Regions Of One File , then No Region Is Corrupted By Another | pass | pass |
 | SharedAccess | `SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeVersion` | Given Writers Replacing It By Rename , then Every Read Is AWhole Version _(held back: Fails against a REAL defect, not a flaky one: after a file is replaced by rename, readers that open the name afresh keep seeing the OLD content. Measured on Windows: 6 replacements landed and the file settled on version 40, while all 3200 reads taken during the run returned version 1. Left in place, and ignored rather than weakened, so the scenario is not lost - see docs/Issues.md 'Still open'.)_ | skipped | skipped |
-| Tiering | `Tiering_GivenAFileHasDrained_ThenTheFastTierIsFreedAgain` | The fast tier is freed again after a file drains, so a landing zone does not fill up permanently. _(held back: Same observation as the drain test above: the fast tier is never freed because the file never leaves it. See docs/Issues.md.)_ | skipped | skipped |
-| Tiering | `Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` | New data lands on the fast tier first, then the drainer moves it down to capacity storage on its own. _(held back: Observed: a file written to a pool with a landing-zone member is still not present on the capacity member two minutes later, with the background pump running. Needs confirming whether the drainer never ran or the landing role was not applied to the member. See docs/Issues.md.)_ | skipped | skipped |
+| Tiering | `Tiering_GivenAFileHasDrained_ThenTheFastTierIsFreedAgain` | The fast tier is freed again after a file drains, so a landing zone does not fill up permanently. | pass | pass |
+| Tiering | `Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` | New data lands on the fast tier first, then the drainer moves it down to capacity storage on its own. | pass | pass |
 | Tiering | `Tiering_GivenALandingZone_ThenWritesAreAcceptedAndReadBackIntact` | A landing-zone pool accepts writes and serves them back correctly through the mount. | pass | pass |
 | Tiering | `Tiering_WhileTheMoverIsRelocatingFiles_ThenTheyStayReadableAndWritable` | Tiering is transparent: a file stays readable AND writable throughout, including while the mover is relocating it. | pass | pass |
 | WebUi | `Dashboard_WhenAPoolIsPresent_ThenItsActionsAreOffered` | , when APool Is Present , then Its Actions Are Offered | pass | pass |
