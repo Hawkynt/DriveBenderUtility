@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 
 namespace DivisonM.Vfs.Engine;
 
@@ -87,6 +87,30 @@ public sealed class MeasuredVolumeIO(IVolumeIO inner) : IVolumeIO {
 
     public override int Read(byte[] buffer, int offset, int count) => owner._Timed(() => inner.Read(buffer, offset, count));
     public override void Write(byte[] buffer, int offset, int count) => owner._Timed(() => inner.Write(buffer, offset, count));
+
+    // The span overloads must be forwarded too, not inherited. Stream's base versions serve a span
+    // caller by renting an array, copying through it and returning it — so a wrapper that forwards
+    // only the array overloads silently reintroduces the copy for every span caller, and
+    // Stream.CopyTo is one. Forwarding keeps the caller's own memory all the way to the member.
+    public override int Read(Span<byte> buffer) {
+      // timed inline rather than through _Timed: a Span is a ref struct and cannot be captured by
+      // the lambda that helper takes
+      var clock = System.Diagnostics.Stopwatch.StartNew();
+      try {
+        return inner.Read(buffer);
+      } finally {
+        owner.RecordLatency(clock.Elapsed.TotalMilliseconds);
+      }
+    }
+
+    public override void Write(ReadOnlySpan<byte> buffer) {
+      var clock = System.Diagnostics.Stopwatch.StartNew();
+      try {
+        inner.Write(buffer);
+      } finally {
+        owner.RecordLatency(clock.Elapsed.TotalMilliseconds);
+      }
+    }
     public override void Flush() => owner._Timed(inner.Flush);
     public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
     public override void SetLength(long value) => inner.SetLength(value);

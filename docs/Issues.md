@@ -211,7 +211,13 @@ These now fail the build rather than needing to be re-found:
   default global cache is 4 GiB, so a 2 GiB file fits in it entirely and the mount's memory would
   sit near the file size for a perfectly good reason — with a small cache, memory has to track the
   BUDGET, which is the property SAFE-BIGFILE actually claims. Measured 469 MiB peak for a 2112 MiB
-  file at 2131 MiB/s. It self-skips, with the reason, when the machine lacks ~6 GiB free.
+  file at 2333 MiB/s. It self-skips, with the reason, when the machine lacks ~6 GiB free.
+- `RentedBufferSafetyTests` — every pooled-buffer site run against a DELIBERATELY DIRTIED
+  `ArrayPool`, so each rented array arrives full of a poison byte, and read through a stream that
+  dribbles a few bytes per call. A clean pool hands out zeroed arrays and would pass all three of
+  the mistakes this guards: trusting `buffer.Length` as "how much data there is", trusting one
+  `Read` to fill the buffer, and letting a rented array escape after return. Mutation-checked —
+  writing one byte too many from the buffer fails three of the four.
 - `EnginePerformanceTests` — allocation budgets for folder-config resolution, block routing, the
   activity-feed drop path, cached reads and write staging.
 - `BlockingIoSchedulerTests`, `JobRegistryTests`, `MetadataCoherenceTests`, `DataSafetyTests`,
