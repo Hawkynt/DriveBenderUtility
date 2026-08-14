@@ -7,16 +7,16 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [31788568623](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/31788568623).
+Generated from run: [31793010617](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/31793010617).
 
-66 scenarios — 62 passing on at least one target, 3 failing.
+67 scenarios — 65 passing on at least one target, 3 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
-| BitRot | `BitRot_GivenEveryCopyIsDamaged_ThenTheLossIsNotPassedOffAsGoodData` | Both copies rot differently: the pool must not silently hand back damaged data as if it were fine. _(held back: When every copy is damaged IDENTICALLY the deep scan reports the pool healthy and the damaged bytes are served without complaint - consistent with copies being compared against each other rather than against the recorded checksums. See docs/Issues.md.)_ | skipped | skipped |
-| BitRot | `BitRot_GivenOneCopyIsSilentlyDamaged_ThenTheIntactContentIsStillServed` | One copy rots silently: the pool still serves the intact content rather than the damaged bytes. _(held back: Reads are not verified against the checksum database, so a silently damaged copy is served to the application even though an intact copy sits on the other member. Reproduced with and without a prior deep scan. This is the failure duplication exists for. See docs/Issues.md.)_ | skipped | skipped |
-| BitRot | `BitRot_WhenTheDeepHealthCheckRepairs_ThenBothCopiesAreIntactAgain` | A deep health check with --fix repairs the damaged copy from the intact one. _(held back: pool-health --deep --fix detects the divergence but declines to repair it: it logs "divergent copies with identical timestamps kept for user resolution" and creates 0 copies. With a checksum baseline the good copy is identifiable, so this need not be a stalemate. See docs/Issues.md.)_ | skipped | skipped |
-| BitRot | `BitRot_WhenTheDeepHealthCheckRuns_ThenTheDamageIsReported` | A deep health check finds silent damage that a shallow one cannot, and reports it. | **FAIL** | pass |
+| BitRot | `BitRot_GivenEveryCopyIsDamaged_ThenTheLossIsNotPassedOffAsGoodData` | Both copies rot differently: the pool must not silently hand back damaged data as if it were fine. | pass | pass |
+| BitRot | `BitRot_GivenOneCopyIsSilentlyDamaged_ThenTheIntactContentIsStillServed` | One copy rots silently: the pool still serves the intact content rather than the damaged bytes. _(held back: Reads are not verified against the checksum database, so a silently damaged copy is served even though an intact one sits on the other member. Not a quick fix: the database holds WHOLE-FILE hashes, and a read serves a block, so there is nothing to check a block against without per-block checksums - a format change with a real cost. A scrub detects and repairs the damage; the exposure is the window before one runs. See docs/Issues.md.)_ | skipped | skipped |
+| BitRot | `BitRot_WhenTheDeepHealthCheckRepairs_ThenBothCopiesAreIntactAgain` | A deep health check with --fix repairs the damaged copy from the intact one. | pass | pass |
+| BitRot | `BitRot_WhenTheDeepHealthCheckRuns_ThenTheDamageIsReported` | A deep health check finds silent damage that a shallow one cannot, and reports it. | pass | pass |
 | Boundary | `Create_GivenManyThreadsRaceForOnePath_ThenExactlyOneFileExistsAndItIsWhole` | Many threads creating the same new path at once: one wins, no exception escapes unexplained, and the file is whole. | pass | pass |
 | Boundary | `Names_GivenLongPathsAndAwkwardNames_ThenTheyRemainAddressableAfterARemount` | A deep tree with long paths and awkward but legal names survives a remount with its content addressable. | pass | pass |
 | Boundary | `Names_GivenTwoPathsDifferingOnlyInCase_ThenNoContentIsLost` | Two names differing only in case: on Windows they are one file, on Linux two, and in neither case does content go missing. | pass | **FAIL** |
@@ -25,7 +25,7 @@ Generated from run: [31788568623](https://github.com/Hawkynt/DriveBenderUtility/
 | Boundary | `Sparse_GivenAWriteFarBeyondTheEnd_ThenTheHoleReadsAsZeroes` | Writing far past the end of a file leaves a hole that reads as zeroes, and the bytes written land at the right offset. | pass | pass |
 | Boundary | `Truncate_GivenAFileIsShrunkThenGrown_ThenTheOldContentDoesNotResurface` | A file shrunk and grown again reads as zeroes in the re-exposed region, never the content that used to be there. | pass | pass |
 | Driver | `Append_GivenRepeatedOpens_ThenTheFileGrowsMonotonically` | Given Repeated Opens , then The File Grows Monotonically | pass | pass |
-| Driver | `Concurrency_GivenManyReadersAndWritersThroughTheOs_ThenNoFileIsCorrupted` | Given Many Readers And Writers Through The Os , then No File Is Corrupted | pass | pass |
+| Driver | `Concurrency_GivenManyReadersAndWritersThroughTheOs_ThenNoFileIsCorrupted` | Given Many Readers And Writers Through The Os , then No File Is Corrupted | pass | **FAIL** |
 | Driver | `Directories_GivenATreeCreatedThroughTheOs_ThenItEnumeratesAndRemoves` | Given ATree Created Through The Os , then It Enumerates And Removes | pass | pass |
 | Driver | `FreeSpace_GivenTheMountedVolume_ThenTheOsReportsPlausibleCapacity` | Given The Mounted Volume , then The Os Reports Plausible Capacity | pass | skipped |
 | Driver | `LargeFile_GivenAMultiMegabyteStream_ThenItRoundTripsThroughTheDriver` | Given AMulti Megabyte Stream , then It Round Trips Through The Driver | pass | pass |
@@ -45,6 +45,7 @@ Generated from run: [31788568623](https://github.com/Hawkynt/DriveBenderUtility/
 | LargeFile | `LargeFile_GivenReadsAroundTheThirtyTwoBitBoundaries_ThenEveryByteIsCorrect` | Reads on both sides of the 2 GiB and 4 GiB-relevant boundaries return the right bytes. | pass | pass |
 | LargeFile | `LargeFile_WhenAppendedTo_ThenTheNewBytesLandPastTheOldEnd` | Appending to a file that is already past 2 GiB puts the bytes at the true end, not at a wrapped offset. | pass | pass |
 | LargeFile | `LargeFile_WhenStreamedEndToEnd_ThenMemoryStaysBoundedAndThroughputHolds` | A file past 2 GiB streams rather than being materialised: the mount's memory stays far below the file size, and throughput stays reasonable. | pass | pass |
+| LargeFile | `LargeFile_WhenWritten_ThenThroughputHoldsAndDoesNotDegradeWithSize` | Writing a file past 2 GiB sustains a sensible rate and does not slow down as the file grows. | pass | pass |
 | LargeFile | `LargeFile_WhenWrittenInThePastTwoGiBRegion_ThenOnlyThatRegionChanges` | Writing into the middle of a file past 2 GiB changes only that region. | pass | pass |
 | ManagementApi | `Api_GivenNoToken_ThenEveryEndpointRefuses` | Given No Token , then Every Endpoint Refuses | pass | pass |
 | ManagementApi | `Assets_GivenAFreshBrowser_ThenThePageAndItsScriptAndStylesAreServed` | Given AFresh Browser , then The Page And Its Script And Styles Are Served | pass | pass |
