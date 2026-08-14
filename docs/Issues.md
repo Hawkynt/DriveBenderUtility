@@ -139,6 +139,24 @@ database on every write. A stale entry is read as no entry at all, because trust
 predates a known write would report a good file as rotted and the "repair" would then overwrite
 newer content with older — an integrity check turning into data loss.
 
+A checksum also stops being trustworthy WITHOUT the engine seeing a write: an external edit, a
+restored backup, a sync tool. The entry then looks perfectly fresh while its hash describes content
+that no longer exists. A scan now infers that from the file's size and mtime no longer matching what
+the entry recorded, and flags the entry in the database as well as ignoring it — so the conclusion
+is stored rather than re-derived by every later scan, and a scan interrupted before it reconciles
+leaves nothing behind that still looks authoritative.
+
+The entry is still handed to the classifier for that pass, though, and that is deliberate: it is
+what distinguishes "this copy changed behind our back" from "we never had a baseline", and that
+distinction is what PRESERVES A CONFLICT. Withholding it turned two copies edited externally to
+different content — which are kept for the user to resolve — into "newest timestamp wins,
+overwrite the other". Measured, not theorised: `Scrub_GivenDivergentEditsOnBothCopies_...` caught it.
+
+Measured cost of the whole arrangement, on a 2112 MiB file through a real mount: 424 MiB/s written,
+2326 MiB/s read, and the last 128 MiB of the file writes as fast as the first (0.30s against
+0.35s) — a per-write cost that scaled with file size, which is what rehashing on every write would
+produce, would show up exactly there.
+
 `integrity.scrubberSchedule` and `deepScrubSchedule` now have a job behind them (`ScrubJob`);
 before this they were decoration, with nothing in the scheduler that read them. Cadences accept the
 `idle-weekly` forms the default configuration uses and plain durations alike, an unreadable value

@@ -1,4 +1,4 @@
-using DivisonM.Vfs;
+﻿using DivisonM.Vfs;
 using DivisonM.Vfs.Caching;
 using DivisonM.Vfs.Engine;
 using DivisonM.Vfs.Tests.TestSupport;
@@ -39,6 +39,42 @@ public class IntegrityTests {
     return (holder, false);
   }
 
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Scrub_GivenACopyChangedBehindThePool_ThenItsRecordedChecksumIsFlaggedNotLeftLookingFresh() {
+    // The hole this closes: the engine flags a checksum when IT performs a write, but an external
+    // edit happens without the engine ever being told. The entry then looks perfectly fresh while
+    // its hash describes content that no longer exists, and anything reading the database later
+    // would take it as authoritative.
+    var content = new byte[512];
+    Array.Fill(content, (byte)0x11);
+    this._CreateWithContent("edited.bin", content);
+
+    var (holder, shadow) = this._PrimaryHolder("edited.bin");
+    var database = new ChecksumDatabase(holder);
+    var key = PoolPaths.ToPhysical("edited.bin", shadow);
+    database.Get(key).Should().NotBeNull("the baseline scrub records a checksum");
+    database.Get(key)!.Stale.Should().BeFalse("nothing has happened to it yet");
+
+    // edited on the member, behind the pool's back — size and mtime move, as any real editor does
+    var replacement = new byte[600];
+    Array.Fill(replacement, (byte)0x22);
+    using (var stream = holder.OpenWrite("edited.bin", shadow, false)) {
+      stream.SetLength(0);
+      stream.Write(replacement, 0, replacement.Length);
+    }
+
+    this._fs.RunScrub();
+
+    // whatever the scrub decided to DO about the edit, the stored checksum must no longer claim to
+    // describe this file: either it was re-baselined to the new content, or it is flagged
+    var after = new ChecksumDatabase(holder).Get(key);
+    (after == null || after.Stale || after.Size == replacement.Length).Should().BeTrue(
+      $"a checksum whose size/mtime no longer match the file must not be left looking authoritative "
+      + $"— found {(after == null ? "no entry" : $"size {after.Size}, stale {after.Stale}")} for a "
+      + $"{replacement.Length}-byte file");
+  }
   [Test]
   [Category("HappyPath")]
   public void Scrub_GivenCleanPool_WhenScrubbed_ThenNoIssues() {

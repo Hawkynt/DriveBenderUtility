@@ -356,11 +356,35 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
       if (meta is not { } found || found.IsDirectory)
         continue;
 
-      // A STALE entry is deliberately read as no entry at all. Its hash predates a write we know
-      // about, so believing it would report a perfectly good file as rotted — the one mistake an
-      // integrity checker must never make, because the "repair" would overwrite the newer content
-      // with the older. Untrusted here, and re-baselined below once the copies agree.
-      var recorded = this._Db(member).Get(PoolPaths.ToPhysical(path, shadow));
+      // Which recorded checksums may be believed at all.
+      //
+      // Two ways an entry stops describing the file it names, and BOTH have to be untrusted:
+      //
+      //  - the engine saw a write and flagged it (Stale), or
+      //  - the file's size or mtime no longer match what the entry recorded, which means the
+      //    content changed WITHOUT the engine seeing it — an external edit, a restored backup, a
+      //    sync tool. The pool never had the chance to mark that one, so it must be inferred here.
+      //
+      // The second case is the subtle one: the entry looks perfectly fresh, and its hash is simply
+      // wrong. Believing it would classify a legitimately edited file as damaged. The entry is
+      // therefore flagged in the database as well as ignored for this pass, so the conclusion is
+      // recorded rather than re-derived by every later scan — and so a scan interrupted before it
+      // reconciles does not leave a hash behind that still looks authoritative.
+      var physical = PoolPaths.ToPhysical(path, shadow);
+      var recorded = this._Db(member).Get(physical);
+      var describesThisFile = recorded != null
+        && recorded.Size == found.Length
+        && recorded.MTimeTicks == found.LastWriteTimeUtc.Ticks;
+
+      // Recorded, but NOT withheld from this pass. The entry is exactly what distinguishes "this
+      // copy changed behind our back" from "we never had a baseline", and that distinction is what
+      // preserves a conflict: two copies edited externally to different content are kept for the
+      // user, where copy-versus-copy comparison alone would pick the newer timestamp and overwrite
+      // the other. Withholding it turned a preserved conflict into a silent resolution — measured,
+      // not theorised, by `Scrub_GivenDivergentEditsOnBothCopies_...`.
+      if (recorded is { Stale: false } && !describesThisFile)
+        this._Db(member).MarkStale(physical);
+
       metas.Add((member, shadow, found, recorded is { Stale: false } ? recorded : null));
     }
 

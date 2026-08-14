@@ -103,6 +103,51 @@ public class LargeFileEndToEndTests {
     return null;
   }
 
+
+  [Test]
+  [Category("Performance")]
+  [Description("Writing a file past 2 GiB sustains a sensible rate and does not slow down as the file grows.")]
+  public void LargeFile_WhenWritten_ThenThroughputHoldsAndDoesNotDegradeWithSize() {
+    // The write rate is measured on the shared 2 GiB+ file in OneTimeSetUp; this reports it and
+    // guards the floor. Reads had a number and writes did not, which is the half of the workload
+    // that actually has to durably land.
+    TestContext.Out.WriteLine($"write: {_writtenBytesPerSecond / (1024 * 1024)} MiB/s for {_SIZE / (1024 * 1024)} MiB");
+
+    _writtenBytesPerSecond.Should().BeGreaterThan(10L * 1024 * 1024,
+      $"writing a large file must not collapse to a crawl (measured {_writtenBytesPerSecond / (1024 * 1024)} MiB/s)");
+
+    // The shape that matters more than the absolute number: a per-write cost that grows with the
+    // file — rehashing it, rescanning it, copying it — shows up as the last stretch being far
+    // slower than the first. Two equal runs on the SAME file, one starting past the 2 GiB mark.
+    var buffer = new byte[_CHUNK];
+    var span = 128 * 1024 * 1024;
+
+    var early = _TimeWrite(0, span, buffer);
+    var late = _TimeWrite(_SIZE - span, span, buffer);
+    TestContext.Out.WriteLine($"first {span / (1024 * 1024)} MiB: {early.TotalSeconds:F2}s, "
+      + $"last {span / (1024 * 1024)} MiB: {late.TotalSeconds:F2}s");
+
+    late.TotalSeconds.Should().BeLessThan(Math.Max(2.0, early.TotalSeconds * 6),
+      $"writing near the end of a {_SIZE / (1024 * 1024)} MiB file took {late.TotalSeconds:F2}s against "
+      + $"{early.TotalSeconds:F2}s near the start — a per-write cost that scales with the file would "
+      + $"look exactly like this, and it is what rehashing on every write would produce");
+  }
+
+  private static TimeSpan _TimeWrite(long offset, int length, byte[] buffer) {
+    using var stream = new FileStream(_pool.PathTo("huge.bin"), FileMode.Open, FileAccess.Write, FileShare.None, 1 << 20);
+    stream.Position = offset;
+    var clock = Stopwatch.StartNew();
+    for (var written = 0; written < length; written += _CHUNK) {
+      var take = Math.Min(_CHUNK, length - written);
+      _FillChunk(buffer, offset + written, take);
+      stream.Write(buffer, 0, take);
+    }
+
+    stream.Flush();
+    clock.Stop();
+    return clock.Elapsed;
+  }
+
   [Test]
   [Category("HappyPath")]
   [Description("A file larger than 2 GiB reports its true length rather than a 32-bit wrapped one.")]
