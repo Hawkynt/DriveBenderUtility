@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using DivisonM.Vfs.Engine;
 using FluentAssertions;
 using NUnit.Framework;
@@ -100,6 +100,69 @@ public class RentedBufferSafetyTests {
 
   /// <summary>Sizes chosen to sit awkwardly against any buffer size: never a whole multiple.</summary>
   private static IEnumerable<int> _AwkwardLengths => [0, 1, 4095, 4097, 64 * 1024 + 1, (1 << 20) + 3];
+
+
+  /// <summary>Records the largest window any caller ever asks it to fill.</summary>
+  private sealed class MeasuringStream(byte[] content) : Stream {
+
+    private int _position;
+
+    public int LargestRequest { get; private set; }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => content.Length;
+    public override long Position { get => this._position; set => throw new NotSupportedException(); }
+
+    public override int Read(byte[] buffer, int offset, int count) => this.Read(buffer.AsSpan(offset, count));
+
+    public override int Read(Span<byte> buffer) {
+      this.LargestRequest = Math.Max(this.LargestRequest, buffer.Length);
+      var remaining = content.Length - this._position;
+      if (remaining <= 0)
+        return 0;
+
+      var take = Math.Min(buffer.Length, remaining);
+      content.AsSpan(this._position, take).CopyTo(buffer);
+      this._position += take;
+      return take;
+    }
+
+    public override void Flush() {
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Copy_GivenABufferSize_ThenNoReadEverExceedsIt() {
+    // ArrayPool.Rent(n) returns an array of AT LEAST n, rounded up to the pool's bucket — ask for
+    // 100_000 and get 131_072. Reading buffer.Length therefore transfers a size decided by pool
+    // internals rather than by the caller, silently overriding the argument they passed. It
+    // produces CORRECT output, which is exactly why the poison tests above cannot catch it and why
+    // this one exists: the defect is the ignored parameter, not a wrong byte.
+    // The premise, asserted rather than assumed: if the pool handed back exactly what was asked
+    // for, using its length would be harmless and this test would pass against the defect too.
+    var probe = ArrayPool<byte>.Shared.Rent(100_000);
+    var rounded = probe.Length;
+    ArrayPool<byte>.Shared.Return(probe);
+    rounded.Should().BeGreaterThan(100_000,
+      "the pool rounds a rent up to its bucket size — without that, using the rented length would "
+      + "be indistinguishable from using the requested one and this test would prove nothing");
+
+    foreach (var bufferSize in new[] { 4096, 100_000, 1 << 20 }) {
+      var source = new MeasuringStream(_Content(3 * (1 << 20)));
+      WholeFilePublisher.CopyCounted(source, new MemoryStream(), bufferSize);
+
+      source.LargestRequest.Should().Be(bufferSize,
+        $"a copy asked to use {bufferSize}-byte buffers must read in {bufferSize}-byte windows; "
+        + $"{source.LargestRequest} means the rented array's own length was used instead");
+    }
+  }
 
   [Test]
   [Category("EdgeCase")]

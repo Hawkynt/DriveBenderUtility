@@ -25,12 +25,15 @@ public static class WholeFilePublisher {
   public static long CopyCounted(Stream source, Stream destination, int bufferSize = CopyBufferSize) {
     var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
     try {
+      // A rented array is at LEAST the size asked for and routinely LARGER — the pool rounds up to
+      // its bucket. So its Length is never the size we asked for, and using it would make the
+      // transfer size depend on pool internals rather than on `bufferSize`, silently ignoring what
+      // the caller specified. The window is pinned to the requested size, once.
+      var window = buffer.AsSpan(0, bufferSize);
       long total = 0;
       int read;
-      // the rented array is at LEAST bufferSize and often larger — using its real length turns that
-      // spare capacity into fewer round trips instead of leaving it idle
-      while ((read = source.Read(buffer.AsSpan())) > 0) {
-        destination.Write(buffer.AsSpan(0, read));
+      while ((read = source.Read(window)) > 0) {
+        destination.Write(window[..read]);
         total += read;
       }
 

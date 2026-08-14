@@ -33,12 +33,16 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
   public static string HashOf(Stream source) {
     // rented, not allocated: a scrub hashes every file on a member, and a fresh megabyte per file
     // is a megabyte of large-object-heap garbage per file
-    var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(1 << 20);
+    const int size = 1 << 20;
+    var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(size);
     try {
+      // sliced to the size ASKED FOR, never buffer.Length: the pool rounds up, so the array is
+      // routinely bigger and its length is not a fact about this operation
+      var window = buffer.AsSpan(0, size);
       var hash = new XxHash3();
       int read;
-      while ((read = source.Read(buffer.AsSpan())) > 0)
-        hash.Append(buffer.AsSpan(0, read));
+      while ((read = source.Read(window)) > 0)
+        hash.Append(window[..read]);
 
       return Convert.ToHexString(hash.GetCurrentHash());
     } finally {

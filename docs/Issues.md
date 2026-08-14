@@ -217,7 +217,11 @@ These now fail the build rather than needing to be re-found:
   dribbles a few bytes per call. A clean pool hands out zeroed arrays and would pass all three of
   the mistakes this guards: trusting `buffer.Length` as "how much data there is", trusting one
   `Read` to fill the buffer, and letting a rented array escape after return. Mutation-checked —
-  writing one byte too many from the buffer fails three of the four.
+  writing one byte too many from the buffer fails three of the four. A fifth guards the mistake the
+  poison cannot catch, because it produces CORRECT output: a rent returns an array at least as big
+  as asked for and usually bigger, so reading its `Length` transfers a size chosen by the pool's
+  bucket rather than by the caller. The test asserts its own premise first — that the pool really
+  does round up — so it cannot pass vacuously.
 - `EnginePerformanceTests` — allocation budgets for folder-config resolution, block routing, the
   activity-feed drop path, cached reads and write staging.
 - `BlockingIoSchedulerTests`, `JobRegistryTests`, `MetadataCoherenceTests`, `DataSafetyTests`,

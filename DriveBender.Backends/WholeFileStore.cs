@@ -87,10 +87,13 @@ public interface IWholeFileStore : IDisposable {
   }
 
   private static void _SkipForward(Stream source, long count) {
-    var scratch = System.Buffers.ArrayPool<byte>.Shared.Rent(64 * 1024);
+    const int size = 64 * 1024;
+    var scratch = System.Buffers.ArrayPool<byte>.Shared.Rent(size);
     try {
+      // bounded by the size requested, not by scratch.Length — the pool hands back a bigger array
+      // than asked for whenever the bucket is bigger, and that is not this code's business
       while (count > 0) {
-        var read = source.Read(scratch.AsSpan(0, (int)Math.Min(scratch.Length, count)));
+        var read = source.Read(scratch.AsSpan(0, (int)Math.Min(size, count)));
         if (read <= 0)
           return; // past the end — the caller reads nothing, which is the right answer
 
