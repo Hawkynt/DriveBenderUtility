@@ -7,12 +7,16 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [31782670360](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/31782670360).
+Generated from run: [31788568623](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/31788568623).
 
-62 scenarios — 61 passing on at least one target, 2 failing.
+66 scenarios — 62 passing on at least one target, 3 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
+| BitRot | `BitRot_GivenEveryCopyIsDamaged_ThenTheLossIsNotPassedOffAsGoodData` | Both copies rot differently: the pool must not silently hand back damaged data as if it were fine. _(held back: When every copy is damaged IDENTICALLY the deep scan reports the pool healthy and the damaged bytes are served without complaint - consistent with copies being compared against each other rather than against the recorded checksums. See docs/Issues.md.)_ | skipped | skipped |
+| BitRot | `BitRot_GivenOneCopyIsSilentlyDamaged_ThenTheIntactContentIsStillServed` | One copy rots silently: the pool still serves the intact content rather than the damaged bytes. _(held back: Reads are not verified against the checksum database, so a silently damaged copy is served to the application even though an intact copy sits on the other member. Reproduced with and without a prior deep scan. This is the failure duplication exists for. See docs/Issues.md.)_ | skipped | skipped |
+| BitRot | `BitRot_WhenTheDeepHealthCheckRepairs_ThenBothCopiesAreIntactAgain` | A deep health check with --fix repairs the damaged copy from the intact one. _(held back: pool-health --deep --fix detects the divergence but declines to repair it: it logs "divergent copies with identical timestamps kept for user resolution" and creates 0 copies. With a checksum baseline the good copy is identifiable, so this need not be a stalemate. See docs/Issues.md.)_ | skipped | skipped |
+| BitRot | `BitRot_WhenTheDeepHealthCheckRuns_ThenTheDamageIsReported` | A deep health check finds silent damage that a shallow one cannot, and reports it. | **FAIL** | pass |
 | Boundary | `Create_GivenManyThreadsRaceForOnePath_ThenExactlyOneFileExistsAndItIsWhole` | Many threads creating the same new path at once: one wins, no exception escapes unexplained, and the file is whole. | pass | pass |
 | Boundary | `Names_GivenLongPathsAndAwkwardNames_ThenTheyRemainAddressableAfterARemount` | A deep tree with long paths and awkward but legal names survives a remount with its content addressable. | pass | pass |
 | Boundary | `Names_GivenTwoPathsDifferingOnlyInCase_ThenNoContentIsLost` | Two names differing only in case: on Windows they are one file, on Linux two, and in neither case does content go missing. | pass | **FAIL** |
