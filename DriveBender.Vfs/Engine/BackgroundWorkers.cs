@@ -47,6 +47,51 @@ public sealed class BackgroundScheduler(IReadOnlyList<IBackgroundJob> jobs) {
 
 }
 
+
+/// <summary>
+/// The periodic bit-rot sweep (FR-SCRUB), on the cadence `integrity.scrubberSchedule` and
+/// `integrity.deepScrubSchedule` already describe.
+///
+/// Reads are deliberately NOT verified — a pool that hashed every block it served would trade its
+/// throughput away for a check that almost always passes. The bargain is that damage is found by
+/// sweeping instead: writes hash what they can and mark what they cannot, and this comes round on a
+/// schedule to re-baseline what is stale and re-read what is not. Without it the schedule in the
+/// configuration is decoration, which is what it was — nothing ran it.
+///
+/// The QUICK pass is cheap: it only hashes files whose recorded metadata deviates, or whose entry a
+/// write marked stale. The DEEP pass re-reads everything and is what actually finds rot, which is
+/// why its default cadence is long and why it is off unless configured.
+/// </summary>
+public sealed class ScrubJob(PoolFileSystem fs, TimeSpan quickEvery, TimeSpan deepEvery, Func<DateTime> clock) : IBackgroundJob {
+
+  private DateTime _lastQuick = clock();
+  private DateTime _lastDeep = clock();
+
+  public string Name => "scrub";
+
+  public bool RunOnce() {
+    var now = clock();
+
+    // deep first when both are due: it subsumes the quick pass, so running quick as well would be
+    // reading every byte twice
+    if (deepEvery > TimeSpan.Zero && now - this._lastDeep >= deepEvery) {
+      this._lastDeep = this._lastQuick = now;
+      var issues = fs.RunScrub();
+      DriveBender.Logger($" - Scheduled deep scrub finished: {issues.Count} issue(s)");
+      return true;
+    }
+
+    if (quickEvery > TimeSpan.Zero && now - this._lastQuick >= quickEvery) {
+      this._lastQuick = now;
+      fs.RunQuickScrub();
+      return true;
+    }
+
+    return false;
+  }
+
+}
+
 /// <summary>
 /// Completes writes owed to lagging copies (the write-back/deferred tail) — the engine's
 /// duplicator: once it settles, every file is back at its duplication level (SAFE-DUP).

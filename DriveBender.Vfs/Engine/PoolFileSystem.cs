@@ -222,11 +222,55 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this), new MemberWatchJob(this), new HealJob(this),
       new TrimIdleResourcesJob([.. this._members.Select(m => m.Io)]),
     };
+
+    // the configured scrub cadence had no job behind it — the setting existed and nothing ran it
+    if (this._config.Integrity?.ChecksumDb != false) {
+      var quick = ScrubCadence(this._config.Integrity?.ScrubberSchedule, TimeSpan.FromHours(24));
+      var deep = ScrubCadence(this._config.Integrity?.DeepScrubSchedule, TimeSpan.Zero);
+      if (quick > TimeSpan.Zero || deep > TimeSpan.Zero)
+        jobs.Add(new ScrubJob(this, quick, deep, this._clock));
+    }
     if (this._config.Trash?.Enabled == true)
       jobs.Add(new TrashMaintenanceJob(this));
 
     return new(jobs);
   }
+
+  /// <summary>
+  /// Turns a scrub schedule into an interval. Accepts a plain duration ("36h"), the
+  /// <c>idle-</c> cadences the default configuration uses, and "off"/null for disabled.
+  /// </summary>
+  public static TimeSpan ScrubCadence(string? schedule, TimeSpan fallback) {
+    if (schedule == null)
+      return fallback;
+
+    var text = schedule.Trim().ToLowerInvariant();
+    if (text.Length == 0 || text == "off" || text == "never" || text == "manual")
+      return TimeSpan.Zero;
+
+    // "idle-weekly" and friends: the cadence is the period; "idle" is a hint about WHEN within it,
+    // which the cooperative pump already honours by yielding to foreground work
+    var period = text.StartsWith("idle-", StringComparison.Ordinal) ? text[5..] : text;
+    return period switch {
+      "hourly" => TimeSpan.FromHours(1),
+      "daily" => TimeSpan.FromDays(1),
+      "weekly" => TimeSpan.FromDays(7),
+      "monthly" => TimeSpan.FromDays(30),
+      _ => _TryDuration(period, fallback),
+    };
+  }
+
+  private static TimeSpan _TryDuration(string text, TimeSpan fallback) {
+    try {
+      return DurationSpec.Parse(text);
+    } catch (Exception) {
+      DriveBender.Logger($"[Warning]Unrecognised scrub schedule '{text}' — using {fallback}");
+      return fallback;
+    }
+  }
+
+  /// <summary>The cheap integrity pass: only files whose metadata deviates, or whose checksum a write marked stale.</summary>
+  public IReadOnlyList<IntegrityIssue> RunQuickScrub() => this._integrity.QuickScan(this._Invalidate);
 
   /// <summary>Applies the configured trash retention and size cap, purging oldest first (§6.14).</summary>
   public int PurgeTrash() {

@@ -129,7 +129,22 @@ scenarios only pass with the scrub run while nothing is mounted, which is what t
 user this means the obvious action — health-check the pool you have mounted — achieves nothing
 durable. The two processes need to agree on ownership of that file.
 
-**Still open — reads are not verified.** A silently damaged copy is served to the application even
+**Decided, not open — reads are trusted and are not verified.** Hashing every block served would
+trade the pool's throughput away for a check that nearly always passes. The bargain instead is:
+writes record what they can and MARK what they cannot, and a scheduled sweep re-baselines the marks
+and finds the damage. Marking rather than deleting is what makes the write side cheap — a
+positional write cannot rehash a whole file without making random access cost O(file) per
+operation, and a file rewritten continuously marks its entry ONCE instead of dirtying the checksum
+database on every write. A stale entry is read as no entry at all, because trusting a hash that
+predates a known write would report a good file as rotted and the "repair" would then overwrite
+newer content with older — an integrity check turning into data loss.
+
+`integrity.scrubberSchedule` and `deepScrubSchedule` now have a job behind them (`ScrubJob`);
+before this they were decoration, with nothing in the scheduler that read them. Cadences accept the
+`idle-weekly` forms the default configuration uses and plain durations alike, an unreadable value
+degrades to sweeping rather than to silence, and `off`/`never`/`manual` disable it.
+
+**Known consequence of that decision.** A silently damaged copy is served to the application even
 though an intact one sits on the other member, and the caller gets no error, so it believes the
 bytes and writes them onward. This is not a quick fix and should not be treated as one: the
 database holds WHOLE-FILE hashes while a read serves a BLOCK, so there is nothing to check a block

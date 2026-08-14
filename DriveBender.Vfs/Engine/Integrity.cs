@@ -8,7 +8,19 @@ namespace DivisonM.Vfs.Engine;
 public sealed record ChecksumEntry(
   [property: JsonPropertyName("size")] long Size,
   [property: JsonPropertyName("mtime")] long MTimeTicks,
-  [property: JsonPropertyName("hash")] string Hash
+  [property: JsonPropertyName("hash")] string Hash,
+
+  /// <summary>
+  /// The recorded hash is known to be out of date and must NOT be trusted by a scan.
+  ///
+  /// A positional write changes part of a file, and rehashing the whole thing on every such write
+  /// would make random access cost O(file) per operation — unacceptable for a database or a VM
+  /// image. So the write marks the entry stale and moves on, and the next scrub re-baselines it
+  /// from a single streamed read. Marking rather than deleting matters twice over: a scan can tell
+  /// "never known" from "known to be dirty", and a hot file being rewritten thousands of times
+  /// marks the entry ONCE instead of dirtying the database on every write.
+  /// </summary>
+  [property: JsonPropertyName("stale")] bool Stale = false
 );
 
 /// <summary>
@@ -82,6 +94,22 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
     lock (this._lock) {
       this._Load()[physicalPath] = entry;
       this._dirty = true;
+    }
+  }
+
+  /// <summary>
+  /// Flags an entry as no longer trustworthy. Returns false when it was already flagged (or absent),
+  /// so a file under continuous random writes does not dirty the database again and again.
+  /// </summary>
+  public bool MarkStale(string physicalPath) {
+    lock (this._lock) {
+      var entries = this._Load();
+      if (!entries.TryGetValue(physicalPath, out var entry) || entry.Stale)
+        return false;
+
+      entries[physicalPath] = entry with { Stale = true };
+      this._dirty = true;
+      return true;
     }
   }
 
@@ -194,11 +222,19 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     this._Db(member).Set(PoolPaths.ToPhysical(normalizedPath, shadow), new(meta.Value.Length, meta.Value.LastWriteTimeUtc.Ticks, hash));
   }
 
-  /// <summary>A positional write changed part of a file: the stale entries drop; the next scrub re-baselines.</summary>
+  /// <summary>
+  /// A write changed part of a file: its recorded checksums are MARKED stale, not dropped.
+  ///
+  /// Rehashing on the write path would make every positional write cost a full file read, which is
+  /// exactly the pattern a database or a VM image uses. Marking defers that to the scrub, which
+  /// re-baselines from one streamed pass. Keeping the entry lets a scan distinguish "never
+  /// baselined" from "known dirty", and a file being rewritten continuously is marked once rather
+  /// than dirtying the database on every write.
+  /// </summary>
   public void InvalidateFile(string normalizedPath) {
     foreach (var database in this._databases.Values)
     foreach (var shadow in new[] { false, true })
-      database.Remove(PoolPaths.ToPhysical(normalizedPath, shadow));
+      database.MarkStale(PoolPaths.ToPhysical(normalizedPath, shadow));
   }
 
   public void RenameFile(string fromNormalized, string toNormalized) {
@@ -320,7 +356,12 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
       if (meta is not { } found || found.IsDirectory)
         continue;
 
-      metas.Add((member, shadow, found, this._Db(member).Get(PoolPaths.ToPhysical(path, shadow))));
+      // A STALE entry is deliberately read as no entry at all. Its hash predates a write we know
+      // about, so believing it would report a perfectly good file as rotted — the one mistake an
+      // integrity checker must never make, because the "repair" would overwrite the newer content
+      // with the older. Untrusted here, and re-baselined below once the copies agree.
+      var recorded = this._Db(member).Get(PoolPaths.ToPhysical(path, shadow));
+      metas.Add((member, shadow, found, recorded is { Stale: false } ? recorded : null));
     }
 
     if (metas.Count == 0)
@@ -434,6 +475,7 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
         // bit-rot detection could never start working. Recording here is unambiguous — it happens
         // only when every copy of the file agrees, which is the one moment the content is not in
         // question — and it touches the checksum sidecar, never pool data.
+        // this rewrites stale entries too — RecordHash stores a fresh, trusted one
         foreach (var view in views.Where(v => v.Entry == null))
           this.RecordHash(view.Member, path, view.Shadow, view.Hash);
 
