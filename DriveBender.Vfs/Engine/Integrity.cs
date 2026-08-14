@@ -1,4 +1,4 @@
-using System.IO.Hashing;
+﻿using System.IO.Hashing;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -31,13 +31,19 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
 
   /// <summary>Hashes a stream incrementally through a fixed buffer — never materialises the whole file (SAFE-BIGFILE).</summary>
   public static string HashOf(Stream source) {
-    var hash = new XxHash3();
-    var buffer = new byte[1 << 20];
-    int read;
-    while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
-      hash.Append(buffer.AsSpan(0, read));
+    // rented, not allocated: a scrub hashes every file on a member, and a fresh megabyte per file
+    // is a megabyte of large-object-heap garbage per file
+    var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(1 << 20);
+    try {
+      var hash = new XxHash3();
+      int read;
+      while ((read = source.Read(buffer.AsSpan())) > 0)
+        hash.Append(buffer.AsSpan(0, read));
 
-    return Convert.ToHexString(hash.GetCurrentHash());
+      return Convert.ToHexString(hash.GetCurrentHash());
+    } finally {
+      System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+    }
   }
 
   private Dictionary<string, ChecksumEntry> _Load() {

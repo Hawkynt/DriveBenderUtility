@@ -1,4 +1,4 @@
-namespace DivisonM.Vfs.Engine;
+﻿namespace DivisonM.Vfs.Engine;
 
 /// <summary>
 /// Publishes whole-file content honouring backend capability gaps (FR-CAP-ADAPT): a
@@ -27,8 +27,10 @@ public static class WholeFilePublisher {
     try {
       long total = 0;
       int read;
-      while ((read = source.Read(buffer, 0, bufferSize)) > 0) {
-        destination.Write(buffer, 0, read);
+      // the rented array is at LEAST bufferSize and often larger — using its real length turns that
+      // spare capacity into fewer round trips instead of leaving it idle
+      while ((read = source.Read(buffer.AsSpan())) > 0) {
+        destination.Write(buffer.AsSpan(0, read));
         total += read;
       }
 

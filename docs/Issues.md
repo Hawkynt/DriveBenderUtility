@@ -210,8 +210,8 @@ These now fail the build rather than needing to be re-found:
   and the file streams end to end. The fixture caps the pool's cache at 256 MiB on purpose: the
   default global cache is 4 GiB, so a 2 GiB file fits in it entirely and the mount's memory would
   sit near the file size for a perfectly good reason — with a small cache, memory has to track the
-  BUDGET, which is the property SAFE-BIGFILE actually claims. Measured 554 MiB peak for a 2112 MiB
-  file at 1451 MiB/s. It self-skips, with the reason, when the machine lacks ~6 GiB free.
+  BUDGET, which is the property SAFE-BIGFILE actually claims. Measured 469 MiB peak for a 2112 MiB
+  file at 2131 MiB/s. It self-skips, with the reason, when the machine lacks ~6 GiB free.
 - `EnginePerformanceTests` — allocation budgets for folder-config resolution, block routing, the
   activity-feed drop path, cached reads and write staging.
 - `BlockingIoSchedulerTests`, `JobRegistryTests`, `MetadataCoherenceTests`, `DataSafetyTests`,

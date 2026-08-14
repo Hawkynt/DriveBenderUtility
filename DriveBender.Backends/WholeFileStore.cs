@@ -87,13 +87,17 @@ public interface IWholeFileStore : IDisposable {
   }
 
   private static void _SkipForward(Stream source, long count) {
-    var scratch = new byte[64 * 1024];
-    while (count > 0) {
-      var read = source.Read(scratch, 0, (int)Math.Min(scratch.Length, count));
-      if (read <= 0)
-        return; // past the end — the caller reads nothing, which is the right answer
+    var scratch = System.Buffers.ArrayPool<byte>.Shared.Rent(64 * 1024);
+    try {
+      while (count > 0) {
+        var read = source.Read(scratch.AsSpan(0, (int)Math.Min(scratch.Length, count)));
+        if (read <= 0)
+          return; // past the end — the caller reads nothing, which is the right answer
 
-      count -= read;
+        count -= read;
+      }
+    } finally {
+      System.Buffers.ArrayPool<byte>.Shared.Return(scratch);
     }
   }
 

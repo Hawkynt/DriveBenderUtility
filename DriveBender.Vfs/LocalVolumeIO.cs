@@ -152,15 +152,27 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     public override long Length => RandomAccess.GetLength(lease.Handle);
     public override long Position { get => this._position; set => this._position = value; }
 
-    public override int Read(byte[] buffer, int offset, int count) {
-      var read = RandomAccess.Read(lease.Handle, buffer.AsSpan(offset, count), this._position);
+    public override int Read(byte[] buffer, int offset, int count) => this.Read(buffer.AsSpan(offset, count));
+
+    public override void Write(byte[] buffer, int offset, int count) => this.Write(buffer.AsSpan(offset, count));
+
+    /// <summary>
+    /// The span overloads are the REAL implementations, and overriding them matters.
+    ///
+    /// <see cref="Stream"/>'s base versions satisfy a span caller by renting an array, copying
+    /// into it and copying back out — so every <see cref="Stream.CopyTo(Stream)"/>, which uses the
+    /// span path internally, paid for two copies it did not need. Going straight to
+    /// <see cref="RandomAccess"/> is one syscall against the caller's own memory.
+    /// </summary>
+    public override int Read(Span<byte> buffer) {
+      var read = RandomAccess.Read(lease.Handle, buffer, this._position);
       this._position += read;
       return read;
     }
 
-    public override void Write(byte[] buffer, int offset, int count) {
-      RandomAccess.Write(lease.Handle, buffer.AsSpan(offset, count), this._position);
-      this._position += count;
+    public override void Write(ReadOnlySpan<byte> buffer) {
+      RandomAccess.Write(lease.Handle, buffer, this._position);
+      this._position += buffer.Length;
     }
 
     public override void Flush() {

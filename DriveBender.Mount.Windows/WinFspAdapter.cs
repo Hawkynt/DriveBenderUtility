@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using DivisonM.Vfs;
 using DivisonM.Vfs.Engine;
 using Fsp;
@@ -173,16 +173,22 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
     }
   }
 
-  public override int Read(object fileNode, object fileDesc, IntPtr buffer, ulong offset, uint length, out uint bytesTransferred) {
+  /// <summary>
+  /// Reads STRAIGHT into WinFsp's buffer.
+  ///
+  /// The engine takes a <see cref="Span{T}"/>, and WinFsp hands us native memory, so the obvious
+  /// implementation — allocate a scratch array, read into it, <c>Marshal.Copy</c> it out — buys
+  /// nothing and costs a great deal: at megabyte transfers every read allocated on the large object
+  /// heap and copied the payload a second time, on the hottest path there is.
+  /// </summary>
+  public override unsafe int Read(object fileNode, object fileDesc, IntPtr buffer, ulong offset, uint length, out uint bytesTransferred) {
     bytesTransferred = 0;
     var descriptor = (FileDescriptor)fileDesc;
     try {
-      var scratch = new byte[length];
-      var read = pool.Read(descriptor.Handle, scratch, (long)offset);
+      var read = pool.Read(descriptor.Handle, new Span<byte>((void*)buffer, (int)length), (long)offset);
       if (read == 0)
         return STATUS_END_OF_FILE;
 
-      Marshal.Copy(scratch, 0, buffer, read);
       bytesTransferred = (uint)read;
       return STATUS_SUCCESS;
     } catch (PoolFsException e) {
@@ -194,7 +200,8 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
     }
   }
 
-  public override int Write(object fileNode, object fileDesc, IntPtr buffer, ulong offset, uint length, bool writeToEndOfFile, bool constrainedIo, out uint bytesTransferred, out FspFileInfo fileInfo) {
+  /// <summary>Writes STRAIGHT out of WinFsp's buffer — see <see cref="Read"/> for why the copy is gone.</summary>
+  public override unsafe int Write(object fileNode, object fileDesc, IntPtr buffer, ulong offset, uint length, bool writeToEndOfFile, bool constrainedIo, out uint bytesTransferred, out FspFileInfo fileInfo) {
     bytesTransferred = 0;
     fileInfo = default;
     var descriptor = (FileDescriptor)fileDesc;
@@ -209,9 +216,8 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
         length = (uint)Math.Min(length, currentLength - (long)offset);
       }
 
-      var scratch = new byte[length];
-      Marshal.Copy(buffer, scratch, 0, (int)length);
-      var written = pool.Write(descriptor.Handle, scratch, writeToEndOfFile ? 0 : (long)offset, writeToEndOfFile ? WriteMode.Append : WriteMode.Normal);
+      var written = pool.Write(descriptor.Handle, new ReadOnlySpan<byte>((void*)buffer, (int)length),
+        writeToEndOfFile ? 0 : (long)offset, writeToEndOfFile ? WriteMode.Append : WriteMode.Normal);
       bytesTransferred = (uint)written;
       _Fill(pool.GetAttributes(descriptor.Path), out fileInfo);
       return STATUS_SUCCESS;
