@@ -216,6 +216,21 @@ public sealed class MountedPool : IDisposable {
   /// </summary>
   public bool IsMountAlive => !this._mountProcess.HasExited;
 
+  /// <summary>
+  /// The largest resident memory the mount process has reached, for tests that assert the engine
+  /// STREAMS rather than materialising. A whole-file buffer shows up here and nowhere else.
+  /// </summary>
+  public long PeakWorkingSetBytes {
+    get {
+      try {
+        this._mountProcess.Refresh();
+        return this._mountProcess.PeakWorkingSet64;
+      } catch (Exception) {
+        return 0; // the process is gone; the caller's other assertions will say so
+      }
+    }
+  }
+
   public string PathTo(params string[] segments) => Path.Combine([this.MountPath, .. segments]);
 
   /// <summary>

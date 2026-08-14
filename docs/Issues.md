@@ -183,6 +183,16 @@ provider-level range reads, and the whole-object RAM spikes — are closed above
   are synchronous; what is fixed is that the wait is safe, contained, and off the shared thread
   pool (`BlockingIoScheduler`).
 
+## Known limits, deliberately
+
+- **A remote member whose provider can neither range-read nor stream cannot hold a file over ~2 GiB.**
+  Such an object has to pass through a `byte[]`, and .NET caps one just above 2 GiB. The engine now
+  says exactly that — naming the file, its size and the missing capability — instead of surfacing an
+  OutOfMemoryException from inside a provider SDK. Providers that stream are no longer capped: the
+  whole-file read path uses the stream when ranges are unavailable, and the interface's ranged-read
+  default skips forward through a stream rather than slicing an array. Local members, and any
+  provider with range or streaming support, have no such limit.
+
 ## Standing guards
 
 These now fail the build rather than needing to be re-found:
@@ -194,6 +204,14 @@ These now fail the build rather than needing to be re-found:
 - `CrashConsistencyTests` — write, delete, rename and create each interrupted at **every** volume
   operation they perform, with a guard that fails if a case sits past the operation's real length
   and therefore tests nothing.
+- `LargeFileEndToEndTests` — a 2 GiB + 64 MiB file through a real mount: the length is reported in
+  full, reads land correctly on both sides of `int.MaxValue` and 2 GiB, an append extends the true
+  end rather than wrapping to the start, a positional write past 2 GiB touches only its own region,
+  and the file streams end to end. The fixture caps the pool's cache at 256 MiB on purpose: the
+  default global cache is 4 GiB, so a 2 GiB file fits in it entirely and the mount's memory would
+  sit near the file size for a perfectly good reason — with a small cache, memory has to track the
+  BUDGET, which is the property SAFE-BIGFILE actually claims. Measured 554 MiB peak for a 2112 MiB
+  file at 1451 MiB/s. It self-skips, with the reason, when the machine lacks ~6 GiB free.
 - `EnginePerformanceTests` — allocation budgets for folder-config resolution, block routing, the
   activity-feed drop path, cached reads and write staging.
 - `BlockingIoSchedulerTests`, `JobRegistryTests`, `MetadataCoherenceTests`, `DataSafetyTests`,

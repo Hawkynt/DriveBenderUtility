@@ -57,15 +57,58 @@ public interface IWholeFileStore : IDisposable {
   /// difference the capability exists to express.
   /// </summary>
   Stream OpenReadRange(string physicalPath, long offset, long count) {
-    var whole = this.Download(physicalPath);
-    if (offset >= whole.LongLength || count <= 0)
+    if (count <= 0)
       return new MemoryStream([], false);
 
+    // Stream and skip when the provider can stream: the object still moves whole, but never
+    // becomes a byte[], so this works past 2 GiB — where the slice below cannot, because both a
+    // .NET array and MemoryStream's offset are capped at int (SAFE-BIGFILE).
+    if ((this.Caps & StoreCaps.StreamingDownload) != 0) {
+      var source = this.OpenRead(physicalPath);
+      try {
+        if (source.CanSeek)
+          source.Seek(offset, SeekOrigin.Begin);
+        else
+          _SkipForward(source, offset);
+
+        return new WindowedStream(source, count);
+      } catch {
+        source.Dispose();
+        throw;
+      }
+    }
+
+    var whole = this.Download(physicalPath);
+    if (offset >= whole.LongLength)
+      return new MemoryStream([], false);
+
+    // offset is inside a byte[] here, so it fits an int by construction
     return new MemoryStream(whole, (int)offset, (int)Math.Min(count, whole.LongLength - offset), false);
+  }
+
+  private static void _SkipForward(Stream source, long count) {
+    var scratch = new byte[64 * 1024];
+    while (count > 0) {
+      var read = source.Read(scratch, 0, (int)Math.Min(scratch.Length, count));
+      if (read <= 0)
+        return; // past the end — the caller reads nothing, which is the right answer
+
+      count -= read;
+    }
   }
 
   /// <summary>Uploads from a stream; the default buffers it whole, which is what <see cref="StoreCaps.StreamingUpload"/> avoids.</summary>
   void Upload(string physicalPath, Stream content, long length = -1) {
+    // Same ceiling as the read side: without streaming the object has to become a byte[], and .NET
+    // caps one at just over 2 GiB. Saying so plainly beats an OutOfMemoryException from inside a
+    // provider SDK, which names neither the file nor the reason.
+    const long limit = 2L * 1024 * 1024 * 1024 - 64 * 1024 * 1024;
+    if (length > limit)
+      throw new NotSupportedException(
+        $"Cannot upload '{physicalPath}' ({length / (1024 * 1024)} MiB): this provider cannot stream an upload, so "
+        + $"the object must be held whole in memory, which is capped at about 2 GiB. Files this size need a "
+        + $"provider with streaming upload support.");
+
     using var buffer = length is > 0 and <= int.MaxValue ? new MemoryStream((int)length) : new MemoryStream();
     content.CopyTo(buffer);
     this.Upload(physicalPath, buffer.ToArray());
@@ -91,6 +134,52 @@ public interface IWholeFileStore : IDisposable {
   /// overrides this to true so it is not needlessly serialized.
   /// </summary>
   bool ThreadSafe => false;
+
+}
+
+/// <summary>
+/// The first <c>count</c> bytes of another stream, which it owns.
+///
+/// Used to answer a ranged read from a provider that can stream but cannot seek: the object is
+/// skipped forward to the offset and then cut off after the window, so only the window is ever
+/// held — an object larger than a <c>byte[]</c> can hold is served without materialising it.
+/// </summary>
+internal sealed class WindowedStream(Stream inner, long count) : Stream {
+
+  private long _remaining = count;
+
+  public override bool CanRead => true;
+  public override bool CanSeek => false;
+  public override bool CanWrite => false;
+  public override long Length => count;
+
+  public override long Position {
+    get => count - this._remaining;
+    set => throw new NotSupportedException();
+  }
+
+  public override int Read(byte[] buffer, int offset, int length) {
+    if (this._remaining <= 0)
+      return 0;
+
+    var read = inner.Read(buffer, offset, (int)Math.Min(length, this._remaining));
+    this._remaining -= read;
+    return read;
+  }
+
+  public override void Flush() {
+  }
+
+  public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+  public override void SetLength(long value) => throw new NotSupportedException();
+  public override void Write(byte[] buffer, int offset, int length) => throw new NotSupportedException();
+
+  protected override void Dispose(bool disposing) {
+    if (disposing)
+      inner.Dispose();
+
+    base.Dispose(disposing);
+  }
 
 }
 
@@ -159,6 +248,26 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
   private readonly LinkedList<string> _readCacheOrder = new();
   private readonly Dictionary<string, (byte[] content, DateTime at, LinkedListNode<string> node)> _readCache = new(StringComparer.OrdinalIgnoreCase);
   private long _readCacheBytes;
+
+  /// <summary>
+  /// Refuses, in terms the user can act on, an object too big to pass through a <c>byte[]</c>.
+  ///
+  /// A provider with neither ranges nor streaming can only be handed a whole array, and .NET caps
+  /// one at just over 2 GiB. Left alone this surfaces as an OutOfMemoryException from somewhere
+  /// deep in a provider SDK, which says nothing about which file, which member, or what to do.
+  /// The limit belongs to the provider's capabilities, so the message names them.
+  /// </summary>
+  private static void _RefuseIfTooLargeToMaterialise(string physical, long size, string relativePath, string operation) {
+    const long limit = 2L * 1024 * 1024 * 1024 - 64 * 1024 * 1024; // .NET's array ceiling, with headroom
+
+    if (size <= limit)
+      return;
+
+    throw new PoolFsException(PoolFsError.NotSupported,
+      $"Cannot {operation} '{relativePath}' ({size / (1024 * 1024)} MiB) on this member: its provider supports "
+      + $"neither ranged reads nor streaming, so the object has to be held whole in memory, and that is capped "
+      + $"at about 2 GiB. Files this size need a provider with range or streaming support. (object: {physical})");
+  }
 
   private byte[] _CachedDownload(string physical) {
     lock (this._readCacheLock) {
@@ -323,6 +432,13 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
     if ((this._store.Caps & StoreCaps.RangeRead) != 0)
       return new RangeReadStream(this, physical, size);
 
+    // Streaming beats materialising even without ranges: the object still moves whole, but through
+    // a pipe rather than into a byte[], so it is not capped at 2 GiB and does not spike RAM by its
+    // own size (SAFE-BIGFILE).
+    if ((this._store.Caps & StoreCaps.StreamingDownload) != 0)
+      return this._store.OpenRead(physical);
+
+    _RefuseIfTooLargeToMaterialise(physical, size, relativePath, "read");
     return new MemoryStream(this._CachedDownload(physical), writable: false);
   });
 
