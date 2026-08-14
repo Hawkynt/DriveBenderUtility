@@ -196,6 +196,45 @@ four times slower than it is (15,000 rather than 69,000). Each worker now takes 
 the clock starts.
 
 
+### Why writes look slow, and how much of it is deliberate
+
+The write rows in `docs/Performance.md` were all within a few percent of each other — around
+700 MiB/s whether the pool's cache was 3 GiB or 32 MiB. That is the tell: **cache size makes no
+difference to a write because a write never touches the cache.** By default an acknowledgement
+means the bytes are on a disk (SAFE-NOLOSS), so the rate is the device's, minus the engine.
+
+Measured, so the trade-off is priced rather than argued:
+
+| | Sequential write, 1.5 GiB |
+| --- | ---: |
+| Raw device, buffered, one fsync at the end | 1,920 MiB/s |
+| Raw device, WRITE_THROUGH (what a member handle uses) | 1,930 MiB/s |
+| Pool, default (ack means on disk) | ~660 MiB/s |
+| Pool, `write.policy: performance` + `acceptVolatileAck` | ~1,100 MiB/s |
+
+Three things fall out of that:
+
+1. **WRITE_THROUGH is free on this device** — 1,930 against 1,920 buffered. It is not the cost, and
+   an NVMe that ignores the distinction is the common case now.
+2. **The RAM-ack path is worth roughly 1.4–1.7x** and already exists as an explicit per-folder
+   opt-in. Nothing needs building for a user who wants it; it needs documenting so they know the
+   choice is theirs.
+3. **A gap to the device remains even with the ack from RAM** — 1,100 against 1,920. That is engine
+   overhead on the write path, and it is worth chasing.
+
+Ruled out while looking, so the next pass does not repeat it:
+- **Not transfer chunking.** WinFsp delivers the application's writes whole — instrumented and
+  counted: 64 callbacks averaging exactly 8 MiB for a 512 MiB write, not the 64 KiB fragments that
+  would explain this.
+- **Not WRITE_THROUGH**, per the table above.
+
+The strongest remaining suspect is `PoolFileSystem.Write`, which begins `var bytes = data.ToArray()`
+— a full copy of every write before anything else happens, so an 8 MiB write allocates 8 MiB on the
+large object heap and a 512 MiB transfer produces 512 MiB of garbage. The copy exists so the write
+buffer can take ownership when copies are owed; when nothing is owed it is pure waste. Making it
+conditional touches the ack-quorum and journalling path, which is the most safety-critical code in
+the product, so it is written down rather than attempted in passing.
+
 ## Still open
 
 An earlier revision of this file claimed "nothing known" here. That was wrong — it dropped the two

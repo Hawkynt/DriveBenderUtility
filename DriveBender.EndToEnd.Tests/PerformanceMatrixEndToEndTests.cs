@@ -59,9 +59,22 @@ public class PerformanceMatrixEndToEndTests {
   /// <summary>A pool whose cache is far below the working set: reads hit the member.</summary>
   private const string _SMALL_CACHE = """{ "caches": { "global": { "size": "32MiB" } } }""";
 
+  /// <summary>
+  /// The only configuration in which a WRITE is answered from RAM.
+  ///
+  /// By default an acknowledgement means the bytes are on a disk — which is why the cache size
+  /// makes no difference at all to the write rows above, and why they look slow next to what RAM
+  /// can do. `performance` + `acceptVolatileAck` is the explicit, per-folder opt-in that lets the
+  /// ack come from memory (SAFE-RAM); fsync still forces durability. Measuring it is the only way
+  /// to show what the default is BUYING.
+  /// </summary>
+  private const string _VOLATILE_ACK =
+    """{ "write": { "policy": "performance", "acceptVolatileAck": true } }""";
+
   private static MountedPool _cached = null!;
   private static MountedPool _uncached = null!;
   private static MountedPool _tiered = null!;
+  private static MountedPool _volatileAck = null!;
   private static readonly List<(string Tier, string Workload, string Threads, string Result)> _rows = [];
 
   private static void _Record(string tier, string workload, string threads, string result) {
@@ -85,6 +98,7 @@ public class PerformanceMatrixEndToEndTests {
     _cached = MountedPool.Create(poolDefaults: _BIG_CACHE);
     _uncached = MountedPool.Create(poolDefaults: _SMALL_CACHE);
     _tiered = MountedPool.Create(members: 2, poolDefaults: _SMALL_CACHE, landingZones: 1);
+    _volatileAck = MountedPool.Create(poolDefaults: _VOLATILE_ACK);
   }
 
   [OneTimeTearDown]
@@ -92,6 +106,7 @@ public class PerformanceMatrixEndToEndTests {
     _cached?.Dispose();
     _uncached?.Dispose();
     _tiered?.Dispose();
+    _volatileAck?.Dispose();
 
     if (_rows.Count == 0)
       return;
@@ -186,6 +201,14 @@ public class PerformanceMatrixEndToEndTests {
 
     var landingWrite = _WriteLarge(_tiered, "large.bin");
     _Record("Landing", "sequential write, 1.5 GiB", "1", _Rate(landingWrite));
+
+    // The row that explains the three above. They are all within a few percent of each other
+    // BECAUSE none of them uses RAM: by default the acknowledgement means the bytes are on a disk,
+    // so the cache size is irrelevant to a write and the rate is the device's, minus the engine.
+    var volatileWrite = _WriteLarge(_volatileAck, "large.bin");
+    _Record("RAM ack", "sequential write, 1.5 GiB (opt-in)", "1", _Rate(volatileWrite));
+    _Record("RAM ack", "vs. durability-first default", "1",
+      string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{(double)volatileWrite / cachedWrite:N2}x"));
 
     foreach (var (what, rate) in new[] {
                ("cached write", cachedWrite), ("cached read", warm),

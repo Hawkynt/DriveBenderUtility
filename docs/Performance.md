@@ -13,19 +13,21 @@ Host: 20 logical CPUs; multi-thread rows use 20 threads.
 
 | Tier | Workload | Threads | Result |
 | --- | --- | --- | ---: |
-| RAM cache | sequential write, 1.5 GiB | 1 | 683 MiB/s |
-| RAM cache | sequential read, 1.5 GiB | 1 | 3,167 MiB/s |
-| Storage | sequential write, 1.5 GiB | 1 | 712 MiB/s |
-| Storage | sequential read, 1.5 GiB | 1 | 2,153 MiB/s |
-| Landing | sequential write, 1.5 GiB | 1 | 703 MiB/s |
-| RAM cache | random 4 KiB read | 1 | 73,011 IOPS |
-| RAM cache | random 4 KiB read | 20 | 56,626 IOPS |
-| Storage | random 4 KiB read | 1 | 3,682 IOPS |
-| Storage | random 4 KiB read | 20 | 3,158 IOPS |
-| RAM cache | random 4 KiB read scaling | 1 -> 20 | 78 % of single-thread |
+| RAM cache | sequential write, 1.5 GiB | 1 | 679 MiB/s |
+| RAM cache | sequential read, 1.5 GiB | 1 | 1,962 MiB/s |
+| Storage | sequential write, 1.5 GiB | 1 | 562 MiB/s |
+| Storage | sequential read, 1.5 GiB | 1 | 1,890 MiB/s |
+| Landing | sequential write, 1.5 GiB | 1 | 653 MiB/s |
+| RAM ack | sequential write, 1.5 GiB (opt-in) | 1 | 956 MiB/s |
+| RAM ack | vs. durability-first default | 1 | 1.41x |
+| RAM cache | random 4 KiB read | 1 | 55,812 IOPS |
+| RAM cache | random 4 KiB read | 20 | 42,557 IOPS |
+| Storage | random 4 KiB read | 1 | 2,738 IOPS |
+| Storage | random 4 KiB read | 20 | 2,810 IOPS |
+| RAM cache | random 4 KiB read scaling | 1 -> 20 | 76 % of single-thread |
 | Storage | create+write+close, 3072 B | 1 | 67 IOPS |
-| Storage | create+write+close, 3072 B | 20 | 103 IOPS |
+| Storage | create+write+close, 3072 B | 20 | 98 IOPS |
 | Landing | create+write+close, 3072 B | 20 | 96 IOPS |
-| RAM cache | open+read+close, 3072 B | 1 | 2,259 IOPS |
-| RAM cache | open+read+close, 3072 B | 20 | 10,906 IOPS |
-| RAM cache | open+read+close scaling, 3072 B | 1 -> 20 | 4.8x |
+| RAM cache | open+read+close, 3072 B | 1 | 2,113 IOPS |
+| RAM cache | open+read+close, 3072 B | 20 | 10,698 IOPS |
+| RAM cache | open+read+close scaling, 3072 B | 1 -> 20 | 5.1x |
