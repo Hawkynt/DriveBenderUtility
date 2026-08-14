@@ -99,41 +99,44 @@ member-returns-while-io-is-in-flight scenario — all four were held back and al
 end-to-end suite also dropped from 5m09s to 2m25s, because those tests no longer sit out two-minute
 timeouts.
 
-### Found this pass: duplication protects against a disk dying, not against silent corruption
+### Bit-rot: two of three fixed, and the remaining one is a format decision
 
-The end-to-end battery had no bit-rot scenario at all, which is a striking gap for a product whose
-central promise is holding two copies. `BitRotEndToEndTests` adds one: the bytes of ONE copy are
-altered on the member behind the pool's back and the timestamps are then restored, because real rot
-does not update mtime. A pool that resolves conflicts by comparing modification times cannot tell
-the good copy from the rotten one under those conditions — only content can.
+The battery had no bit-rot scenario at all, which was a striking gap for a product whose central
+promise is holding two copies. `BitRotEndToEndTests` adds one: the bytes of ONE copy are altered on
+the member behind the pool's back and the timestamps are then restored, because real rot does not
+update mtime — so a pool that resolves conflicts by comparing times cannot tell the good copy from
+the rotten one, and only content can.
 
-What works: `pool-health --deep` DOES notice that two copies have diverged and reports it. That
-scenario passes and stays in the suite as a guard.
+The classification in `IntegrityService` turned out to be sound already — it separates rot (content
+changed, metadata did not) from an edit (both changed) and repairs the former from a
+checksum-verified copy. Every branch of it hangs on one condition: the copy must HAVE a recorded
+checksum. It never did.
 
-What does not, each held back with its measurement:
+**Fixed — a deep health check now establishes the baseline it needs.** Checksums for ordinary files
+are not written by the write path, and the baseline recording in the scrub was guarded by
+`if (!detectOnly)`, so `pool-health --deep` computed every hash and then threw them away. A pool
+that was only ever health-checked could therefore never acquire a baseline, and rot stayed
+indistinguishable from an edit forever. The baseline is now recorded on a detect-only pass too, but
+ONLY when every copy of a file agrees — the one moment its content is not in question — and it
+touches the checksum sidecar, never pool data. With that in place, `--fix` repairs a rotted copy
+from the good one, and rot on EVERY copy is reported as unrecoverable instead of `healthy (deep
+scan)`. Both scenarios pass.
 
-1. **A damaged copy is served to the application.** With two copies and only one damaged, reading
-   through the mount returns the DAMAGED bytes rather than the intact ones. Reproduced with and
-   without a prior deep scan to baseline the checksums. This is precisely the failure the second
-   copy exists to survive, and the application gets no error — it believes the bytes and writes
-   them onward, so the corruption propagates into whatever it produces. Reads are not verified
-   against the checksum database.
-2. **`--fix` declines to repair.** It logs `Conflict on '<file>': divergent copies with identical
-   timestamps kept for user resolution` and then `Restored pool: 0 copy(ies) created/promoted`. As
-   a tie-break rule between two equally-plausible edits that is defensible; as the answer to
-   bit-rot it is not, because a checksum baseline makes the good copy identifiable and the
-   stalemate unnecessary.
-3. **Identical damage to every copy reads as healthy.** Rot both copies the same way and
-   `pool-health --deep` reports `healthy (deep scan)` while the damaged bytes are served. That is
-   consistent with the deep scan comparing copies against EACH OTHER rather than against the
-   recorded checksums — two matching wrong copies look like agreement.
+**Still open — a scrub of a MOUNTED pool loses its baseline.** `pool-health` runs in its own
+process and writes the checksum sidecar; the mounted engine holds the same sidecar and saves its
+own view over the top on unmount, so the baseline silently disappears. That is why the repair
+scenarios only pass with the scrub run while nothing is mounted, which is what they now do. For a
+user this means the obvious action — health-check the pool you have mounted — achieves nothing
+durable. The two processes need to agree on ownership of that file.
 
-Underlying all three: checksums for ordinary files are recorded by a scrub rather than by the write
-path (`IntegrityService.InvalidateFile` says so — "the next scrub re-baselines"), and nothing on
-the read path consults them. So bit-rot protection is retroactive and advisory rather than
-automatic. Worth deciding deliberately: verifying every read against a checksum costs real
-throughput, and the honest options are per-read verification, verification on the repair path only,
-or recording checksums on the write path so at least `--fix` can break the tie.
+**Still open — reads are not verified.** A silently damaged copy is served to the application even
+though an intact one sits on the other member, and the caller gets no error, so it believes the
+bytes and writes them onward. This is not a quick fix and should not be treated as one: the
+database holds WHOLE-FILE hashes while a read serves a BLOCK, so there is nothing to check a block
+against without per-block checksums — a format change with a real throughput and space cost. What
+exists today is detect-and-repair at scrub time, and the exposure is the window before a scrub
+runs. Pinned by `BitRotEndToEndTests.BitRot_GivenOneCopyIsSilentlyDamaged_...`, held back rather
+than weakened.
 
 ## Still open
 

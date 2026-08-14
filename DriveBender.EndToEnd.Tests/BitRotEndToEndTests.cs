@@ -36,6 +36,19 @@ public class BitRotEndToEndTests {
   /// like the NEWEST one, and any policy that resolves conflicts by time would then prefer the
   /// damage and call it an external edit. Rot does not touch metadata, so neither does this.
   /// </summary>
+  /// <summary>
+  /// Records the checksums the pool will later need, with NOTHING MOUNTED.
+  ///
+  /// Checksums for ordinary files are recorded by a scrub rather than by the write path, so a pool
+  /// that has never been scrubbed has nothing to compare a copy against and cannot tell rot from an
+  /// edit. It runs unmounted because the mounted engine owns the same checksum sidecar: a scrub in
+  /// a second process writes the baseline, and the mount then saves its own view over the top.
+  /// </summary>
+  private static void _Baseline(MountedPool pool) {
+    var result = DbMount.Run(TimeSpan.FromMinutes(3), "pool-health", pool.PoolName, "--deep");
+    TestContext.Out.WriteLine($"baseline: exit {result.ExitCode}{Environment.NewLine}{result.Output}");
+  }
+
   private static void _Rot(string physicalPath, int atOffset = 4096, int length = 512) {
     var created = File.GetCreationTimeUtc(physicalPath);
     var written = File.GetLastWriteTimeUtc(physicalPath);
@@ -63,14 +76,6 @@ public class BitRotEndToEndTests {
 
       copies = [.. found.Select(c => c.where)];
 
-      // Baseline the checksum database before anything is damaged. Checksums for ordinary files are
-      // recorded by a scrub, not by the write path — `IntegrityService.InvalidateFile` says as much
-      // ("the next scrub re-baselines") — so without this the pool has NOTHING to compare a copy
-      // against and cannot tell a rotted copy from a good one. Every scenario here is therefore
-      // about a pool that HAS been scrubbed at least once; the un-baselined case is recorded in
-      // docs/Issues.md as its own gap.
-      var baseline = DbMount.Run(TimeSpan.FromMinutes(3), "pool-health", pool.PoolName, "--deep");
-      TestContext.Out.WriteLine($"baseline: exit {baseline.ExitCode}{Environment.NewLine}{baseline.Output}");
       return pool;
     } catch {
       pool.Dispose();
@@ -81,16 +86,21 @@ public class BitRotEndToEndTests {
   [Test]
   [Category("EdgeCase")]
   [Description("One copy rots silently: the pool still serves the intact content rather than the damaged bytes.")]
-  [Ignore("Reads are not verified against the checksum database, so a silently damaged copy is served to "
-          + "the application even though an intact copy sits on the other member. Reproduced with and "
-          + "without a prior deep scan. This is the failure duplication exists for. See docs/Issues.md.")]
+  [Ignore("Reads are not verified against the checksum database, so a silently damaged copy is "
+          + "served even though an intact one sits on the other member. Not a quick fix: the database "
+          + "holds WHOLE-FILE hashes, and a read serves a block, so there is nothing to check a block "
+          + "against without per-block checksums - a format change with a real cost. A scrub detects "
+          + "and repairs the damage; the exposure is the window before one runs. See docs/Issues.md.")]
   public void BitRot_GivenOneCopyIsSilentlyDamaged_ThenTheIntactContentIsStillServed() {
     var content = _Payload(256 * 1024, 71);
     using var pool = _PoolWithADuplicatedFile("rot.bin", content, out var copies);
 
     // the damage happens with nothing mounted: the engine pools open handles into its members, so
     // rotting a file under a live mount tests the handle cache rather than the stored data
-    pool.WhileUnmounted(() => _Rot(copies[0]));
+    pool.WhileUnmounted(() => {
+      _Baseline(pool);
+      _Rot(copies[0]);
+    });
 
     var served = File.ReadAllBytes(pool.PathTo("rot.bin"));
 
@@ -107,7 +117,10 @@ public class BitRotEndToEndTests {
     var content = _Payload(256 * 1024, 72);
     using var pool = _PoolWithADuplicatedFile("reported.bin", content, out var copies);
 
-    pool.WhileUnmounted(() => _Rot(copies[0]));
+    pool.WhileUnmounted(() => {
+      _Baseline(pool);
+      _Rot(copies[0]);
+    });
 
     // size and timestamps are untouched, so only re-reading the content can find this
     var deep = DbMount.Run(TimeSpan.FromMinutes(3), "pool-health", pool.PoolName, "--deep");
@@ -123,15 +136,14 @@ public class BitRotEndToEndTests {
   [Test]
   [Category("EdgeCase")]
   [Description("A deep health check with --fix repairs the damaged copy from the intact one.")]
-  [Ignore("pool-health --deep --fix detects the divergence but declines to repair it: it logs "
-          + "\"divergent copies with identical timestamps kept for user resolution\" and creates 0 copies. "
-          + "With a checksum baseline the good copy is identifiable, so this need not be a stalemate. "
-          + "See docs/Issues.md.")]
   public void BitRot_WhenTheDeepHealthCheckRepairs_ThenBothCopiesAreIntactAgain() {
     var content = _Payload(256 * 1024, 73);
     using var pool = _PoolWithADuplicatedFile("repaired.bin", content, out var copies);
 
-    pool.WhileUnmounted(() => _Rot(copies[0]));
+    pool.WhileUnmounted(() => {
+      _Baseline(pool);
+      _Rot(copies[0]);
+    });
 
     var fix = DbMount.Run(TimeSpan.FromMinutes(3), "pool-health", pool.PoolName, "--deep", "--fix");
     pool.Remount();
@@ -148,14 +160,12 @@ public class BitRotEndToEndTests {
   [Test]
   [Category("Exception")]
   [Description("Both copies rot differently: the pool must not silently hand back damaged data as if it were fine.")]
-  [Ignore("When every copy is damaged IDENTICALLY the deep scan reports the pool healthy and the damaged "
-          + "bytes are served without complaint - consistent with copies being compared against each "
-          + "other rather than against the recorded checksums. See docs/Issues.md.")]
   public void BitRot_GivenEveryCopyIsDamaged_ThenTheLossIsNotPassedOffAsGoodData() {
     var content = _Payload(256 * 1024, 74);
     using var pool = _PoolWithADuplicatedFile("hopeless.bin", content, out var copies);
 
     pool.WhileUnmounted(() => {
+      _Baseline(pool);
       foreach (var copy in copies)
         _Rot(copy, atOffset: 8192);
     });

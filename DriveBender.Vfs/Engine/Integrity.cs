@@ -229,8 +229,13 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     => this._Scrub(quick: true, detectOnly: false, invalidateCaches);
 
   /// <summary>
-  /// Deep detection pass: re-checksums every file (bit-rot, stale copies, conflicts) but
-  /// NEVER mutates the pool — health checking is read-only unless a fix is asked for.
+  /// Deep detection pass: re-checksums every file (bit-rot, stale copies, conflicts) but never
+  /// mutates POOL DATA — health checking repairs nothing unless a fix is asked for.
+  ///
+  /// It does record a checksum for a file the database does not know yet, and only when every copy
+  /// of that file agrees. That is what gives bit-rot detection something to compare against later;
+  /// without it a pool that is only ever health-checked never acquires a baseline, and rot stays
+  /// indistinguishable from an edit forever.
   /// </summary>
   public IReadOnlyList<IntegrityIssue> DetectAll()
     => this._Scrub(quick: false, detectOnly: true, null);
@@ -255,8 +260,9 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
       this._ClassifyAndReconcile(path, views, issues, invalidateCaches, detectOnly);
     }
 
-    if (!detectOnly)
-      this.SaveAll();
+    // saved even after a detect-only pass: it may have baselined files the DB did not know, and a
+    // baseline that is not persisted is no baseline at all — the next scan would start over
+    this.SaveAll();
     return issues;
   }
 
@@ -418,10 +424,19 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
           return;
         }
 
-        // no divergence — baseline anything the DB does not know yet (streamed re-hash)
-        if (!detectOnly)
-          foreach (var view in views.Where(v => v.Entry == null))
-            this.RecordHash(view.Member, path, view.Shadow, view.Hash);
+        // No divergence — baseline anything the DB does not know yet (streamed re-hash).
+        //
+        // This happens on a DETECT-ONLY pass too, and deliberately. Every classification above
+        // turns on a copy having a recorded checksum: without one, rot cannot be told apart from an
+        // edit, and two copies that rot identically look like agreement. Checksums for ordinary
+        // files are not written by the write path, so if a read-only health check also declined to
+        // record them, a pool that was only ever health-checked would never acquire a baseline and
+        // bit-rot detection could never start working. Recording here is unambiguous — it happens
+        // only when every copy of the file agrees, which is the one moment the content is not in
+        // question — and it touches the checksum sidecar, never pool data.
+        foreach (var view in views.Where(v => v.Entry == null))
+          this.RecordHash(view.Member, path, view.Shadow, view.Hash);
+
         return;
       }
 
