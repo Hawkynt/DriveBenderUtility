@@ -27,8 +27,15 @@ public sealed class FileState(string normalizedPath) {
   /// </summary>
   internal int AppHandleCount;
 
-  /// <summary>Per-handle read-ahead detectors keyed by handle value.</summary>
-  internal readonly Dictionary<long, ReadAheadState> ReadAhead = [];
+  /// <summary>
+  /// Per-handle read-ahead detectors keyed by handle value.
+  ///
+  /// Concurrent rather than lock-guarded: this is touched on EVERY read, and the map is shared by
+  /// every handle open on the file, so an exclusive lock here serialised all readers of one file
+  /// behind a single monitor. Measured: 20 threads doing cached random reads went BACKWARDS against
+  /// one thread until this stopped being a `lock`.
+  /// </summary>
+  internal readonly System.Collections.Concurrent.ConcurrentDictionary<long, ReadAheadState> ReadAhead = new();
 }
 
 /// <summary>
@@ -197,10 +204,9 @@ public sealed class HandleTable {
       if (!this._handles.Remove(handle.Value, out var open))
         throw new PoolFsException(PoolFsError.StaleHandle, $"Handle {handle.Value} is not open");
 
-      // the read path mutates ReadAhead under lock(File.ReadAhead) — take the SAME lock here so
-      // a concurrent Read + Close on one file never corrupts the dictionary
-      lock (open.File.ReadAhead)
-        open.File.ReadAhead.Remove(handle.Value);
+      // the map is concurrent, so a Read racing this Close cannot corrupt it; the worst case is a
+      // read-ahead state recreated for a handle that is going away, which the next Close removes
+      open.File.ReadAhead.TryRemove(handle.Value, out _);
       --open.File.HandleCount;
       if (!open.ApplicationClosed) {
         open.ApplicationClosed = true; // a handle closed without an explicit cleanup still counts

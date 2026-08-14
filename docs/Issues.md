@@ -171,6 +171,31 @@ exists today is detect-and-repair at scrub time, and the exposure is the window 
 runs. Pinned by `BitRotEndToEndTests.BitRot_GivenOneCopyIsSilentlyDamaged_...`, held back rather
 than weakened.
 
+### Measured, and one of the numbers is a problem: cached random reads do not scale with threads
+
+`PerformanceMatrixEndToEndTests` prices the pool per tier, per concurrency, per file size through a
+real mount, and writes `docs/Performance.md`. Most of it reads well — around 700 MiB/s sequential
+write and 2-3 GiB/s sequential read, small-file reads scaling roughly five-fold across twenty
+threads. One row does not.
+
+**Cached random 4 KiB reads go BACKWARDS with concurrency**: about 69,000 IOPS on one thread and
+about 53,000 across twenty, on a twenty-CPU host. Reads that all hit RAM should scale close to
+linearly, so this is threads queueing on something rather than a hardware limit.
+
+Ruled out: the per-file read-ahead map, which was a `Dictionary` behind `lock (File.ReadAhead)`
+taken on EVERY read and shared by every handle open on that file. It is now a
+`ConcurrentDictionary` — worth doing regardless, and it moved nothing measurable, so it was not the
+bottleneck. The remaining suspect is `HandleTable`: every read takes the table's single global lock
+to resolve the path, then the file's `ReaderWriterLockSlim`. At tens of thousands of operations a
+second across twenty threads, one global monitor per read is enough to explain this. Not yet
+isolated with a profiler, which is what the next pass should do rather than guessing again.
+
+The benchmark itself was wrong first time round and is worth remembering: it opened a `FileStream`
+per operation, so it measured open+read+close and reported it as read IOPS — the read path looked
+four times slower than it is (15,000 rather than 69,000). Each worker now takes its handle before
+the clock starts.
+
+
 ## Still open
 
 An earlier revision of this file claimed "nothing known" here. That was wrong — it dropped the two

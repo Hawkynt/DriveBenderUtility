@@ -985,11 +985,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._activity.Publish(ActivityKind.Read, path, count, fromMember: copies[0].Volume.DisplayName, reason: "user I/O");
 
       if (this._readAheadEnabled) {
-        ReadAheadState? state;
-        lock (lease.File.ReadAhead) {
-          if (!lease.File.ReadAhead.TryGetValue(handle.Value, out state))
-            lease.File.ReadAhead.Add(handle.Value, state = new(this._readAheadMin, this._readAheadMax, this._readAheadAdaptive));
-        }
+        // No lock: the map is shared by every handle on this file, so taking one here serialised
+        // all of its readers behind a single monitor on the hottest path there is. The state itself
+        // is per HANDLE, so the lock below contends only with the same caller's own reads.
+        var state = lease.File.ReadAhead.GetOrAdd(handle.Value,
+          _ => new ReadAheadState(this._readAheadMin, this._readAheadMax, this._readAheadAdaptive));
 
         long prefetchBytes;
         lock (state)
