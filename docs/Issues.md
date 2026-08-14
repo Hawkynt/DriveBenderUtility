@@ -235,6 +235,30 @@ buffer can take ownership when copies are owed; when nothing is owed it is pure 
 conditional touches the ack-quorum and journalling path, which is the most safety-critical code in
 the product, so it is written down rather than attempted in passing.
 
+### Linux end-to-end has been RED in CI, and I did not look
+
+Every "suite green" in this file and in my reporting came from a local Windows run. The Linux
+end-to-end job has been failing since at least 13 August across many commits, and nothing here said
+so. Local runs are not CI, and a claim of green that was never checked against the second target is
+worth nothing on that target. Three distinct failures, all reproduced on `main` and none caused by
+the commit they happened to land on:
+
+1. **A torn read through FUSE.** `DriverEndToEndTests.Concurrency_GivenManyReadersAndWriters...`
+   reports `read back 4096 bytes, which is neither empty nor the full 32768`. This is the most
+   serious of the three: a reader observing a partially-written file is exactly the corruption the
+   whole concurrency design exists to prevent, and the Windows path does not do it.
+2. **Two names differing only in case cannot both exist.** `BoundaryEndToEndTests.Names_Given...`
+   fails creating `REPORT.TXT` beside `Report.txt`. POSIX says those are two files; the engine
+   compares paths with `OrdinalIgnoreCase` throughout (`HandleTable._files`, the path helpers), so
+   it cannot represent both. On Windows that is right and on Linux it silently is not — a user
+   copying a case-sensitive tree into a pool loses whichever file lands second.
+3. **The mount detaches during eject/restore.** `DurabilityEndToEndTests.Divergence_...` fails with
+   `Transport endpoint is not connected`, which is FUSE saying the server is gone. The scenario
+   removes a member symlink under a live mount; on Windows the junction equivalent survives it.
+
+None of these is fixed here. They are written down first because they were invisible, which was the
+larger problem.
+
 ## Still open
 
 An earlier revision of this file claimed "nothing known" here. That was wrong — it dropped the two
