@@ -99,6 +99,42 @@ member-returns-while-io-is-in-flight scenario — all four were held back and al
 end-to-end suite also dropped from 5m09s to 2m25s, because those tests no longer sit out two-minute
 timeouts.
 
+### Found this pass: duplication protects against a disk dying, not against silent corruption
+
+The end-to-end battery had no bit-rot scenario at all, which is a striking gap for a product whose
+central promise is holding two copies. `BitRotEndToEndTests` adds one: the bytes of ONE copy are
+altered on the member behind the pool's back and the timestamps are then restored, because real rot
+does not update mtime. A pool that resolves conflicts by comparing modification times cannot tell
+the good copy from the rotten one under those conditions — only content can.
+
+What works: `pool-health --deep` DOES notice that two copies have diverged and reports it. That
+scenario passes and stays in the suite as a guard.
+
+What does not, each held back with its measurement:
+
+1. **A damaged copy is served to the application.** With two copies and only one damaged, reading
+   through the mount returns the DAMAGED bytes rather than the intact ones. Reproduced with and
+   without a prior deep scan to baseline the checksums. This is precisely the failure the second
+   copy exists to survive, and the application gets no error — it believes the bytes and writes
+   them onward, so the corruption propagates into whatever it produces. Reads are not verified
+   against the checksum database.
+2. **`--fix` declines to repair.** It logs `Conflict on '<file>': divergent copies with identical
+   timestamps kept for user resolution` and then `Restored pool: 0 copy(ies) created/promoted`. As
+   a tie-break rule between two equally-plausible edits that is defensible; as the answer to
+   bit-rot it is not, because a checksum baseline makes the good copy identifiable and the
+   stalemate unnecessary.
+3. **Identical damage to every copy reads as healthy.** Rot both copies the same way and
+   `pool-health --deep` reports `healthy (deep scan)` while the damaged bytes are served. That is
+   consistent with the deep scan comparing copies against EACH OTHER rather than against the
+   recorded checksums — two matching wrong copies look like agreement.
+
+Underlying all three: checksums for ordinary files are recorded by a scrub rather than by the write
+path (`IntegrityService.InvalidateFile` says so — "the next scrub re-baselines"), and nothing on
+the read path consults them. So bit-rot protection is retroactive and advisory rather than
+automatic. Worth deciding deliberately: verifying every read against a checksum costs real
+throughput, and the honest options are per-read verification, verification on the repair path only,
+or recording checksums on the write path so at least `--fix` can break the tie.
+
 ## Still open
 
 An earlier revision of this file claimed "nothing known" here. That was wrong — it dropped the two

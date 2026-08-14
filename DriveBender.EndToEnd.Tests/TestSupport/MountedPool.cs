@@ -448,13 +448,35 @@ public sealed class MountedPool : IDisposable {
   /// crosses on every reboot. Anything the pool acknowledged has to be on disk to survive it.
   /// </summary>
   public void Remount() {
+    this._Unmount();
+    this._StartMount();
+  }
+
+  /// <summary>
+  /// Runs something against the members' real folders with the pool CLEANLY UNMOUNTED, then brings
+  /// it back.
+  ///
+  /// Anything that manipulates stored bytes behind the pool's back — simulating bit-rot, an
+  /// out-of-band edit, a restored backup — has to happen with nothing mounted. The engine pools
+  /// open handles into its members, so touching a file under a live mount tests the handle cache
+  /// rather than the stored data, and on Windows is simply refused.
+  /// </summary>
+  public void WhileUnmounted(Action work) {
+    this._Unmount();
+    try {
+      work();
+    } finally {
+      this._StartMount();
+    }
+  }
+
+  private void _Unmount() {
     DbMount.Run(_UNMOUNT_TIMEOUT, "unmount", this.PoolName);
     if (!this._mountProcess.WaitForExit((int)_UNMOUNT_TIMEOUT.TotalMilliseconds))
       DbMount.KillTree(this._mountProcess);
 
     this._mountProcess.WaitForExit(5000);
     this._mountProcess.Dispose();
-    this._StartMount();
   }
 
   /// <summary>
