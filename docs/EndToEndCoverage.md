@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [31677709809](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/31677709809).
+Generated from run: [31780486916](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/31780486916).
 
-57 scenarios — 56 passing on at least one target, 3 failing.
+62 scenarios — 61 passing on at least one target, 3 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -37,6 +37,11 @@ Generated from run: [31677709809](https://github.com/Hawkynt/DriveBenderUtility/
 | Durability | `Crash_GivenFilesWereWrittenAndClosed_ThenEveryByteSurvivesThePowerCut` | A power cut after files were written and closed: every byte is still there after the pool comes back. | pass | pass |
 | Durability | `Crash_GivenStagedWritesWereInterrupted_ThenNoInternalFileIsExposedToTheUser` | A power cut leaves half-written staging files on the members; none of them may show up in the pool as if they were the user's. | pass | pass |
 | Durability | `Divergence_GivenEachMemberTookAWriteWhileTheOtherWasAway_ThenOneWholeVersionIsServed` | Each member took a write while the other was away: the pool serves one whole version, never a mixture of the two. | pass | **FAIL** |
+| LargeFile | `LargeFile_GivenItExceedsTwoGiB_ThenItsLengthIsReportedInFull` | A file larger than 2 GiB reports its true length rather than a 32-bit wrapped one. | pass | pass |
+| LargeFile | `LargeFile_GivenReadsAroundTheThirtyTwoBitBoundaries_ThenEveryByteIsCorrect` | Reads on both sides of the 2 GiB and 4 GiB-relevant boundaries return the right bytes. | pass | pass |
+| LargeFile | `LargeFile_WhenAppendedTo_ThenTheNewBytesLandPastTheOldEnd` | Appending to a file that is already past 2 GiB puts the bytes at the true end, not at a wrapped offset. | pass | pass |
+| LargeFile | `LargeFile_WhenStreamedEndToEnd_ThenMemoryStaysBoundedAndThroughputHolds` | A file past 2 GiB streams rather than being materialised: the mount's memory stays far below the file size, and throughput stays reasonable. | pass | pass |
+| LargeFile | `LargeFile_WhenWrittenInThePastTwoGiBRegion_ThenOnlyThatRegionChanges` | Writing into the middle of a file past 2 GiB changes only that region. | pass | pass |
 | ManagementApi | `Api_GivenNoToken_ThenEveryEndpointRefuses` | Given No Token , then Every Endpoint Refuses | pass | pass |
 | ManagementApi | `Assets_GivenAFreshBrowser_ThenThePageAndItsScriptAndStylesAreServed` | Given AFresh Browser , then The Page And Its Script And Styles Are Served | pass | pass |
 | ManagementApi | `Job_GivenAnUnknownTicket_ThenItIsReportedRatherThanHanging` | Given An Unknown Ticket , then It Is Reported Rather Than Hanging | pass | pass |
