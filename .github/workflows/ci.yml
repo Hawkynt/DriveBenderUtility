@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
   workflow_call: {}
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: 'Also run the performance benchmark and publish docs/Performance.md'
+        type: boolean
+        default: false
+  schedule:
+    # the benchmark is far too heavy to gate a push on, and a number nobody ever regenerates is
+    # worse than none at all, so it runs weekly and publishes what it measured
+    - cron: '17 4 * * 1'
 
 # Force JavaScript-based actions to run on Node 24 instead of the deprecated Node 20 ahead of
 # the 2026-06-16 hard cutover, until we bump each action to a Node-24-native major version.
@@ -280,4 +290,67 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/EndToEndCoverage.md
           git commit -m "* end-to-end coverage matrix regenerated from the latest run on both targets"
+          git push
+
+  # The benchmark is [Explicit] in the suite because it mounts several pools and moves ~9 GiB —
+  # that belongs nowhere near a push. It runs here on a schedule or on request, and commits the
+  # table it measured, so docs/Performance.md is a real measurement with a date rather than a
+  # number somebody typed once.
+  benchmark:
+    name: Performance benchmark (Windows - WinFsp driver)
+    if: github.event_name == 'schedule' || inputs.benchmark
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.x
+            10.x
+
+      - name: Stamp versions
+        shell: bash
+        run: perl .github/workflows/scripts/version.pl --stamp
+
+      - name: Install WinFsp v2.1 (the version the product pins)
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod 'https://api.github.com/repos/winfsp/winfsp/releases/tags/v2.1'
+          $asset = $release.assets | Where-Object { $_.name -like '*.msi' } | Select-Object -First 1
+          if (-not $asset) { throw 'No MSI in the winfsp v2.1 release' }
+          $msi = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest $asset.browser_download_url -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -NoNewWindow
+
+      - name: Build
+        run: dotnet build DriveBender.sln --configuration Release
+
+      # It self-skips, saying so, when the runner lacks the headroom — a hosted runner is tight on
+      # disk and a benchmark that quietly measured a nearly-full volume would publish a bad number.
+      - name: Run the benchmark
+        shell: bash
+        env:
+          DBE2E_REQUIRE_DRIVER: '1'
+          DBMOUNT_EXE: ${{ github.workspace }}/DriveBender.Mount/bin/Release/net10.0-windows/dbmount.exe
+        run: >
+          dotnet test DriveBender.EndToEnd.Tests/DriveBender.EndToEnd.Tests.csproj
+          --configuration Release --no-build
+          --filter "FullyQualifiedName~PerformanceMatrix"
+
+      - name: Publish the measurements
+        shell: bash
+        run: |
+          if [ -z "$(git status --porcelain docs/Performance.md)" ]; then
+            echo "::notice::the benchmark produced no change to docs/Performance.md"
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add docs/Performance.md
+          git commit -m "* performance measurements refreshed from run ${GITHUB_RUN_ID}"
           git push
