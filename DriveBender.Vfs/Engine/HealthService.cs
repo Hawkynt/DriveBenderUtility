@@ -46,8 +46,13 @@ public sealed class HealthService(
   /// duplicates, size mismatches, external edits); <paramref name="deep"/> re-checksums
   /// every byte to also surface silent bit-rot — opt-in because it reads the whole pool.
   /// </summary>
-  public HealthReport Check(bool deep = false)
-    => new(this._MemberHealth(), deep ? integrity.DetectAll() : integrity.DetectQuick(), media.CountUnderDuplicated(), 0, Corrected: false, DeepScan: deep);
+  public HealthReport Check(bool deep = false, OperationContext? operation = null) {
+    var context = operation ?? OperationContext.None;
+    var issues = deep ? integrity.DetectAll(context) : integrity.DetectQuick(context);
+    context.ThrowIfStopping();
+    context.Phase("counting under-duplicated files");
+    return new(this._MemberHealth(), issues, media.CountUnderDuplicated(), 0, Corrected: false, DeepScan: deep);
+  }
 
   /// <summary>
   /// Full check with correction (always deep): repairs bit-rot from good copies, re-syncs
@@ -56,9 +61,11 @@ public sealed class HealthService(
   /// shadows recreated). SMART/temperature are reported for alerting — hardware faults
   /// cannot be auto-fixed, only surfaced.
   /// </summary>
-  public HealthReport CheckAndCorrect(Action<string>? invalidateCaches = null) {
-    var issues = integrity.ScrubAll(invalidateCaches);
-    var restore = media.RestorePool();
+  public HealthReport CheckAndCorrect(Action<string>? invalidateCaches = null, OperationContext? operation = null) {
+    var context = operation ?? OperationContext.None;
+    var issues = integrity.ScrubAll(invalidateCaches, context);
+    var restore = media.RestorePool(context);
+    context.Phase("counting under-duplicated files");
     var underDuplicatedAfter = media.CountUnderDuplicated();
 
     foreach (var member in this._MemberHealth().Where(m => m.Smart.Health is DiskHealth.Warning or DiskHealth.Failing))

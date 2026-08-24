@@ -211,8 +211,12 @@ public class DriverEndToEndTests {
 
     var failures = new System.Collections.Concurrent.ConcurrentBag<string>();
     var paths = Enumerable.Range(0, files).Select(f => this._pool.PathTo($"conc{f}.bin")).ToArray();
-    foreach (var path in paths)
-      File.WriteAllBytes(path, _Payload(length, 100));
+
+    // a DISTINCT seed per file, including for the initial content: the block-ownership check below
+    // identifies a file by its bytes, and seeding every file's first version identically would make
+    // four files indistinguishable and report their own data as somebody else's
+    for (var file = 0; file < files; ++file)
+      File.WriteAllBytes(paths[file], _Payload(length, file * 1000));
 
     var writers = Enumerable.Range(0, files).Select(file => new Thread(() => {
       for (var round = 1; round <= rounds; ++round)
@@ -223,12 +227,48 @@ public class DriverEndToEndTests {
         }
     }) { IsBackground = true }).ToArray();
 
+    // What an in-place overwrite does NOT promise, measured rather than argued.
+    //
+    // `File.WriteAllBytes` truncates and then writes, and a whole-file `read` is not atomic against
+    // that. This scenario used to require every read to be empty or exactly `length`, and no
+    // filesystem provides it: the same four writers and four readers against a plain tmpfs
+    // directory produce 1-6 short reads per run, and against btrfs 2-4 — the pool is not doing
+    // anything the bare kernel does not. It "passed" on Windows only because share violations there
+    // turn the same race into the IOException below instead of a short read. Content is not
+    // promised either: a plain filesystem occasionally hands back a full-length BLEND of two
+    // versions, because the reader read some pages before the overwrite and some after.
+    //
+    // What is never legal on any filesystem, and is entirely the pool's own to get right, is a byte
+    // that belongs to a DIFFERENT FILE. That is the failure a pool can produce and a plain
+    // filesystem cannot — a block cache keyed so two paths collide, a placement resolved to the
+    // wrong member, a handle reused across names. The payloads are random per file and per round,
+    // so a block fingerprint identifies its owner beyond coincidence.
+    var versions = Enumerable.Range(0, files)
+      .Select(file => Enumerable.Range(0, rounds + 1).Select(round => _Payload(length, file * 1000 + round)).ToArray())
+      .ToArray();
+
+    const int fingerprintBlock = 4096;
+    var owners = new Dictionary<string, int>(StringComparer.Ordinal);
+    for (var file = 0; file < files; ++file)
+      foreach (var version in versions[file])
+        for (var at = 0; at + 16 <= version.Length; at += fingerprintBlock)
+          owners[Convert.ToHexString(version, at, 16)] = file;
+
     var readers = Enumerable.Range(0, files).Select(file => new Thread(() => {
       for (var round = 0; round < rounds * 3; ++round)
         try {
           var got = File.ReadAllBytes(paths[file]);
-          if (got.Length is not (0 or length))
-            failures.Add($"'{paths[file]}' read back {got.Length} bytes, which is neither empty nor the full {length}");
+          if (got.Length > length) {
+            failures.Add($"'{paths[file]}' read back {got.Length} bytes, longer than any version ({length})");
+            continue;
+          }
+
+          for (var at = 0; at + 16 <= got.Length; at += fingerprintBlock)
+            if (owners.TryGetValue(Convert.ToHexString(got, at, 16), out var owner) && owner != file) {
+              failures.Add($"'{paths[file]}' read back a block at offset {at} that belongs to conc{owner}.bin — "
+                           + "one file's data was served for another");
+              break;
+            }
         } catch (IOException) {
           // legal under contention
         }
@@ -241,9 +281,15 @@ public class DriverEndToEndTests {
 
     failures.Should().BeEmpty();
 
-    // every file settles on a whole payload of the right size
-    foreach (var path in paths)
-      new FileInfo(path).Length.Should().Be(length);
+    // once the contention stops there is no excuse left: every file settles on ONE WHOLE version,
+    // not merely on something of the right size
+    for (var file = 0; file < files; ++file) {
+      new FileInfo(paths[file]).Length.Should().Be(length, $"'{paths[file]}' must settle at its full size");
+      var settled = File.ReadAllBytes(paths[file]);
+      versions[file].Any(v => settled.AsSpan().SequenceEqual(v)).Should().BeTrue(
+        $"'{paths[file]}' settled on {settled.Length} bytes that are not any version written to it."
+        + $"{Environment.NewLine}{this._pool.DescribeMembers()}");
+    }
   }
 
   [Test]

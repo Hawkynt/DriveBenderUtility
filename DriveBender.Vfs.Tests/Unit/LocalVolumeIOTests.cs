@@ -124,6 +124,61 @@ public class LocalVolumeIOTests {
   }
 
   [Test]
+  [Category("EdgeCase")]
+  public void CaseSensitivity_GivenARealMemberRoot_ThenItIsProbedRatherThanAssumed() {
+    // the probe reads the member marker every member carries, so it needs one to ask about
+    var utility = Path.Combine(this._root, PoolPaths.UtilityFolderName);
+    Directory.CreateDirectory(utility);
+    File.WriteAllText(Path.Combine(utility, PoolPaths.MemberMarkerFileName), "{}");
+
+    var volume = new LocalVolumeIO(Guid.NewGuid(), "probed", this._root, "PHYS-PROBE");
+
+    // The answer must come from the STORAGE, not from the platform: an NTFS volume or an SMB share
+    // mounted under Linux is case-insensitive on a case-sensitive host, and that is the
+    // configuration where a case-only rename would otherwise delete the file it was moving.
+    var twoNamesAreTwoFiles = _HostTellsCaseApart(this._root);
+    volume.IsCaseSensitive.Should().Be(twoNamesAreTwoFiles,
+      "the member must report what its filesystem actually does with two spellings of one name");
+  }
+
+  /// <summary>Asks the filesystem under <paramref name="directory"/> directly, by making two names.</summary>
+  private static bool _HostTellsCaseApart(string directory) {
+    var lower = Path.Combine(directory, "casing-probe.tmp");
+    var upper = Path.Combine(directory, "CASING-PROBE.TMP");
+    try {
+      File.WriteAllText(lower, "x");
+      return !File.Exists(upper);
+    } finally {
+      File.Delete(lower);
+      if (File.Exists(upper))
+        File.Delete(upper);
+    }
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Capacity_GivenTheMemberHasGoneAway_ThenItReportsUnknownRatherThanThrowing() {
+    this._Write("before.bin", [1, 2, 3]);
+    this._volume.BytesTotal.Should().BeGreaterThan(0, "the volume is present to begin with");
+
+    // the disk is pulled / the share drops: the member's root simply stops existing
+    Directory.Delete(this._root, true);
+
+    // These are PROPERTIES, read from LINQ pipelines, from placement on the write path, and from
+    // the mount's background metrics tick. An exception from a timer callback kills the process,
+    // and that is not a hypothetical: DriveInfo raises DriveNotFoundException here, which is a raw
+    // System.IO exception rather than the engine's own error model, so it passed through every
+    // catch in the engine and took the whole FUSE session down with it. One disk going away must
+    // not end the mount — surviving that is what the pool is FOR.
+    this._volume.Invoking(v => v.BytesFree).Should().NotThrow("a vanished member must not throw from a property");
+    this._volume.Invoking(v => v.BytesTotal).Should().NotThrow();
+
+    this._volume.BytesTotal.Should().Be(0, "zero is the FR-STAT convention for capacity unknown, which StatFs excludes");
+    this._volume.BytesFree.Should().Be(0);
+    this._volume.IsOnline.Should().BeFalse("reachability is what reports the loss, not an exception from a size");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public void Truncate_GivenPooledHandle_WhenShrunkAndGrown_ThenLengthTracks() {
     this._Write("size.bin", new byte[100]);

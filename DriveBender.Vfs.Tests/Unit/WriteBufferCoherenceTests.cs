@@ -68,18 +68,38 @@ public class WriteBufferCoherenceTests {
 
   [Test]
   [Category("EdgeCase")]
-  public void PageKey_GivenDifferentCasing_WhenCompared_ThenEqual() {
+  public void PageKey_GivenDifferentCasing_WhenCompared_ThenItFollowsThePlatform() {
     var pool = Guid.NewGuid();
-    new PageKey(pool, "Docs/File.bin", 3).Should().Be(new PageKey(pool, "docs/file.bin", 3));
-    new PageKey(pool, "Docs/File.bin", 3).GetHashCode().Should().Be(new PageKey(pool, "docs/file.bin", 3).GetHashCode());
+    var mixed = new PageKey(pool, "Docs/File.bin", 3);
+    var lowered = new PageKey(pool, "docs/file.bin", 3);
+
+    if (OperatingSystem.IsWindows()) {
+      // one file under two spellings: a block cached under either must be found — and invalidated —
+      // under the other, or a mutation through one casing leaves a stale block behind the other
+      mixed.Should().Be(lowered);
+      mixed.GetHashCode().Should().Be(lowered.GetHashCode());
+      return;
+    }
+
+    // POSIX: two names are two files. Sharing a cache entry between them serves one file's blocks
+    // for the other's reads, which is silent corruption rather than a stale-cache annoyance.
+    mixed.Should().NotBe(lowered, "on POSIX these address different files");
   }
 
   [Test]
   [Category("EdgeCase")]
-  public void MetadataKey_GivenDifferentCasing_WhenCompared_ThenEqual() {
+  public void MetadataKey_GivenDifferentCasing_WhenCompared_ThenItFollowsThePlatform() {
     var pool = Guid.NewGuid();
-    new MetadataKey(pool, "A/B.txt", MetadataKind.Stat).Should().Be(new MetadataKey(pool, "a/b.txt", MetadataKind.Stat));
-    new MetadataKey(pool, "A/B.txt", MetadataKind.Stat).Should().NotBe(new MetadataKey(pool, "a/b.txt", MetadataKind.Placement));
+    var mixed = new MetadataKey(pool, "A/B.txt", MetadataKind.Stat);
+    var lowered = new MetadataKey(pool, "a/b.txt", MetadataKind.Stat);
+
+    if (OperatingSystem.IsWindows())
+      mixed.Should().Be(lowered, "Windows resolves both spellings to one file");
+    else
+      mixed.Should().NotBe(lowered, "POSIX resolves them to two files, and a stat for one is not a stat for the other");
+
+    // the KIND is part of the identity on every platform — a cached stat is not a cached placement
+    mixed.Should().NotBe(new MetadataKey(pool, "A/B.txt", MetadataKind.Placement));
   }
 
   [Test]

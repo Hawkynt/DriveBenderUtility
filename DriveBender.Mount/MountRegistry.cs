@@ -100,6 +100,56 @@ public sealed class MountRegistry(IHostEnvironment host) {
 
   private string _OpPath(Guid poolId, string id) => Path.Combine(this._Directory, $"{poolId:D}.op-{id}.json");
   private string _OpResultPath(Guid poolId, string id) => Path.Combine(this._Directory, $"{poolId:D}.opdone-{id}.json");
+  private string _OpCancelPath(Guid poolId, string id) => Path.Combine(this._Directory, $"{poolId:D}.opstop-{id}");
+  private string _OpProgressPath(Guid poolId, string id) => Path.Combine(this._Directory, $"{poolId:D}.opstep-{id}.json");
+
+  /// <summary>
+  /// Asks the pool's own process to stop an operation the manager relayed to it.
+  ///
+  /// The relay was one-way: the manager filed a request and then had nothing to say, so such work
+  /// reported itself un-cancellable — honest, but it meant a deep scrub of a mounted pool could not
+  /// be stopped for however many hours it took. This is the way back, in the same channel directory
+  /// and with the same file-drop shape as the request itself.
+  /// </summary>
+  public void RequestOpCancel(Guid poolId, string id) {
+    this._EnsureSecureDir();
+    host.WriteAllTextAtomic(this._OpCancelPath(poolId, id), DateTime.UtcNow.ToString("O"));
+  }
+
+  /// <summary>Polled by the running operation, between items.</summary>
+  public bool IsOpCancelRequested(Guid poolId, string id) => host.FileExists(this._OpCancelPath(poolId, id));
+
+  /// <summary>The pool process publishes how far it has got; the manager pumps it into the job ticket.</summary>
+  public void WriteOpProgress(Guid poolId, string id, string json) {
+    this._EnsureSecureDir();
+    try {
+      host.WriteAllTextAtomic(this._OpProgressPath(poolId, id), json);
+    } catch (IOException) {
+      // progress is best-effort and must never disturb the work it is describing
+    }
+  }
+
+  /// <summary>The manager's view of that progress, or null when none has been published yet.</summary>
+  public string? ReadOpProgress(Guid poolId, string id) {
+    var path = this._OpProgressPath(poolId, id);
+    try {
+      return host.FileExists(path) ? host.ReadAllText(path) : null;
+    } catch (IOException) {
+      return null; // mid-write; the next poll gets it
+    }
+  }
+
+  /// <summary>Clears an operation's side-channel files once it is over, whichever way it ended.</summary>
+  public void ClearOp(Guid poolId, string id) {
+    foreach (var path in new[] { this._OpCancelPath(poolId, id), this._OpProgressPath(poolId, id) })
+      try {
+        if (host.FileExists(path))
+          host.DeleteFile(path);
+      } catch (IOException) {
+        // best-effort: a stale marker is pruned by the next operation with the same id, which
+        // cannot happen anyway because ids are fresh guids
+      }
+  }
 
   /// <summary>
   /// Cross-process pool operations (health/fix/restore): the MANAGER only files the request —
@@ -138,19 +188,27 @@ public sealed class MountRegistry(IHostEnvironment host) {
     host.WriteAllTextAtomic(this._OpResultPath(poolId, id), json);
   }
 
+  /// <summary>Collects the pool process's result if it has filed one yet; null means "not finished".</summary>
+  public string? TryTakeOpResult(Guid poolId, string id) {
+    var path = this._OpResultPath(poolId, id);
+    if (!host.FileExists(path))
+      return null;
+
+    try {
+      var json = host.ReadAllText(path);
+      host.DeleteFile(path);
+      return json;
+    } catch (IOException) {
+      return null; // mid-write — the caller polls again
+    }
+  }
+
   /// <summary>The manager waits for the pool process's result (long ops allowed; null on timeout).</summary>
   public string? WaitOpResult(Guid poolId, string id, TimeSpan timeout) {
-    var path = this._OpResultPath(poolId, id);
     var deadline = DateTime.UtcNow + timeout;
     while (DateTime.UtcNow < deadline) {
-      if (host.FileExists(path))
-        try {
-          var json = host.ReadAllText(path);
-          host.DeleteFile(path);
-          return json;
-        } catch (IOException) {
-          // mid-write — retry
-        }
+      if (this.TryTakeOpResult(poolId, id) is { } json)
+        return json;
 
       Thread.Sleep(250);
     }

@@ -210,3 +210,7 @@ table.browse td.sz { color: var(--muted); font-size: 11px; text-align: right; }
 table.browse td.pm { text-align: center; }
 table.browse tr.dir { cursor: pointer; }
 table.browse tr.dir:hover td { background: var(--panel-2); color: var(--accent); }
+
+/* job progress — shown only once the operation knows its denominator */
+.progress-bar { height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; margin: 8px 0 2px; }
+.progress-fill { height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .35s ease; }

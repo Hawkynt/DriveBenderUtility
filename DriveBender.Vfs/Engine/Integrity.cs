@@ -66,7 +66,7 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
     if (this._entries != null)
       return this._entries;
 
-    this._entries = new(StringComparer.OrdinalIgnoreCase);
+    this._entries = new(PoolPaths.PathComparer);
     if (member.IsOnline && member.FileExists(DbPath, false)) {
       try {
         using var stream = member.OpenRead(DbPath, false);
@@ -136,7 +136,7 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
     lock (this._lock) {
       var entries = this._Load();
       var fromPrefix = fromPhysicalFolder + "/";
-      foreach (var key in entries.Keys.Where(k => k.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray()) {
+      foreach (var key in entries.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray()) {
         entries.Remove(key, out var entry);
         entries[toPhysicalFolder + "/" + key[fromPrefix.Length..]] = entry!;
         this._dirty = true;
@@ -257,12 +257,12 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
   #endregion
 
   /// <summary>Full scrub: verifies every file on every member against the DB and across copies (FR-SCRUB).</summary>
-  public IReadOnlyList<IntegrityIssue> ScrubAll(Action<string>? invalidateCaches = null)
-    => this._Scrub(quick: false, detectOnly: false, invalidateCaches);
+  public IReadOnlyList<IntegrityIssue> ScrubAll(Action<string>? invalidateCaches = null, OperationContext? operation = null)
+    => this._Scrub(quick: false, detectOnly: false, invalidateCaches, operation);
 
   /// <summary>Mount-time delta scan (FR-OOB-MOUNT): only files whose (size, mtime) deviate from the DB are verified.</summary>
-  public IReadOnlyList<IntegrityIssue> QuickScan(Action<string>? invalidateCaches = null)
-    => this._Scrub(quick: true, detectOnly: false, invalidateCaches);
+  public IReadOnlyList<IntegrityIssue> QuickScan(Action<string>? invalidateCaches = null, OperationContext? operation = null)
+    => this._Scrub(quick: true, detectOnly: false, invalidateCaches, operation);
 
   /// <summary>
   /// Deep detection pass: re-checksums every file (bit-rot, stale copies, conflicts) but never
@@ -273,12 +273,12 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
   /// without it a pool that is only ever health-checked never acquires a baseline, and rot stays
   /// indistinguishable from an edit forever.
   /// </summary>
-  public IReadOnlyList<IntegrityIssue> DetectAll()
-    => this._Scrub(quick: false, detectOnly: true, null);
+  public IReadOnlyList<IntegrityIssue> DetectAll(OperationContext? operation = null)
+    => this._Scrub(quick: false, detectOnly: true, null, operation);
 
   /// <summary>Cheap detection pass: only files whose metadata deviates (from the DB, or across copies) are verified; never mutates.</summary>
-  public IReadOnlyList<IntegrityIssue> DetectQuick()
-    => this._Scrub(quick: true, detectOnly: true, null);
+  public IReadOnlyList<IntegrityIssue> DetectQuick(OperationContext? operation = null)
+    => this._Scrub(quick: true, detectOnly: true, null, operation);
 
   // no whole-file Content: the hash is computed by streaming, repair re-streams from the source
   private sealed record CopyView(IVolumeIO Member, bool Shadow, long Size, long MTimeTicks, ChecksumEntry? Entry, string Hash) {
@@ -286,24 +286,45 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     public bool MetaMatchesEntry => this.Entry != null && this.Size == this.Entry.Size && this.MTimeTicks == this.Entry.MTimeTicks;
   }
 
-  private IReadOnlyList<IntegrityIssue> _Scrub(bool quick, bool detectOnly, Action<string>? invalidateCaches) {
+  private IReadOnlyList<IntegrityIssue> _Scrub(bool quick, bool detectOnly, Action<string>? invalidateCaches, OperationContext? operation = null) {
+    var context = operation ?? OperationContext.None;
     var issues = new List<IntegrityIssue>();
-    foreach (var path in this._AllLogicalPaths()) {
-      var views = this._CollectCopies(path, quick);
-      if (views == null)
-        continue; // quick scan: nothing deviates
 
-      this._ClassifyAndReconcile(path, views, issues, invalidateCaches, detectOnly);
+    // Materialised so the progress has a REAL denominator. The walk is metadata only; on a deep
+    // scrub, which re-checksums every byte, it is noise next to the hashing, and a total that grew
+    // as the run went would make the bar meaningless.
+    context.Phase("listing the pool");
+    var paths = this._AllLogicalPaths().ToArray();
+    long done = 0;
+
+    try {
+      foreach (var path in paths) {
+        // between files, never inside one: a scrub interrupted mid-repair is the torn state it
+        // exists to fix
+        context.ThrowIfStopping();
+        context.Step(done++, paths.Length, path);
+
+        var views = this._CollectCopies(path, quick);
+        if (views == null)
+          continue; // quick scan: nothing deviates
+
+        this._ClassifyAndReconcile(path, views, issues, invalidateCaches, detectOnly);
+      }
+
+      context.Step(done, paths.Length, "done");
+    } finally {
+      // Saved even after a detect-only pass, and even after a CANCELLED one: the pass may have
+      // baselined files the database did not know, and a baseline that is not persisted is no
+      // baseline at all — the next scan would start from nothing. Cancelling a scrub means "stop
+      // here", not "throw away what you learned on the way".
+      this.SaveAll();
     }
 
-    // saved even after a detect-only pass: it may have baselined files the DB did not know, and a
-    // baseline that is not persisted is no baseline at all — the next scan would start over
-    this.SaveAll();
     return issues;
   }
 
   private IEnumerable<string> _AllLogicalPaths() {
-    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var seen = new HashSet<string>(PoolPaths.PathComparer);
     foreach (var member in this._Online) {
       var stack = new Stack<string>();
       stack.Push("");

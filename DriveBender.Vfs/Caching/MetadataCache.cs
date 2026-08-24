@@ -7,17 +7,18 @@ public enum MetadataKind {
 }
 
 /// <summary>
-/// Key of one metadata entry: pool, normalized pool-relative path, kind. The path compares
-/// case-INSENSITIVELY to match the engine's OrdinalIgnoreCase model, so a stat/placement
-/// cached under one casing is invalidated by a mutation under another (SAFE-COHERE).
+/// Key of one metadata entry: pool, normalized pool-relative path, kind. The path compares exactly
+/// as the rest of the engine does (<see cref="PoolPaths.PathComparison"/>), so on Windows a
+/// stat/placement cached under one casing is invalidated by a mutation under another, while on
+/// POSIX — where the two names are two files — neither can answer for the other (SAFE-COHERE).
 /// </summary>
 public sealed record MetadataKey(Guid PoolId, string Path, MetadataKind Kind) {
   public bool Equals(MetadataKey? other)
     => other != null && this.PoolId == other.PoolId && this.Kind == other.Kind
-       && string.Equals(this.Path, other.Path, StringComparison.OrdinalIgnoreCase);
+       && string.Equals(this.Path, other.Path, PoolPaths.PathComparison);
 
   public override int GetHashCode()
-    => HashCode.Combine(this.PoolId, StringComparer.OrdinalIgnoreCase.GetHashCode(this.Path), this.Kind);
+    => HashCode.Combine(this.PoolId, PoolPaths.PathComparer.GetHashCode(this.Path), this.Kind);
 }
 
 /// <summary>

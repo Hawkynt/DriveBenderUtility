@@ -47,7 +47,11 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     private const int _CAPACITY = 64;
     private const long _IDLE_TTL_MS = 3000;
 
-    private readonly Dictionary<string, HandleLease> _leases = new(StringComparer.OrdinalIgnoreCase);
+    // Keyed the way the HOST filesystem resolves names. Case-insensitively on Linux, the pooled
+    // handle opened for 'Report.txt' would be handed back for a read of 'REPORT.TXT' — two genuinely
+    // different files on ext4 — so one file's bytes would serve the other's reads for as long as the
+    // handle stayed pooled.
+    private readonly Dictionary<string, HandleLease> _leases = new(PoolPaths.PathComparer);
     private readonly Lock _lock = new();
 
     private static string _Key(string physicalPath, bool writable) => (writable ? "w|" : "r|") + physicalPath;
@@ -111,7 +115,7 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
 
     public void InvalidatePrefix(string physicalPrefix) {
       lock (this._lock)
-        foreach (var key in this._leases.Keys.Where(k => k.AsSpan(2).StartsWith(physicalPrefix, StringComparison.OrdinalIgnoreCase)).ToArray())
+        foreach (var key in this._leases.Keys.Where(k => k.AsSpan(2).StartsWith(physicalPrefix, PoolPaths.PathComparison)).ToArray())
           this._Retire(key);
     }
 
@@ -260,6 +264,30 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     }
   }
 
+  private bool? _caseSensitive;
+
+  /// <summary>
+  /// Probed from the member's own marker file rather than assumed from the platform, and WITHOUT
+  /// writing anything: every member carries <c>.drivebenderutility/member.json</c>, so asking
+  /// whether the SHOUTED spelling of that same path also exists answers the question outright — a
+  /// case-insensitive volume says yes, a case-sensitive one says no. Falls back to the platform
+  /// default when the marker is not there to ask about (a member mid-creation, a stripped tree).
+  /// </summary>
+  public bool IsCaseSensitive => this._caseSensitive ??= this._ProbeCaseSensitivity();
+
+  private bool _ProbeCaseSensitivity() {
+    try {
+      var folder = PoolPaths.UtilityFolderName;
+      var marker = PoolPaths.MemberMarkerFileName;
+      if (!File.Exists(System.IO.Path.Combine(this._rootPath, folder, marker)))
+        return !OperatingSystem.IsWindows();
+
+      return !File.Exists(System.IO.Path.Combine(this._rootPath, folder.ToUpperInvariant(), marker.ToUpperInvariant()));
+    } catch (Exception) {
+      return !OperatingSystem.IsWindows();
+    }
+  }
+
   /// <summary>
   /// Lets go of pooled OS handles the pool has finished with. Without this they live until the
   /// NEXT request touches the member — so an idle pool holds its members' files open forever and
@@ -276,8 +304,28 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     | BackendCaps.Delete
     | BackendCaps.Timestamps;
 
-  public long BytesFree => (long)this._GetDiskSpace().free;
-  public long BytesTotal => (long)this._GetDiskSpace().total;
+  /// <summary>
+  /// Capacity of the volume behind this member, or ZERO when it cannot be interrogated — the
+  /// documented FR-STAT convention for "capacity unknown", which <see cref="PoolFileSystem.StatFs"/>
+  /// excludes from the aggregate and placement treats as ineligible.
+  ///
+  /// These deliberately do not throw. They are PROPERTIES, and they are read from LINQ pipelines,
+  /// from placement on the write path and from the background metrics tick — places where an
+  /// exception is not expected and, in the case of a timer callback, kills the process outright.
+  /// A member disappearing is the ordinary event this product exists to survive, so it must not
+  /// arrive as an exception from a property that merely reports a number.
+  /// </summary>
+  public long BytesFree => (long)this._TryGetDiskSpace().free;
+
+  public long BytesTotal => (long)this._TryGetDiskSpace().total;
+
+  private (ulong free, ulong total) _TryGetDiskSpace() {
+    try {
+      return this._GetDiskSpace();
+    } catch (Exception) {
+      return (0, 0); // unreachable right now; IsOnline is what says so, not a throw from here
+    }
+  }
 
   private (ulong free, ulong total) _GetDiskSpace() {
     if (OperatingSystem.IsWindows()) {
@@ -287,8 +335,17 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
       throw this._Offline();
     }
 
-    var drive = new DriveInfo(this._rootPath);
-    return ((ulong)drive.AvailableFreeSpace, (ulong)drive.TotalSize);
+    // A member whose path has gone (the disk was pulled, the share dropped) makes DriveInfo throw
+    // DriveNotFoundException — a raw System.IO exception, where the Windows branch above raises the
+    // engine's own PoolFsException. Every engine catch is written against the engine's error model,
+    // so the untranslated one sailed straight through all of them. Translated here so both
+    // platforms fail the same way, and swallowed by the caller so neither fails loudly.
+    try {
+      var drive = new DriveInfo(this._rootPath);
+      return ((ulong)drive.AvailableFreeSpace, (ulong)drive.TotalSize);
+    } catch (Exception e) when (e is DriveNotFoundException or IOException or UnauthorizedAccessException or ArgumentException) {
+      throw this._Offline();
+    }
   }
 
   private string _Resolve(string relativePath, bool shadow)

@@ -525,7 +525,7 @@ internal sealed class ServeCommand(
   private object _StartUnstoppableJob(string kind, Func<object> work, string pool = "")
     => this._StartJob(kind, (_, _) => work(), pool, cancellable: false);
 
-  private object _StartJob(string kind, Func<CancellationToken, Action<string>, object> work, string pool = "", bool cancellable = true) {
+  private object _StartJob(string kind, Func<CancellationToken, Action<JobRegistry.JobProgress>, object> work, string pool = "", bool cancellable = true) {
     var job = this._jobs.Start(kind, pool, work, cancellable);
     return new { ok = true, result = new { jobId = job.Id, kind, state = "running", job.Cancellable } };
   }
@@ -543,6 +543,9 @@ internal sealed class ServeCommand(
           state = "running",
           runningSeconds = (int)(DateTime.UtcNow - job.StartedUtc).TotalSeconds,
           job.Progress,
+          job.Completed,
+          job.Total,
+          job.Item,
           job.Cancellable,
           cancelling = job.IsCancelling,
         },
@@ -574,6 +577,9 @@ internal sealed class ServeCommand(
       job.Pool,
       runningSeconds = (int)(now - job.StartedUtc).TotalSeconds,
       job.Progress,
+      job.Completed,
+      job.Total,
+      job.Item,
       job.Cancellable,
       cancelling = job.IsCancelling,
     })];
@@ -587,18 +593,23 @@ internal sealed class ServeCommand(
   /// TRANSIENT worker process. Either way, a manager reload cannot kill pool work.
   /// </summary>
   private object _PoolOp(string poolRef, string op, string[] workerArgs,
-    CancellationToken cancellation = default, Action<string>? progress = null) => _Guard(() => {
+    CancellationToken cancellation = default, Action<JobRegistry.JobProgress>? progress = null) => _Guard(() => {
     var pool = this._Discover(poolRef);
     string? json;
     if (mountRegistry.Find(pool.PoolId.ToString()) != null) {
-      // relayed to the pool's OWN process: it owns the engine, so it runs to completion there
+      // Relayed to the pool's OWN process, which owns the engine. The relay used to be one-way, so
+      // this work reported itself un-cancellable and showed no progress — for a deep scrub of a
+      // mounted pool that is hours of a dead spinner with no stop button. Both directions now ride
+      // the channel directory: a cancel marker going in, a progress file coming back.
       var id = Guid.NewGuid().ToString("N");
       mountRegistry.RequestOp(pool.PoolId, id, op);
-      json = mountRegistry.WaitOpResult(pool.PoolId, id, TimeSpan.FromMinutes(30))
+      using var relayCancel = cancellation.Register(() => mountRegistry.RequestOpCancel(pool.PoolId, id));
+      json = _WaitRelayedOp(pool.PoolId, id, progress)
              ?? throw new ManifestException("the pool's process did not answer — check the mount");
     } else {
       // a transient worker is ours to kill, so this path honours cancellation and reports progress
-      json = _RunWorker(workerArgs, cancellation, progress)
+      // a transient worker reports by printing; its lines become plain progress text
+      json = _RunWorker(workerArgs, cancellation, line => progress?.Invoke(JobRegistry.JobProgress.Line(line)))
              ?? throw new ManifestException("the worker process failed — check the daemon log");
     }
 
@@ -608,6 +619,40 @@ internal sealed class ServeCommand(
 
     return document.RootElement.Clone();
   });
+
+  /// <summary>
+  /// Waits for a relayed operation, forwarding whatever progress the pool's process publishes.
+  ///
+  /// The deadline is generous because these legitimately run for hours — but it is not the only
+  /// way out any more: a cancelled job files a stop marker, the pool process answers "cancelled",
+  /// and that answer arrives here like any other result.
+  /// </summary>
+  private string? _WaitRelayedOp(Guid poolId, string id, Action<JobRegistry.JobProgress>? progress) {
+    var deadline = DateTime.UtcNow + TimeSpan.FromHours(12);
+    var lastSeen = "";
+    while (DateTime.UtcNow < deadline) {
+      if (mountRegistry.TryTakeOpResult(poolId, id) is { } json)
+        return json;
+
+      if (progress != null && mountRegistry.ReadOpProgress(poolId, id) is { } stepJson && stepJson != lastSeen) {
+        lastSeen = stepJson;
+        try {
+          var step = JsonDocument.Parse(stepJson).RootElement;
+          progress(new(
+            step.TryGetProperty("completed", out var done) ? done.GetInt64() : 0,
+            step.TryGetProperty("total", out var total) ? total.GetInt64() : 0,
+            step.TryGetProperty("item", out var item) ? item.GetString() ?? "" : "",
+            step.TryGetProperty("text", out var text) ? text.GetString() ?? "" : ""));
+        } catch (JsonException) {
+          // a half-written progress file is not worth reporting; the next poll gets a whole one
+        }
+      }
+
+      Thread.Sleep(250);
+    }
+
+    return null;
+  }
 
   /// <summary>
   /// Runs the problem scan (optionally deep or correcting) — relayed to the pool's process or a
@@ -624,18 +669,16 @@ internal sealed class ServeCommand(
       : deep ? ["pool-health", poolRef, "--deep", "--json"]
       : ["pool-health", poolRef, "--json"];
 
+    // Cancellable either way now. A transient worker is killed; one relayed into a MOUNTED pool's
+    // own process is asked to stop through the channel directory, and stops between files.
     return fix || deep
-      // a scan relayed into a MOUNTED pool's own process cannot be called back from here; one
-      // running in a transient worker can be killed, so only that one offers Cancel
-      ? this._StartJob(op, (cancellation, progress) => this._PoolOp(poolRef, op, args, cancellation, progress),
-        poolRef, cancellable: mountRegistry.Find(this._Discover(poolRef).PoolId.ToString()) == null)
+      ? this._StartJob(op, (cancellation, progress) => this._PoolOp(poolRef, op, args, cancellation, progress), poolRef)
       : this._PoolOp(poolRef, op, args);
   }
 
   private object _RunRestore(HttpListenerRequest request) {
     var poolRef = this._RequirePool(request);
-    return this._StartJob("restore", (cancellation, progress) => this._PoolOp(poolRef, "restore", ["pool-restore", poolRef, "--json"], cancellation, progress),
-      poolRef, cancellable: mountRegistry.Find(this._Discover(poolRef).PoolId.ToString()) == null);
+    return this._StartJob("restore", (cancellation, progress) => this._PoolOp(poolRef, "restore", ["pool-restore", poolRef, "--json"], cancellation, progress), poolRef);
   }
 
   /// <summary>
@@ -655,7 +698,7 @@ internal sealed class ServeCommand(
       throw new ManifestException("unmount the pool first — media operations rearrange the members' files and must not race the live mount");
 
     return this._StartJob(kind, (cancellation, progress) => _Guard(() => {
-      var output = _RunWorkerText(workerArgs, out var exitCode, cancellation, progress);
+      var output = _RunWorkerText(workerArgs, out var exitCode, cancellation, line => progress(JobRegistry.JobProgress.Line(line)));
       cancellation.ThrowIfCancellationRequested();
       if (exitCode != 0)
         throw new ManifestException(output.Length > 0 ? output : "the media operation failed — check the daemon log");

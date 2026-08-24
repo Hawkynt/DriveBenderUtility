@@ -38,6 +38,7 @@ public sealed class ProbeVolumeIO(IVolumeIO inner, TimeSpan readDelay = default)
   public long BytesFree => inner.BytesFree;
   public long BytesTotal => inner.BytesTotal;
   public BackendCaps Caps => inner.Caps;
+  public bool IsCaseSensitive => inner.IsCaseSensitive;
 
   public Stream OpenRead(string relativePath, bool shadow) {
     Interlocked.Increment(ref this._reads);

@@ -92,7 +92,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   public IReadOnlyList<TrashEntry> List() {
     // one logical entry per original path; the NEWEST trashed version represents it (older
     // versions are still on disk and purged by age, but Restore hands back the newest)
-    var entries = new Dictionary<string, TrashEntry>(StringComparer.OrdinalIgnoreCase);
+    var entries = new Dictionary<string, TrashEntry>(PoolPaths.PathComparer);
     foreach (var member in this._Online)
     foreach (var (trashPath, info) in this._EntriesOn(member)) {
       var length = member.Stat(trashPath, false)?.Length ?? 0;
@@ -107,7 +107,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   private IEnumerable<(IVolumeIO member, string trashPath, TrashInfo info)> _VersionsOf(string normalizedOriginal) {
     foreach (var member in this._Online)
     foreach (var (trashPath, info) in this._EntriesOn(member))
-      if (info.OriginalPath.Equals(normalizedOriginal, StringComparison.OrdinalIgnoreCase))
+      if (info.OriginalPath.Equals(normalizedOriginal, PoolPaths.PathComparison))
         yield return (member, trashPath, info);
   }
 

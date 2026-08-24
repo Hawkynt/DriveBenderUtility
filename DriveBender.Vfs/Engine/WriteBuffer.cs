@@ -34,7 +34,7 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
     public DateTime FirstStagedUtc { get; internal set; }
   }
 
-  private readonly Dictionary<string, FileBuffer> _files = new(StringComparer.OrdinalIgnoreCase);
+  private readonly Dictionary<string, FileBuffer> _files = new(PoolPaths.PathComparer);
   private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
   private readonly Lock _lock = new();
 

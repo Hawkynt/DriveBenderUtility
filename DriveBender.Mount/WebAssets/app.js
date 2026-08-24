@@ -811,7 +811,7 @@ async function awaitJob(started, onTick) {
     // onTick gets the worker's own latest line as well as the elapsed time, so a long operation
     // reports what it is DOING rather than only that it is still going
     if (onTick)
-      onTick(j.result.runningSeconds || 0, j.result.progress || "", j.result.cancelling === true);
+      onTick(j.result.runningSeconds || 0, j.result.progress || "", j.result.cancelling === true, j.result);
   }
 }
 
@@ -852,10 +852,34 @@ async function runJobWithProgress(title, what, started) {
   overlay.appendChild(modal);
   document.getElementById("modal-root").appendChild(overlay);
 
+  // A bar only appears once the operation KNOWS its denominator. A scan spends its first moments
+  // walking the pool to find out how much there is, and a bar that filled during that walk and then
+  // reset would be a lie about progress rather than a report of it.
+  const bar = el("div", "progress-bar");
+  const fill = el("div", "progress-fill");
+  bar.appendChild(fill);
+  bar.style.display = "none";
+  body.appendChild(bar);
+
   try {
-    return await awaitJob(started, (secs, progress, cancelling) => {
-      detail.textContent = cancelling
-        ? `Cancelling — ${secs}s elapsed…`
+    return await awaitJob(started, (secs, progress, cancelling, result) => {
+      const total = (result && result.total) || 0;
+      const done = (result && result.completed) || 0;
+      if (total > 0) {
+        bar.style.display = "";
+        fill.style.width = `${Math.min(100, Math.round((done / total) * 100))}%`;
+      }
+
+      if (cancelling) {
+        detail.textContent = `Cancelling — ${secs}s elapsed…`;
+        return;
+      }
+
+      // "1,204 of 18,932 — Photos/2019/DSC_0043.NEF" says far more than a spinner: how far in, how
+      // much is left, and whether it is moving at all
+      const item = (result && result.item) || "";
+      detail.textContent = total > 0
+        ? `${done.toLocaleString()} of ${total.toLocaleString()}${item ? " — " + item : ""} (${secs}s)`
         : (progress ? `${progress} (${secs}s)` : `Still working — ${secs}s elapsed.`);
     });
   } finally {

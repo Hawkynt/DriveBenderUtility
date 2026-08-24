@@ -40,6 +40,29 @@ public readonly record struct VolumeEntry(string Name, bool IsDirectory, long Le
 /// </summary>
 public static class PoolPaths {
 
+  /// <summary>
+  /// How two pool-relative paths are compared for identity — the single authority for it.
+  ///
+  /// Windows says <c>Report.txt</c> and <c>REPORT.TXT</c> are one file; POSIX says they are two.
+  /// The engine used to answer OrdinalIgnoreCase everywhere, on both platforms, and that is not a
+  /// cosmetic difference on Linux: the handle table, the page and metadata caches, the write
+  /// buffer, the staging map and the directory merge all collapsed the two names onto one entry,
+  /// so copying a case-sensitive tree into a pool lost whichever file landed second — silently,
+  /// with the bytes of one name serving reads of the other.
+  ///
+  /// The approximation is the PLATFORM rather than the member's actual filesystem, which is what
+  /// <see cref="LocalVolumeIO"/> already assumes when it proves containment. A case-INsensitive
+  /// filesystem mounted under Linux (an NTFS volume, a ciopfs) would therefore be treated as
+  /// sensitive and could still collide at the member; that is a narrower and much rarer case than
+  /// the one this fixes, and it needs a per-member capability probe rather than a constant.
+  /// </summary>
+  public static StringComparison PathComparison { get; } =
+    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+  /// <summary><see cref="PathComparison"/> as a comparer, for the path-keyed dictionaries and sets.</summary>
+  public static StringComparer PathComparer { get; } =
+    OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
   /// <summary>Marker folder for DriveBenderUtility sidecars (manifest mirror, member identity, trash, conflicts).</summary>
   public const string UtilityFolderName = ".drivebenderutility";
   public const string MemberMarkerFileName = "member.json";

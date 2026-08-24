@@ -51,7 +51,7 @@ public class JobRegistryTests {
     using var release = new ManualResetEventSlim(false);
 
     var job = registry.Start("scan", "pool-1", (_, progress) => {
-      progress("scanning member 2 of 3");
+      progress(JobRegistry.JobProgress.Line("scanning member 2 of 3"));
       reported.Set();
       release.Wait(TimeSpan.FromSeconds(30));
       return new { ok = true };
@@ -60,6 +60,57 @@ public class JobRegistryTests {
     reported.Wait(TimeSpan.FromSeconds(10)).Should().BeTrue();
     job.Progress.Should().Be("scanning member 2 of 3", "the UI must be able to show what the work is doing, not just that it is running");
     job.IsFinished.Should().BeFalse("progress must be readable BEFORE the job completes");
+
+    release.Set();
+    _WaitUntil(() => job.IsFinished).Should().BeTrue();
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Progress_GivenTheWorkCountsItems_ThenTheCountsAreVisibleAndNotJustAnAdjective() {
+    var registry = new JobRegistry();
+    using var reported = new ManualResetEventSlim(false);
+    using var release = new ManualResetEventSlim(false);
+
+    var job = registry.Start("scrub", "pool-1", (_, progress) => {
+      progress(JobRegistry.JobProgress.Line("listing the pool")); // before the total is known
+      progress(new(1204, 18932, "Photos/2019/DSC_0043.NEF", "1,204 of 18,932 — Photos/2019/DSC_0043.NEF"));
+      reported.Set();
+      release.Wait(TimeSpan.FromSeconds(30));
+      return new { ok = true };
+    });
+
+    reported.Wait(TimeSpan.FromSeconds(10)).Should().BeTrue();
+
+    // A line of text cannot be drawn as a bar and cannot say whether an hours-long pass is a tenth
+    // or nine tenths through — which is most of what the person watching it wants to know.
+    job.Completed.Should().Be(1204);
+    job.Total.Should().Be(18932, "the denominator is what turns 'still working' into 'nearly done'");
+    job.Item.Should().Be("Photos/2019/DSC_0043.NEF", "and WHICH item, so a run wedged on one huge file is visible");
+
+    release.Set();
+    _WaitUntil(() => job.IsFinished).Should().BeTrue();
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Progress_GivenTheWorkCannotCountYet_ThenTheTotalStaysZeroRatherThanBeingGuessed() {
+    var registry = new JobRegistry();
+    using var reported = new ManualResetEventSlim(false);
+    using var release = new ManualResetEventSlim(false);
+
+    var job = registry.Start("scrub", "pool-1", (_, progress) => {
+      progress(JobRegistry.JobProgress.Line("listing the pool"));
+      reported.Set();
+      release.Wait(TimeSpan.FromSeconds(30));
+      return new { ok = true };
+    });
+
+    reported.Wait(TimeSpan.FromSeconds(10)).Should().BeTrue();
+    job.Total.Should().Be(0,
+      "a scan spends its first moments finding out how much there is; a denominator invented during "
+      + "that walk would make a bar fill and then reset, which is a lie about progress rather than a report of it");
+    job.Progress.Should().Be("listing the pool", "the phase is still worth showing while the count is unknown");
 
     release.Set();
     _WaitUntil(() => job.IsFinished).Should().BeTrue();
