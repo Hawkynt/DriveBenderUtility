@@ -17,6 +17,21 @@ public sealed class JobRegistry(Func<DateTime>? clock = null) {
 
   private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
 
+  /// <summary>
+  /// How far a job has got, in items rather than in prose.
+  ///
+  /// The only thing a job could report used to be its worker's most recent line of output. That
+  /// cannot be drawn as a bar, cannot say whether a run is a tenth or nine tenths through, and
+  /// cannot tell "still working" from "wedged on one enormous file" — which for an operation that
+  /// legitimately takes hours is most of what the person watching it wants to know.
+  /// <see cref="Total"/> is 0 when the work genuinely cannot count itself yet; reported honestly
+  /// rather than guessed, because a denominator that moves is worse than none.
+  /// </summary>
+  public readonly record struct JobProgress(long Completed, long Total, string Item, string Text) {
+    /// <summary>A plain line of output — a worker's stdout, a phase announcement.</summary>
+    public static JobProgress Line(string text) => new(0, 0, "", text);
+  }
+
   public sealed class Job : IDisposable {
 
     private readonly CancellationTokenSource _cancellation = new();
@@ -54,6 +69,25 @@ public sealed class JobRegistry(Func<DateTime>? clock = null) {
       internal set => Volatile.Write(ref this._progress, value);
     }
 
+    private long _completed;
+    private long _total;
+    private string _item = "";
+
+    /// <summary>Items finished, and out of how many; <see cref="Total"/> 0 means "not countable yet".</summary>
+    public long Completed => Interlocked.Read(ref this._completed);
+
+    public long Total => Interlocked.Read(ref this._total);
+
+    /// <summary>What the job is working on right now — a pool-relative path, or a phase name.</summary>
+    public string Item => Volatile.Read(ref this._item);
+
+    internal void Advance(JobProgress step) {
+      Interlocked.Exchange(ref this._completed, step.Completed);
+      Interlocked.Exchange(ref this._total, step.Total);
+      Volatile.Write(ref this._item, step.Item);
+      Volatile.Write(ref this._progress, step.Text);
+    }
+
     public bool IsFinished => Interlocked.Read(ref this._finishedTicks) != 0;
 
     public DateTime? FinishedUtc {
@@ -89,7 +123,7 @@ public sealed class JobRegistry(Func<DateTime>? clock = null) {
   /// work is handed a cancellation token and a progress sink; a cancelled job reports as such
   /// rather than as a crash.
   /// </summary>
-  public Job Start(string kind, string pool, Func<CancellationToken, Action<string>, object> work, bool cancellable = true) {
+  public Job Start(string kind, string pool, Func<CancellationToken, Action<JobProgress>, object> work, bool cancellable = true) {
     this.Prune();
     var job = new Job(Guid.NewGuid().ToString("N"), kind, pool, this._clock(), cancellable);
     this._jobs[job.Id] = job;
@@ -97,7 +131,7 @@ public sealed class JobRegistry(Func<DateTime>? clock = null) {
     new Thread(() => {
       object envelope;
       try {
-        envelope = work(job.Cancellation, progress => job.Progress = progress);
+        envelope = work(job.Cancellation, job.Advance);
       } catch (OperationCanceledException) {
         envelope = new { ok = false, error = "cancelled" };
       } catch (Exception e) {

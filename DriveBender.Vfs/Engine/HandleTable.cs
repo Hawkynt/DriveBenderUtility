@@ -87,7 +87,7 @@ public sealed class HandleTable {
   }
 
   private readonly Dictionary<long, OpenHandle> _handles = [];
-  private readonly Dictionary<string, FileState> _files = new(StringComparer.OrdinalIgnoreCase);
+  private readonly Dictionary<string, FileState> _files = new(PoolPaths.PathComparer);
   private readonly Lock _lock = new();
   private long _nextHandle;
 
@@ -274,7 +274,7 @@ public sealed class HandleTable {
   public void RenameSubtree(string fromNormalized, string toNormalized) {
     lock (this._lock) {
       var fromPrefix = fromNormalized + "/";
-      foreach (var key in this._files.Keys.Where(k => k.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray()) {
+      foreach (var key in this._files.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray()) {
         var file = this._files[key];
         this._files.Remove(key);
         file.Path = toNormalized + "/" + key[fromPrefix.Length..];

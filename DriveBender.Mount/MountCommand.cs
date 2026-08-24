@@ -193,6 +193,34 @@ internal static class MountCommand {
   /// </summary>
   private static void _RunPoolOp(PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, PoolConfig config, MountRegistry registry, string id, string op) {
     string json;
+
+    // The manager cannot call into this process, so the two directions it needs — "stop" and "how
+    // far along are you" — ride the same channel directory the request arrived through. The stop
+    // marker is polled BETWEEN items by OperationContext rather than watched, because the only
+    // safe place to abandon a scrub or a restore is between files.
+    using var stopping = new CancellationTokenSource();
+    using var stopWatcher = new Timer(_ => {
+      try {
+        if (registry.IsOpCancelRequested(pool.PoolId, id))
+          stopping.Cancel();
+      } catch (Exception) {
+        // the channel is unreadable for a moment; the next tick tries again
+      }
+    }, null, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(500));
+
+    var lastPublished = 0L;
+    var context = new OperationContext(stopping.Token, step => {
+      // rate-limited to one file write a second: a scrub steps once per file and a pool has
+      // millions of them, so publishing every step would cost more than the work being reported
+      var now = Environment.TickCount64;
+      if (now - Interlocked.Read(ref lastPublished) < 1000 && step.Completed < step.Total)
+        return;
+
+      Interlocked.Exchange(ref lastPublished, now);
+      registry.WriteOpProgress(pool.PoolId, id, System.Text.Json.JsonSerializer.Serialize(
+        new { completed = step.Completed, total = step.Total, item = step.Item, text = step.ToString() }));
+    });
+
     try {
       var duplication = Math.Max(1, config.Duplication ?? 1);
       var allowSamePhysical = config.Placement?.ShadowNeverSamePhysical == false;
@@ -200,12 +228,14 @@ internal static class MountCommand {
       switch (op) {
         case "health" or "health-deep" or "fix": {
           var service = new HealthService(ios, new SmartctlMonitor(), fs.Integrity, media);
-          var report = op == "fix" ? service.CheckAndCorrect() : service.Check(deep: op == "health-deep");
+          var report = op == "fix"
+            ? service.CheckAndCorrect(operation: context)
+            : service.Check(deep: op == "health-deep", operation: context);
           json = PoolOpsCommand.HealthReportJson(report);
           break;
         }
         case "restore": {
-          var report = media.RestorePool();
+          var report = media.RestorePool(context);
           json = System.Text.Json.JsonSerializer.Serialize(new { ok = true, copiesCreated = report.CopiesCreated });
           break;
         }
@@ -213,11 +243,16 @@ internal static class MountCommand {
           json = System.Text.Json.JsonSerializer.Serialize(new { ok = false, error = $"unknown pool operation '{op}'" });
           break;
       }
+    } catch (OperationCanceledException) {
+      // asked to stop, and it did: a distinct answer from a failure, because everything it managed
+      // before the stop is real work that was kept
+      json = System.Text.Json.JsonSerializer.Serialize(new { ok = false, error = "cancelled" });
     } catch (Exception e) {
       json = System.Text.Json.JsonSerializer.Serialize(new { ok = false, error = e.Message });
     }
 
     registry.WriteOpResult(pool.PoolId, id, json);
+    registry.ClearOp(pool.PoolId, id);
   }
 
   private static int _MountPlatform(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, PoolConfig config, string target, string label, MountRegistry registry, MountOptions options) {

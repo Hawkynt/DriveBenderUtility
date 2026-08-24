@@ -62,6 +62,7 @@ public sealed class MeasuredVolumeIO(IVolumeIO inner) : IVolumeIO {
   public long BytesFree => inner.BytesFree;
   public long BytesTotal => inner.BytesTotal;
   public BackendCaps Caps => inner.Caps;
+  public bool IsCaseSensitive => inner.IsCaseSensitive; // a decorator must never answer for its member
 
   public Stream OpenRead(string relativePath, bool shadow) => new MeasuredStream(this._Timed(() => inner.OpenRead(relativePath, shadow)), this);
   public Stream OpenWrite(string relativePath, bool shadow, bool create) => new MeasuredStream(this._Timed(() => inner.OpenWrite(relativePath, shadow, create)), this);

@@ -32,6 +32,18 @@ public interface IVolumeIO {
   BackendCaps Caps { get; }
 
   /// <summary>
+  /// Whether THIS member's storage tells <c>Report.txt</c> and <c>REPORT.TXT</c> apart.
+  ///
+  /// It is a property of the backend, not of the host: an NTFS volume or an SMB share mounted
+  /// under Linux is case-insensitive on a platform that is not. The engine's internal maps key on
+  /// the platform (<see cref="PoolPaths.PathComparison"/>), but one decision cannot be taken that
+  /// way — a rename that differs from its target only in case. Where the backend folds the two
+  /// names into one file, "delete the old target, then rename onto it" deletes the file being
+  /// renamed. So that path asks the member instead of assuming.
+  /// </summary>
+  bool IsCaseSensitive => !OperatingSystem.IsWindows();
+
+  /// <summary>
   /// True when an operation on this member PARKS the calling thread for a network round trip.
   /// Every cloud provider behind the whole-file backend is sync-over-async (the driver callbacks
   /// are synchronous, so the engine cannot be async end to end), which means each in-flight

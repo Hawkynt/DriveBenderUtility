@@ -391,7 +391,7 @@ un-stoppable job never claims to be STOPPING. That is what it asserts now.
 failure and not a skip. Installing the pinned build turned all four green. Worth recording because
 "it is the environment" is exactly the claim that should not be made without checking.
 
-### Linux end-to-end has been RED in CI, and I did not look
+### Linux end-to-end was RED in CI, I did not look, and two of the three were platform asymmetries
 
 Every "suite green" in this file and in my reporting came from a local Windows run. The Linux
 end-to-end job has been failing since at least 13 August across many commits, and nothing here said
@@ -399,42 +399,120 @@ so. Local runs are not CI, and a claim of green that was never checked against t
 worth nothing on that target. Three distinct failures, all reproduced on `main` and none caused by
 the commit they happened to land on:
 
-1. **A torn read through FUSE.** `DriverEndToEndTests.Concurrency_GivenManyReadersAndWriters...`
-   reports `read back 4096 bytes, which is neither empty nor the full 32768`. This is the most
-   serious of the three: a reader observing a partially-written file is exactly the corruption the
-   whole concurrency design exists to prevent, and the Windows path does not do it.
+1. **A torn read through FUSE — and it was the TEST that was wrong.**
+   `DriverEndToEndTests.Concurrency_GivenManyReadersAndWriters...` required every read to come back
+   either empty or exactly 32768 bytes, and reported short reads such as 4096. That was recorded
+   here as the most serious of the three, on the reasoning that a reader observing a
+   partially-written file is the corruption the concurrency design exists to prevent.
 
-   **It is INTERMITTENT, which was not known and changes how to hunt it.** Run alone twelve times
-   on a 16-CPU Linux host it failed twice; nine times on an unmodified tree, twice again. So the
-   rate is roughly one in four or five, not "always" — which means a single green run of this
-   scenario proves nothing, and any change claimed to fix it needs a run of a dozen or more before
-   the claim is worth anything. The pairing above was measured deliberately, current tree against
-   a stashed pristine one, because the I/O-path work in this pass could plausibly have caused a
-   torn read and "it was already failing" is not something to take on trust. Same rate both sides.
-2. **Two names differing only in case cannot both exist.** `BoundaryEndToEndTests.Names_Given...`
-   fails creating `REPORT.TXT` beside `Report.txt`. POSIX says those are two files; the engine
-   compares paths with `OrdinalIgnoreCase` throughout (`HandleTable._files`, the path helpers), so
-   it cannot represent both. On Windows that is right and on Linux it silently is not — a user
-   copying a case-sensitive tree into a pool loses whichever file lands second.
-3. **The mount detaches during eject/restore.** `DurabilityEndToEndTests.Divergence_...` fails with
-   `Transport endpoint is not connected`, which is FUSE saying the server is gone. The scenario
-   removes a member symlink under a live mount; on Windows the junction equivalent survives it.
+   It is not a pool defect. `File.WriteAllBytes` truncates and then writes, and a whole-file read is
+   not atomic against that on ANY filesystem. Measured rather than argued: the same four writers and
+   four readers against a plain tmpfs directory produce 1-6 short reads per run, and against btrfs
+   2-4 — the pool is doing exactly what the bare kernel does. Content is not promised either; a
+   plain filesystem occasionally returns a full-length BLEND of two versions, because the reader
+   took some pages before the overwrite and some after. The scenario "passed" on Windows only
+   because share violations there turn the same race into an IOException the test already tolerates,
+   so the platform difference was never evidence of a platform defect.
 
-None of these is fixed here. They are written down first because they were invisible, which was the
-larger problem.
+   The scenario now asserts what a pool genuinely owes and a filesystem cannot excuse: no read may
+   be longer than any version, every file settles on ONE WHOLE version once the contention stops,
+   and — the part only a pool can get wrong — **no read may contain a block belonging to a
+   DIFFERENT FILE**. Payloads are random per file and per round, so a 16-byte fingerprint identifies
+   its owner beyond coincidence, and a cache keyed so two paths collide, a placement resolved to the
+   wrong member or a handle reused across names would all fail it. That is strictly stronger than
+   the length check it replaces, and it passes nine runs in a row where the old one failed two in
+   nine.
+
+   One caution for whoever writes the next oracle of this kind: the first version of it fired
+   immediately, and the cause was the fixture, not the engine. All four files were seeded with the
+   same initial payload, so their blocks were indistinguishable and each file's own data was
+   reported as another's. Seeds are distinct per file now.
+2. **Two names differing only in case cannot both exist. FIXED.** The engine compared paths with
+   `OrdinalIgnoreCase` everywhere, on both platforms. On POSIX that is not cosmetic: the handle
+   table, the page and metadata caches, the write buffer, the staging map, the trash, the checksum
+   database, the shadow namespace and the directory merge all folded the two names onto one entry,
+   so copying a case-sensitive tree into a pool lost whichever file landed second — silently, with
+   one name's bytes serving the other's reads. `LocalVolumeIO`'s pooled handles collided the same
+   way, which would have served one file's content for the other even had the rest been correct.
+
+   `PoolPaths.PathComparison`/`PathComparer` is the single authority now — insensitive on Windows,
+   sensitive elsewhere — and every path-keyed structure uses it. Deliberately NOT changed: the
+   comparisons that key on a physical volume id, a member display name, a config key or a fixed
+   marker name, none of which are pool paths.
+
+   **The fix has a hazard of its own, and closing it is the more interesting half.** The platform is
+   an approximation of what the STORAGE does: an NTFS volume or an SMB share mounted under Linux is
+   case-insensitive on a case-sensitive host. There, "delete the old target, then rename onto it"
+   deletes the file being renamed — the engine would have destroyed data in a configuration where
+   the old code was safe. So `IVolumeIO.IsCaseSensitive` asks the member instead of assuming, and
+   the rename path skips the overwrite-delete when the two names differ only in case and that member
+   does not tell them apart. `LocalVolumeIO` answers it by probing, and without writing anything:
+   every member carries `.drivebenderutility/member.json`, so asking whether the SHOUTED spelling of
+   that same path also exists settles it. This is what the engine unit suite caught the moment the
+   comparison changed, on a fake whose namespace is case-insensitive.
+3. **The mount detached during eject/restore. FIXED, and it was worse than "the scenario fails".**
+   Pulling a member out from under a live mount killed the FUSE session: everything the user had
+   open on the pool failed with `Transport endpoint is not connected`, from ONE disk going away,
+   which is the exact opposite of what a redundant pool is for. Two causes, both asymmetries where
+   the Windows path had been hardened and the Linux one had not:
+
+   - `LocalVolumeIO.BytesFree`/`BytesTotal` raise `DriveNotFoundException` on Linux when the member
+     path is gone. The Windows branch of the same method raises the engine's own `PoolFsException`,
+     which every catch in the engine is written against; the raw System.IO exception sailed through
+     all of them. They now answer 0 — the documented FR-STAT convention for "capacity unknown" —
+     because these are PROPERTIES, read from LINQ pipelines, from placement on the write path and
+     from a background timer, and a member disappearing is the ordinary event this product exists to
+     survive rather than something that should arrive as an exception from a size.
+   - The FUSE host's pump timer had no try/catch, and an unhandled exception in a `Timer` callback
+     kills the process. The WinFsp host has carried exactly that guard, with exactly that comment,
+     for some time. The same timer was also PERIODIC, so a slow tick overlapped the next one and ran
+     `Pump()`/metrics/reload concurrently against the engine; it is single-shot and re-armed at the
+     end of each tick now, again matching Windows.
+
+None of the three is still open. What made all three hard to see is worth keeping: two of them were
+platform asymmetries where one host had been fixed and the other silently had not, and the third was
+a test asserting a guarantee no filesystem makes.
 
 ## Still open
 
 An earlier revision of this file claimed "nothing known" here. That was wrong — it dropped the two
-UI items below, which were open then and are open now. "Nothing known" is a claim to be re-earned
-after each pass, not a state to reach.
+UI items below. Both are now closed, and they are kept rather than deleted because what they cost
+is the point: a capability gap that is merely WRITTEN DOWN reads as a decision, and these two sat
+here through several passes looking like ones.
 
-1. **Jobs relayed into a MOUNTED pool's own process cannot be cancelled.** The operation runs in
-   that process and the manager has no channel to call it back, so such jobs report
-   `cancellable: false` — honest, but the capability is missing. `MountRegistry` needs a cancel op
-   alongside `RequestOp`.
-2. **Progress is per-job, not per-item.** The worker's latest stdout line is surfaced; there is no
-   structured "N of M files" for a long scatter or scrub.
+1. **Jobs relayed into a MOUNTED pool's own process could not be cancelled. FIXED.** Pool work
+   never runs inside the manager — the manager is a reload-safe UI shell and a mounted pool owns
+   its engine — so a scan or a restore on a mounted pool is FILED as a request and executed over
+   there. That relay was one-way: once filed, the manager had nothing more to say. Such jobs
+   reported `cancellable: false`, which was honest and useless, because it meant a deep scrub of a
+   mounted pool could not be stopped for however many hours it took.
+
+   `MountRegistry` now carries the other two directions in the same channel directory and with the
+   same file-drop shape as the request: a stop marker going in, a progress file coming back. The
+   pool's process polls the stop marker BETWEEN ITEMS via `OperationContext`, never inside one — a
+   scrub abandoned mid-repair, or a restore abandoned mid-copy, is precisely the torn state those
+   operations exist to fix. A stopped pass answers `cancelled`, which is a distinct outcome from a
+   failure because everything it managed first is real work that was kept: the checksum baseline is
+   persisted in a `finally`, so cancelling a scrub means "stop here", not "throw away what you
+   learned on the way".
+2. **Progress was per-job, not per-item. FIXED.** The only thing a job could report was its
+   worker's most recent line of output. That cannot be drawn as a bar, cannot say whether an
+   hours-long pass is a tenth or nine tenths through, and cannot tell "still working" from "wedged
+   on one enormous file" — which is most of what the person watching it wants to know.
+
+   `IntegrityService` and `MediaLifecycle.RestorePool` now materialise their work list up front and
+   report `(completed, total, item)`; `HealthService` threads it through; the job ticket and the SSE
+   frame carry the counts; the modal draws a bar. `Total` stays 0 while the pass is still finding
+   out how much there is, reported honestly rather than guessed — a denominator that grew as the run
+   went would make the bar fill and reset, which is a lie about progress rather than a report of it,
+   and for the same reason the bar only appears once the total is known. Publishing is rate-limited
+   to one channel write a second, because a scrub steps once per file and a pool has millions.
+
+   **Both verified end to end through the shipped binary**, not only in unit tests: a deep scan of a
+   mounted 21,300-file pool reported `cancellable: true` (it reported `false` before), streamed
+   `20,977 / 21,300 — big/g322.bin` to the HTTP API the browser polls, accepted a cancel with
+   `"cancelling"`, ended as `{"ok": false, "error": "cancelled"}`, and a second scan afterwards
+   completed normally with no issues — so stopping one left the pool and its baseline intact.
 3. **A file replaced by rename keeps serving its OLD content to new readers — Windows.** After
    `File.Move(source, target, overwrite: true)` succeeds, a reader that opens the target path
    afresh still gets the pre-replacement bytes. Measured through a real WinFsp mount: six
@@ -474,11 +552,20 @@ after each pass, not a state to reach.
 
    It also passes when run ALONE and fails in the full suite, so it is timing-sensitive; a single
    green run of this scenario means nothing without the whole suite behind it.
-4. **`HandleTable.RenameSubtree` has the same shape as the `RenamePath` defect fixed in `4ad2094`**
-   — it re-keys children with `_files[file.Path] = file`, clobbering any state already there — and
-   `_RenameFolder` holds leases on the two folder paths but on **no child file** while moving them.
-   Not reproduced end to end; flagged because it is the sibling of a bug that was proven real, and
-   the stress suite races file renames only, which is why it was not caught.
+4. **`_RenameFolder` holds leases on the two folder paths but on NO CHILD FILE while moving them.**
+   It flushes dirty children and publishes staged ones first, but takes no lease on any of them, so
+   a write can land between that flush and the member-level `RenameFolder` and address a path whose
+   physical file has since moved. Not reproduced end to end; the stress suite races file renames
+   only, which is why it would not be caught. Fixing it needs a lock-ordering story for an unbounded
+   set of children, which is why it is written down rather than attempted in passing.
+
+   **Half of this entry was wrong and is withdrawn.** It also claimed `HandleTable.RenameSubtree`
+   repeats the defect fixed in `4ad2094` by re-keying children over any state already there. It does
+   re-key that way — and so does `RenamePath`, the method that fix landed in. Displacing an entry was
+   never the defect; the defect was the CLOSE path unkeying an entry that had come to belong to
+   somebody else, and `4ad2094` fixed that centrally by guarding both removal sites with
+   `ReferenceEquals(current, file)`. `RenameSubtree` therefore has the shape of the FIXED code, not
+   of the bug. Checked against the commit rather than inferred from the shape a second time.
 
 The three throughput items that stood here — sync-over-async across the providers, the absence of
 provider-level range reads, and the whole-object RAM spikes — are closed above.

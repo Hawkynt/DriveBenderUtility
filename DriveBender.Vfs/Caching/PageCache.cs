@@ -1,18 +1,20 @@
 namespace DivisonM.Vfs.Caching;
 
 /// <summary>
-/// Key of one cached block: pool, normalized pool-relative path, block index. The path
-/// compares case-INSENSITIVELY to match the rest of the engine (handles, write buffer,
-/// staging all use OrdinalIgnoreCase) — otherwise an invalidation under one casing would
-/// leave a stale block cached under another for a full TTL (SAFE-COHERE).
+/// Key of one cached block: pool, normalized pool-relative path, block index. The path compares
+/// exactly as the rest of the engine does (<see cref="PoolPaths.PathComparison"/>) — insensitively
+/// on Windows, sensitively on POSIX. Both directions matter: matching more loosely than the
+/// platform serves one file's blocks for another's reads, and matching more strictly leaves an
+/// invalidation under one casing with a stale block cached under another for a full TTL
+/// (SAFE-COHERE).
 /// </summary>
 public sealed record PageKey(Guid PoolId, string Path, long BlockIndex) {
   public bool Equals(PageKey? other)
     => other != null && this.PoolId == other.PoolId && this.BlockIndex == other.BlockIndex
-       && string.Equals(this.Path, other.Path, StringComparison.OrdinalIgnoreCase);
+       && string.Equals(this.Path, other.Path, PoolPaths.PathComparison);
 
   public override int GetHashCode()
-    => HashCode.Combine(this.PoolId, StringComparer.OrdinalIgnoreCase.GetHashCode(this.Path), this.BlockIndex);
+    => HashCode.Combine(this.PoolId, PoolPaths.PathComparer.GetHashCode(this.Path), this.BlockIndex);
 }
 
 public sealed record CacheStatistics(long Hits, long Misses, long Bytes, int Entries) {
@@ -46,7 +48,7 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
     /// file — so a write's invalidation cost grew with total cache occupancy rather than with
     /// the file. Kept in exact step with <see cref="Blocks"/>.
     /// </summary>
-    public readonly Dictionary<string, HashSet<long>> ByPath = new(StringComparer.OrdinalIgnoreCase);
+    public readonly Dictionary<string, HashSet<long>> ByPath = new(PoolPaths.PathComparer);
 
     /// <summary>Occupancy. Read WITHOUT the shard lock during victim selection, so it moves atomically.</summary>
     public long Bytes;

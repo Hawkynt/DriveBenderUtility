@@ -329,20 +329,43 @@ public static class LinuxFuseMountHost {
     fs.Mount(new(target, readOnly));
     var scheduler = fs.CreateScheduler();
     var registered = false;
-    using var pump = new Timer(_ => {
-      scheduler.Pump();
-      if (!registered && (System.IO.Directory.Exists(target) && _IsMounted(target))) {
-        registered = true;
-        onMounted?.Invoke();
+
+    // NON-REENTRANT AND NON-FATAL, matching the WinFsp host — this pump had neither, and both
+    // gaps were real. An unhandled exception in a Timer callback KILLS THE PROCESS: pulling a
+    // member out from under a live mount made the very next tick throw while reading the vanished
+    // member's free space, and the FUSE session died with it. Everything the user had open on the
+    // pool then failed with ENOTCONN, from one disk going away — which is the exact opposite of
+    // what a redundant pool is for. And the timer was PERIODIC, so a slow tick (a live reload, a
+    // big metrics publish) overlapped the next one on another thread-pool thread and ran
+    // Pump()/metrics/reload concurrently against the engine; it is armed for a single shot and
+    // re-armed at the end of each tick instead.
+    Timer? pump = null;
+    pump = new Timer(_ => {
+      try {
+        scheduler.Pump();
+        if (!registered && (System.IO.Directory.Exists(target) && _IsMounted(target))) {
+          registered = true;
+          onMounted?.Invoke();
+        }
+
+        if (registered)
+          onTick?.Invoke(); // periodic metrics snapshot for the serve daemon
+
+        // another dbmount asked for a clean unmount → detach; libfuse returns from Mount()
+        if (stopRequested?.Invoke() == true)
+          Unmount(target);
+      } catch (Exception e) {
+        DriveBender.Logger($"[Warning]background pump tick failed: {e.Message}");
+      } finally {
+        try {
+          pump?.Change(TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan);
+        } catch (ObjectDisposedException) {
+          // the mount is shutting down and the timer is already gone
+        }
       }
+    }, null, TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan);
 
-      if (registered)
-        onTick?.Invoke(); // periodic metrics snapshot for the serve daemon
-
-      // another dbmount asked for a clean unmount → detach; libfuse returns from Mount()
-      if (stopRequested?.Invoke() == true)
-        Unmount(target);
-    }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+    using var pumpLifetime = pump;
 
     Console.CancelKeyPress += (_, e) => {
       e.Cancel = true;

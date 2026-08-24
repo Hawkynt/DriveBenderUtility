@@ -19,7 +19,7 @@ public sealed class ShadowNamespace {
   private const int _DEFAULT_MAX_ENTRIES = 1_000_000;
 
   private readonly int _maxEntries;
-  private readonly Dictionary<string, (NamespaceNode node, LinkedListNode<string> lru)> _nodes = new(StringComparer.OrdinalIgnoreCase);
+  private readonly Dictionary<string, (NamespaceNode node, LinkedListNode<string> lru)> _nodes = new(PoolPaths.PathComparer);
   private readonly LinkedList<string> _order = new(); // MRU at the front, LRU at the back
   private readonly Lock _lock = new();
 
@@ -63,7 +63,7 @@ public sealed class ShadowNamespace {
 
       // a removed directory takes its subtree with it
       var prefix = normalizedPath + "/";
-      foreach (var key in this._nodes.Keys.Where(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToArray())
+      foreach (var key in this._nodes.Keys.Where(k => k.StartsWith(prefix, PoolPaths.PathComparison)).ToArray())
         this._RemoveLocked(key);
     }
   }
@@ -81,7 +81,7 @@ public sealed class ShadowNamespace {
       }
 
       var fromPrefix = fromNormalized + "/";
-      foreach (var key in this._nodes.Keys.Where(k => k.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray()) {
+      foreach (var key in this._nodes.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray()) {
         this._nodes.Remove(key, out var child);
         this._order.Remove(child.lru);
         var newKey = toNormalized + "/" + key[fromPrefix.Length..];
@@ -101,7 +101,7 @@ public sealed class ShadowNamespace {
     lock (this._lock) {
       var result = new List<DirEntry>();
       foreach (var (path, entry) in this._nodes) {
-        if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        if (!path.StartsWith(prefix, PoolPaths.PathComparison))
           continue;
 
         var rest = path[prefix.Length..];

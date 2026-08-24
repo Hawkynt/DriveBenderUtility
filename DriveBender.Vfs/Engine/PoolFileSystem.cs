@@ -36,7 +36,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   // double as access stays sequential, so two chains already cover a long way ahead, and every
   // extra chain is another set of threads competing for the same device queue.
   private const int _MAX_PREFETCH_CHAINS = 2;
-  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _prefetching = new(StringComparer.OrdinalIgnoreCase);
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _prefetching = new(PoolPaths.PathComparer);
 
   /// <summary>Claims one of this path's read-ahead slots; false when they are all in use.</summary>
   private bool _TryBeginPrefetch(string path) {
@@ -78,7 +78,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   // (*.TEMP.$DRIVEBENDER, hidden on disk), so it never looks fully written until it is. The value
   // is the still-open Create journal sequence — the atomic temp→final rename is the LAST action
   // before that intent completes; a crash before it leaves only temps the recovery sweep removes.
-  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _staging = new(StringComparer.OrdinalIgnoreCase);
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _staging = new(PoolPaths.PathComparer);
 
   private static string _StagedNameOf(string normalized) => normalized + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
 
@@ -96,7 +96,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private IEnumerator<string>? _healScan; // advanced only by HealStep (single pump thread)
 
   // degraded-write warnings deduplicate per path; cleared when membership changes
-  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _degradedAckWarned = new(StringComparer.OrdinalIgnoreCase);
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _degradedAckWarned = new(PoolPaths.PathComparer);
 
   // FR-STRIPE-READY: outstanding I/O per member — the stripe selector routes each block to the
   // storage that is READY, so a fast/idle SSD naturally takes more blocks than a slow/busy HDD
@@ -527,7 +527,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._cache.Metadata.TryGet<IReadOnlyList<DirEntry>>(key, out var cached))
       return cached;
 
-    var entries = new Dictionary<string, DirEntry>(StringComparer.OrdinalIgnoreCase);
+    var entries = new Dictionary<string, DirEntry>(PoolPaths.PathComparer);
     var folderSeen = normalized.Length == 0;
 
     // Captured BEFORE the members are enumerated. A listing takes each entry's length from
@@ -574,7 +574,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // with their live size (FR-STAGED-WRITE)
     var stagingPrefix = normalized.Length == 0 ? "" : normalized + "/";
     foreach (var stagedPath in this._staging.Keys) {
-      if (!stagedPath.StartsWith(stagingPrefix, StringComparison.OrdinalIgnoreCase)
+      if (!stagedPath.StartsWith(stagingPrefix, PoolPaths.PathComparison)
           || stagedPath.Length <= stagingPrefix.Length
           || stagedPath.IndexOf('/', stagingPrefix.Length) >= 0)
         continue;
@@ -605,7 +605,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // durable length and the overlay are read atomically against a flush (SAFE-COHERE)
     var childPrefix = normalized.Length == 0 ? "" : normalized + "/";
     foreach (var dirty in dirtyAtStart) {
-      if (!dirty.StartsWith(childPrefix, StringComparison.OrdinalIgnoreCase))
+      if (!dirty.StartsWith(childPrefix, PoolPaths.PathComparison))
         continue;
 
       var name = dirty[childPrefix.Length..];
@@ -620,7 +620,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       entries[name] = listed with { Length = this._writeBuffer.OverlayLength(dirty, meta.Length) };
     }
 
-    IReadOnlyList<DirEntry> result = [.. entries.Values.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase)];
+    IReadOnlyList<DirEntry> result = [.. entries.Values.OrderBy(e => e.Name, PoolPaths.PathComparer)];
     this._cache.Metadata.Put(key, result);
 
     // remember the live namespace so it survives a later member loss
@@ -742,9 +742,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // renaming a path to itself (identical, or only a case change on a case-insensitive backend)
     // must NEVER go through the overwrite path — "the target" resolves to the source's own copies,
     // and deleting them would destroy the file. An exact no-op returns; a case change flips in place.
-    var sameFile = fromNormalized.Equals(toNormalized, StringComparison.OrdinalIgnoreCase);
-    if (sameFile && fromNormalized.Equals(toNormalized, StringComparison.Ordinal))
+    var sameFile = fromNormalized.Equals(toNormalized, PoolPaths.PathComparison);
+    if (fromNormalized.Equals(toNormalized, StringComparison.Ordinal))
       return; // pure no-op
+
+    // Differing ONLY in case is the dangerous shape. Where the storage folds the two names into
+    // one file, "the target" IS the source and the overwrite path below would delete the very file
+    // being renamed. The engine's own comparison follows the PLATFORM, which is right for its
+    // internal maps and not sufficient here: an NTFS volume or an SMB share mounted under Linux is
+    // case-insensitive on a platform that is not, so the member is asked rather than assumed.
+    var caseOnly = fromNormalized.Equals(toNormalized, StringComparison.OrdinalIgnoreCase);
 
     // exclusive on BOTH endpoints for the whole rename, acquired in a deterministic ordinal
     // order so two renames in opposite directions can never deadlock. A case-only rename maps
@@ -783,10 +790,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
 
-    // overwrite-on-rename removes every copy of the old target first (no orphans); never for a
-    // case-only rename — that would delete the source we are about to move
-    foreach (var stale in targetCopies)
+    // overwrite-on-rename removes every copy of the old target first (no orphans) — except where
+    // that copy is the SOURCE wearing the other spelling, which is what a case-only rename means on
+    // a member whose storage does not distinguish the two. Deleting it there destroys the file the
+    // rename was supposed to move, and the AtomicReplace below flips the name in place anyway.
+    foreach (var stale in targetCopies) {
+      if (caseOnly && !stale.Volume.IsCaseSensitive)
+        continue;
+
       stale.Volume.Delete(toNormalized, stale.Shadow);
+    }
 
     // namespace-atomic per member: the name flips via rename on every member holding a copy (FR-RENAME)
     foreach (var copy in copies) {
@@ -815,7 +828,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _RenameFolder(string fromNormalized, string toNormalized) {
     if (toNormalized.Length == 0 || fromNormalized.Length == 0)
       throw new PoolFsException(PoolFsError.AccessDenied, "The pool root cannot be renamed");
-    if ((toNormalized + "/").StartsWith(fromNormalized + "/", StringComparison.OrdinalIgnoreCase))
+    if ((toNormalized + "/").StartsWith(fromNormalized + "/", PoolPaths.PathComparison))
       throw new PoolFsException(PoolFsError.InvalidArgument, $"Cannot move a folder into itself: {fromNormalized} → {toNormalized}");
     if (!this._ParentExists(toNormalized))
       throw new PoolFsException(PoolFsError.NotFound, $"Target parent folder not found: {toNormalized}");
@@ -825,9 +838,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // dirty children must land under the old name before the tree moves (SAFE-NOLOSS), and
     // children still being written publish first so no temp names travel with the subtree
     var fromPrefix = fromNormalized + "/";
-    foreach (var stagedChild in this._staging.Keys.Where(k => k.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray())
+    foreach (var stagedChild in this._staging.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray())
       this._PublishStaged(stagedChild);
-    foreach (var dirty in this._writeBuffer.DirtyPaths.Where(p => p.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray())
+    foreach (var dirty in this._writeBuffer.DirtyPaths.Where(p => p.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray())
       this.FlushPath(dirty);
 
     this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
@@ -1738,7 +1751,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return true;
 
     foreach (var dirty in this._writeBuffer.DirtyPaths) {
-      if (string.Equals(dirty, path, StringComparison.OrdinalIgnoreCase))
+      if (string.Equals(dirty, path, PoolPaths.PathComparison))
         continue;
 
       // the caller already holds THIS path's write lock; a second writer throttling in the
@@ -2107,7 +2120,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   /// <summary>Every logical file across all online members — primaries and shadow-only survivors alike.</summary>
   private IEnumerable<string> _AllLogicalFiles() {
-    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var seen = new HashSet<string>(PoolPaths.PathComparer);
     foreach (var member in this._Online.ToArray()) {
       var stack = new Stack<string>();
       stack.Push("");

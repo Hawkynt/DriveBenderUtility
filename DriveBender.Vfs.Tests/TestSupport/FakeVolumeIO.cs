@@ -64,6 +64,14 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
     set { lock (this._lock) this._capacity = value; }
   }
 
+  /// <summary>
+  /// This double keeps its namespace in OrdinalIgnoreCase dictionaries, so it behaves like an
+  /// NTFS/SMB volume: 'a.txt' and 'A.TXT' are ONE file. Saying so is what lets the engine's
+  /// rename path be tested against a case-insensitive member on a case-sensitive host, which is
+  /// exactly the configuration where getting it wrong deletes the file being renamed.
+  /// </summary>
+  public bool IsCaseSensitive => false;
+
   public BackendCaps Caps { get; init; } = BackendCaps.RandomRead | BackendCaps.RandomWrite | BackendCaps.AtomicRename | BackendCaps.DurableFlush | BackendCaps.List | BackendCaps.Delete | BackendCaps.Timestamps;
 
   public long BytesUsed {

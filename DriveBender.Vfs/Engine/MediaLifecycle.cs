@@ -191,9 +191,24 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
   /// primary is missing, and creates missing shadow copies on independent failure domains
   /// (SAFE-DUP / SAFE-PHYS). Reuses existing copies as the source — no data is fetched twice.
   /// </summary>
-  public MediaLifecycleReport RestorePool() {
+  /// <param name="operation">
+  /// Reports which file is being restored and how far through the pass it is, and carries the
+  /// caller's cancellation. Stopping is checked BETWEEN files: a copy abandoned half-written is
+  /// the very state this method exists to repair.
+  /// </param>
+  public MediaLifecycleReport RestorePool(OperationContext? operation = null) {
+    var context = operation ?? OperationContext.None;
     var created = 0;
-    foreach (var (path, copies) in this._EnumerateLogicalFiles()) {
+
+    // materialised up front so the count is REAL. The walk is metadata-only and cheap next to the
+    // copying that follows, and a progress bar whose total grows as it goes is worse than none.
+    context.Phase("looking at what the members hold");
+    var files = this._EnumerateLogicalFiles();
+    long done = 0;
+
+    foreach (var (path, copies) in files) {
+      context.ThrowIfStopping();
+      context.Step(done++, files.Count, path);
       var distinctDomains = this._Coverage(copies);
       var hasPrimary = copies.Any(c => !c.Shadow);
       var source = copies[0];
@@ -228,6 +243,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
       }
     }
 
+    context.Step(done, files.Count, "done");
     DriveBender.Logger($"Restored pool: {created} copy(ies) created/promoted to reach duplication level {duplicationLevel}");
     return new(0, created, 0);
   }
