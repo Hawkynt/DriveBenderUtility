@@ -235,6 +235,162 @@ buffer can take ownership when copies are owed; when nothing is owed it is pure 
 conditional touches the ack-quorum and journalling path, which is the most safety-critical code in
 the product, so it is written down rather than attempted in passing.
 
+### The storages behind a tier were taking turns instead of working together
+
+`CFG.io.queueDepthPerVolume` was decoration. `ConfigValidation` checked the numbers in it and
+nothing ever read them, so §6.4's "HDD default 2, SSD/landing 8+" described a setting that did
+not exist. `io.elevatorOrdering` is in the same state and still is — it is a PRD "Could".
+
+What that cost is bigger than a missing knob. A read that spanned several blocks loaded them ONE
+AT A TIME unless the file was duplicated AND the read was over `mirrorReadSplitThreshold`
+(8 MiB) — so the ordinary case ran a device at queue depth one.
+
+**And on Linux that threshold can never be met.** Measured through a real mount with libfuse's own
+tracing (`DBMOUNT_FUSE_DEBUG=1`), reading a 64 MiB file with an 8 MiB application buffer: 512 READ
+requests, every one of them exactly 131,072 bytes. The kernel splits a read into 128 KiB requests
+and the adapter sets no `max_read`/`max_pages` to change that — writes arrive whole at 1 MiB
+(`max_write=0x100000`), which is why the write path looked fine and the read path did not. So
+`count >= 8 MiB` was false for every read FUSE has ever delivered, and mirror read splitting has
+never engaged on that target at all. It was not tuned badly; it was unreachable.
+
+Which also says where the win on Linux actually comes from. A 128 KiB request touches at most two
+1 MiB blocks, so fanning out WITHIN one request buys little there — the lever is the read-ahead
+window, the one thing on the read path whose entire job is to keep the device busy, and it fanned
+out to `copies.Count`, which on an unduplicated file is one. That is the queue depth of one, and
+it is what the measurement below moves.
+
+Now: any multi-block request loads its missing blocks concurrently, `VolumeQueues` sizes the
+fan-out from the summed queue depth of the DISTINCT devices the copies sit on (two members on one
+spindle are one queue, not two), and each device has a cap it is admitted through. Defaults are
+asymmetric on purpose — 2 for rotating media, 4 for a member whose operations park the caller for
+a network round trip, and a host-scaled depth for anything solid or unrecognised, because a cap
+that binds on a fast local device costs throughput to protect against nothing. Media is
+classified from sysfs on Linux; every other platform answers Unknown, so `hdd`/`ssd` keys do not
+bind there and a member name, a role or `default` does. Guessing at the Windows seek-penalty
+ioctl untested would mis-tune every pool on that platform silently.
+
+**Measured, on this host** (16 CPUs, `/tmp` on tmpfs, so this is the RAM path rather than an SSD):
+cold sequential read of 512 MiB through a real mount, same pool, same cache, only the queue depth
+differing. The benchmark carries that control row permanently
+(`Scatter_OverlappedIoAcrossStorages`), because it needs no second device to mean something —
+queue depth 1 IS what the engine used to do.
+
+| | 512 MiB cold sequential read |
+| --- | ---: |
+| queue depth 1, before single-flight (the old engine) | 1,313 MiB/s |
+| queue depth 1, with single-flight | 1,379 / 1,422 MiB/s |
+| overlapped | 1,601 / 1,631 / 1,663 MiB/s |
+| overlapped, two copies on one device | 1,551 / 1,596 MiB/s |
+
+Read it as: overlapping is worth about **1.15x** over the serial path as it now stands, and about
+**1.22x** against the engine as it was. Repeat samples are given rather than one number because
+this host drifts ±7% run to run and a single figure would be a claim the measurement does not
+support. Single-flight is what lifted the serial control from 1,313 to ~1,400 and did nothing
+measurable to the overlapped figure — which fits: at queue depth 1 the reader constantly outran
+its read-ahead and re-fetched the block it was already loading, and with a wide fan-out the
+read-ahead is far enough ahead that there was little duplication left to remove.
+
+The `2 copies` row sits slightly BELOW the single-copy overlapped number, which is the honest
+result when both copies share one device: the split costs a few percent and can only pay for
+itself on hardware that actually has two.
+
+**Whole-file transfers were single-buffered.** `WholeFilePublisher.CopyCounted` alternated
+read-chunk / write-chunk on one thread, and every caller that matters moves bytes BETWEEN TWO
+STORAGES — a landing-zone drain to capacity, a duplication heal, a media move. So the two devices
+took turns and each sat idle for the other's half of every chunk. It is double-buffered now:
+chunk N+1 is read while chunk N is written, so the transfer costs max(read, write) rather than
+their sum. Two details that a review should not have to rediscover — an outstanding read OWNS a
+rented buffer, so the copy waits for it before returning either array to the pool even when it is
+unwinding from an exception; and the read-ahead goes through a fill-completely helper, because
+one `Read` may return short at any point and "short chunk means exhausted" is only true after
+that. Without the helper the overlap would have turned every dribbling network read into its own
+thread, and treating the first short read as EOF would have truncated files silently.
+
+**A dying storage was being asked first, over and over.** Failover tried copies in a fixed order,
+so a member whose reads error was tried FIRST for every block of every read, with a healthy copy
+beside it. On real hardware each of those is a driver timeout measured in seconds. A member that
+throws is now parked at the back of the readiness order for five seconds — never removed, because
+one bad sector is not a dead disk and failover has to stay a fallback rather than a fork in the
+code. The device cap has a matching escape: admission waits at most five seconds and then goes
+anyway, so a member that hangs while holding a permit cannot turn a tuning knob into a hang.
+
+**The same block was being fetched twice, and the read-ahead could not pipeline.** Two callers
+who wanted the same uncached block issued two device reads — so a reader that outran its own
+read-ahead re-fetched the very block the prefetch chain had in flight. And there was exactly ONE
+read-ahead chain per path, so the chain that would fetch window N+1 was not allowed to start
+until the chain fetching window N had finished: the moment the application caught up with the
+frontier it waited at device latency instead of at cache latency, which is precisely the stall a
+read-ahead exists to prevent.
+
+`_LoadBlock` now single-flights. The interesting part is what makes sharing SAFE, because the
+naive version is a stale read:
+
+- **Only an identical question is shared.** The `expectedLength` a caller passes is what decides
+  whether a short block means "this copy is behind, fail over" or "this is the end of the file".
+  Two callers with different expectations are asking different things, so they do not share.
+  Getting that direction wrong hands a lagging copy's short block to a caller that asked for it
+  to be verified — the class of bug recorded twice above.
+- **A failure is never inherited.** The leader may simply have been unlucky in which copy it
+  tried; a caller whose own attempt might succeed has to make it.
+- **A background read-ahead runs without the path lease**, so its bytes may predate a write that
+  has since landed. A lease-holding reader may take them only if the pool's invalidation epoch is
+  still what the leader captured before reading — the epoch moves in one direction, so equality
+  proves the whole interval was quiet. That epoch is POOL-wide, so an unrelated write costs an
+  adoption that was in principle keepable. Conservative in that direction is free; wrong in the
+  other is a stale read.
+
+With duplicates gone, a second chain is safe, and there are now two. The read-ahead also skips
+blocks that are already IN FLIGHT rather than queueing behind them — a chain's job is the bytes
+nobody is fetching yet.
+
+Pinned by two guards that need no clock: eight threads racing for one uncached block must cost
+the storage exactly ONE read, and a 48-block file read end to end must cost exactly 48 — anything
+above that is the reader and the read-ahead, or two chains, fetching the same block twice.
+Mutation-checked: disabling single-flight fails both.
+
+Honest limit: the SECOND chain's benefit is latency, and latency is the one thing those two
+guards cannot see. It is reasoned above and visible end to end; there is no unit test that fails
+if the chain limit goes back to one.
+
+### Three crash scenarios were betting on the host being slow
+
+`Crash_GivenStagedWritesWereInterrupted_...`, `Crash_GivenARenameWasInFlight_...` and
+`Crash_GivenAnOverwriteWasInFlight_...` all needed the power to go off WHILE something was
+happening, and each arranged that by racing a fixed amount of work against a fixed sleep. That is
+a bet on the machine. On a 16-CPU host with `/tmp` on tmpfs the work finishes first and the
+scenario silently becomes "crash after everything completed" — which is why two of the three
+tripped their own `or this tests nothing` guard, one per full run. They were right to refuse to
+report green, and raising the workload would only move the goalposts until the next machine.
+Making the I/O path faster makes it worse, so this had to be fixed alongside.
+
+The two that failed now run an UNBOUNDED loop: there is no amount of work to finish, so being
+mid-flight when the power is cut is structural rather than lucky, and the only thing left to
+establish is that the workload got far enough to be worth interrupting — an observation, not a
+race. The rename scenario gained something from it: instead of one sweep through twelve files it
+now renames back and FORTH without end, reading each file's current name off the disk so an
+interrupted sweep never leaves it moving a name that is not there. The third was passing with a
+comfortable margin and kept its structure — a single overwrite through ONE held-open handle,
+which is the case the staged-write lifecycle has to survive and which closing per chunk would
+make easier — but it now cuts the power on OBSERVED progress instead of after a fixed wait.
+
+None of this was a product defect and none of it was a data-loss finding: every assertion about
+surviving bytes passed on every run, before and after.
+
+**A fourth test was racing the host in the same way, and it took longer to see because it looked
+like a product bug.** `LongOperation_GivenTheDriverInstallEndpoint_...` starts an un-stoppable job
+and then asserted that cancelling it comes back `ok: false`. `JobRegistry.Cancel` checks
+`IsFinished` before `Cancellable`, so on a machine where the prerequisite is ALREADY satisfied the
+installer finishes in microseconds and the answer is the equally honest `already finished`
+(`ok: true`). The daemon is right and the assertion was too specific: which of the two honest
+answers arrives depends on the host, and the invariant that actually matters is that an
+un-stoppable job never claims to be STOPPING. That is what it asserts now.
+
+**And the four `WebUi` failures were the environment, verified rather than assumed.** Playwright
+1.49 wants Chromium build 1148; this machine's cache held build 1234 from a newer Playwright, so
+`OneTimeSetUp` refused — correctly, because `DBE2E_REQUIRE_DRIVER=1` says a missing browser is a
+failure and not a skip. Installing the pinned build turned all four green. Worth recording because
+"it is the environment" is exactly the claim that should not be made without checking.
+
 ### Linux end-to-end has been RED in CI, and I did not look
 
 Every "suite green" in this file and in my reporting came from a local Windows run. The Linux
@@ -247,6 +403,14 @@ the commit they happened to land on:
    reports `read back 4096 bytes, which is neither empty nor the full 32768`. This is the most
    serious of the three: a reader observing a partially-written file is exactly the corruption the
    whole concurrency design exists to prevent, and the Windows path does not do it.
+
+   **It is INTERMITTENT, which was not known and changes how to hunt it.** Run alone twelve times
+   on a 16-CPU Linux host it failed twice; nine times on an unmodified tree, twice again. So the
+   rate is roughly one in four or five, not "always" — which means a single green run of this
+   scenario proves nothing, and any change claimed to fix it needs a run of a dozen or more before
+   the claim is worth anything. The pairing above was measured deliberately, current tree against
+   a stashed pristine one, because the I/O-path work in this pass could plausibly have caused a
+   torn read and "it was already failing" is not something to take on trust. Same rate both sides.
 2. **Two names differing only in case cannot both exist.** `BoundaryEndToEndTests.Names_Given...`
    fails creating `REPORT.TXT` beside `Report.txt`. POSIX says those are two files; the engine
    compares paths with `OrdinalIgnoreCase` throughout (`HandleTable._files`, the path helpers), so
@@ -384,6 +548,17 @@ These now fail the build rather than needing to be re-found:
   does round up — so it cannot pass vacuously.
 - `EnginePerformanceTests` — allocation budgets for folder-config resolution, block routing, the
   activity-feed drop path, cached reads and write staging.
+- `ScatterIoTests`, `DoubleBufferedCopyTests`, `VolumeQueueTests` — the overlap itself, which no
+  assertion about returned bytes can see: a serial engine gives the same answer as a fan-out one,
+  and an engine that retries a dead disk once per block gives the right answer too, just far too
+  late. The engine is driven through a member that COUNTS what happens to it — peak concurrent
+  reads, and read ATTEMPTS including failures. Each claim is pinned from both sides, so the probe
+  cannot pass vacuously: a multi-block read must exceed one in flight, the same read with
+  `queueDepthPerVolume: 1` must never exceed one, and a read inside a single block must cost
+  exactly one. Two more count DUPLICATED work, which is the other half of using a device well:
+  eight threads racing for one uncached block cost the storage exactly one read, and a 48-block
+  file read end to end costs exactly 48. Mutation-checked — forcing the fan-out back to one and
+  dropping the failure note fails three of them; disabling single-flight fails the other two.
 - `BlockingIoSchedulerTests`, `JobRegistryTests`, `MetadataCoherenceTests`, `DataSafetyTests`,
   `PageCacheTests` — the isolation, UI-responsiveness, coherence and accounting invariants above.
 - `RemoteRangeReadTests` — counts what actually crosses the store boundary: a partial read of a

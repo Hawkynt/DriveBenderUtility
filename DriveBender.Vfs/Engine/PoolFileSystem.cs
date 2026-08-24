@@ -27,7 +27,52 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly PoolTrash _trash;
   private readonly IntegrityService _integrity;
   private readonly ActivityFeed _activity;
-  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _prefetching = new(StringComparer.OrdinalIgnoreCase);
+  // FR-RA, double-buffered: how many read-ahead chains one path may have running at once. With
+  // ONE, the reader stalls at every window boundary — the chain that would fetch window N+1 is
+  // not allowed to start until the chain fetching window N has finished, so the moment the
+  // application catches up with the frontier it waits at device latency instead of cache latency.
+  // Two means the next window is already loading while the current one is being consumed, which
+  // is the whole point of a read-ahead. It is not more than two because the windows themselves
+  // double as access stays sequential, so two chains already cover a long way ahead, and every
+  // extra chain is another set of threads competing for the same device queue.
+  private const int _MAX_PREFETCH_CHAINS = 2;
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _prefetching = new(StringComparer.OrdinalIgnoreCase);
+
+  /// <summary>Claims one of this path's read-ahead slots; false when they are all in use.</summary>
+  private bool _TryBeginPrefetch(string path) {
+    while (true) {
+      if (this._prefetching.TryAdd(path, 1))
+        return true;
+
+      if (!this._prefetching.TryGetValue(path, out var running))
+        continue; // it was released between the two calls — try to claim it afresh
+
+      if (running >= _MAX_PREFETCH_CHAINS)
+        return false;
+
+      if (this._prefetching.TryUpdate(path, running + 1, running))
+        return true;
+    }
+  }
+
+  private void _EndPrefetch(string path) {
+    while (true) {
+      if (!this._prefetching.TryGetValue(path, out var running))
+        return;
+
+      // the last one out REMOVES the key rather than leaving a zero behind: a mount that reads a
+      // million files would otherwise accumulate a million entries that are never looked at again
+      if (running <= 1) {
+        if (((ICollection<KeyValuePair<string, int>>)this._prefetching).Remove(new(path, running)))
+          return;
+
+        continue; // the value changed under us — re-read and decide again
+      }
+
+      if (this._prefetching.TryUpdate(path, running - 1, running))
+        return;
+    }
+  }
 
   // FR-STAGED-WRITE: a file between Create and its last Close lives under a temp physical name
   // (*.TEMP.$DRIVEBENDER, hidden on disk), so it never looks fully written until it is. The value
@@ -60,11 +105,42 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _BeginIo(Guid memberId) => this._memberLoad.AddOrUpdate(memberId, 1, static (_, v) => v + 1);
   private void _EndIo(Guid memberId) => this._memberLoad.AddOrUpdate(memberId, 0, static (_, v) => Math.Max(0, v - 1));
 
-  /// <summary>Readiness score: queued work dominates, measured latency breaks ties — lower is readier.</summary>
+  // SAFE-DEGRADE, latency side: a storage that just failed an operation is almost certainly
+  // about to fail the next one, and on a real dying disk that failure arrives via a driver
+  // timeout measured in SECONDS. Trying it first for every block of a large read turns one bad
+  // member into a pool-wide stall even though a healthy copy sits right beside it. A member that
+  // throws is therefore parked at the BACK of the readiness order for a short window — never
+  // removed, because it may simply have hit one bad sector and failover must stay a fallback,
+  // not a fork in the code.
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, long> _memberFaultedTicks = new();
+  private const long _FAULT_COOLDOWN_MS = 5_000;
+
+  private void _NoteMemberFault(Guid memberId) => this._memberFaultedTicks[memberId] = Environment.TickCount64;
+
+  private bool _IsCoolingDown(Guid memberId) {
+    if (!this._memberFaultedTicks.TryGetValue(memberId, out var at))
+      return false;
+
+    if (Environment.TickCount64 - at < _FAULT_COOLDOWN_MS)
+      return true;
+
+    // Expired entries are PRUNED rather than left to age in place: the fast path below is
+    // "nothing has ever failed", and a single transient error hours ago would otherwise cost
+    // every later read a lookup per copy per block for the lifetime of the mount.
+    this._memberFaultedTicks.TryRemove(memberId, out _);
+    return false;
+  }
+
+  /// <summary>Readiness score: a recent failure sinks a member outright, then queued work, then measured latency — lower is readier.</summary>
   private double _LoadScore(IVolumeIO volume)
-    => (this._memberLoad.TryGetValue(volume.MemberId, out var inflight) ? inflight : 0) * 1000.0
+    => (this._IsCoolingDown(volume.MemberId) ? 1_000_000.0 : 0.0)
+       + (this._memberLoad.TryGetValue(volume.MemberId, out var inflight) ? inflight : 0) * 1000.0
        + (volume is MeasuredVolumeIO { Samples: > 0 } measured ? measured.AverageLatencyMs : 0.0);
   private readonly ShadowNamespace _shadow = new();
+
+  // FR-PAR / §6.4: how wide a request may fan out across the storages behind it, and how much
+  // any one device is allowed to have outstanding at once (CFG.io.queueDepthPerVolume)
+  private readonly VolumeQueues _queues;
   private readonly MemberWatcher _watcher;
   private readonly Func<DateTime> _clock;
   private long _readAheadMin;
@@ -93,6 +169,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       effectiveConfig,
       members.ToDictionary(m => m.Io.MemberId, m => m.Role));
 
+    this._queues = new(effectiveConfig, members.ToDictionary(m => m.Io.MemberId, m => m.Role));
     this._tombstones = new([.. members.Select(m => m.Io)]);
     this._watcher = new([.. members.Select(m => m.Io)]);
     this._watcher.MemberLost += this._OnMemberLost;
@@ -144,6 +221,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // placement reads its tuning live from the config reference it was given; refresh caches so new policy takes effect
     this._cache.Metadata.InvalidatePool(this._poolId);
     this._placement.UpdateConfig(newConfig);
+    this._queues.UpdateConfig(newConfig);
     this._activity.Publish(ActivityKind.Recovery, "", reason: "config reloaded");
     DriveBender.Logger("Configuration reloaded live");
   }
@@ -154,6 +232,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// </summary>
   public void UpdateMemberRoles(IReadOnlyDictionary<Guid, MemberRole> roles) {
     this._placement.UpdateRoles(roles);
+    this._queues.UpdateRoles(roles); // the role is one of the queue-depth keys
     this._placement.InvalidateAll();
     this._activity.Publish(ActivityKind.Recovery, "", reason: "member roles reloaded");
     DriveBender.Logger("Member roles reloaded live");
@@ -177,6 +256,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _OnMemberReturned(IVolumeIO member) {
     this._activity.Publish(ActivityKind.Recovery, "", reason: $"member returned: {member.DisplayName}");
     this._degradedAckWarned.Clear();
+    this._memberFaultedTicks.TryRemove(member.MemberId, out _); // a member that came back is a candidate again
 
     // 0) heal its stale journal mirror so a compaction it missed can't resurrect old intents (SAFE-OFFLINE)
     this._journal.ReconcileMirrors();
@@ -995,9 +1075,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         lock (state)
           prefetchBytes = state.OnRead(offset, count);
 
-        // background prefetch (FR-RA): the window loads on the thread pool so the foreground
-        // read returns at once; one prefetch chain per path at a time prevents pile-up
-        if (prefetchBytes > 0 && this._prefetching.TryAdd(path, 0)) {
+        // background prefetch (FR-RA): the window loads on the thread pool so the foreground read
+        // returns at once. Up to _MAX_PREFETCH_CHAINS run at a time, so window N+1 is already on
+        // its way while N is being consumed; a second chain that overlaps the first costs nothing
+        // extra because _LoadBlock single-flights and _Prefetch skips blocks already in flight.
+        if (prefetchBytes > 0 && this._TryBeginPrefetch(path)) {
           var from = offset + count;
           ThreadPool.QueueUserWorkItem(_ => {
             try {
@@ -1005,7 +1087,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
             } catch (Exception) {
               // prefetch is strictly best-effort — the foreground read surfaces real errors
             } finally {
-              this._prefetching.TryRemove(path, out var _);
+              this._EndPrefetch(path);
             }
           });
         }
@@ -1026,12 +1108,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// </summary>
   private int[] _OrderCopiesForBlock(IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit) {
     var count = copies.Count;
-    if (!mirrorSplit || count <= 1)
+    if (count <= 1)
+      return _IdentityOrder(count);
+
+    // Without a split the rotation is skipped — mirrorReadSplitThreshold governs whether reads
+    // are spread across copies, and this is not the place to overrule it. A member that just
+    // FAILED still has to sink to the back, though, split or no split: otherwise a large read
+    // tries the dying disk first for every one of its blocks and pays the driver timeout each
+    // time, with a healthy copy sitting right beside it.
+    if (!mirrorSplit && !this._AnyCoolingDown(copies))
       return _IdentityOrder(count);
 
     var order = new int[count];
     var scores = new double[count];
-    var rotation = (int)(blockIndex % count);
+    var rotation = mirrorSplit ? (int)(blockIndex % count) : 0;
     for (var i = 0; i < count; ++i) {
       order[i] = (rotation + i) % count; // rotation order first, so a stable sort keeps it as the tiebreak
       scores[i] = this._LoadScore(copies[order[i]].Volume);
@@ -1053,6 +1143,18 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     return order;
+  }
+
+  /// <summary>True when any of these copies is inside its post-failure cooldown; checked before paying for a sort.</summary>
+  private bool _AnyCoolingDown(IReadOnlyList<PhysicalCopy> copies) {
+    if (this._memberFaultedTicks.IsEmpty)
+      return false; // the overwhelmingly common case: nothing has ever failed
+
+    for (var index = 0; index < copies.Count; ++index)
+      if (this._IsCoolingDown(copies[index].Volume.MemberId))
+        return true;
+
+    return false;
   }
 
   /// <summary>Shared 0,1,2… index arrays for the no-split case, so the common read allocates nothing to order one copy.</summary>
@@ -1103,23 +1205,40 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   private void _ReadRange(string path, string dataPath, IReadOnlyList<PhysicalCopy> copies, Span<byte> buffer, long offset, bool mirrorSplit, long fileLength) {
     var blockSize = this._cache.Pages.BlockSize;
+    var firstBlock = offset / blockSize;
+    var lastBlock = (offset + buffer.Length - 1) / blockSize;
 
-    // FR-MIRROR: a large read pulls its uncached blocks from MULTIPLE copies CONCURRENTLY — each
-    // copy serves different offsets, so independent disks add up their throughput
-    if (mirrorSplit && copies.Count > 1) {
-      var missing = new List<long>();
-      for (var blockIndex = offset / blockSize; blockIndex <= (offset + buffer.Length - 1) / blockSize; ++blockIndex)
+    // FR-PAR / FR-MIRROR: every block this request still needs is loaded CONCURRENTLY — across
+    // the copies when the file is duplicated, and across the device's own queue when it is not.
+    //
+    // This used to require BOTH a duplicated file AND a read over the mirror-split threshold,
+    // which meant the ordinary case ran a storage at queue depth ONE: block, wait, block, wait.
+    // A device that can serve a dozen requests at once was being asked for one, and the tier's
+    // other storages sat idle while it did. The width comes from the queue depths of the DISTINCT
+    // devices the copies live on, so several storages in one tier add up instead of taking turns,
+    // and a spindle is still only asked for the two concurrent requests it actually wants.
+    if (lastBlock > firstBlock) {
+      List<long>? missing = null;
+      for (var blockIndex = firstBlock; blockIndex <= lastBlock; ++blockIndex)
         if (!this._cache.Pages.TryGet(new(this._poolId, dataPath, blockIndex), out _))
-          missing.Add(blockIndex);
+          (missing ??= []).Add(blockIndex);
 
-      if (missing.Count > 1)
-        try {
-          Parallel.ForEach(missing, _ParallelOver(copies, copies.Count),
-            blockIndex => this._LoadBlock(dataPath, copies, blockIndex, mirrorSplit: true,
-              expectedLength: _ExpectedBlockLength(fileLength, blockIndex, blockSize)));
-        } catch (AggregateException e) when (e.InnerExceptions.OfType<PoolFsException>().FirstOrDefault() is { } inner) {
-          throw inner;
-        }
+      if (missing is { Count: > 1 }) {
+        // Only a SPLIT read is served by more than one storage, so only a split read gets the
+        // summed width — otherwise the extra workers would just park on the one device's own cap.
+        var width = mirrorSplit ? this._queues.FanOutFor(copies) : this._queues.FanOutFor(copies[0].Volume);
+        var fanOut = Math.Min(missing.Count, width);
+        if (fanOut > 1)
+          try {
+            Parallel.ForEach(missing, _ParallelOver(copies, fanOut),
+              blockIndex => this._LoadBlock(dataPath, copies, blockIndex, mirrorSplit,
+                expectedLength: _ExpectedBlockLength(fileLength, blockIndex, blockSize)));
+          } catch (Exception) {
+            // Warm-up, not the read itself. The assembly loop below re-runs _LoadBlock for every
+            // block in order, so a genuine failure surfaces there — at the FIRST bad block, with
+            // its own message, rather than at whichever of them happened to lose the race here.
+          }
+      }
     }
 
     var written = 0;
@@ -1140,10 +1259,113 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
+  /// <summary>
+  /// One block load already under way, so that N callers wanting the same block cost ONE trip to
+  /// the storage instead of N. Without this a reader that outran its own read-ahead re-read the
+  /// very block the prefetch chain had in flight, and two read-ahead chains on one path
+  /// duplicated wherever their windows overlapped — the same bytes fetched twice, which is exactly
+  /// the overhead a read-ahead exists to remove.
+  /// </summary>
+  private sealed class BlockLoad(int expectedLength, long epoch) {
+    public readonly int ExpectedLength = expectedLength;
+
+    /// <summary>The page-cache epoch captured BEFORE the read began — see <see cref="_TryAdoptLoad"/>.</summary>
+    public readonly long Epoch = epoch;
+
+    public readonly TaskCompletionSource<byte[]> Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+  }
+
+  /// <summary>
+  /// Block loads under way right now. A read-ahead consults it to SKIP blocks somebody is already
+  /// fetching, and <see cref="_LoadBlock"/> to join one instead of starting a second.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<PageKey, BlockLoad> _loadsInFlight = new();
+
+  /// <summary>
+  /// Waits for a load someone else started and decides whether its bytes are usable here.
+  ///
+  /// Two things make that a decision rather than a hand-over. A background read-ahead runs
+  /// WITHOUT the path lease, so its bytes may predate a write that has since landed — the same
+  /// hazard <see cref="PageCache.PutIfCurrent"/> exists for. The pool's invalidation epoch only
+  /// moves forward, so finding it still equal to the value captured before the read began proves
+  /// nothing invalidated anything in the whole interval, which is the one condition under which
+  /// a lease-holding reader may take those bytes. It is a POOL-wide epoch, so an unrelated write
+  /// costs us an adoption we could in principle have kept; being conservative in that direction
+  /// is free, and being wrong in the other is a stale read.
+  ///
+  /// And a failure is never inherited: the leader may have been asked to validate the block
+  /// against a different length, or simply have been unlucky in which copy it tried, so a caller
+  /// whose own attempt might succeed must make it.
+  /// </summary>
+  private bool _TryAdoptLoad(BlockLoad running, out byte[] block) {
+    block = [];
+    byte[] result;
+    try {
+      result = running.Completion.Task.GetAwaiter().GetResult();
+    } catch (Exception) {
+      return false;
+    }
+
+    if (this._cache.Pages.EpochOf(this._poolId) != running.Epoch)
+      return false;
+
+    block = result;
+    return true;
+  }
+
   private byte[] _LoadBlock(string path, IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit, long? guardEpoch = null, int expectedLength = 0) {
     var key = new PageKey(this._poolId, path, blockIndex);
-    if (this._cache.Pages.TryGet(key, out var cached))
-      return cached;
+
+    // There are three ways to come by this block — it is cached, it is already in flight, or it is
+    // ours to fetch — and they race with one another. Losing that race between two of the checks
+    // is a reason to LOOK AGAIN, not a reason to fetch the block a second time, which is why this
+    // is a short loop rather than a fall-through: a fall-through turns every lost race into
+    // exactly the duplicate device read the whole mechanism exists to remove.
+    for (var attempt = 0; attempt < 3; ++attempt) {
+      if (this._cache.Pages.TryGet(key, out var cached))
+        return cached;
+
+      if (this._loadsInFlight.TryGetValue(key, out var running)) {
+        // "Equivalent" is exact: the same expected length means the same validation, so the answer
+        // means the same thing to both callers. Two callers with different expectations of how long
+        // this block should be are asking different questions, and each has to ask its own.
+        if (running.ExpectedLength != expectedLength)
+          break;
+
+        if (this._TryAdoptLoad(running, out var shared))
+          return shared;
+
+        break; // the leader failed, or its bytes are no longer current — fetch it properly
+      }
+
+      var load = new BlockLoad(expectedLength, guardEpoch ?? this._cache.Pages.EpochOf(this._poolId));
+      if (!this._loadsInFlight.TryAdd(key, load))
+        continue; // somebody registered between the two calls — look again
+
+      try {
+        var block = this._ReadBlockThroughCopies(path, copies, blockIndex, mirrorSplit, guardEpoch, expectedLength);
+        load.Completion.TrySetResult(block);
+        return block;
+      } catch (Exception e) {
+        load.Completion.TrySetException(e);
+
+        // Observed HERE, because nobody else may ever look: a failed load with no follower leaves
+        // a task holding an exception no one read, and those surface later as unobserved-exception
+        // noise from the finalizer rather than where they happened. The caller below still gets it.
+        _ = load.Completion.Task.Exception;
+        throw;
+      } finally {
+        // AFTER the completion is set, never before: a caller that took the entry a moment ago is
+        // waiting on it and must be handed the result rather than left on a task nobody completes
+        this._loadsInFlight.TryRemove(key, out _);
+      }
+    }
+
+    return this._ReadBlockThroughCopies(path, copies, blockIndex, mirrorSplit, guardEpoch, expectedLength);
+  }
+
+  private byte[] _ReadBlockThroughCopies(string path, IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit, long? guardEpoch, int expectedLength) {
+    var key = new PageKey(this._poolId, path, blockIndex);
 
     // readiness block routing (FR-MIRROR, FR-STRIPE-READY): a split read sends each block to the
     // copy that is READY — least outstanding I/O, then measured latency, plain alternation when
@@ -1158,9 +1380,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       byte[] block;
       this._BeginIo(copy.Volume.MemberId);
       try {
+        // admission on the DEVICE, not the member: the fan-out above may have several blocks of
+        // this same request in flight, and other requests theirs, and a disk has one queue
+        using var admission = this._queues.Enter(copy.Volume);
         block = _ReadBlockFrom(copy, path, blockIndex, this._cache.Pages.BlockSize);
       } catch (PoolFsException e) {
         lastError = e;
+        this._NoteMemberFault(copy.Volume.MemberId); // the rest of this read routes around it
         continue;
       } finally {
         this._EndIo(copy.Volume.MemberId);
@@ -1264,10 +1490,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _Prefetch(string path, IReadOnlyList<PhysicalCopy> copies, long fromOffset, long windowBytes, long fileLength, long expectedFileLength) {
     var blockSize = this._cache.Pages.BlockSize;
     var lastByte = Math.Min(fileLength, fromOffset + windowBytes) - 1; // never past EOF (FR-RA)
+    // Blocks already IN FLIGHT are skipped as well as blocks already cached. With two read-ahead
+    // chains running, their windows overlap wherever the second was triggered before the first
+    // finished; joining the first chain's loads would be correct but would only park a thread
+    // waiting for bytes that are already on their way. A read-ahead's job is the bytes NOBODY is
+    // fetching yet.
     var missing = new List<long>();
-    for (var blockIndex = fromOffset / blockSize; blockIndex <= lastByte / blockSize; ++blockIndex)
-      if (!this._cache.Pages.TryGet(new(this._poolId, path, blockIndex), out _))
+    for (var blockIndex = fromOffset / blockSize; blockIndex <= lastByte / blockSize; ++blockIndex) {
+      var key = new PageKey(this._poolId, path, blockIndex); // built once and asked twice
+      if (!this._cache.Pages.TryGet(key, out _) && !this._loadsInFlight.ContainsKey(key))
         missing.Add(blockIndex);
+    }
 
     if (missing.Count == 0)
       return;
@@ -1278,9 +1511,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     // the whole window loads CONCURRENTLY across the copies (readiness-routed): fast storages keep
     // filling the cache while a slow one finishes its block, so once the slow block arrives a burst
-    // of already-ready blocks hands over at once
+    // of already-ready blocks hands over at once.
+    //
+    // The width used to be the COPY COUNT, which on the ordinary unduplicated file is one — so the
+    // read-ahead window, the one thing on the read path that exists purely to keep the device busy,
+    // was itself issued one block at a time. It is now the summed queue depth of the devices behind
+    // the copies, which is what actually keeps them all working (§6.4).
     try {
-      Parallel.ForEach(missing, _ParallelOver(copies, copies.Count),
+      Parallel.ForEach(missing, _ParallelOver(copies, Math.Min(missing.Count, this._queues.FanOutFor(copies))),
         blockIndex => this._LoadBlock(path, copies, blockIndex, mirrorSplit: copies.Count > 1, guardEpoch: epoch,
           expectedLength: _ExpectedBlockLength(expectedFileLength, blockIndex, blockSize)));
     } catch (Exception) {
@@ -1411,10 +1649,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _WriteOneCopy(PhysicalCopy copy, string path, byte[] bytes, long offset) {
     this._BeginIo(copy.Volume.MemberId); // visible to the readiness selector while queued
     try {
+      using var admission = this._queues.Enter(copy.Volume); // the device's queue, not the member's
       using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
       stream.Seek(offset, SeekOrigin.Begin);
       stream.Write(bytes, 0, bytes.Length);
       stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+    } catch (Exception) {
+      this._NoteMemberFault(copy.Volume.MemberId); // the next block prefers a storage that still works
+      throw;
     } finally {
       this._EndIo(copy.Volume.MemberId);
     }

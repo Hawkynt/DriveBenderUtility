@@ -16,31 +16,95 @@ public static class WholeFilePublisher {
   public const int CopyBufferSize = 1 << 20; // 1 MiB
 
   /// <summary>
-  /// Copies <paramref name="source"/> into <paramref name="destination"/> through a fixed buffer
-  /// and returns the byte count. The buffer is RENTED, not allocated: at 1 MiB every call would
-  /// otherwise put an array straight on the Large Object Heap, and heal/drain/scrub run this per
-  /// file — a pool-wide heal would churn the LOH once per file for no reason. The buffer is
-  /// transient and never retained, so pooling it is safe.
+  /// Copies <paramref name="source"/> into <paramref name="destination"/> through a pair of fixed
+  /// buffers and returns the byte count.
+  ///
+  /// DOUBLE-BUFFERED: chunk N+1 is read while chunk N is being written. Every caller that matters
+  /// here moves bytes BETWEEN TWO STORAGES — a landing-zone drain down to capacity, a duplication
+  /// heal onto a second member, a media move — so with one buffer the two devices took turns and
+  /// the transfer cost read + write per chunk while each device was idle for the other's half. It
+  /// now costs max(read, write), which is what "combine their throughput" means in practice: on a
+  /// drain from a fast tier to a slow one the fast side stays ahead instead of waiting.
+  ///
+  /// The buffers are RENTED, not allocated: at 1 MiB each, allocating would put arrays straight on
+  /// the Large Object Heap, and heal/drain/scrub run this once per file — a pool-wide heal would
+  /// churn the LOH per file for no reason. They are transient and never retained, so pooling is safe.
   /// </summary>
-  public static long CopyCounted(Stream source, Stream destination, int bufferSize = CopyBufferSize) {
-    var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+  /// <param name="blockingSource">
+  /// True when reading the source PARKS a thread for a network round trip. The read-ahead then runs
+  /// on the engine's own bounded threads rather than the shared pool, for the same reason every
+  /// other remote read does (see <see cref="BlockingIoScheduler"/>).
+  /// </param>
+  public static long CopyCounted(Stream source, Stream destination, int bufferSize = CopyBufferSize, bool blockingSource = false) {
+    // A rented array is at LEAST the size asked for and routinely LARGER — the pool rounds up to
+    // its bucket. So its Length is never the size we asked for, and using it would make the
+    // transfer size depend on pool internals rather than on `bufferSize`, silently ignoring what
+    // the caller specified. Every read and write below is pinned to the requested size instead.
+    var front = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+    var back = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+    Task<int>? pending = null;
     try {
-      // A rented array is at LEAST the size asked for and routinely LARGER — the pool rounds up to
-      // its bucket. So its Length is never the size we asked for, and using it would make the
-      // transfer size depend on pool internals rather than on `bufferSize`, silently ignoring what
-      // the caller specified. The window is pinned to the requested size, once.
-      var window = buffer.AsSpan(0, bufferSize);
       long total = 0;
-      int read;
-      while ((read = source.Read(window)) > 0) {
-        destination.Write(window[..read]);
-        total += read;
+      var filled = _ReadFully(source, front, bufferSize);
+      while (filled > 0) {
+        // A short chunk means the source is genuinely EXHAUSTED — _ReadFully has already absorbed
+        // the dribbling reads a network stream hands back — so there is nothing left to overlap
+        // and no reason to pay for a thread. That covers every small file and every in-memory
+        // source, which is most of the callers by count.
+        pending = filled == bufferSize ? _ReadAhead(source, back, bufferSize, blockingSource) : null;
+        destination.Write(front, 0, filled);
+        total += filled;
+        if (pending == null)
+          break;
+
+        filled = pending.GetAwaiter().GetResult(); // the read-ahead's own exception surfaces here
+        pending = null;
+        (front, back) = (back, front);
       }
 
       return total;
     } finally {
-      System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+      // An outstanding read still OWNS one of these buffers. Returning it to the pool while a
+      // thread is filling it hands a live array to the next renter, which is the one bug a
+      // double-buffered copy can introduce that a single-buffered one cannot.
+      if (pending != null)
+        try {
+          pending.GetAwaiter().GetResult();
+        } catch (Exception) {
+          // the copy is already unwinding; this read's failure is not the one worth reporting
+        }
+
+      System.Buffers.ArrayPool<byte>.Shared.Return(front);
+      System.Buffers.ArrayPool<byte>.Shared.Return(back);
     }
+  }
+
+  private static Task<int> _ReadAhead(Stream source, byte[] buffer, int count, bool blockingSource)
+    => blockingSource
+      ? Task.Factory.StartNew(() => _ReadFully(source, buffer, count), CancellationToken.None,
+        TaskCreationOptions.DenyChildAttach, BlockingIoScheduler.Shared)
+      : Task.Run(() => _ReadFully(source, buffer, count));
+
+  /// <summary>
+  /// Fills the buffer, or returns less only at the real end of the stream.
+  ///
+  /// One <see cref="Stream.Read(byte[],int,int)"/> is allowed to return fewer bytes than asked for
+  /// at ANY point — a network source routinely hands back what one packet carried — so treating a
+  /// short read as the end of the file is the classic way a copy loop truncates silently. It also
+  /// matters for the overlap above: without this, "short chunk" would not mean "exhausted", and
+  /// the read-ahead would have to be started for every dribble.
+  /// </summary>
+  private static int _ReadFully(Stream source, byte[] buffer, int count) {
+    var total = 0;
+    while (total < count) {
+      var read = source.Read(buffer, total, count - total);
+      if (read == 0)
+        break;
+
+      total += read;
+    }
+
+    return total;
   }
 
   /// <summary>Publishes a small, already-materialised payload (empty markers, checksum-verified small copies).</summary>
@@ -54,14 +118,14 @@ public static class WholeFilePublisher {
   /// a previous interrupted publish can never leave a corrupt tail (SAFE-ATOMIC). Size is
   /// verified after publication; a mismatch throws before the caller completes its intent.
   /// </summary>
-  public static void PublishStream(IVolumeIO member, string normalizedPath, bool shadow, Func<Stream> openSource, long? expectedLength = null) {
+  public static void PublishStream(IVolumeIO member, string normalizedPath, bool shadow, Func<Stream> openSource, long? expectedLength = null, bool blockingSource = false) {
     long written;
     if ((member.Caps & BackendCaps.AtomicRename) != 0) {
       var temp = normalizedPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
       using (var source = openSource())
       using (var stream = member.OpenWrite(temp, shadow, true)) {
         stream.SetLength(0); // never inherit a stale temp's tail
-        written = CopyCounted(source, stream);
+        written = CopyCounted(source, stream, blockingSource: blockingSource);
         stream.Flush();
       }
 
@@ -74,7 +138,7 @@ public static class WholeFilePublisher {
     using (var source = openSource())
     using (var stream = member.OpenWrite(normalizedPath, shadow, true)) {
       stream.SetLength(0);
-      written = CopyCounted(source, stream);
+      written = CopyCounted(source, stream, blockingSource: blockingSource);
       stream.Flush();
     }
 
@@ -95,7 +159,8 @@ public static class WholeFilePublisher {
   /// </summary>
   public static void CopyBetween(IVolumeIO source, string sourcePath, bool sourceShadow, IVolumeIO target, string targetPath, bool targetShadow) {
     var expected = source.Stat(sourcePath, sourceShadow)?.Length;
-    PublishStream(target, targetPath, targetShadow, () => source.OpenRead(sourcePath, sourceShadow), expected);
+    PublishStream(target, targetPath, targetShadow, () => source.OpenRead(sourcePath, sourceShadow), expected,
+      blockingSource: source.BlocksCallingThread);
   }
 
   /// <summary>A member can hold an acknowledged durable copy only when its flush is a real durability barrier (SAFE-REMOTE).</summary>
