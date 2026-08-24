@@ -319,27 +319,75 @@ public class ScatterIoTests {
 [Category("Unit")]
 public class DoubleBufferedCopyTests {
 
-  /// <summary>A stream whose every read and write costs real time, so the overlap is measurable.</summary>
-  private sealed class SlowStream(Stream inner, TimeSpan perOperation) : Stream {
-    public override bool CanRead => inner.CanRead;
-    public override bool CanSeek => inner.CanSeek;
-    public override bool CanWrite => inner.CanWrite;
+  /// <summary>
+  /// Watches the two devices for the thing that actually matters: was a READ under way while a
+  /// WRITE was happening?
+  ///
+  /// Timing this instead — asserting the transfer beats some fraction of its serial cost — looks
+  /// equivalent and is not. The bound has to come from somewhere, and deriving it from the sleep
+  /// the test asked for assumes the host delivers that sleep: Windows' default timer granularity
+  /// is about 15.6 ms, so every "10 ms" is really 15.6, the whole run inflates, and a perfectly
+  /// overlapped copy lands the wrong side of a threshold computed from the nominal figure. That is
+  /// a statement about the runner's clock, not about the copy. Observing the overlap needs no
+  /// clock and no threshold.
+  /// </summary>
+  private sealed class DeviceProbe {
+    private int _readsInFlight;
+    public volatile bool SawReadDuringWrite;
+
+    public void ReadStarted() => Interlocked.Increment(ref this._readsInFlight);
+    public void ReadFinished() => Interlocked.Decrement(ref this._readsInFlight);
+
+    /// <summary>Spends <paramref name="duration"/> in a write, sampling whether the other device is busy.</summary>
+    public void WriteTakingTime(TimeSpan duration) {
+      for (var slice = 0; slice < 20; ++slice) {
+        if (Volatile.Read(ref this._readsInFlight) > 0)
+          this.SawReadDuringWrite = true;
+
+        Thread.Sleep(duration / 20);
+      }
+    }
+  }
+
+  private sealed class SlowSource(Stream inner, TimeSpan perRead, DeviceProbe probe) : Stream {
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
     public override long Length => inner.Length;
     public override long Position { get => inner.Position; set => inner.Position = value; }
 
     public override int Read(byte[] buffer, int offset, int count) {
-      Thread.Sleep(perOperation);
-      return inner.Read(buffer, offset, count);
+      probe.ReadStarted();
+      try {
+        Thread.Sleep(perRead);
+        return inner.Read(buffer, offset, count);
+      } finally {
+        probe.ReadFinished();
+      }
     }
 
+    public override void Flush() { }
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+  }
+
+  private sealed class SlowDestination(Stream inner, TimeSpan perWrite, DeviceProbe probe) : Stream {
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => inner.Length;
+    public override long Position { get => inner.Position; set => inner.Position = value; }
+
     public override void Write(byte[] buffer, int offset, int count) {
-      Thread.Sleep(perOperation);
+      probe.WriteTakingTime(perWrite);
       inner.Write(buffer, offset, count);
     }
 
     public override void Flush() => inner.Flush();
-    public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
-    public override void SetLength(long value) => inner.SetLength(value);
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
   }
 
   private static byte[] _Content(int size) {
@@ -417,22 +465,20 @@ public class DoubleBufferedCopyTests {
   public void CopyCounted_GivenSlowSourceAndSlowDestination_ThenTheyOverlap() {
     const int chunk = 1024;
     const int chunks = 8;
-    var delay = TimeSpan.FromMilliseconds(10);
     var content = _Content(chunk * chunks);
+    var probe = new DeviceProbe();
 
-    using var source = new SlowStream(new MemoryStream(content, writable: false), delay);
-    using var destination = new SlowStream(new MemoryStream(), delay);
+    // the source is deliberately the slower of the two, so a read is genuinely still running while
+    // a write is in progress rather than the two merely brushing past one another
+    using var source = new SlowSource(new MemoryStream(content, writable: false), TimeSpan.FromMilliseconds(40), probe);
+    using var destination = new SlowDestination(new MemoryStream(), TimeSpan.FromMilliseconds(20), probe);
 
-    var clock = Stopwatch.StartNew();
-    WholeFilePublisher.CopyCounted(source, destination, bufferSize: chunk);
-    clock.Stop();
+    WholeFilePublisher.CopyCounted(source, destination, bufferSize: chunk).Should().Be(content.LongLength);
 
-    // serial costs (reads + writes) x delay; overlapped costs about max(reads, writes) x delay
-    var serial = delay.TotalMilliseconds * (chunks * 2 + 1);
-    clock.Elapsed.TotalMilliseconds.Should().BeLessThan(serial * 0.8,
-      "a drain reads from one storage and writes to another; with one buffer the two take turns "
-      + "and each is idle for the other's half of every chunk. {0:N0} ms against a serial {1:N0} ms",
-      clock.Elapsed.TotalMilliseconds, serial);
+    probe.SawReadDuringWrite.Should().BeTrue(
+      "a drain reads from one storage and writes to another. With a single buffer the two take "
+      + "turns and each sits idle for the other's half of every chunk, so a read is NEVER under way "
+      + "while a write is — which is exactly what this looks for, and what double-buffering changes");
   }
 
   [Test]
