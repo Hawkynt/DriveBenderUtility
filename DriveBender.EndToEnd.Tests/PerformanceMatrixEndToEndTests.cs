@@ -45,6 +45,7 @@ namespace DivisonM.EndToEnd.Tests;
 public class PerformanceMatrixEndToEndTests {
 
   private const long _LARGE = 1536L * 1024 * 1024; // 1.5 GiB — "large" in the 1 GB+ sense
+  private const long _SCATTER = 512L * 1024 * 1024; // enough to measure a rate, small enough to add three more pools
   private const int _CHUNK = 8 * 1024 * 1024;
   private const int _SMALL = 3072; // under 4 KiB, so it is one page and one round trip
   private const int _SMALL_FILES = 1500;
@@ -71,10 +72,35 @@ public class PerformanceMatrixEndToEndTests {
   private const string _VOLATILE_ACK =
     """{ "write": { "policy": "performance", "acceptVolatileAck": true } }""";
 
+  /// <summary>
+  /// The same pool as <see cref="_SMALL_CACHE"/> with the storage pinned to ONE outstanding
+  /// request — which is what the engine used to do everywhere. It is the control: the difference
+  /// between this and the default row is exactly what overlapping the block loads is worth on
+  /// whatever hardware the benchmark happens to be running on.
+  /// </summary>
+  private const string _QUEUE_DEPTH_ONE =
+    """{ "caches": { "global": { "size": "32MiB" } }, "io": { "queueDepthPerVolume": { "default": 1 } } }""";
+
+  /// <summary>
+  /// Two storages, each holding a whole copy, with the mirror-split threshold dropped so any read
+  /// may be served from both. On a machine with two real devices this is where they add up.
+  /// </summary>
+  private const string _MIRRORED =
+    """
+    {
+      "caches": { "global": { "size": "32MiB" } },
+      "duplication": 2,
+      "placement": { "shadowNeverSamePhysical": false },
+      "io": { "mirrorReadSplitThreshold": "64KiB" }
+    }
+    """;
+
   private static MountedPool _cached = null!;
   private static MountedPool _uncached = null!;
   private static MountedPool _tiered = null!;
   private static MountedPool _volatileAck = null!;
+  private static MountedPool _serialIo = null!;
+  private static MountedPool _mirrored = null!;
   private static readonly List<(string Tier, string Workload, string Threads, string Result)> _rows = [];
 
   private static void _Record(string tier, string workload, string threads, string result) {
@@ -91,14 +117,19 @@ public class PerformanceMatrixEndToEndTests {
 
   [OneTimeSetUp]
   public void Prepare() {
+    // four pools hold 1.5 GiB each, and the scatter pools hold 0.5 GiB each — one of them twice,
+    // because it is duplicated
+    var needed = _LARGE * 5 + _SCATTER * 4;
     var free = new DriveInfo(Path.GetPathRoot(Path.GetTempPath())!).AvailableFreeSpace;
-    if (free < _LARGE * 5)
-      Assert.Ignore($"needs about {_LARGE * 5 / (1024 * 1024 * 1024)} GiB free, has {free / (1024 * 1024 * 1024)} GiB");
+    if (free < needed)
+      Assert.Ignore($"needs about {needed / (1024 * 1024 * 1024)} GiB free, has {free / (1024 * 1024 * 1024)} GiB");
 
     _cached = MountedPool.Create(poolDefaults: _BIG_CACHE);
     _uncached = MountedPool.Create(poolDefaults: _SMALL_CACHE);
     _tiered = MountedPool.Create(members: 2, poolDefaults: _SMALL_CACHE, landingZones: 1);
     _volatileAck = MountedPool.Create(poolDefaults: _VOLATILE_ACK);
+    _serialIo = MountedPool.Create(poolDefaults: _QUEUE_DEPTH_ONE);
+    _mirrored = MountedPool.Create(members: 2, poolDefaults: _MIRRORED);
   }
 
   [OneTimeTearDown]
@@ -107,6 +138,8 @@ public class PerformanceMatrixEndToEndTests {
     _uncached?.Dispose();
     _tiered?.Dispose();
     _volatileAck?.Dispose();
+    _serialIo?.Dispose();
+    _mirrored?.Dispose();
 
     if (_rows.Count == 0)
       return;
@@ -122,6 +155,11 @@ public class PerformanceMatrixEndToEndTests {
     report.AppendLine("remount, and `Landing` is a tiered pool. The landing-zone rows therefore price the CODE PATH,");
     report.AppendLine("not an SSD-versus-HDD difference — both members share one device on a test machine, so only a");
     report.AppendLine("host with genuinely different devices can price the tiering itself.");
+    report.AppendLine();
+    report.AppendLine("The `Scatter` rows price OVERLAPPED I/O directly, and they need no second device to mean");
+    report.AppendLine("something: the control is the same pool with `io.queueDepthPerVolume` pinned to 1, which is");
+    report.AppendLine("one outstanding request at a time — what the engine used to do everywhere. The `2 copies` row");
+    report.AppendLine("does share one device here, so it prices the split's overhead rather than the gain.");
     report.AppendLine();
     report.AppendLine($"Host: {Environment.ProcessorCount} logical CPUs; multi-thread rows use {_THREADS} threads.");
     report.AppendLine();
@@ -140,12 +178,12 @@ public class PerformanceMatrixEndToEndTests {
   }
 
   /// <summary>Writes one large file sequentially and returns the rate in bytes per second.</summary>
-  private static long _WriteLarge(MountedPool pool, string name) {
+  private static long _WriteLarge(MountedPool pool, string name, long size = _LARGE) {
     var buffer = new byte[_CHUNK];
     var clock = Stopwatch.StartNew();
     using (var stream = new FileStream(pool.PathTo(name), FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20)) {
-      for (var written = 0L; written < _LARGE; written += _CHUNK) {
-        var take = (int)Math.Min(_CHUNK, _LARGE - written);
+      for (var written = 0L; written < size; written += _CHUNK) {
+        var take = (int)Math.Min(_CHUNK, size - written);
         stream.Write(buffer, 0, take);
       }
 
@@ -153,7 +191,7 @@ public class PerformanceMatrixEndToEndTests {
     }
 
     clock.Stop();
-    return (long)(_LARGE / Math.Max(0.001, clock.Elapsed.TotalSeconds));
+    return (long)(size / Math.Max(0.001, clock.Elapsed.TotalSeconds));
   }
 
   private static long _ReadLarge(MountedPool pool, string name) {
@@ -359,6 +397,51 @@ public class PerformanceMatrixEndToEndTests {
 
     readMany.Should().BeGreaterThan(readSingle * 0.9,
       $"{_THREADS} threads read {readMany:N0}/s against {readSingle:N0}/s on one — small-file reads are serialising");
+  }
+
+  /// <summary>Writes a file, drops the pool's cache by remounting, and times reading it back.</summary>
+  private static long _ColdRead(MountedPool pool, string name) {
+    _WriteLarge(pool, name, _SCATTER);
+    pool.Remount(); // nothing of it survives in the POOL's cache; the OS page cache is not ours to drop
+    var buffer = new byte[_CHUNK];
+    var clock = Stopwatch.StartNew();
+    var total = 0L;
+    using (var stream = new FileStream(pool.PathTo(name), FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20)) {
+      int read;
+      while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+        total += read;
+    }
+
+    clock.Stop();
+    return (long)(total / Math.Max(0.001, clock.Elapsed.TotalSeconds));
+  }
+
+  [Test]
+  [Order(4)]
+  [Category("Performance")]
+  [Description("What overlapping the block loads is worth: one storage held at queue depth 1, the same storage overlapped, and a file whose two copies are read together.")]
+  public void Scatter_OverlappedIoAcrossStorages() {
+    var serial = _ColdRead(_serialIo, "scatter.bin");
+    _Record("Scatter", $"sequential read, {_SCATTER / (1024 * 1024)} MiB, queue depth 1", "1", _Rate(serial));
+
+    var overlapped = _ColdRead(_uncached, "scatter.bin");
+    _Record("Scatter", $"sequential read, {_SCATTER / (1024 * 1024)} MiB, overlapped", "1", _Rate(overlapped));
+    _Record("Scatter", "overlapped vs. queue depth 1", "1",
+      string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{(double)overlapped / Math.Max(1, serial):N2}x"));
+
+    var mirrored = _ColdRead(_mirrored, "scatter.bin");
+    _Record("Scatter", $"sequential read, {_SCATTER / (1024 * 1024)} MiB, 2 copies", "1", _Rate(mirrored));
+
+    foreach (var (what, rate) in new[] { ("queue depth 1", serial), ("overlapped", overlapped), ("two copies", mirrored) })
+      rate.Should().BeGreaterThan(10L * 1024 * 1024, $"the {what} read collapsed to {rate / (1024 * 1024)} MiB/s");
+
+    // Deliberately NOT asserting that overlapped beats serial. On a host whose members share one
+    // device — every CI runner, and most developer machines — the two numbers can land either way,
+    // and a benchmark that fails on the hardware it was given teaches nothing. The RATIO is the
+    // deliverable; what is guarded here is that neither path has collapsed.
+    mirrored.Should().BeGreaterThan(serial / 4,
+      $"reading a file from both its copies managed {_Rate(mirrored)} against {_Rate(serial)} from one at "
+      + "queue depth 1 — splitting a read across storages must never cost more than it saves");
   }
 
 }

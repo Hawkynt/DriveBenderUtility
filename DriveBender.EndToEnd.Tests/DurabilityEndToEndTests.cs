@@ -26,6 +26,57 @@ public class DurabilityEndToEndTests {
     return content;
   }
 
+  /// <summary>
+  /// Work that runs until something stops it — the crash, normally.
+  ///
+  /// These scenarios all need the power to go off WHILE something is happening, and each of them
+  /// used to arrange that by racing a fixed amount of work against a fixed sleep. That is a bet on
+  /// the host's speed, and on a fast enough machine the work finishes first: the scenario quietly
+  /// becomes "crash after everything completed", which tests nothing. Both of the guards that catch
+  /// that ("or this tests nothing") have now been seen to fire, on a 16-CPU host with tmpfs — and
+  /// making the I/O path faster makes them fire MORE often, so raising the workload would only
+  /// move the goalposts until the next machine.
+  ///
+  /// An UNBOUNDED loop removes the bet. There is no amount of work to finish, so the workload is
+  /// still running when the power is cut no matter how fast the host is; the only thing left to
+  /// establish is that it got far enough to be worth interrupting, which is an observation rather
+  /// than a race.
+  /// </summary>
+  private sealed class Workload : IDisposable {
+
+    private readonly Thread _thread;
+    private volatile bool _stop;
+    private int _completed;
+
+    public Workload(Action<int> step, TimeSpan pace = default) {
+      this._thread = new(() => {
+        try {
+          for (var iteration = 0; !this._stop; ++iteration) {
+            step(iteration);
+            Interlocked.Increment(ref this._completed);
+            if (pace > TimeSpan.Zero)
+              Thread.Sleep(pace);
+          }
+        } catch (Exception) {
+          // the crash is expected to interrupt this
+        }
+      }) { IsBackground = true };
+
+      this._thread.Start();
+    }
+
+    public int Completed => Volatile.Read(ref this._completed);
+
+    /// <summary>Waits until the workload has completed <paramref name="steps"/> steps — the "it got going" observation.</summary>
+    public bool ReachedAtLeast(int steps, TimeSpan timeout)
+      => MountedPool.WaitUntil(() => this.Completed >= steps, timeout);
+
+    public void Dispose() {
+      this._stop = true;
+      this._thread.Join(TimeSpan.FromSeconds(30));
+    }
+  }
+
   [Test]
   [Category("HappyPath")]
   [Description("A power cut after files were written and closed: every byte is still there after the pool comes back.")]
@@ -65,14 +116,19 @@ public class DurabilityEndToEndTests {
 
     File.WriteAllBytes(path, old);
 
-    // start overwriting and pull the plug part-way through
+    // start overwriting and pull the plug part-way through. The stream stays open across the whole
+    // overwrite on purpose — an interrupted write with the handle still held is the case the staged
+    // -write lifecycle has to survive, and closing per chunk would test something easier.
+    const int chunk = 64 * 1024;
     var finished = false;
+    var landed = 0;
     var writer = new Thread(() => {
       try {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite, 1 << 16);
-        for (var offset = 0; offset < size; offset += 64 * 1024) {
-          stream.Write(fresh, offset, Math.Min(64 * 1024, size - offset));
+        for (var offset = 0; offset < size; offset += chunk) {
+          stream.Write(fresh, offset, Math.Min(chunk, size - offset));
           stream.Flush();
+          Interlocked.Increment(ref landed);
           Thread.Sleep(25); // paced so the overwrite is still in flight when the power goes
         }
 
@@ -83,7 +139,12 @@ public class DurabilityEndToEndTests {
     }) { IsBackground = true };
 
     writer.Start();
-    Thread.Sleep(TimeSpan.FromMilliseconds(1200)); // let a good part of the overwrite land
+
+    // Cut the power on OBSERVED progress rather than after a fixed wait. A fixed wait is a bet on
+    // the host: too short and nothing has landed, too long and the overwrite is already over. The
+    // pacing above means an eighth of the chunks takes at least 400 ms of wall clock whatever the
+    // machine, and leaves seven eighths still to write.
+    MountedPool.WaitUntil(() => Volatile.Read(ref landed) >= size / chunk / 8, TimeSpan.FromSeconds(60));
     pool.CrashAndRemount();
     writer.Join(TimeSpan.FromSeconds(30));
 
@@ -119,32 +180,22 @@ public class DurabilityEndToEndTests {
   public void Crash_GivenStagedWritesWereInterrupted_ThenNoInternalFileIsExposedToTheUser() {
     using var pool = MountedPool.Create();
 
-    // the same 20 names rewritten round after round: staging is happening continuously, while the
-    // disk footprint stays at 5 MiB rather than growing with the test's duration
-    const int rounds = 30;
+    // the same 20 names rewritten round after round, without end: staging happens continuously
+    // until the power goes off, while the disk footprint stays at 5 MiB rather than growing with
+    // the test's duration
     const int files = 20;
-    var written = 0;
-    var writer = new Thread(() => {
-      try {
-        for (var round = 0; round < rounds; ++round)
-          for (var file = 0; file < files; ++file) {
-            File.WriteAllBytes(pool.PathTo($"staged{file}.bin"), _Payload(256 * 1024, round * files + file));
-            Interlocked.Increment(ref written);
-          }
-      } catch (Exception) {
-        // the crash is expected to interrupt this
-      }
-    }) { IsBackground = true };
-
-    writer.Start();
-    Thread.Sleep(TimeSpan.FromMilliseconds(1500));
-    pool.CrashAndRemount();
-    writer.Join(TimeSpan.FromSeconds(30));
+    using var writer = new Workload(iteration =>
+      File.WriteAllBytes(pool.PathTo($"staged{iteration % files}.bin"), _Payload(256 * 1024, iteration)));
 
     // the crash has to land while files are still being staged, or there is no interrupted staging
-    // to find and the assertions below have nothing to bite on
-    Volatile.Read(ref written).Should().BeLessThan(rounds * files,
-      "the writer must still be going when the power is cut, or this tests nothing");
+    // to find and the assertions below have nothing to bite on. The loop above never ends, so being
+    // mid-flight is structural; what has to be established is that it got far enough to matter.
+    writer.ReachedAtLeast(files * 3, TimeSpan.FromSeconds(60)).Should().BeTrue(
+      $"staging never got going — only {writer.Completed} files were written in a minute, so there is "
+      + $"nothing interrupted to look for.{Environment.NewLine}{pool.MountLog}");
+
+    pool.CrashAndRemount();
+    writer.Dispose(); // stop it here, not at end of scope: it must not write into the REMOUNTED pool
 
     var visible = Directory.EnumerateFileSystemEntries(pool.MountPath, "*", SearchOption.AllDirectories)
       .Select(entry => Path.GetRelativePath(pool.MountPath, entry))
@@ -199,27 +250,30 @@ public class DurabilityEndToEndTests {
     for (var file = 0; file < 12; ++file)
       File.WriteAllBytes(pool.PathTo($"from{file}.bin"), content);
 
-    var renamed = 0;
-    var renamer = new Thread(() => {
-      try {
-        for (var file = 0; file < 12; ++file) {
-          File.Move(pool.PathTo($"from{file}.bin"), pool.PathTo($"to{file}.bin"));
-          Interlocked.Increment(ref renamed);
-          Thread.Sleep(50);
-        }
-      } catch (Exception) {
-        // the crash is expected to interrupt this
-      }
-    }) { IsBackground = true };
+    // Renaming back and FORTH, without end: each file moves from→to→from→to for as long as the
+    // pool is alive. Sweeping once through twelve files was a race against the host — the sweep
+    // finished before the kill landed and the scenario degraded into "crash after the renames",
+    // which is not what it is named for. Which direction a file goes is read off the disk rather
+    // than tracked, so an interrupted sweep never leaves the loop trying to move a name that is
+    // no longer there.
+    using var renamer = new Workload(iteration => {
+      var file = iteration % 12;
+      var source = pool.PathTo($"from{file}.bin");
+      var destination = pool.PathTo($"to{file}.bin");
+      if (File.Exists(source))
+        File.Move(source, destination);
+      else
+        File.Move(destination, source);
+    }, pace: TimeSpan.FromMilliseconds(10));
 
-    renamer.Start();
-    Thread.Sleep(TimeSpan.FromMilliseconds(400));
+    // the crash has to land among the renames rather than after them; the loop has no end, so that
+    // is structural, and what remains is to see it actually moving
+    renamer.ReachedAtLeast(4, TimeSpan.FromSeconds(60)).Should().BeTrue(
+      $"only {renamer.Completed} renames happened in a minute, so the crash has nothing to interrupt."
+      + $"{Environment.NewLine}{pool.MountLog}");
+
     pool.CrashAndRemount();
-    renamer.Join(TimeSpan.FromSeconds(30));
-
-    // some must have been renamed and some not, otherwise the crash missed the window entirely
-    Volatile.Read(ref renamed).Should().BeInRange(1, 11,
-      "the crash must land in the middle of the renames, or this tests nothing");
+    renamer.Dispose(); // stop it here: it must not go on renaming inside the REMOUNTED pool
 
     for (var file = 0; file < 12; ++file) {
       var source = pool.PathTo($"from{file}.bin");

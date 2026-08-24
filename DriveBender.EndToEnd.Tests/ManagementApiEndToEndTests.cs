@@ -128,8 +128,20 @@ public class ManagementApiEndToEndTests {
     var status = this._daemon.PostJson($"api/job?id={jobId}");
     status.GetProperty("ok").GetBoolean().Should().BeTrue("the ticket must be pollable");
 
+    // The invariant is that an unstoppable job never claims to be stopping. WHICH honest answer
+    // comes back — "cannot be stopped" or "already finished" — depends on whether the installer
+    // has got there yet, and on a machine where the prerequisite is already satisfied it finishes
+    // in microseconds. Asserting one of the two specifically was therefore a race against the
+    // host's speed rather than a statement about the daemon, and it lost that race here.
     var refused = this._daemon.PostJson($"api/job/cancel?id={jobId}");
-    refused.GetProperty("ok").GetBoolean().Should().BeFalse("an unstoppable job must refuse cancellation honestly");
+    var answer = refused.GetProperty("ok").GetBoolean()
+      ? refused.GetProperty("result").GetString()
+      : refused.GetProperty("error").GetString();
+
+    answer.Should().NotBe("cancelling",
+      $"the ticket reported itself un-stoppable, so the daemon must not turn round and say it is "
+      + $"stopping it — a Cancel button that silently does nothing is the thing 'cancellable: false' "
+      + $"exists to prevent. It answered '{answer}'");
   }
 
   [Test]
