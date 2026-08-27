@@ -147,13 +147,31 @@ public class PathContainmentTests {
     // The names that CANNOT be normalised into something safe are rejected rather than
     // reinterpreted: silently turning '../x' into 'x' would be its own hazard, quietly writing to
     // the wrong file. A bare leading separator is not in this set — it means "from the pool root"
-    // and is trimmed — but a relative segment or a drive/volume qualifier can only be a mistake or
-    // an attack.
-    foreach (var name in _HostileNames.Where(n => n.Contains("..") || n.Contains(':')))
+    // and is trimmed — but a relative segment can only be a mistake or an attack.
+    foreach (var name in _HostileNames.Where(n => n.Contains("..")))
       _Attempt(() => {
         using var stream = this._volume.OpenWrite(name, false, true);
         stream.Write([1], 0, 1);
       }).Should().BeTrue($"'{name}' cannot be made safe by normalising, so it must be refused");
+
+    // A DRIVE QUALIFIER is refused only where it is dangerous, and that is a platform fact rather
+    // than a weaker promise. `_Contain` refuses it because Path.Combine would otherwise hand back
+    // the rooted path and leave the member root entirely — which is what Combine does on Windows
+    // and not what it does on POSIX, where 'C:\...' is an ordinary relative name with no special
+    // meaning. Demanding refusal on both would assert the implementation rather than the property,
+    // exactly as this fixture's own documentation warns; what has to hold everywhere is that
+    // nothing lands outside the root, and that is asserted below and by the sibling tests.
+    const string driveQualified = @"C:\Windows\Temp\escaped.txt";
+    var refused = _Attempt(() => {
+      using var stream = this._volume.OpenWrite(driveQualified, false, true);
+      stream.Write([1], 0, 1);
+    });
+
+    if (OperatingSystem.IsWindows())
+      refused.Should().BeTrue($"'{driveQualified}' would escape the member root on this platform, so it must be refused");
+
+    this._EscapedEntries().Should().BeEmpty(
+      $"whether '{driveQualified}' is refused or merely contained, it must never put anything outside the member root");
   }
 
   [Test]

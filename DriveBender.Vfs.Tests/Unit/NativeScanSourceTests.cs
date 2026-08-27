@@ -16,6 +16,16 @@ public class NativeScanSourceTests {
   [SetUp]
   public void SetUp() => this._host = new();
 
+  /// <summary>
+  /// The member path a native scan derives for a drive: the drive's pool-GUID folder (§1.3).
+  ///
+  /// Built the same way the scanner builds it, because the SEPARATOR is the host's and these
+  /// fixtures model Windows drive letters on whatever machine they run on. Hard-coding
+  /// <c>F:\{guid}</c> asserted the rule AND the platform, and failed on Linux for the second
+  /// reason while the first was perfectly satisfied.
+  /// </summary>
+  private static string _MemberPath(string root, Guid poolId) => Path.Combine(root, $"{{{poolId}}}");
+
   private void _AddNativeDrive(string root, string physicalId, Guid poolId, string label = "MediaPool") {
     this._host.AddVolume(root, physicalId);
     this._host.AddFile(Path.Combine(root, "pool info." + DriveBender.DriveBenderConstants.INFO_EXTENSION),
@@ -38,7 +48,7 @@ public class NativeScanSourceTests {
     manifest.IsVirtual.Should().BeTrue();
     manifest.Members.Should().HaveCount(2);
     manifest.Members.Select(m => m.Path).Should().BeEquivalentTo(
-      [$@"F:\{{{_poolId}}}", $@"G:\{{{_poolId}}}"],
+      [_MemberPath(@"F:\", _poolId), _MemberPath(@"G:\", _poolId)],
       "members are the drives' pool-GUID root folders (§1.3)");
   }
 
@@ -67,7 +77,7 @@ public class NativeScanSourceTests {
       "poolId": "{{_poolId}}",
       "name": "MediaPool",
       "members": [
-        { "memberId": "{{NativeScanSource.DeriveMemberId(_poolId, "PHYS-F")}}", "path": "F:\\{{{_poolId}}}", "role": "capacity", "label": "MediaPool" }
+        { "memberId": "{{NativeScanSource.DeriveMemberId(_poolId, "PHYS-F")}}", "path": "{{_MemberPath(@"F:\", _poolId).Replace(@"\", @"\\")}}", "role": "capacity", "label": "MediaPool" }
       ]
     }
     """);

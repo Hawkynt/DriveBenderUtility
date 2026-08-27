@@ -24,8 +24,23 @@ public sealed class FakeHostEnvironment : IHostEnvironment {
 
   public int AtomicWriteCount { get; private set; }
 
+  /// <summary>
+  /// Puts a path into this fake's own (Windows-shaped) form, which is deliberately independent of
+  /// the HOST it runs on — the whole point of the fake is that discovery and resolution are
+  /// testable headless, on any platform (TST-FAKE).
+  ///
+  /// Collapsing repeated separators is what makes that true in practice. Fixtures build their
+  /// paths with <see cref="Path.Combine"/>, and on Linux that joins with '/' because a trailing
+  /// '\' is not a separator there — so <c>Combine(@"F:\", "x")</c> yields <c>F:\/x</c>, which
+  /// normalised naively becomes <c>F:\\x</c> and matches nothing the code under test asks for.
+  /// The whole native-scan and pool-discovery set failed on Linux for that reason alone, which
+  /// reads as a product defect and is not one.
+  /// </summary>
   private static string _Normalize(string path) {
     var normalized = path.Replace('/', '\\').TrimEnd('\\');
+    while (normalized.Contains(@"\\", StringComparison.Ordinal))
+      normalized = normalized.Replace(@"\\", @"\", StringComparison.Ordinal);
+
     return normalized.Length == 2 && normalized[1] == ':' ? normalized + '\\' : normalized;
   }
 
