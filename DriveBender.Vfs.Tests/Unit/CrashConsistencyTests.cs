@@ -275,8 +275,12 @@ public class CrashConsistencyTests {
 
   [Test]
   [Category("EdgeCase")]
+  // 21, not 25: a write into a not-yet-published staging temp no longer journals an intent and a
+  // completion of its own, and each of those cost one volume write PER MEMBER — four operations
+  // that a create simply does not perform any more. The guard below caught the stale range the
+  // moment the path got shorter, which is exactly what it is for.
   public void Crash_GivenACreateInterruptedAtEveryStep_ThenNoHalfWrittenFileIsEverVisible(
-    [Range(1, 25)] int abortAfter) {
+    [Range(1, 21)] int abortAfter) {
     var content = _Version(5);
 
     using (var fs = _NewEngine()) {

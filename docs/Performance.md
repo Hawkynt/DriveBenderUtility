@@ -18,25 +18,25 @@ Host: 20 logical CPUs; multi-thread rows use 20 threads.
 
 | Tier | Workload | Threads | Result |
 | --- | --- | --- | ---: |
-| RAM cache | sequential write, 1.5 GiB | 1 | 750 MiB/s |
-| RAM cache | sequential read, 1.5 GiB | 1 | 3,314 MiB/s |
-| Storage | sequential write, 1.5 GiB | 1 | 771 MiB/s |
-| Storage | sequential read, 1.5 GiB | 1 | 1,758 MiB/s |
-| Landing | sequential write, 1.5 GiB | 1 | 695 MiB/s |
-| RAM ack | sequential write, 1.5 GiB (opt-in) | 1 | 979 MiB/s |
-| RAM ack | vs. durability-first default | 1 | 1.31x |
-| RAM cache | random 4 KiB read | 1 | 65,061 IOPS |
-| RAM cache | random 4 KiB read | 20 | 54,562 IOPS |
-| Storage | random 4 KiB read | 1 | 3,835 IOPS |
-| Storage | random 4 KiB read | 20 | 3,650 IOPS |
-| RAM cache | random 4 KiB read scaling | 1 -> 20 | 84 % of single-thread |
-| Storage | create+write+close, 3072 B | 1 | 87 IOPS |
-| Storage | create+write+close, 3072 B | 20 | 150 IOPS |
-| Landing | create+write+close, 3072 B | 20 | 159 IOPS |
-| RAM cache | open+read+close, 3072 B | 1 | 2,340 IOPS |
-| RAM cache | open+read+close, 3072 B | 20 | 7,715 IOPS |
-| RAM cache | open+read+close scaling, 3072 B | 1 -> 20 | 3.3x |
-| Scatter | sequential read, 512 MiB, queue depth 1 | 1 | 2,020 MiB/s |
-| Scatter | sequential read, 512 MiB, overlapped | 1 | 1,777 MiB/s |
-| Scatter | overlapped vs. queue depth 1 | 1 | 0.88x |
-| Scatter | sequential read, 512 MiB, 2 copies | 1 | 1,873 MiB/s |
+| RAM cache | sequential write, 1.5 GiB | 1 | 1,075 MiB/s |
+| RAM cache | sequential read, 1.5 GiB | 1 | 2,751 MiB/s |
+| Storage | sequential write, 1.5 GiB | 1 | 1,122 MiB/s |
+| Storage | sequential read, 1.5 GiB | 1 | 1,927 MiB/s |
+| Landing | sequential write, 1.5 GiB | 1 | 1,084 MiB/s |
+| RAM ack | sequential write, 1.5 GiB (opt-in) | 1 | 1,030 MiB/s |
+| RAM ack | vs. durability-first default | 1 | 0.96x |
+| RAM cache | random 4 KiB read | 1 | 68,294 IOPS |
+| RAM cache | random 4 KiB read | 20 | 51,920 IOPS |
+| Storage | random 4 KiB read | 1 | 3,728 IOPS |
+| Storage | random 4 KiB read | 20 | 3,465 IOPS |
+| RAM cache | random 4 KiB read scaling | 1 -> 20 | 76 % of single-thread |
+| Storage | create+write+close, 3072 B | 1 | 113 IOPS |
+| Storage | create+write+close, 3072 B | 20 | 148 IOPS |
+| Landing | create+write+close, 3072 B | 20 | 163 IOPS |
+| RAM cache | open+read+close, 3072 B | 1 | 1,975 IOPS |
+| RAM cache | open+read+close, 3072 B | 20 | 7,296 IOPS |
+| RAM cache | open+read+close scaling, 3072 B | 1 -> 20 | 3.7x |
+| Scatter | sequential read, 512 MiB, queue depth 1 | 1 | 1,857 MiB/s |
+| Scatter | sequential read, 512 MiB, overlapped | 1 | 1,728 MiB/s |
+| Scatter | overlapped vs. queue depth 1 | 1 | 0.93x |
+| Scatter | sequential read, 512 MiB, 2 copies | 1 | 1,750 MiB/s |
