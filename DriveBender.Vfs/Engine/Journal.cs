@@ -44,6 +44,18 @@ public interface IJournalStore {
   /// <summary>Appends one line durably (fsync before returning) — the fsync-before-mutate ordering (SAFE-ORDER).</summary>
   void Append(string line);
 
+  /// <summary>
+  /// Appends several lines with ONE durability barrier covering all of them.
+  ///
+  /// The ordering guarantee is unchanged — this does not return until every line is on disk — but
+  /// the cost of the barrier is shared instead of paid per record. A store that cannot do better
+  /// falls back to appending one at a time, which is what this default does.
+  /// </summary>
+  void AppendBatch(IReadOnlyList<string> lines) {
+    foreach (var line in lines)
+      this.Append(line);
+  }
+
   IEnumerable<string> ReadAll();
 
   /// <summary>Atomically replaces the journal content (checkpoint compaction).</summary>
@@ -83,22 +95,42 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
     }
   }
 
-  public void Append(string line) {
-    var wrote = false;
-    var bytes = Encoding.UTF8.GetBytes(line + "\n");
-    foreach (var member in this._Online) {
+  public void Append(string line) => this.AppendBatch([line]);
+
+  /// <summary>
+  /// One write and one flush per member, with the members done CONCURRENTLY.
+  ///
+  /// Two costs used to be paid needlessly. Lines were appended one at a time, so ten records cost
+  /// ten durability barriers; and the members were walked in sequence, so the journal cost the SUM
+  /// of their flushes rather than the slowest one. The mirror is NOT reduced — every member still
+  /// receives every line, because a journal that survives on only one disk is not a journal — it is
+  /// only the waiting that is overlapped.
+  /// </summary>
+  public void AppendBatch(IReadOnlyList<string> lines) {
+    if (lines.Count == 0)
+      return;
+
+    var builder = new StringBuilder();
+    foreach (var line in lines)
+      builder.Append(line).Append('\n');
+
+    var bytes = Encoding.UTF8.GetBytes(builder.ToString());
+    var targets = this._Online.ToArray();
+    var wrote = 0;
+
+    Parallel.ForEach(targets, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, targets.Length) }, member => {
       try {
         using var stream = member.OpenWrite(JournalPath, false, true);
         stream.Seek(0, SeekOrigin.End);
         stream.Write(bytes, 0, bytes.Length);
         stream.Flush();
-        wrote = true;
+        Interlocked.Increment(ref wrote);
       } catch (PoolFsException e) {
         DriveBender.Logger($"[Warning]Journal append failed on '{member.DisplayName}': {e.Message}");
       }
-    }
+    });
 
-    if (!wrote)
+    if (Volatile.Read(ref wrote) == 0)
       throw new PoolFsException(PoolFsError.IoError, "Journal intent could not be persisted on any member — refusing the mutation (SAFE-WAL)");
   }
 
@@ -254,7 +286,72 @@ public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
     this._loaded = true;
   }
 
+  /// <summary>One caller waiting for its record to become durable.</summary>
+  private sealed class PendingRecord(string line) {
+    public readonly string Line = line;
+    public readonly ManualResetEventSlim Durable = new(false);
+    public Exception? Failure;
+  }
+
+  private readonly Lock _commitLock = new();
+  private readonly List<PendingRecord> _queued = [];
+  private readonly Lock _queueLock = new();
+
+  /// <summary>
+  /// Makes one record durable, sharing the barrier with whatever else is waiting (group commit).
+  ///
+  /// The guarantee is exactly as before: this does not return until THIS record is on disk, so a
+  /// caller still never mutates anything before its intent is durable. What changes is who pays for
+  /// the flush. Every journalled operation used to take its own barrier while holding the journal's
+  /// lock, so concurrent operations queued behind each other and each paid in full — a small file
+  /// costs an intent and a completion, and with two members that was four serial fsyncs, which is
+  /// most of the fifteen milliseconds a small file took.
+  ///
+  /// Leader/followers: whoever wins <see cref="_commitLock"/> flushes everything queued, including
+  /// records that arrived while the previous leader was inside its flush. Under load one barrier
+  /// covers many operations; a lone caller simply commits its own record and waits for nothing, so
+  /// there is no latency added when there is nothing to batch with.
+  ///
+  /// Deliberately NOT called while holding <see cref="_lock"/> — that is the whole point, and it is
+  /// also why compaction takes <see cref="_commitLock"/>: a rewrite must not run while a batch is
+  /// in flight against the same file.
+  /// </summary>
+  private void _AppendDurable(string line) {
+    var mine = new PendingRecord(line);
+    lock (this._queueLock)
+      this._queued.Add(mine);
+
+    lock (this._commitLock)
+      if (!mine.Durable.IsSet) {
+        List<PendingRecord> batch;
+        lock (this._queueLock) {
+          batch = [.. this._queued];
+          this._queued.Clear();
+        }
+
+        if (batch.Count > 0) {
+          Exception? failure = null;
+          try {
+            store.AppendBatch([.. batch.Select(p => p.Line)]);
+          } catch (Exception e) {
+            failure = e;
+          }
+
+          foreach (var pending in batch) {
+            pending.Failure = failure;
+            pending.Durable.Set();
+          }
+        }
+      }
+
+    mine.Durable.Wait();
+    if (mine.Failure != null)
+      throw mine.Failure;
+  }
+
   public long LogIntent(JournalOp op, string? path = null, string? targetPath = null, long offset = 0, long length = 0, Guid memberId = default) {
+    string line;
+    long sequence;
     lock (this._lock) {
       this._EnsureLoaded();
       var record = new JournalRecord {
@@ -266,38 +363,63 @@ public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
         Length = length,
         MemberId = memberId,
       };
-      store.Append(JsonSerializer.Serialize(record, _OPTIONS));
+      line = JsonSerializer.Serialize(record, _OPTIONS);
       this._open.Add(record.Sequence);
-      return record.Sequence;
+      sequence = record.Sequence;
     }
+
+    // durability happens OUTSIDE the journal lock, which is what lets concurrent operations share
+    // one barrier. Records may therefore reach the file out of sequence order, which is harmless:
+    // each one carries its own sequence, and a completion is only ever enqueued after its intent
+    // has already returned durable, so an intent can never land after the completion it belongs to.
+    this._AppendDurable(line);
+    return sequence;
   }
 
   public void Complete(long sequence, JournalOp op) {
+    string line;
     lock (this._lock) {
       this._EnsureLoaded();
-      store.Append(JsonSerializer.Serialize(new JournalRecord { Sequence = sequence, Op = op, Completed = true }, _OPTIONS));
+      line = JsonSerializer.Serialize(new JournalRecord { Sequence = sequence, Op = op, Completed = true }, _OPTIONS);
       this._open.Remove(sequence);
       ++this._completedSinceCompact;
+    }
 
-      // compaction keeps the at-rest journal down to its open entries — but AMORTIZED: a large
-      // sequential copy quiesces after every chunk, and rewriting the journal on each of those
-      // starves the data path (the disk ends up writing journals instead of the file). A
-      // checkpoint line always survives so the high-water sequence is never lost (SAFE-OFFLINE).
+    this._AppendDurable(line);
+    this._CompactIfDue();
+  }
+
+  /// <summary>
+  /// Compaction keeps the at-rest journal down to its open entries — but AMORTIZED: a large
+  /// sequential copy quiesces after every chunk, and rewriting the journal on each of those starves
+  /// the data path (the disk ends up writing journals instead of the file). A checkpoint line always
+  /// survives so the high-water sequence is never lost (SAFE-OFFLINE).
+  ///
+  /// It takes <see cref="_commitLock"/> around the rewrite because a rewrite REPLACES the file, and
+  /// a group-commit batch may be appending to it at that moment — the two must never overlap. The
+  /// lock order is always <see cref="_lock"/> then <see cref="_commitLock"/>, and the commit path
+  /// takes only the latter, so the two can never deadlock.
+  /// </summary>
+  private void _CompactIfDue() {
+    lock (this._lock) {
       var now = this._clock();
-      if (this._open.Count == 0 && now - this._lastCompactUtc >= _COMPACT_MIN_INTERVAL) {
-        store.Rewrite(this._CheckpointLines());
-        this._completedSinceCompact = 0;
-        this._lastCompactUtc = now;
-      } else if (this._completedSinceCompact >= _COMPACT_THRESHOLD) {
-        store.Rewrite([
-          .. this._CheckpointLines(),
-          .. this.ReadAll()
-            .Where(r => !r.Completed && !r.Checkpoint && this._open.Contains(r.Sequence))
-            .Select(r => JsonSerializer.Serialize(r, _OPTIONS)),
-        ]);
-        this._completedSinceCompact = 0;
-        this._lastCompactUtc = now;
-      }
+      var quiescent = this._open.Count == 0 && now - this._lastCompactUtc >= _COMPACT_MIN_INTERVAL;
+      var overdue = !quiescent && this._completedSinceCompact >= _COMPACT_THRESHOLD;
+      if (!quiescent && !overdue)
+        return;
+
+      lock (this._commitLock)
+        store.Rewrite(quiescent
+          ? this._CheckpointLines()
+          : [
+            .. this._CheckpointLines(),
+            .. this.ReadAll()
+              .Where(r => !r.Completed && !r.Checkpoint && this._open.Contains(r.Sequence))
+              .Select(r => JsonSerializer.Serialize(r, _OPTIONS)),
+          ]);
+
+      this._completedSinceCompact = 0;
+      this._lastCompactUtc = now;
     }
   }
 
