@@ -157,6 +157,33 @@ public class BitRotEndToEndTests {
         + $"{Environment.NewLine}stdout:{fix.StandardOutput}{Environment.NewLine}stderr:{fix.StandardError}");
   }
 
+
+  [Test]
+  [Category("EdgeCase")]
+  [Description("A deep health check run while the pool is MOUNTED still leaves a usable baseline, so later rot is repairable.")]
+  public void BitRot_GivenTheBaselineWasTakenWhileMounted_ThenRotIsStillRepaired() {
+    // The obvious thing a user does is health-check the pool they have mounted. That used to
+    // achieve nothing durable: `pool-health` runs in its own process and writes the checksum
+    // sidecar, and the mounted engine then saved its own view over the top on unmount, discarding
+    // the baseline it had just computed. Bit-rot afterwards was undetectable, and the health check
+    // had reported success.
+    var content = _Payload(256 * 1024, 75);
+    using var pool = _PoolWithADuplicatedFile("mounted-baseline.bin", content, out var copies);
+
+    _Baseline(pool); // WHILE MOUNTED - this is the whole point of the scenario
+
+    pool.WhileUnmounted(() => _Rot(copies[0]));
+
+    var fix = DbMount.Run(TimeSpan.FromMinutes(3), "pool-health", pool.PoolName, "--deep", "--fix");
+    pool.Remount();
+
+    foreach (var (where, bytes) in pool.PhysicalCopies("mounted-baseline.bin"))
+      bytes.Should().Equal(content,
+        $"a baseline taken while the pool was mounted must survive the unmount, or the damage is "
+        + $"unrepairable and nothing said so. '{where}' still differs."
+        + $"{Environment.NewLine}stdout:{fix.StandardOutput}{Environment.NewLine}stderr:{fix.StandardError}");
+  }
+
   [Test]
   [Category("Exception")]
   [Description("Both copies rot differently: the pool must not silently hand back damaged data as if it were fine.")]

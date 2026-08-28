@@ -167,7 +167,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       [.. members.Select(m => m.Io)],
       cache.Metadata,
       effectiveConfig,
-      members.ToDictionary(m => m.Io.MemberId, m => m.Role));
+      members.ToDictionary(m => m.Io.MemberId, m => m.Role),
+      members.ToDictionary(m => m.Io.MemberId, m => m.ReserveBytes));
 
     this._queues = new(effectiveConfig, members.ToDictionary(m => m.Io.MemberId, m => m.Role));
     this._tombstones = new([.. members.Select(m => m.Io)]);

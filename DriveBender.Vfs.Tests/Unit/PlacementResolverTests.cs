@@ -1,4 +1,4 @@
-using DivisonM.Vfs;
+﻿using DivisonM.Vfs;
 using DivisonM.Vfs.Caching;
 using DivisonM.Vfs.Engine;
 using DivisonM.Vfs.Tests.TestSupport;
@@ -26,14 +26,59 @@ public class PlacementResolverTests {
     this._metadata = new(EvictionPolicy.Lru, 1000, TimeSpan.FromMinutes(1));
   }
 
-  private PlacementResolver _Resolver(PoolConfig? config = null, bool ssdIsLanding = true) {
+  private PlacementResolver _Resolver(PoolConfig? config = null, bool ssdIsLanding = true,
+    IReadOnlyDictionary<Guid, long>? reserves = null) {
     var members = new IVolumeIO[] { this._ssd, this._hdd1, this._hdd2 };
     var roles = new Dictionary<Guid, MemberRole> {
       [this._ssd.MemberId] = ssdIsLanding ? MemberRole.Landing : MemberRole.Capacity,
       [this._hdd1.MemberId] = MemberRole.Capacity,
       [this._hdd2.MemberId] = MemberRole.Capacity,
     };
-    return new(_pool, members, this._metadata, config ?? ConfigResolver.ResolveEffective(null, null), roles);
+    return new(_pool, members, this._metadata, config ?? ConfigResolver.ResolveEffective(null, null), roles, reserves);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Placement_GivenAMemberIsReservedToTheBrim_ThenNothingIsPlacedOnIt() {
+    // A reserve is a promise to leave room - for the host filesystem, for another tenant, for the
+    // headroom a nearly-full disk needs. Placement looked only at raw free space, so the pool would
+    // fill a member straight through its reserve and stop only when the DEVICE refused, which is
+    // the one moment there is no room left to fail gracefully in.
+    var reserves = new Dictionary<Guid, long> {
+      [this._hdd1.MemberId] = 10_000, // its entire capacity
+      [this._hdd2.MemberId] = 20_000,
+    };
+
+    var target = this._Resolver(ssdIsLanding: false, reserves: reserves).ChoosePrimaryTarget(500);
+
+    target.Should().NotBeNull("the SSD has no reserve and can still take the file");
+    target!.MemberId.Should().Be(this._ssd.MemberId,
+      "a member reserved to its capacity has no space to lend the pool, whatever the device reports free");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Placement_GivenEveryMemberIsReservedToTheBrim_ThenThereIsNowhereToPlace() {
+    var reserves = new Dictionary<Guid, long> {
+      [this._ssd.MemberId] = 1_000,
+      [this._hdd1.MemberId] = 10_000,
+      [this._hdd2.MemberId] = 20_000,
+    };
+
+    // the caller turns this into NoSpace; what matters here is that placement REFUSES rather than
+    // handing back a member it is about to overfill
+    this._Resolver(ssdIsLanding: false, reserves: reserves).ChoosePrimaryTarget(500)
+      .Should().BeNull("with every member reserved there is genuinely nowhere the file may go");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Placement_GivenAReserveLeavesRoom_ThenTheFileStillFits() {
+    // the other side of the same rule: a reserve must not make a member unusable, only bounded
+    var reserves = new Dictionary<Guid, long> { [this._hdd2.MemberId] = 19_000 };
+
+    this._Resolver(ssdIsLanding: false, reserves: reserves).ChoosePrimaryTarget(500)
+      .Should().NotBeNull("500 bytes fit in the 1,000 the reserve leaves");
   }
 
   [Test]

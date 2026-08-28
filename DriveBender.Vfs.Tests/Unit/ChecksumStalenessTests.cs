@@ -95,6 +95,90 @@ public class ChecksumStalenessTests {
       + "a hash that was never computed");
   }
 
+
+  [Test]
+  [Category("Exception")]
+  public void Save_GivenTwoWritersOnOneMember_ThenNeitherDiscardsTheOther() {
+    // The sidecar has more than one writer: `pool-health` runs in its own process while the pool
+    // may be mounted in another. Writing a whole view over the top silently discarded the other's
+    // work - which is exactly how a deep scrub of a MOUNTED pool lost the baseline it had just
+    // computed, leaving bit-rot undetectable while appearing to have done something.
+    var member = new InMemoryVolume();
+
+    var scrubber = new ChecksumDatabase(member);
+    scrubber.Set("photos/a.jpg", new(10, 100, "AAAA"));
+    scrubber.Save();
+
+    var mount = new ChecksumDatabase(member); // loads what the scrubber wrote
+    mount.Set("photos/b.jpg", new(20, 200, "BBBB"));
+    mount.Save();
+
+    var reloaded = new ChecksumDatabase(member);
+    reloaded.Get("photos/a.jpg").Should().NotBeNull("the scrubber's baseline must survive the mount's save");
+    reloaded.Get("photos/b.jpg").Should().NotBeNull("and the mount's own record must survive too");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Save_GivenTheOtherWriterAddedEntriesAfterWeLoaded_ThenTheySurvive() {
+    // the harder ordering: BOTH load, then both write. A merge that only read at load time would
+    // still lose whatever appeared in between.
+    var member = new InMemoryVolume();
+    var first = new ChecksumDatabase(member);
+    var second = new ChecksumDatabase(member);
+
+    first.Set("one.bin", new(1, 10, "1111"));
+    second.Set("two.bin", new(2, 20, "2222"));
+
+    first.Save();
+    second.Save(); // must merge with what `first` has just written, not overwrite it
+
+    var reloaded = new ChecksumDatabase(member);
+    reloaded.Get("one.bin").Should().NotBeNull("an entry written while we held our own view must not be dropped");
+    reloaded.Get("two.bin").Should().NotBeNull();
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Save_GivenWeDeletedAnEntry_ThenTheMergeDoesNotResurrectIt() {
+    // the trap in merging: the other writer still has the entry, so a plain union brings back a
+    // record for a file that is gone - a rename's old name reappearing for something not there
+    var member = new InMemoryVolume();
+    var writer = new ChecksumDatabase(member);
+    writer.Set("gone.bin", new(5, 50, "5555"));
+    writer.Save();
+
+    var other = new ChecksumDatabase(member); // still holds `gone.bin`
+    writer.Remove("gone.bin");
+    writer.Save();
+
+    new ChecksumDatabase(member).Get("gone.bin").Should().BeNull("a deliberate deletion must not come back from disk");
+    _ = other;
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Save_GivenBothSidesKnowAFile_ThenTheTrustworthyRecordWins() {
+    var member = new InMemoryVolume();
+    var first = new ChecksumDatabase(member);
+    first.Set("shared.bin", new(10, 100, "GOOD"));
+    first.Save();
+
+    // the other side only knows the entry is not to be believed; ours knows what the content is
+    var second = new ChecksumDatabase(member);
+    second.MarkStale("shared.bin");
+    second.Save();
+
+    var third = new ChecksumDatabase(member);
+    third.Set("shared.bin", new(10, 100, "GOOD"));
+    third.Save();
+
+    var reloaded = new ChecksumDatabase(member).Get("shared.bin");
+    reloaded.Should().NotBeNull();
+    reloaded!.Stale.Should().BeFalse(
+      "a record that says what the content IS beats one that only says do not believe the old value");
+  }
+
   /// <summary>The smallest member that satisfies the checksum database: it only reads and writes one sidecar.</summary>
   private sealed class InMemoryVolume : IVolumeIO {
     private readonly Dictionary<string, byte[]> _files = new(StringComparer.OrdinalIgnoreCase);
