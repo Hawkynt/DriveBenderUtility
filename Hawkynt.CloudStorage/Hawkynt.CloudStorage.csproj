@@ -23,7 +23,15 @@
     <PackageProjectUrl>https://github.com/Hawkynt/DriveBenderUtility</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Hawkynt/DriveBenderUtility</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- PackageReadmeFile names the README inside the package; it does not put it there. -->
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <!-- Official first-party SDKs only — no wrapper/meta libraries -->
   <ItemGroup>

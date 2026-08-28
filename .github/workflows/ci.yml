@@ -48,6 +48,12 @@ jobs:
 
       - name: Build
         run: dotnet build DriveBender.sln --configuration Release --no-restore
+      # The package README must follow the house template, and its API reference must still match
+      # the assembly just built. The template lives in RepositoryTemplate; nothing is copied here.
+      # This job has no OS matrix (it is windows-only for the net47 tier), so the step is
+      # unconditional -- a matrix.os guard here would silently never run.
+      - name: Check package READMEs
+        uses: Hawkynt/RepositoryTemplate/package-readme@v1
 
       # Filter out every test that needs a real DriveBender install or a
        # mountable filesystem. Some fixtures are missing their `[Category]`
