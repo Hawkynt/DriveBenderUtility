@@ -3,7 +3,8 @@
 namespace DivisonM.Vfs.Engine;
 
 /// <summary>One member as the engine sees it: its I/O backend plus manifest facts.</summary>
-public sealed record EngineMember(IVolumeIO Io, MemberRole Role = MemberRole.Capacity, long ReserveBytes = 0);
+public sealed record EngineMember(IVolumeIO Io, MemberRole Role = MemberRole.Capacity, long ReserveBytes = 0,
+  int MaxIops = 0, long MaxThroughput = 0);
 
 /// <summary>
 /// The VFS engine (CMP-VFS) over a set of pool members: presents the merged logical
@@ -167,9 +168,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       [.. members.Select(m => m.Io)],
       cache.Metadata,
       effectiveConfig,
-      members.ToDictionary(m => m.Io.MemberId, m => m.Role));
+      members.ToDictionary(m => m.Io.MemberId, m => m.Role),
+      members.ToDictionary(m => m.Io.MemberId, m => m.ReserveBytes),
+      this._LoadScore); // new files go where the least work is already queued
 
     this._queues = new(effectiveConfig, members.ToDictionary(m => m.Io.MemberId, m => m.Role));
+    this._queues.SetThrottles(members.Select(m => (m.Io.MemberId, m.MaxIops, m.MaxThroughput)));
     this._tombstones = new([.. members.Select(m => m.Io)]);
     this._watcher = new([.. members.Select(m => m.Io)]);
     this._watcher.MemberLost += this._OnMemberLost;
@@ -1395,7 +1399,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       try {
         // admission on the DEVICE, not the member: the fan-out above may have several blocks of
         // this same request in flight, and other requests theirs, and a disk has one queue
-        using var admission = this._queues.Enter(copy.Volume);
+        using var admission = this._queues.Enter(copy.Volume, this._cache.Pages.BlockSize);
         block = _ReadBlockFrom(copy, path, blockIndex, this._cache.Pages.BlockSize);
       } catch (PoolFsException e) {
         lastError = e;
@@ -1607,7 +1611,31 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // intent → mutate the ack set durably → (write-through: complete now; write-back /
       // deferred: the intent stays open until the owed copies are applied, so a crash
       // in the gap reconciles from the durable primary) (SAFE-ORDER, FR-WT, FR-WB)
-      var sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
+      //
+      // EXCEPT into a not-yet-published staging temp, which needs no intent of its own. That temp
+      // is invisible in the namespace, and the Create intent that opened the staging is still open
+      // — that open intent is precisely what tells recovery to sweep it. Replaying a write into a
+      // file recovery discards wholesale cannot fix anything, so the barrier buys nothing at all.
+      // Measured: a small file paid FOUR durability barriers and two of them were this pair.
+      //
+      // The intent is opened LAZILY below if a copy ends up owed, because the owed-copy machinery
+      // keys off the sequence. Logging it after the mutation is sound HERE and only here: the
+      // fsync-before-mutate ordering exists so an interrupted mutation of LIVE data is
+      // recoverable, and nothing about this temp survives a crash to need recovering.
+      var staged = this._staging.ContainsKey(path);
+      var sequence = staged
+        ? 0L
+        : this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
+
+      long OwedIntent() => sequence != 0
+        ? sequence
+        : sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
+
+      void CompleteIfLogged() {
+        if (sequence != 0)
+          this._journal.Complete(sequence, JournalOp.Write);
+      }
+
       var mirroredNow = requiredCopies > 1;
 
       // ack quorum with mid-write failover (SAFE-NOLOSS): a storage vanishing DURING the write
@@ -1622,7 +1650,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         // every copy now durably holds these bytes: any older buffered write of this range is
         // obsolete and must not later flush over them (SAFE-NOLOSS)
         this._writeBuffer.Supersede(path, offset, bytes.Length);
-        this._journal.Complete(sequence, JournalOp.Write);
+        CompleteIfLogged();
       }
       else if (policy == WritePolicy.WriteThrough) {
         // write-through: apply the remaining copies now (best effort); a copy that fails stays
@@ -1630,16 +1658,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         mirroredNow = true;
         if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset)) {
           this._writeBuffer.Supersede(path, offset, bytes.Length);
-          this._journal.Complete(sequence, JournalOp.Write);
+          CompleteIfLogged();
         } else
-          this._StageWithThrottle(path, offset, bytes, sequence, appliedCount); // hold the block for the lagging copy
+          this._StageWithThrottle(path, offset, bytes, OwedIntent(), appliedCount); // hold the block for the lagging copy
       }
-      else if (!this._StageWithThrottle(path, offset, bytes, sequence, appliedCount)) {
+      else if (!this._StageWithThrottle(path, offset, bytes, OwedIntent(), appliedCount)) {
         // buffer full even after throttling: degrade to synchronous catch-up (FR-BACKP)
         mirroredNow = true;
         if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset)) {
           this._writeBuffer.Supersede(path, offset, bytes.Length);
-          this._journal.Complete(sequence, JournalOp.Write);
+          CompleteIfLogged(); // OwedIntent ran in the condition above, so there is always one here
         }
         // else: the intent stays open — recovery reconciles the copies that never took the block
       }
@@ -1662,7 +1690,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _WriteOneCopy(PhysicalCopy copy, string path, byte[] bytes, long offset) {
     this._BeginIo(copy.Volume.MemberId); // visible to the readiness selector while queued
     try {
-      using var admission = this._queues.Enter(copy.Volume); // the device's queue, not the member's
+      using var admission = this._queues.Enter(copy.Volume, bytes.Length); // the device's queue, not the member's
       using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
       stream.Seek(offset, SeekOrigin.Begin);
       stream.Write(bytes, 0, bytes.Length);

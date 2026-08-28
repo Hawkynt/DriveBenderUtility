@@ -35,6 +35,15 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
 
   private Dictionary<string, ChecksumEntry>? _entries;
   private bool _dirty;
+
+  /// <summary>
+  /// Keys this instance deliberately dropped since it loaded.
+  ///
+  /// <see cref="Save"/> merges with whatever is on disk rather than overwriting it, and without
+  /// this a deletion would simply come back: the other writer still has the entry, the merge unions
+  /// the two, and a rename's old key reappears for a file that no longer exists there.
+  /// </summary>
+  private readonly HashSet<string> _removed = new(PoolPaths.PathComparer);
   private readonly Lock _lock = new();
 
   public IVolumeIO Member => member;
@@ -115,8 +124,11 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
 
   public void Remove(string physicalPath) {
     lock (this._lock) {
-      if (this._Load().Remove(physicalPath))
-        this._dirty = true;
+      if (!this._Load().Remove(physicalPath))
+        return;
+
+      this._removed.Add(physicalPath);
+      this._dirty = true;
     }
   }
 
@@ -126,6 +138,8 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
       if (!entries.Remove(fromPhysical, out var entry))
         return;
 
+      this._removed.Add(fromPhysical);
+      this._removed.Remove(toPhysical); // it exists again, under the new name
       entries[toPhysical] = entry;
       this._dirty = true;
     }
@@ -138,10 +152,44 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
       var fromPrefix = fromPhysicalFolder + "/";
       foreach (var key in entries.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray()) {
         entries.Remove(key, out var entry);
-        entries[toPhysicalFolder + "/" + key[fromPrefix.Length..]] = entry!;
+        var moved = toPhysicalFolder + "/" + key[fromPrefix.Length..];
+        this._removed.Add(key);
+        this._removed.Remove(moved);
+        entries[moved] = entry!;
         this._dirty = true;
       }
     }
+  }
+
+  /// <summary>Reads the sidecar as it stands on disk right now, without disturbing our own view.</summary>
+  private Dictionary<string, ChecksumEntry> _ReadFromDisk() {
+    var onDisk = new Dictionary<string, ChecksumEntry>(PoolPaths.PathComparer);
+    if (!member.IsOnline || !member.FileExists(DbPath, false))
+      return onDisk;
+
+    try {
+      using var stream = member.OpenRead(DbPath, false);
+      using var reader = new StreamReader(stream, Encoding.UTF8);
+      var loaded = JsonSerializer.Deserialize<Dictionary<string, ChecksumEntry>>(reader.ReadToEnd());
+      if (loaded != null)
+        foreach (var (key, value) in loaded)
+          onDisk[key] = value;
+    } catch (Exception e) when (e is PoolFsException or JsonException) {
+      DriveBender.Logger($"[Warning]Checksum DB on '{member.DisplayName}' unreadable while merging: {e.Message}");
+    }
+
+    return onDisk;
+  }
+
+  /// <summary>Of two records for one file, the one a scan may believe.</summary>
+  private static ChecksumEntry _Better(ChecksumEntry ours, ChecksumEntry theirs) {
+    // a trustworthy record beats a flagged one whichever side it came from — a stale entry says
+    // only "do not believe this", so the other side knowing something concrete wins
+    if (ours.Stale != theirs.Stale)
+      return ours.Stale ? theirs : ours;
+
+    // otherwise the one describing the newer state of the file
+    return theirs.MTimeTicks > ours.MTimeTicks ? theirs : ours;
   }
 
   public void Save() {
@@ -149,6 +197,19 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
       if (!this._dirty || this._entries == null || !member.IsOnline)
         return;
 
+      // MERGE, never overwrite. This sidecar has more than one writer: `pool-health` runs in its
+      // own process while a pool may be mounted in another, and each holds its own view. Writing
+      // ours wholesale silently discarded the other's work — which is exactly how a deep scrub of a
+      // MOUNTED pool lost the baseline it had just computed, leaving bit-rot undetectable while
+      // appearing to have done something.
+      var merged = this._ReadFromDisk();
+      foreach (var key in this._removed)
+        merged.Remove(key); // never resurrect what this instance deliberately dropped
+
+      foreach (var (key, ours) in this._entries)
+        merged[key] = merged.TryGetValue(key, out var theirs) ? _Better(ours, theirs) : ours;
+
+      this._entries = merged;
       var json = JsonSerializer.Serialize(this._entries);
       var bytes = Encoding.UTF8.GetBytes(json);
       try {
@@ -160,6 +221,7 @@ public sealed class ChecksumDatabase(IVolumeIO member) {
         }
 
         member.AtomicReplace(temp, DbPath, false);
+        this._removed.Clear();
         this._dirty = false;
       } catch (PoolFsException e) {
         DriveBender.Logger($"[Warning]Could not persist checksum DB on '{member.DisplayName}': {e.Message}");

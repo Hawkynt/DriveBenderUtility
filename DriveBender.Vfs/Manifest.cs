@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace DivisonM.Vfs;
@@ -29,6 +29,22 @@ public sealed record PoolMemberDefinition {
   [JsonPropertyName("reserveBytes")]
   [JsonConverter(typeof(ByteSizeJsonConverter))]
   public long ReserveBytes { get; init; }
+
+  /// <summary>
+  /// Operations per second this member may be asked to perform; 0 for unlimited.
+  ///
+  /// A pool is rarely the only thing using a disk. A mechanical drive shared with a media server,
+  /// or a cloud endpoint with a rate limit and a bill attached, is better served slowly than
+  /// saturated — so the pool can be told to take only its share. Placement already prefers the
+  /// storage with the least in flight, so a throttled member naturally receives less work rather
+  /// than becoming a queue everything waits behind.
+  /// </summary>
+  [JsonPropertyName("maxIops")] public int MaxIops { get; init; }
+
+  /// <summary>Bytes per second this member may be asked to transfer; 0 for unlimited.</summary>
+  [JsonPropertyName("maxThroughput")]
+  [JsonConverter(typeof(ByteSizeJsonConverter))]
+  public long MaxThroughput { get; init; }
 
   /// <summary>Indirect OS-credential-store reference for network members — never a plaintext secret (SEC-CRED).</summary>
   [JsonPropertyName("credential")] public string? Credential { get; init; }

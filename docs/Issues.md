@@ -473,6 +473,44 @@ None of the three is still open. What made all three hard to see is worth keepin
 platform asymmetries where one host had been fixed and the other silently had not, and the third was
 a test asserting a guarantee no filesystem makes.
 
+### Small-file creation: measured against the floor, and a target of mine was wrong
+
+Small-file creation was the worst number in the product, and it is now roughly 70% faster. More
+usefully, it has been measured against what the operating system can actually do, which turns out
+to matter more than any of the guesses about it.
+
+The pool's durability shape for one small file is: stage to a temp, flush, atomically rename, once
+per copy. Doing exactly that from plain .NET, with nothing else in the way:
+
+| | 1 thread | 20 threads |
+| --- | ---: | ---: |
+| Raw NTFS, 2 copies, fsync (the floor) | 322 files/s | 480 files/s |
+| The engine, no driver | 162 | 322 |
+| Through the mount | 113 | 148 |
+
+Two things follow, and the second corrects a target I set:
+
+1. **The engine sits at about half the floor single-threaded and two thirds of it at twenty
+   threads.** The remaining gap is journal barriers: a create still costs two, and each is fsynced
+   to every member, so a two-member pool pays four journal flushes against the floor's two data
+   flushes.
+2. **The 20-thread target of >1,000 files/s was not achievable and should not have been written.**
+   The operating system itself only reaches 480 with this durability shape — fsync and
+   single-directory metadata serialise inside NTFS, which is why the raw floor scales just 1.5x
+   across twenty threads. Any figure above that requires giving up either the fsync or the
+   per-member copy, which is a durability decision and not a tuning one.
+
+**Ruled out along the way, with numbers, so nobody re-walks it:** `HandleTable`'s single global
+lock is NOT the limiter. It sustains ~1.8M acquisitions/s under twenty-way contention and the read
+workload needs about 110k/s — and critically, twenty threads on DIFFERENT paths scale no better
+than twenty on the same path, which rules out the per-file lock too. This was the leading suspect in
+the plan and the profile refuted it before any code was changed.
+
+The one clear remaining lever is the journal mirror: every barrier is fsynced to EVERY member, so
+halving that to a durable quorum with the mirror written behind it would remove two of the five
+flushes a create pays. That is a genuine durability trade — a journal on one disk is a journal that
+one disk loss destroys — so it belongs to whoever owns the risk, not to a performance pass.
+
 ## Still open
 
 An earlier revision of this file claimed "nothing known" here. That was wrong — it dropped the two

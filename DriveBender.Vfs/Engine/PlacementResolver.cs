@@ -1,4 +1,4 @@
-using DivisonM.Vfs.Caching;
+﻿using DivisonM.Vfs.Caching;
 
 namespace DivisonM.Vfs.Engine;
 
@@ -11,7 +11,8 @@ public sealed record PhysicalCopy(IVolumeIO Volume, bool Shadow);
 /// member by configured strategy, shadows never in the primary's failure domain
 /// (SAFE-PHYS).
 /// </summary>
-public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> members, MetadataCache metadata, PoolConfig config, IReadOnlyDictionary<Guid, MemberRole>? memberRoles = null) {
+public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> members, MetadataCache metadata, PoolConfig config, IReadOnlyDictionary<Guid, MemberRole>? memberRoles = null, IReadOnlyDictionary<Guid, long>? memberReserves = null,
+  Func<IVolumeIO, double>? loadOf = null) {
 
   private int _roundRobinCounter;
   private IReadOnlyDictionary<Guid, MemberRole>? _roles = memberRoles;
@@ -64,8 +65,23 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
     return Math.Max(1, effective.Duplication ?? 1);
   }
 
+  /// <summary>
+  /// Free space a member will actually lend the pool: what the device reports, less the reserve the
+  /// manifest set aside on it.
+  ///
+  /// A reserve is a promise to leave room — for the host filesystem, for another tenant, for the
+  /// headroom a nearly-full disk needs to stay healthy. Placement ignored it entirely and looked
+  /// only at raw free space, so the pool would keep filling a member straight through its reserve
+  /// and only stop when the device itself refused, which is the one moment there is no room left
+  /// to fail gracefully in.
+  /// </summary>
+  private long _UsableFree(IVolumeIO member) {
+    var reserve = memberReserves != null && memberReserves.TryGetValue(member.MemberId, out var bytes) ? bytes : 0;
+    return Math.Max(0, member.BytesFree - reserve);
+  }
+
   private bool _IsEligible(IVolumeIO member, long size, MemberRole? roleFilter) {
-    if (!member.IsOnline || member.BytesFree < size)
+    if (!member.IsOnline || this._UsableFree(member) < size)
       return false;
 
     var role = this._RoleOf(member);
@@ -111,7 +127,7 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
 
     var independent = this._Online
       .Where(m => this._IsEligible(m, size, null) && !occupiedDomains.Contains(m.PhysicalVolumeId))
-      .OrderByDescending(m => m.BytesFree)
+      .OrderByDescending(this._UsableFree)
       .FirstOrDefault();
     if (independent != null)
       return independent;
@@ -122,7 +138,7 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
       var holderIds = new HashSet<Guid>(holders.Select(m => m.MemberId));
       return this._Online
         .Where(m => this._IsEligible(m, size, null) && !holderIds.Contains(m.MemberId))
-        .OrderByDescending(m => m.BytesFree)
+        .OrderByDescending(this._UsableFree)
         .FirstOrDefault();
     }
 
@@ -169,8 +185,35 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
         .OrderBy(m => m is MeasuredVolumeIO { Samples: > 0 } measured ? measured.AverageLatencyMs : double.MaxValue)
         .ThenByDescending(m => m.BytesFree)
         .First(),
-      _ => candidates.OrderByDescending(m => m.BytesFree).First(),
+      _ => this._BusiestLast(candidates),
     };
+  }
+
+  /// <summary>
+  /// The default: the storage with the least work already in flight, with free space breaking ties.
+  ///
+  /// Picking purely by free space sends CONSECUTIVE new files to the same member, because writing
+  /// one barely moves its free space — so a burst of small files queues on one device while the
+  /// others sit idle, and the pool delivers one disk's IOPS however many it has. The engine already
+  /// counts what each member has outstanding (it routes individual blocks by exactly this measure);
+  /// this simply lets the same knowledge decide where a NEW file goes.
+  ///
+  /// Free space still decides when nothing is in flight, so an idle pool fills evenly exactly as
+  /// before and capacity balancing is unchanged. The load term only breaks the tie that a burst
+  /// creates — which is the moment it matters.
+  ///
+  /// Note for anyone benchmarking this on one physical disk: it will show nothing. Two members on
+  /// one device share one queue, so spreading across them buys no parallelism. The gain is real
+  /// only where the members are genuinely separate hardware.
+  /// </summary>
+  private IVolumeIO _BusiestLast(IVolumeIO[] candidates) {
+    if (candidates.Length == 1 || loadOf == null)
+      return candidates.OrderByDescending(m => m.BytesFree).First();
+
+    return candidates
+      .OrderBy(loadOf)
+      .ThenByDescending(m => m.BytesFree)
+      .First();
   }
 
 }

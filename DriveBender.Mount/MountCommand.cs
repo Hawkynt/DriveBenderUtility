@@ -1,4 +1,4 @@
-using DivisonM.Backends;
+﻿using DivisonM.Backends;
 using DivisonM.Vfs;
 using DivisonM.Vfs.Caching;
 using DivisonM.Vfs.Engine;
@@ -51,7 +51,7 @@ internal static class MountCommand {
           ? remoteResolver.OpenVolume(definition)
           : new LocalVolumeIO(m.MemberId, m.Label ?? m.ResolvedPath, m.ResolvedPath, m.PhysicalVolumeId);
         // measured so the auto-tier advisor and the dashboard see real per-member latency (FR-AUTO-TIER)
-        return new EngineMember(new MeasuredVolumeIO(io), m.Role, m.ReserveBytes);
+        return new EngineMember(new MeasuredVolumeIO(io), m.Role, m.ReserveBytes, m.MaxIops, m.MaxThroughput);
       }).ToArray();
 
       if (members.Length == 0)

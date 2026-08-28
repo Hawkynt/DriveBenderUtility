@@ -1,4 +1,4 @@
-using DivisonM.Vfs;
+﻿using DivisonM.Vfs;
 using DivisonM.Vfs.Caching;
 using DivisonM.Vfs.Engine;
 using DivisonM.Vfs.Tests.TestSupport;
@@ -26,14 +26,166 @@ public class PlacementResolverTests {
     this._metadata = new(EvictionPolicy.Lru, 1000, TimeSpan.FromMinutes(1));
   }
 
-  private PlacementResolver _Resolver(PoolConfig? config = null, bool ssdIsLanding = true) {
+  private PlacementResolver _Resolver(PoolConfig? config = null, bool ssdIsLanding = true,
+    IReadOnlyDictionary<Guid, long>? reserves = null, Func<IVolumeIO, double>? loadOf = null) {
     var members = new IVolumeIO[] { this._ssd, this._hdd1, this._hdd2 };
     var roles = new Dictionary<Guid, MemberRole> {
       [this._ssd.MemberId] = ssdIsLanding ? MemberRole.Landing : MemberRole.Capacity,
       [this._hdd1.MemberId] = MemberRole.Capacity,
       [this._hdd2.MemberId] = MemberRole.Capacity,
     };
-    return new(_pool, members, this._metadata, config ?? ConfigResolver.ResolveEffective(null, null), roles);
+    return new(_pool, members, this._metadata, config ?? ConfigResolver.ResolveEffective(null, null), roles, reserves, loadOf);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Placement_GivenAStorageIsAlreadyBusy_ThenTheNextFileGoesElsewhere() {
+    // Picking purely by free space sends CONSECUTIVE new files to the same member, because writing
+    // one barely moves its free space. A burst of small files then queues on one device while the
+    // others sit idle, and the pool delivers ONE disk's IOPS however many disks it has.
+    var busy = new Dictionary<Guid, double> {
+      [this._hdd2.MemberId] = 8, // most free space, but eight operations already in flight
+    };
+
+    var target = this._Resolver(ssdIsLanding: false, loadOf: v => busy.GetValueOrDefault(v.MemberId))
+      .ChoosePrimaryTarget(100);
+
+    target!.MemberId.Should().NotBe(this._hdd2.MemberId,
+      "the roomiest member is the busiest one, and queueing behind eight operations costs more than "
+      + "the space it would save");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Placement_GivenEverythingIsIdle_ThenFreeSpaceStillDecides() {
+    // the balancing property must survive: with nothing in flight the load term ties for every
+    // candidate and capacity is what is left to choose on, exactly as before
+    var target = this._Resolver(ssdIsLanding: false, loadOf: _ => 0)
+      .ChoosePrimaryTarget(100);
+
+    target!.MemberId.Should().Be(this._hdd2.MemberId,
+      "an idle pool must still fill by free space, or load-awareness would quietly break balancing");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Placement_GivenConsecutiveFilesAndRisingLoad_ThenTheySpreadAcrossStorages() {
+    // the shape that matters: each placement makes its target busier, so the next file should land
+    // somewhere else rather than piling onto one spindle
+    var inFlight = new Dictionary<Guid, double>();
+    var resolver = this._Resolver(ssdIsLanding: false, loadOf: v => inFlight.GetValueOrDefault(v.MemberId));
+
+    var chosen = new List<Guid>();
+    for (var file = 0; file < 6; ++file) {
+      var target = resolver.ChoosePrimaryTarget(100)!;
+      chosen.Add(target.MemberId);
+      inFlight[target.MemberId] = inFlight.GetValueOrDefault(target.MemberId) + 1; // it is now writing
+    }
+
+    chosen.Distinct().Should().HaveCountGreaterThan(1,
+      $"six consecutive files all went to one storage, so the other spindles stayed idle and the "
+      + $"pool delivered one disk's IOPS: {string.Join(", ", chosen.Select(id => id.ToString()[..4]))}");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Placement_GivenAMemberIsReservedToTheBrim_ThenNothingIsPlacedOnIt() {
+    // A reserve is a promise to leave room - for the host filesystem, for another tenant, for the
+    // headroom a nearly-full disk needs. Placement looked only at raw free space, so the pool would
+    // fill a member straight through its reserve and stop only when the DEVICE refused, which is
+    // the one moment there is no room left to fail gracefully in.
+    var reserves = new Dictionary<Guid, long> {
+      [this._hdd1.MemberId] = 10_000, // its entire capacity
+      [this._hdd2.MemberId] = 20_000,
+    };
+
+    var target = this._Resolver(ssdIsLanding: false, reserves: reserves).ChoosePrimaryTarget(500);
+
+    target.Should().NotBeNull("the SSD has no reserve and can still take the file");
+    target!.MemberId.Should().Be(this._ssd.MemberId,
+      "a member reserved to its capacity has no space to lend the pool, whatever the device reports free");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Placement_GivenEveryMemberIsReservedToTheBrim_ThenThereIsNowhereToPlace() {
+    var reserves = new Dictionary<Guid, long> {
+      [this._ssd.MemberId] = 1_000,
+      [this._hdd1.MemberId] = 10_000,
+      [this._hdd2.MemberId] = 20_000,
+    };
+
+    // the caller turns this into NoSpace; what matters here is that placement REFUSES rather than
+    // handing back a member it is about to overfill
+    this._Resolver(ssdIsLanding: false, reserves: reserves).ChoosePrimaryTarget(500)
+      .Should().BeNull("with every member reserved there is genuinely nowhere the file may go");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Placement_GivenAReserveLeavesRoom_ThenTheFileStillFits() {
+    // the other side of the same rule: a reserve must not make a member unusable, only bounded
+    var reserves = new Dictionary<Guid, long> { [this._hdd2.MemberId] = 19_000 };
+
+    this._Resolver(ssdIsLanding: false, reserves: reserves).ChoosePrimaryTarget(500)
+      .Should().NotBeNull("500 bytes fit in the 1,000 the reserve leaves");
+  }
+
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Throttle_GivenAMemberIsRateLimited_ThenItsOperationsAreHeldToTheLimit() {
+    // The feature in its own right: a pool is rarely the only user of a disk, so a mechanical drive
+    // shared with something else - or a cloud endpoint with a rate limit and a bill - can be told
+    // to take only its share.
+    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    queues.SetThrottles([(this._hdd1.MemberId, 20, 0)]); // 20 operations per second
+
+    // the bucket starts full, so drain the first second of credit before timing anything
+    for (var i = 0; i < 20; ++i)
+      queues.Enter(this._hdd1).Dispose();
+
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    for (var i = 0; i < 10; ++i)
+      queues.Enter(this._hdd1).Dispose();
+
+    clock.Stop();
+    clock.Elapsed.Should().BeGreaterThan(TimeSpan.FromMilliseconds(250),
+      $"ten operations against a 20/s limit cannot finish in {clock.ElapsedMilliseconds} ms — the "
+      + "limit is not being applied at all");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Throttle_GivenNoLimitIsSet_ThenNothingIsSlowedDown() {
+    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    queues.SetThrottles([(this._hdd1.MemberId, 5, 0)]); // a limit on a DIFFERENT member
+
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    for (var i = 0; i < 200; ++i)
+      queues.Enter(this._hdd2).Dispose();
+
+    clock.Stop();
+    clock.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(1),
+      "an unthrottled member must not pay for another member's limit");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Throttle_GivenAThrottledMemberIsBusy_ThenNewFilesPreferTheOtherStorage() {
+    // Why the two features belong together, and the thing a single-disk machine cannot otherwise
+    // demonstrate: a throttled storage stays busy longer, so load-aware placement routes new files
+    // away from it. Throttling one member is how a slow device can be SIMULATED on hardware where
+    // every member is the same NVMe.
+    var inFlight = new Dictionary<Guid, double> { [this._hdd1.MemberId] = 4 }; // still working through its allowance
+    var resolver = this._Resolver(ssdIsLanding: false, loadOf: v => inFlight.GetValueOrDefault(v.MemberId));
+
+    var chosen = new List<Guid>();
+    for (var file = 0; file < 4; ++file)
+      chosen.Add(resolver.ChoosePrimaryTarget(100)!.MemberId);
+
+    chosen.Should().NotContain(this._hdd1.MemberId,
+      "a storage that is already backed up behind its own rate limit is the last place to send more work");
   }
 
   [Test]
