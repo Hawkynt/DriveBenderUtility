@@ -1,4 +1,4 @@
-namespace DivisonM.Vfs;
+﻿namespace DivisonM.Vfs;
 
 /// <summary>
 /// One resolved pool member (§6.0.7): the live path, its physical failure domain
@@ -17,6 +17,10 @@ public sealed record PoolMember(
   public string? Label { get; init; }
   public bool MarkerVerified { get; init; }
   public bool PathChanged { get; init; }
+
+  /// <summary>Rate limits for this storage, null meaning unlimited (see the manifest for why).</summary>
+  public int MaxIops { get; init; }
+  public long MaxThroughput { get; init; }
 }
 
 /// <summary>
@@ -56,6 +60,8 @@ public sealed class MemberResolver(IHostEnvironment host, ManifestStore store, I
     return new(definition.MemberId, definition.Path, string.Empty, definition.Role, false, definition.ReserveBytes) {
       Network = definition.Network,
       Label = definition.Label,
+      MaxIops = definition.MaxIops,
+      MaxThroughput = definition.MaxThroughput,
     };
   }
 
@@ -69,6 +75,8 @@ public sealed class MemberResolver(IHostEnvironment host, ManifestStore store, I
       Label = definition.Label,
       MarkerVerified = markerVerified,
       PathChanged = pathChanged,
+      MaxIops = definition.MaxIops,
+      MaxThroughput = definition.MaxThroughput,
     };
   }
 

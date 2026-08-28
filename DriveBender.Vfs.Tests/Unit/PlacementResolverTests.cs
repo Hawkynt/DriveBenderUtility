@@ -131,6 +131,63 @@ public class PlacementResolverTests {
       .Should().NotBeNull("500 bytes fit in the 1,000 the reserve leaves");
   }
 
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Throttle_GivenAMemberIsRateLimited_ThenItsOperationsAreHeldToTheLimit() {
+    // The feature in its own right: a pool is rarely the only user of a disk, so a mechanical drive
+    // shared with something else - or a cloud endpoint with a rate limit and a bill - can be told
+    // to take only its share.
+    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    queues.SetThrottles([(this._hdd1.MemberId, 20, 0)]); // 20 operations per second
+
+    // the bucket starts full, so drain the first second of credit before timing anything
+    for (var i = 0; i < 20; ++i)
+      queues.Enter(this._hdd1).Dispose();
+
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    for (var i = 0; i < 10; ++i)
+      queues.Enter(this._hdd1).Dispose();
+
+    clock.Stop();
+    clock.Elapsed.Should().BeGreaterThan(TimeSpan.FromMilliseconds(250),
+      $"ten operations against a 20/s limit cannot finish in {clock.ElapsedMilliseconds} ms — the "
+      + "limit is not being applied at all");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Throttle_GivenNoLimitIsSet_ThenNothingIsSlowedDown() {
+    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    queues.SetThrottles([(this._hdd1.MemberId, 5, 0)]); // a limit on a DIFFERENT member
+
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    for (var i = 0; i < 200; ++i)
+      queues.Enter(this._hdd2).Dispose();
+
+    clock.Stop();
+    clock.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(1),
+      "an unthrottled member must not pay for another member's limit");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Throttle_GivenAThrottledMemberIsBusy_ThenNewFilesPreferTheOtherStorage() {
+    // Why the two features belong together, and the thing a single-disk machine cannot otherwise
+    // demonstrate: a throttled storage stays busy longer, so load-aware placement routes new files
+    // away from it. Throttling one member is how a slow device can be SIMULATED on hardware where
+    // every member is the same NVMe.
+    var inFlight = new Dictionary<Guid, double> { [this._hdd1.MemberId] = 4 }; // still working through its allowance
+    var resolver = this._Resolver(ssdIsLanding: false, loadOf: v => inFlight.GetValueOrDefault(v.MemberId));
+
+    var chosen = new List<Guid>();
+    for (var file = 0; file < 4; ++file)
+      chosen.Add(resolver.ChoosePrimaryTarget(100)!.MemberId);
+
+    chosen.Should().NotContain(this._hdd1.MemberId,
+      "a storage that is already backed up behind its own rate limit is the last place to send more work");
+  }
+
   [Test]
   [Category("HappyPath")]
   public void ResolveCopies_GivenPrimaryAndShadow_WhenResolved_ThenPrimariesFirst() {

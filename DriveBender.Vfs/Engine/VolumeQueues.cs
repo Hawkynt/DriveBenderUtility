@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 
 namespace DivisonM.Vfs.Engine;
 
@@ -135,9 +135,81 @@ public sealed class VolumeQueues {
   /// operation (a block read, a block write) and is never held across a call back into the
   /// engine, so admission can never be part of a cycle.
   /// </summary>
-  public Admission Enter(IVolumeIO volume) {
+  public Admission Enter(IVolumeIO volume, long bytes = 0) {
+    this._Throttle(volume, bytes);
     var gate = this._GateFor(volume);
     return gate.Wait(_ADMISSION_TIMEOUT) ? new(gate) : new(null); // over-subscribe rather than stall
+  }
+
+  /// <summary>
+  /// Holds a member to the rate its manifest allows, if it set one.
+  ///
+  /// A pool is rarely the only thing using a disk. A mechanical drive shared with something else,
+  /// or a cloud endpoint with a rate limit and a bill attached, is better served slowly than
+  /// saturated. Two independent buckets, because the two limits mean different things: operations
+  /// per second is what a seek-bound device runs out of, bytes per second is what a link runs out
+  /// of, and a member may want either or both.
+  ///
+  /// The wait happens BEFORE taking a concurrency permit, so a throttled member never occupies a
+  /// slot while doing nothing — otherwise a slow storage would throttle the pool rather than
+  /// itself. Combined with load-aware placement, a throttled member simply receives less work: its
+  /// in-flight count stays high, and new files go elsewhere.
+  /// </summary>
+  private void _Throttle(IVolumeIO volume, long bytes) {
+    if (!this._throttles.TryGetValue(volume.MemberId, out var throttle))
+      return;
+
+    var wait = throttle.Reserve(bytes);
+    if (wait > TimeSpan.Zero)
+      Thread.Sleep(wait);
+  }
+
+  private readonly ConcurrentDictionary<Guid, MemberThrottle> _throttles = new();
+
+  /// <summary>Applies per-member rate limits; a member absent from the map is unlimited.</summary>
+  public void SetThrottles(IEnumerable<(Guid MemberId, int MaxIops, long MaxThroughput)> limits) {
+    this._throttles.Clear();
+    foreach (var (memberId, maxIops, maxThroughput) in limits)
+      if (maxIops > 0 || maxThroughput > 0)
+        this._throttles[memberId] = new(maxIops, maxThroughput);
+  }
+
+  /// <summary>
+  /// A pair of token buckets — one counting operations, one counting bytes.
+  ///
+  /// Each refills continuously at its configured rate and holds at most one second of credit, so a
+  /// member idle for a while may burst briefly and then settles to the limit. Deliberately not a
+  /// fixed window: a window lets a caller spend the whole allowance instantly and then stall for
+  /// the remainder, which reads to a user as a stutter rather than a limit.
+  /// </summary>
+  private sealed class MemberThrottle(int maxIops, long maxThroughput) {
+    private readonly Lock _lock = new();
+    private double _operations = maxIops;
+    private double _bytes = maxThroughput;
+    private long _lastTicks = Environment.TickCount64;
+
+    public TimeSpan Reserve(long bytes) {
+      lock (this._lock) {
+        var now = Environment.TickCount64;
+        var elapsed = Math.Max(0, now - this._lastTicks) / 1000.0;
+        this._lastTicks = now;
+
+        var wait = 0.0;
+        if (maxIops > 0) {
+          this._operations = Math.Min(maxIops, this._operations + elapsed * maxIops) - 1;
+          if (this._operations < 0)
+            wait = Math.Max(wait, -this._operations / maxIops);
+        }
+
+        if (maxThroughput > 0 && bytes > 0) {
+          this._bytes = Math.Min(maxThroughput, this._bytes + elapsed * maxThroughput) - bytes;
+          if (this._bytes < 0)
+            wait = Math.Max(wait, -this._bytes / (double)maxThroughput);
+        }
+
+        return TimeSpan.FromSeconds(wait);
+      }
+    }
   }
 
   /// <summary>How many block loads a request over <paramref name="copies"/> may keep in flight at once.</summary>
