@@ -168,7 +168,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       cache.Metadata,
       effectiveConfig,
       members.ToDictionary(m => m.Io.MemberId, m => m.Role),
-      members.ToDictionary(m => m.Io.MemberId, m => m.ReserveBytes));
+      members.ToDictionary(m => m.Io.MemberId, m => m.ReserveBytes),
+      this._LoadScore); // new files go where the least work is already queued
 
     this._queues = new(effectiveConfig, members.ToDictionary(m => m.Io.MemberId, m => m.Role));
     this._tombstones = new([.. members.Select(m => m.Io)]);

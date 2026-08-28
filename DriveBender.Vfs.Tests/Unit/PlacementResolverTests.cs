@@ -27,14 +27,64 @@ public class PlacementResolverTests {
   }
 
   private PlacementResolver _Resolver(PoolConfig? config = null, bool ssdIsLanding = true,
-    IReadOnlyDictionary<Guid, long>? reserves = null) {
+    IReadOnlyDictionary<Guid, long>? reserves = null, Func<IVolumeIO, double>? loadOf = null) {
     var members = new IVolumeIO[] { this._ssd, this._hdd1, this._hdd2 };
     var roles = new Dictionary<Guid, MemberRole> {
       [this._ssd.MemberId] = ssdIsLanding ? MemberRole.Landing : MemberRole.Capacity,
       [this._hdd1.MemberId] = MemberRole.Capacity,
       [this._hdd2.MemberId] = MemberRole.Capacity,
     };
-    return new(_pool, members, this._metadata, config ?? ConfigResolver.ResolveEffective(null, null), roles, reserves);
+    return new(_pool, members, this._metadata, config ?? ConfigResolver.ResolveEffective(null, null), roles, reserves, loadOf);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Placement_GivenAStorageIsAlreadyBusy_ThenTheNextFileGoesElsewhere() {
+    // Picking purely by free space sends CONSECUTIVE new files to the same member, because writing
+    // one barely moves its free space. A burst of small files then queues on one device while the
+    // others sit idle, and the pool delivers ONE disk's IOPS however many disks it has.
+    var busy = new Dictionary<Guid, double> {
+      [this._hdd2.MemberId] = 8, // most free space, but eight operations already in flight
+    };
+
+    var target = this._Resolver(ssdIsLanding: false, loadOf: v => busy.GetValueOrDefault(v.MemberId))
+      .ChoosePrimaryTarget(100);
+
+    target!.MemberId.Should().NotBe(this._hdd2.MemberId,
+      "the roomiest member is the busiest one, and queueing behind eight operations costs more than "
+      + "the space it would save");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Placement_GivenEverythingIsIdle_ThenFreeSpaceStillDecides() {
+    // the balancing property must survive: with nothing in flight the load term ties for every
+    // candidate and capacity is what is left to choose on, exactly as before
+    var target = this._Resolver(ssdIsLanding: false, loadOf: _ => 0)
+      .ChoosePrimaryTarget(100);
+
+    target!.MemberId.Should().Be(this._hdd2.MemberId,
+      "an idle pool must still fill by free space, or load-awareness would quietly break balancing");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Placement_GivenConsecutiveFilesAndRisingLoad_ThenTheySpreadAcrossStorages() {
+    // the shape that matters: each placement makes its target busier, so the next file should land
+    // somewhere else rather than piling onto one spindle
+    var inFlight = new Dictionary<Guid, double>();
+    var resolver = this._Resolver(ssdIsLanding: false, loadOf: v => inFlight.GetValueOrDefault(v.MemberId));
+
+    var chosen = new List<Guid>();
+    for (var file = 0; file < 6; ++file) {
+      var target = resolver.ChoosePrimaryTarget(100)!;
+      chosen.Add(target.MemberId);
+      inFlight[target.MemberId] = inFlight.GetValueOrDefault(target.MemberId) + 1; // it is now writing
+    }
+
+    chosen.Distinct().Should().HaveCountGreaterThan(1,
+      $"six consecutive files all went to one storage, so the other spindles stayed idle and the "
+      + $"pool delivered one disk's IOPS: {string.Join(", ", chosen.Select(id => id.ToString()[..4]))}");
   }
 
   [Test]

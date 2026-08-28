@@ -11,7 +11,8 @@ public sealed record PhysicalCopy(IVolumeIO Volume, bool Shadow);
 /// member by configured strategy, shadows never in the primary's failure domain
 /// (SAFE-PHYS).
 /// </summary>
-public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> members, MetadataCache metadata, PoolConfig config, IReadOnlyDictionary<Guid, MemberRole>? memberRoles = null, IReadOnlyDictionary<Guid, long>? memberReserves = null) {
+public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> members, MetadataCache metadata, PoolConfig config, IReadOnlyDictionary<Guid, MemberRole>? memberRoles = null, IReadOnlyDictionary<Guid, long>? memberReserves = null,
+  Func<IVolumeIO, double>? loadOf = null) {
 
   private int _roundRobinCounter;
   private IReadOnlyDictionary<Guid, MemberRole>? _roles = memberRoles;
@@ -184,8 +185,35 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
         .OrderBy(m => m is MeasuredVolumeIO { Samples: > 0 } measured ? measured.AverageLatencyMs : double.MaxValue)
         .ThenByDescending(m => m.BytesFree)
         .First(),
-      _ => candidates.OrderByDescending(m => m.BytesFree).First(),
+      _ => this._BusiestLast(candidates),
     };
+  }
+
+  /// <summary>
+  /// The default: the storage with the least work already in flight, with free space breaking ties.
+  ///
+  /// Picking purely by free space sends CONSECUTIVE new files to the same member, because writing
+  /// one barely moves its free space — so a burst of small files queues on one device while the
+  /// others sit idle, and the pool delivers one disk's IOPS however many it has. The engine already
+  /// counts what each member has outstanding (it routes individual blocks by exactly this measure);
+  /// this simply lets the same knowledge decide where a NEW file goes.
+  ///
+  /// Free space still decides when nothing is in flight, so an idle pool fills evenly exactly as
+  /// before and capacity balancing is unchanged. The load term only breaks the tie that a burst
+  /// creates — which is the moment it matters.
+  ///
+  /// Note for anyone benchmarking this on one physical disk: it will show nothing. Two members on
+  /// one device share one queue, so spreading across them buys no parallelism. The gain is real
+  /// only where the members are genuinely separate hardware.
+  /// </summary>
+  private IVolumeIO _BusiestLast(IVolumeIO[] candidates) {
+    if (candidates.Length == 1 || loadOf == null)
+      return candidates.OrderByDescending(m => m.BytesFree).First();
+
+    return candidates
+      .OrderBy(loadOf)
+      .ThenByDescending(m => m.BytesFree)
+      .First();
   }
 
 }
