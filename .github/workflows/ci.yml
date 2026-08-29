@@ -1,15 +1,6 @@
 ﻿name: CI
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      # Merging one of this workflow's own generated-file pull requests must not start it again.
-      # The action already refuses to publish when nothing meaningful changed; this stops the run
-      # from happening at all, which is cheaper than starting a matrix to discover there is
-      # nothing to do.
-      - 'docs/EndToEndCoverage.md'
-      - 'docs/Performance.md'
   pull_request:
     branches: [main]
   workflow_call: {}
@@ -276,7 +267,9 @@ jobs:
     name: End-to-end coverage matrix
     runs-on: ubuntu-latest
     needs: [e2e-windows, e2e-linux]
-    if: always() && github.event_name == 'push'
+    # Weekly, with the benchmark, rather than per merge. It documents what the suite covers,
+    # which does not change often enough to be worth a run each time something lands.
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: write
       pull-requests: write
