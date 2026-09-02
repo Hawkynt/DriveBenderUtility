@@ -28,6 +28,7 @@ env:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 15
     outputs:
       console-artifact: DriveBender-Console-win-${{ inputs.version }}
       ui-artifact:      DriveBender-App-win-${{ inputs.version }}
