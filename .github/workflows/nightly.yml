@@ -20,6 +20,7 @@ env:
 jobs:
   meta:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       date: ${{ steps.m.outputs.date }}
       version: ${{ steps.m.outputs.version }}
@@ -52,6 +53,7 @@ jobs:
   publish:
     needs: [meta, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,6 +92,7 @@ jobs:
   prune:
     needs: publish
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

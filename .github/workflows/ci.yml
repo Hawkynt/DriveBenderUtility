@@ -32,6 +32,7 @@ jobs:
     # Legacy projects target net47 (.NET Framework) -- Windows runner only.
     # The VFS engine tier (net10.0) is platform-agnostic and runs here too.
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,6 +128,7 @@ jobs:
   e2e-windows:
     name: End-to-end (Windows - WinFsp driver + UI)
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -205,6 +207,7 @@ jobs:
   e2e-linux:
     name: End-to-end (Linux - FUSE driver + UI)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -266,6 +269,7 @@ jobs:
   e2e-matrix:
     name: End-to-end coverage matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [e2e-windows, e2e-linux]
     # Runs whenever the end-to-end jobs did, which is every pull request: the matrix describes what
     # they cover, so it is regenerated from them.
@@ -310,6 +314,7 @@ jobs:
     name: Performance benchmark (Windows - WinFsp driver)
     if: github.event_name == 'schedule' || inputs.benchmark
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
