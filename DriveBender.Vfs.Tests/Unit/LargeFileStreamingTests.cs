@@ -13,6 +13,7 @@ namespace DivisonM.Vfs.Tests.Unit;
 /// </summary>
 [TestFixture]
 [Category("Unit")]
+[Category("Slow")]
 public class LargeFileStreamingTests {
 
   private const long _FiveGiB = 5L * 1024 * 1024 * 1024;
