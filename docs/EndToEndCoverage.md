@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33656053071](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33656053071).
+Generated from run: [33660246072](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33660246072).
 
-72 scenarios — 65 passing on at least one target, 2 failing.
+72 scenarios — 66 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -41,7 +41,7 @@ Generated from run: [33656053071](https://github.com/Hawkynt/DriveBenderUtility/
 | Durability | `Crash_GivenARenameWasInFlight_ThenTheFileExistsUnderExactlyOneName` | A power cut during a rename: the file is at one of the two names with its content intact, never at neither. | pass | pass |
 | Durability | `Crash_GivenFilesWereWrittenAndClosed_ThenEveryByteSurvivesThePowerCut` | A power cut after files were written and closed: every byte is still there after the pool comes back. | pass | pass |
 | Durability | `Crash_GivenStagedWritesWereInterrupted_ThenNoInternalFileIsExposedToTheUser` | A power cut leaves half-written staging files on the members; none of them may show up in the pool as if they were the user's. | pass | pass |
-| Durability | `Divergence_GivenEachMemberTookAWriteWhileTheOtherWasAway_ThenOneWholeVersionIsServed` | Each member took a write while the other was away: the pool serves one whole version, never a mixture of the two. | **FAIL** | pass |
+| Durability | `Divergence_GivenEachMemberTookAWriteWhileTheOtherWasAway_ThenOneWholeVersionIsServed` | Each member took a write while the other was away: the pool serves one whole version, never a mixture of the two. | pass | pass |
 | LargeFile | `LargeFile_GivenItExceedsTwoGiB_ThenItsLengthIsReportedInFull` | A file larger than 2 GiB reports its true length rather than a 32-bit wrapped one. | pass | pass |
 | LargeFile | `LargeFile_GivenReadsAroundTheThirtyTwoBitBoundaries_ThenEveryByteIsCorrect` | Reads on both sides of the 2 GiB and 4 GiB-relevant boundaries return the right bytes. | pass | pass |
 | LargeFile | `LargeFile_WhenAppendedTo_ThenTheNewBytesLandPastTheOldEnd` | Appending to a file that is already past 2 GiB puts the bytes at the true end, not at a wrapped offset. | pass | pass |
@@ -57,7 +57,7 @@ Generated from run: [33656053071](https://github.com/Hawkynt/DriveBenderUtility/
 | ManagementApi | `Prereqs_GivenThisMachine_ThenTheDriverStatusIsReportedHonestly` | Given This Machine , then The Driver Status Is Reported Honestly | pass | pass |
 | ManagementApi | `Stream_GivenAConnectedClient_ThenLiveFramesArrive` | Given AConnected Client , then Live Frames Arrive | pass | pass |
 | MemberLoss | `Capacity_GivenAMemberIsPulledMidWrite_ThenTheReportedSpaceNeverCountsTheLostStorage` | A member pulled mid-write: the pool reports less free space afterwards and never claims the lost disk's capacity. | pass | skipped |
-| MemberLoss | `Capacity_GivenDuplicationIsOn_ThenStoringAFileCostsTwiceItsSize` | Duplication charges twice: storing N bytes with two copies consumes about 2N of the pool's free space. | **FAIL** | skipped |
+| MemberLoss | `Capacity_GivenDuplicationIsOn_ThenStoringAFileCostsTwiceItsSize` | Duplication charges twice: storing N bytes with two copies consumes about 2N of the pool's free space. | pass | skipped |
 | MemberLoss | `Capacity_GivenTheMountedPool_ThenTheReportedSizeTracksTheStorageBehindIt` | Given The Mounted Pool , then The Reported Size Tracks The Storage Behind It | pass | skipped |
 | MemberLoss | `Duplication_GivenTheConfiguredPool_ThenEveryFileReallyExistsTwice` | Given The Configured Pool , then Every File Really Exists Twice | pass | pass |
 | MemberLoss | `Eject_GivenAFileIsDeletedWhileAMemberIsAway_ThenItDoesNotResurrectOnItsReturn` | Given AFile Is Deleted While AMember Is Away , then It Does Not Resurrect On Its Return | pass | pass |
