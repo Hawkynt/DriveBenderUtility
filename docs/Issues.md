@@ -513,10 +513,73 @@ one disk loss destroys — so it belongs to whoever owns the risk, not to a perf
 
 ## Still open
 
-An earlier revision of this file claimed "nothing known" here. That was wrong — it dropped the two
-UI items below. Both are now closed, and they are kept rather than deleted because what they cost
-is the point: a capability gap that is merely WRITTEN DOWN reads as a decision, and these two sat
-here through several passes looking like ones.
+Two items that stood here are closed; they moved to "Closed, kept as a record" below rather than
+being deleted, because what they cost is the point.
+
+1. **A file replaced by rename keeps serving its OLD content to new readers — Windows.** After
+   `File.Move(source, target, overwrite: true)` succeeds, a reader that opens the target path
+   afresh still gets the pre-replacement bytes. Measured through a real WinFsp mount: six
+   replacements landed and the file settled on version 40, while all 3,200 reads taken during the
+   run returned version 1 — so the replacements were real and every reader missed all of them.
+   Atomic replace-by-rename is the pattern careful software uses precisely to publish a new
+   version safely, so this makes the safe pattern the broken one. Pinned by
+   `SharedAccessEndToEndTests.SharedFile_GivenWritersReplacingItByRename_...`, `[Ignore]`d with
+   this reason rather than weakened.
+
+   **Ruled out: IndexNumber.** `WinFspAdapter._Fill` never sets `FspFileInfo.IndexNumber`, so
+   every file reports file id 0, and Windows associates a file's cached data section with its
+   IndexNumber — a good story for why the section survives a replacing rename. It was implemented
+   (a real per-file identity from path plus creation time, which stays constant across appends and
+   changes when the name comes to hold a different file) and it does NOT fix this. Reverted rather
+   than carried, because it costs a hash on every `GetFileInfo`, which is a hot path, and bought
+   nothing measurable. Setting it may still be worth doing for its own sake; it is not the lever
+   here.
+
+   **New evidence, and it narrows things a lot.** Re-measured this pass: 16 replacements landed,
+   all 3,200 reads during the run returned version 1 — and the read taken AFTER the workers stopped
+   returned version 60. So the bytes on disk are correct and the invalidation is not permanently
+   broken; the staleness lasts exactly as long as readers keep the name open. Whatever serves those
+   reads is pinned by an open handle and outlives the rename underneath it.
+
+   **Also ruled out, so the next pass need not re-walk them:**
+   - The engine's `Rename` does invalidate both endpoints, and `_Invalidate` clears placement and
+     the path's cache entry under the same name it caches them — no mismatch there.
+   - The pooled physical handles in `LocalVolumeIO.HandlePool` are not it. `AtomicReplace`
+     invalidates before AND after the swap, and `_Retire` removes the key from the dictionary, so a
+     handle rented before the replace is closed when its borrower returns it rather than re-pooled
+     — a later reader cannot be served the pre-replace file out of the pool.
+
+   What is left is whatever a READER holds across the replace, since the staleness ends the moment
+   the readers stop. `FileState.ReadAhead` is per-handle and survives a rename — `RenamePath`
+   repoints the state rather than retiring it — which makes the read-ahead buffers the most
+   promising remaining candidate.
+
+   It also passes when run ALONE and fails in the full suite, so it is timing-sensitive; a single
+   green run of this scenario means nothing without the whole suite behind it.
+2. **`_RenameFolder` holds leases on the two folder paths but on NO CHILD FILE while moving them.**
+   It flushes dirty children and publishes staged ones first, but takes no lease on any of them, so
+   a write can land between that flush and the member-level `RenameFolder` and address a path whose
+   physical file has since moved. Not reproduced end to end; the stress suite races file renames
+   only, which is why it would not be caught. Fixing it needs a lock-ordering story for an unbounded
+   set of children, which is why it is written down rather than attempted in passing.
+
+   **Half of this entry was wrong and is withdrawn.** It also claimed `HandleTable.RenameSubtree`
+   repeats the defect fixed in `4ad2094` by re-keying children over any state already there. It does
+   re-key that way — and so does `RenamePath`, the method that fix landed in. Displacing an entry was
+   never the defect; the defect was the CLOSE path unkeying an entry that had come to belong to
+   somebody else, and `4ad2094` fixed that centrally by guarding both removal sites with
+   `ReferenceEquals(current, file)`. `RenameSubtree` therefore has the shape of the FIXED code, not
+   of the bug. Checked against the commit rather than inferred from the shape a second time.
+
+The three throughput items that stood here — sync-over-async across the providers, the absence of
+provider-level range reads, and the whole-object RAM spikes — are closed above.
+
+## Closed, kept as a record
+
+An earlier revision of this file claimed "nothing known" under "Still open". That was wrong — it
+dropped the two UI items below. A capability gap that is merely WRITTEN DOWN reads as a decision,
+and these two sat there through several passes looking like ones, so they are kept here rather
+than deleted.
 
 1. **Jobs relayed into a MOUNTED pool's own process could not be cancelled. FIXED.** Pool work
    never runs inside the manager — the manager is a reload-safe UI shell and a mounted pool owns
@@ -551,62 +614,6 @@ here through several passes looking like ones.
    `20,977 / 21,300 — big/g322.bin` to the HTTP API the browser polls, accepted a cancel with
    `"cancelling"`, ended as `{"ok": false, "error": "cancelled"}`, and a second scan afterwards
    completed normally with no issues — so stopping one left the pool and its baseline intact.
-3. **A file replaced by rename keeps serving its OLD content to new readers — Windows.** After
-   `File.Move(source, target, overwrite: true)` succeeds, a reader that opens the target path
-   afresh still gets the pre-replacement bytes. Measured through a real WinFsp mount: six
-   replacements landed and the file settled on version 40, while all 3,200 reads taken during the
-   run returned version 1 — so the replacements were real and every reader missed all of them.
-   Atomic replace-by-rename is the pattern careful software uses precisely to publish a new
-   version safely, so this makes the safe pattern the broken one. Pinned by
-   `SharedAccessEndToEndTests.SharedFile_GivenWritersReplacingItByRename_...`, `[Ignore]`d with
-   this reason rather than weakened.
-
-   **Ruled out: IndexNumber.** `WinFspAdapter._Fill` never sets `FspFileInfo.IndexNumber`, so
-   every file reports file id 0, and Windows associates a file's cached data section with its
-   IndexNumber — a good story for why the section survives a replacing rename. It was implemented
-   (a real per-file identity from path plus creation time, which stays constant across appends and
-   changes when the name comes to hold a different file) and it does NOT fix this. Reverted rather
-   than carried, because it costs a hash on every `GetFileInfo`, which is a hot path, and bought
-   nothing measurable. Setting it may still be worth doing for its own sake; it is not the lever
-   here.
-
-   **New evidence, and it narrows things a lot.** Re-measured this pass: 16 replacements landed,
-   all 3,200 reads during the run returned version 1 — and the read taken AFTER the workers stopped
-   returned version 60. So the bytes on disk are correct and the invalidation is not permanently
-   broken; the staleness lasts exactly as long as readers keep the name open. Whatever serves those
-   reads is pinned by an open handle and outlives the rename underneath it. The engine's own
-   **Also ruled out, so the next pass need not re-walk them:**
-   - The engine's `Rename` does invalidate both endpoints, and `_Invalidate` clears placement and
-     the path's cache entry under the same name it caches them — no mismatch there.
-   - The pooled physical handles in `LocalVolumeIO.HandlePool` are not it. `AtomicReplace`
-     invalidates before AND after the swap, and `_Retire` removes the key from the dictionary, so a
-     handle rented before the replace is closed when its borrower returns it rather than re-pooled
-     — a later reader cannot be served the pre-replace file out of the pool.
-
-   What is left is whatever a READER holds across the replace, since the staleness ends the moment
-   the readers stop. `FileState.ReadAhead` is per-handle and survives a rename — `RenamePath`
-   repoints the state rather than retiring it — which makes the read-ahead buffers the most
-   promising remaining candidate.
-
-   It also passes when run ALONE and fails in the full suite, so it is timing-sensitive; a single
-   green run of this scenario means nothing without the whole suite behind it.
-4. **`_RenameFolder` holds leases on the two folder paths but on NO CHILD FILE while moving them.**
-   It flushes dirty children and publishes staged ones first, but takes no lease on any of them, so
-   a write can land between that flush and the member-level `RenameFolder` and address a path whose
-   physical file has since moved. Not reproduced end to end; the stress suite races file renames
-   only, which is why it would not be caught. Fixing it needs a lock-ordering story for an unbounded
-   set of children, which is why it is written down rather than attempted in passing.
-
-   **Half of this entry was wrong and is withdrawn.** It also claimed `HandleTable.RenameSubtree`
-   repeats the defect fixed in `4ad2094` by re-keying children over any state already there. It does
-   re-key that way — and so does `RenamePath`, the method that fix landed in. Displacing an entry was
-   never the defect; the defect was the CLOSE path unkeying an entry that had come to belong to
-   somebody else, and `4ad2094` fixed that centrally by guarding both removal sites with
-   `ReferenceEquals(current, file)`. `RenameSubtree` therefore has the shape of the FIXED code, not
-   of the bug. Checked against the commit rather than inferred from the shape a second time.
-
-The three throughput items that stood here — sync-over-async across the providers, the absence of
-provider-level range reads, and the whole-object RAM spikes — are closed above.
 
 ## Closed in the provider pass
 
