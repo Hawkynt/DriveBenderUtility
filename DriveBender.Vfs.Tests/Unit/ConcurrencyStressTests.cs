@@ -503,8 +503,14 @@ public class ConcurrencyStressTests {
   [Category("HappyPath")]
   public void Stress_GivenSustainedConcurrentIo_ThenCpuTimeStaysProportionalToTheWorkDone() {
     const int files = 4;
-    const int rounds = 20;
     const int length = 4096;
+    // Measured for a fixed DURATION rather than a fixed round count. A spin only shows up over a
+    // sustained window, and at 20 rounds the whole measured section ran in about 90 ms - short
+    // enough that starting eight threads and tiered-JIT compiling their bodies dominated the
+    // reading, and TotalProcessorTime counts both. That is how a four-core runner came to report
+    // 6.2 cores busy, a figure the hardware cannot produce. A deadline keeps the window
+    // meaningful on a fast machine and a slow one alike.
+    var sample = TimeSpan.FromSeconds(2);
 
     var paths = Enumerable.Range(0, files).Select(f => $"cpu{f}.bin").ToArray();
     foreach (var path in paths)
@@ -517,7 +523,7 @@ public class ConcurrencyStressTests {
     this._RunWorkers(files * 2, TimeSpan.FromMinutes(2), (worker, breadcrumbs) => {
       var file = worker % files;
       var writer = worker < files;
-      for (var round = 1; round <= rounds; ++round)
+      for (var round = 1; Stopwatch.GetElapsedTime(wallBefore) < sample; ++round)
         if (writer) {
           breadcrumbs.At(worker, $"write {paths[file]} v{round}");
           this._WriteVersion(paths[file], file, round, length);
