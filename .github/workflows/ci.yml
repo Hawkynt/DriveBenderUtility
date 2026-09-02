@@ -54,12 +54,6 @@ jobs:
 
       - name: Build
         run: dotnet build DriveBender.sln --configuration Release --no-restore
-      # The package README must follow the house template, and its API reference must still match
-      # the assembly just built. The template lives in RepositoryTemplate; nothing is copied here.
-      # This job has no OS matrix (it is windows-only for the net47 tier), so the step is
-      # unconditional -- a matrix.os guard here would silently never run.
-      - name: Check package READMEs
-        uses: Hawkynt/RepositoryTemplate/package-readme@v1
 
       # Filter out every test that needs a real DriveBender install or a
        # mountable filesystem. Some fixtures are missing their `[Category]`
@@ -89,6 +83,19 @@ jobs:
           --configuration Release --no-build
           --filter "TestCategory=Integration|TestCategory=EndToEnd|FullyQualifiedName~.Integration.|FullyQualifiedName~.EndToEnd.|FullyQualifiedName~.Regression.|FullyQualifiedName~CreatePool_WithNonExistentDrive|FullyQualifiedName~Bug002_InfiniteLoopInDuplicationEnabling|FullyQualifiedName~PoolManager_WithAccessDeniedToDirectory"
           --logger "trx;LogFileName=extra-tests.trx"
+
+      # AFTER every test leg, and it runs even when one of them failed. Ordered before them it masks
+      # the suite completely: this step going red stops the job, no test runs at all, and the pull
+      # request looks merely blocked rather than failing. The tests are the primary signal and must
+      # always produce one.
+      #
+      # The package README must follow the house template, and its API reference must still match
+      # the assembly just built. The template lives in RepositoryTemplate; nothing is copied here.
+      # This job has no OS matrix (it is windows-only for the net47 tier), so the step is
+      # unconditional -- a matrix.os guard here would silently never run.
+      - name: Check package READMEs
+        if: ${{ !cancelled() }}
+        uses: Hawkynt/RepositoryTemplate/package-readme@v1
 
       # Wall-clock performance tests are advisory -- a slow shared runner must not
       # fail the build on a timing assertion.
