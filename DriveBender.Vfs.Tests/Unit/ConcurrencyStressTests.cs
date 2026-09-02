@@ -537,10 +537,22 @@ public class ConcurrencyStressTests {
     var wall = Stopwatch.GetElapsedTime(wallBefore);
 
     // CPU per unit of wall-clock is the spin detector: a lock-free retry loop, a spinning pump or
-    // a busy-wait shows up as many core-seconds burned per second elapsed. Genuine parallel I/O
-    // over in-memory volumes stays well inside the core count.
+    // a busy-wait shows up as many core-seconds burned per second elapsed.
+    //
+    // The bar is the CORE COUNT, not a fraction of it. This test runs `files * 2` workers against
+    // in-memory volumes, so with eight workers on a four-core runner saturating all four is what
+    // success looks like - it is parallel work, not a spin, and the old three-quarters bar called
+    // that a failure at 3.05 against 3.0. That bar only ever passed because the sample window was
+    // 90 ms of thread start-up; once the window became honest, so did the utilisation.
+    //
+    // Above the core count is still worth catching and still reachable: TotalProcessorTime counts
+    // every thread in the process, and a container that sees more logical CPUs than
+    // Environment.ProcessorCount reports will exceed it - which is how a 90 ms sample once read 6.2
+    // on a four-core runner. What this cannot distinguish is a spin that merely fills cores the
+    // workers would have filled anyway; detecting that needs CPU measured per unit of WORK, with a
+    // single-worker baseline to compare against.
     var coresBusy = cpu.TotalSeconds / Math.Max(0.001, wall.TotalSeconds);
-    coresBusy.Should().BeLessThan(Math.Max(2.0, Environment.ProcessorCount * 0.75),
+    coresBusy.Should().BeLessThan(Math.Max(2.0, Environment.ProcessorCount),
       $"the engine burned {coresBusy:F1} cores of CPU per second of wall-clock — something is spinning rather than waiting");
   }
 
