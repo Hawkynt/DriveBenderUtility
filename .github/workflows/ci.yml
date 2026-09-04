@@ -157,8 +157,15 @@ jobs:
       # product never creates and blame it for the mismatch.
       - name: Install WinFsp v2.1 (the version the product pins)
         shell: pwsh
+        env:
+          # Authenticated, because the anonymous API allowance is per IP and these runners share
+          # theirs: the call resolving the release asset started failing with "API rate limit
+          # exceeded" and took the whole Windows job down in eighteen seconds, having tested nothing.
+          # The token is the run's own and needs no permissions beyond reading a public release.
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $release = Invoke-RestMethod 'https://api.github.com/repos/winfsp/winfsp/releases/tags/v2.1'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'drivebender-ci' }
+          $release = Invoke-RestMethod 'https://api.github.com/repos/winfsp/winfsp/releases/tags/v2.1' -Headers $headers
           $asset = $release.assets | Where-Object { $_.name -like '*.msi' } | Select-Object -First 1
           if (-not $asset) { throw 'No MSI in the winfsp v2.1 release' }
           Write-Host "Installing $($asset.name)"
@@ -339,8 +346,15 @@ jobs:
 
       - name: Install WinFsp v2.1 (the version the product pins)
         shell: pwsh
+        env:
+          # Authenticated, because the anonymous API allowance is per IP and these runners share
+          # theirs: the call resolving the release asset started failing with "API rate limit
+          # exceeded" and took the whole Windows job down in eighteen seconds, having tested nothing.
+          # The token is the run's own and needs no permissions beyond reading a public release.
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $release = Invoke-RestMethod 'https://api.github.com/repos/winfsp/winfsp/releases/tags/v2.1'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'drivebender-ci' }
+          $release = Invoke-RestMethod 'https://api.github.com/repos/winfsp/winfsp/releases/tags/v2.1' -Headers $headers
           $asset = $release.assets | Where-Object { $_.name -like '*.msi' } | Select-Object -First 1
           if (-not $asset) { throw 'No MSI in the winfsp v2.1 release' }
           $msi = Join-Path $env:RUNNER_TEMP $asset.name
