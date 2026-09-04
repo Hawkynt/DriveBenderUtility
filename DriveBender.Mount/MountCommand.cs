@@ -51,7 +51,9 @@ internal static class MountCommand {
           ? remoteResolver.OpenVolume(definition)
           : new LocalVolumeIO(m.MemberId, m.Label ?? m.ResolvedPath, m.ResolvedPath, m.PhysicalVolumeId);
         // measured so the auto-tier advisor and the dashboard see real per-member latency (FR-AUTO-TIER)
-        return new EngineMember(new MeasuredVolumeIO(io), m.Role, m.ReserveBytes, m.MaxIops, m.MaxThroughput);
+        return new EngineMember(new MeasuredVolumeIO(io), m.Role, m.ReserveBytes, m.MaxIops, m.MaxThroughput) {
+          Limits = m.Limits,
+        };
       }).ToArray();
 
       if (members.Length == 0)
@@ -139,7 +141,7 @@ internal static class MountCommand {
       var config = ConfigResolver.ResolveEffective(globalJson, manifest.Defaults?.GetRawText());
       fs.ReloadConfig(config);
       fs.UpdateMemberRoles(manifest.Members.ToDictionary(m => m.MemberId, m => m.Role)); // tier changes act on new writes immediately
-      fs.UpdateMemberLimits(manifest.Members.Select(m => (m.MemberId, m.MaxIops, m.MaxThroughput)));
+      fs.UpdateMemberLimits(manifest.Members.Select(m => (m.MemberId, m.EffectiveLimits)));
 
       // raising the duplication level owes new copies — hand that to the background heal job
       // (it converges incrementally via the scheduler) instead of a blocking RestorePool that

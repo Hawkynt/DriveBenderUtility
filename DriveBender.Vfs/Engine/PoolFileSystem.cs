@@ -4,7 +4,19 @@ namespace DivisonM.Vfs.Engine;
 
 /// <summary>One member as the engine sees it: its I/O backend plus manifest facts.</summary>
 public sealed record EngineMember(IVolumeIO Io, MemberRole Role = MemberRole.Capacity, long ReserveBytes = 0,
-  int MaxIops = 0, long MaxThroughput = 0);
+  int MaxIops = 0, long MaxThroughput = 0) {
+
+  /// <summary>
+  /// The per-kind limit set. Defaults to the simple one-rate shape built from the pair above, so a
+  /// caller that only knows about <c>maxThroughput</c> keeps working unchanged.
+  /// </summary>
+  public MemberLimits Limits { get; init; } = MemberLimits.None;
+
+  /// <summary>What this member is actually held to, whichever shape the caller supplied.</summary>
+  public MemberLimits EffectiveLimits => this.Limits.Any
+    ? this.Limits with { MaxIops = this.Limits.MaxIops > 0 ? this.Limits.MaxIops : this.MaxIops }
+    : MemberLimits.Simple(this.MaxIops, this.MaxThroughput);
+}
 
 /// <summary>
 /// The VFS engine (CMP-VFS) over a set of pool members: presents the merged logical
@@ -154,7 +166,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// seconds.
   /// </summary>
   private Action<long> _AdmitBulkTo(IVolumeIO target)
-    => bytes => this._queues.Enter(target, bytes).Dispose();
+    => bytes => this._queues.Enter(target, IoKind.Background, bytes).Dispose();
 
   private double _LoadScore(IVolumeIO volume) {
     if (this._IsCoolingDown(volume.MemberId))
@@ -217,7 +229,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._LoadScore); // new files go where the least work is already queued
 
     this._queues = new(effectiveConfig, members.ToDictionary(m => m.Io.MemberId, m => m.Role));
-    this._queues.SetThrottles(members.Select(m => (m.Io.MemberId, m.MaxIops, m.MaxThroughput)));
+    this._queues.SetThrottles(members.Select(m => (m.Io.MemberId, m.EffectiveLimits)));
     this._tombstones = new([.. members.Select(m => m.Io)]);
     this._watcher = new([.. members.Select(m => m.Io)]);
     this._watcher.MemberLost += this._OnMemberLost;
@@ -296,7 +308,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// setting exists precisely for the situation you cannot unmount for ("the pool is taking too much
   /// of that disk, ease off"), which made it the least useful thing to require a remount.
   /// </summary>
-  public void UpdateMemberLimits(IEnumerable<(Guid MemberId, int MaxIops, long MaxThroughput)> limits) {
+  public void UpdateMemberLimits(IEnumerable<(Guid MemberId, MemberLimits Limits)> limits) {
     this._queues.SetThrottles(limits);
     this._activity.Publish(ActivityKind.Recovery, "", reason: "member rate limits reloaded");
     DriveBender.Logger("Member rate limits reloaded live");
@@ -1517,7 +1529,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       try {
         // admission on the DEVICE, not the member: the fan-out above may have several blocks of
         // this same request in flight, and other requests theirs, and a disk has one queue
-        using var admission = this._queues.Enter(copy.Volume, this._cache.Pages.BlockSize);
+        using var admission = this._queues.Enter(copy.Volume, IoKind.Read, this._cache.Pages.BlockSize);
         block = _ReadBlockFrom(copy, path, blockIndex, this._cache.Pages.BlockSize);
       } catch (PoolFsException e) {
         lastError = e;
@@ -1808,7 +1820,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _WriteOneCopy(PhysicalCopy copy, string path, byte[] bytes, long offset) {
     this._BeginIo(copy.Volume.MemberId); // visible to the readiness selector while queued
     try {
-      using var admission = this._queues.Enter(copy.Volume, bytes.Length); // the device's queue, not the member's
+      using var admission = this._queues.Enter(copy.Volume, IoKind.Write, bytes.Length); // the device's queue, not the member's
       using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
       stream.Seek(offset, SeekOrigin.Begin);
       stream.Write(bytes, 0, bytes.Length);

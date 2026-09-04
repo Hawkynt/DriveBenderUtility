@@ -319,6 +319,128 @@ function memberHealthNote(m) {
   return bits.join(" · ");
 }
 
+
+// --- per-member I/O limits -------------------------------------------------
+// A pool is rarely the only thing using a disk, and the point of these is to leave some of it for
+// everything else. Three shapes, because the useful answers are genuinely that different: none at
+// all; one rate covering everything INCLUDING the pool's own healing and exchanging, which is what
+// moves the most data; or a rate per kind, so an operator can throttle the housekeeping right down
+// while leaving the reads an application is actually waiting on untouched.
+const MIB = 1024 * 1024;
+
+function limitsDialog(pool, m) {
+  const cur = m.limits || {};
+  const mib = v => (v > 0 ? Math.round(v / MIB) : "");
+
+  // which shape the member is already in, so the dialog opens on what is set rather than on a guess
+  const rateMode = (cur.readThroughput > 0 || cur.writeThroughput > 0 || cur.backgroundThroughput > 0) ? "fine"
+    : cur.maxThroughput > 0 || cur.maxIops > 0 ? "simple" : "none";
+  const timeMode = (cur.readTimeoutMs > 0 || cur.writeTimeoutMs > 0 || cur.backgroundTimeoutMs > 0) ? "fine"
+    : cur.timeoutMs > 0 ? "simple" : "none";
+
+  const form = el("div");
+  form.innerHTML = `
+    <p class="hint">How hard the pool may work <b>${esc(m.label || m.path)}</b>. Leave everything off
+      and it uses the disk as fast as it can; that is the default.</p>
+
+    <div class="g"><label>Throughput limit</label>
+      <select class="ratemode">
+        <option value="none">No limit — use the disk as fast as it can</option>
+        <option value="simple">One limit for everything, including healing and exchanging</option>
+        <option value="fine">A separate limit per kind of work</option>
+      </select></div>
+
+    <div class="ratesimple">
+      <div class="g"><label>All operations (MB/s)</label>
+        <input class="all" type="number" min="0" step="1" placeholder="e.g. 50"></div>
+    </div>
+
+    <div class="ratefine">
+      <div class="g"><label>Reading (MB/s)</label>
+        <input class="rd" type="number" min="0" step="1" placeholder="unlimited"></div>
+      <div class="g"><label>Writing (MB/s)</label>
+        <input class="wr" type="number" min="0" step="1" placeholder="unlimited"></div>
+      <div class="g"><label>Healing &amp; exchanging (MB/s)</label>
+        <input class="bg" type="number" min="0" step="1" placeholder="unlimited"></div>
+      <p class="hint">Healing and exchanging is the pool's own copying — draining a landing zone,
+        rebuilding a missing duplicate, moving a disk's contents to a replacement. It moves far more
+        data than reads and writes do, and nobody is waiting for it, so it is usually the one worth
+        holding down.</p>
+    </div>
+
+    <div class="g"><label>Operations per second</label>
+      <input class="iops" type="number" min="0" step="1" placeholder="unlimited">
+      <p class="hint">What a mechanical disk runs out of before it runs out of bandwidth.</p></div>
+
+    <div class="g"><label>Time limit</label>
+      <select class="timemode">
+        <option value="none">No time limit</option>
+        <option value="simple">One limit per operation (ms)</option>
+        <option value="fine">A separate limit per kind of work (ms)</option>
+      </select></div>
+
+    <div class="timesimple">
+      <div class="g"><label>Any operation (ms)</label>
+        <input class="tall" type="number" min="0" step="10" placeholder="e.g. 500"></div>
+    </div>
+
+    <div class="timefine">
+      <div class="g"><label>Reading (ms)</label><input class="trd" type="number" min="0" step="10" placeholder="none"></div>
+      <div class="g"><label>Writing (ms)</label><input class="twr" type="number" min="0" step="10" placeholder="none"></div>
+      <div class="g"><label>Healing &amp; exchanging (ms)</label><input class="tbg" type="number" min="0" step="10" placeholder="none"></div>
+    </div>
+
+    <p class="hint">A time limit caps how long the throttle may hold one operation back — past it the
+      operation goes through anyway. So a limit set far too low can slow this pool down and can never
+      wedge it. It does not abort I/O already in progress on the disk.</p>`;
+
+  const q = sel => form.querySelector(sel);
+  q(".all").value = mib(cur.maxThroughput);
+  q(".rd").value = mib(cur.readThroughput);
+  q(".wr").value = mib(cur.writeThroughput);
+  q(".bg").value = mib(cur.backgroundThroughput);
+  q(".iops").value = cur.maxIops > 0 ? cur.maxIops : "";
+  q(".tall").value = cur.timeoutMs > 0 ? cur.timeoutMs : "";
+  q(".trd").value = cur.readTimeoutMs > 0 ? cur.readTimeoutMs : "";
+  q(".twr").value = cur.writeTimeoutMs > 0 ? cur.writeTimeoutMs : "";
+  q(".tbg").value = cur.backgroundTimeoutMs > 0 ? cur.backgroundTimeoutMs : "";
+  q(".ratemode").value = rateMode;
+  q(".timemode").value = timeMode;
+
+  const sync = () => {
+    const r = q(".ratemode").value, t = q(".timemode").value;
+    q(".ratesimple").style.display = r === "simple" ? "" : "none";
+    q(".ratefine").style.display = r === "fine" ? "" : "none";
+    q(".timesimple").style.display = t === "simple" ? "" : "none";
+    q(".timefine").style.display = t === "fine" ? "" : "none";
+  };
+  q(".ratemode").onchange = sync;
+  q(".timemode").onchange = sync;
+  sync();
+
+  showModal(`I/O limits — ${m.label || m.path}`, form, async () => {
+    const bytes = sel => { const v = parseInt(q(sel).value, 10); return v > 0 ? v * MIB : 0; };
+    const ms = sel => { const v = parseInt(q(sel).value, 10); return v > 0 ? v : 0; };
+    const r = q(".ratemode").value, t = q(".timemode").value;
+
+    // only the selected shape is sent; switching to "none" therefore CLEARS the limit rather than
+    // hiding it, which is what an operator turning a limit off means
+    const p = new URLSearchParams({ pool: pool.id, member: m.id });
+    p.set("maxIops", String(ms(".iops")));
+    p.set("maxThroughput", String(r === "simple" ? bytes(".all") : 0));
+    p.set("readThroughput", String(r === "fine" ? bytes(".rd") : 0));
+    p.set("writeThroughput", String(r === "fine" ? bytes(".wr") : 0));
+    p.set("backgroundThroughput", String(r === "fine" ? bytes(".bg") : 0));
+    p.set("timeoutMs", String(t === "simple" ? ms(".tall") : 0));
+    p.set("readTimeoutMs", String(t === "fine" ? ms(".trd") : 0));
+    p.set("writeTimeoutMs", String(t === "fine" ? ms(".twr") : 0));
+    p.set("backgroundTimeoutMs", String(t === "fine" ? ms(".tbg") : 0));
+
+    const res = await post("/api/pool/member-limits?" + p.toString());
+    return res.ok ? null : (res.error || "could not apply the limits");
+  }, "Apply");
+}
+
 function memberRow(pool, m) {
   const row = el("div", "member");
   const state = memberStateOf(m);
@@ -339,6 +461,13 @@ function memberRow(pool, m) {
     row.appendChild(sel);
   } else
     row.appendChild(el("span", "role", m.role));
+  if (pool.source === "manifest") {
+    const limits = el("button", "small", "limits");
+    limits.title = "How hard the pool may work this storage — throughput and time limits, per kind of work";
+    limits.onclick = () => limitsDialog(pool, m);
+    row.appendChild(limits);
+  }
+
   const scatter = el("button", "small danger", "remove");
   scatter.title = "Scatter this member's data to the others, then remove it";
   scatter.onclick = async () => {

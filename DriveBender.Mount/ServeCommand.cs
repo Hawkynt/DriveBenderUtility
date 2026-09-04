@@ -229,6 +229,14 @@ internal sealed class ServeCommand(
         case "/api/pool/add-member" when request.HttpMethod == "POST":
           this._WriteJson(context, this._AddMember(request));
           break;
+        case "/api/pool/member-limits" when request.HttpMethod == "POST":
+          this._WriteJson(context, _Guard(() => {
+            var pool = this._Discover(this._RequirePool(request));
+            var memberId = Guid.TryParse(request.QueryString["member"], out var id) ? id : throw new ManifestException("member-limits needs ?member=<id>");
+            lifecycle.SetMemberLimits(pool.Manifest, memberId, _ParseLimits(request.QueryString));
+            return this._ApplyLive(pool);
+          }));
+          break;
         case "/api/pool/member-role" when request.HttpMethod == "POST":
           this._WriteJson(context, _Guard(() => {
             var pool = this._Discover(this._RequirePool(request));
@@ -393,6 +401,7 @@ internal sealed class ServeCommand(
               mediaErrors = smart?.MediaErrors,
               powerOnHours = smart?.PowerOnHours,
               model = smart?.Model,
+              limits = pool.Manifest.FindMember(m.MemberId)?.EffectiveLimits,
             };
           }),
           metrics = snapshot == null ? null : new {
@@ -589,6 +598,39 @@ internal sealed class ServeCommand(
     JobRegistry.CancelResult.NotCancellable => _Failure("this operation cannot be stopped once it has started"),
     _ => _Failure("unknown or expired job"),
   };
+
+  /// <summary>
+  /// Reads a limit set off the query string. Everything is optional and everything defaults to zero,
+  /// which means "no limit for that" — so the three shapes the UI offers (none, one rate for
+  /// everything, a rate per kind) are all just different subsets of the same parameters, and
+  /// clearing a field is how a limit is removed.
+  /// </summary>
+  private static MemberLimits _ParseLimits(System.Collections.Specialized.NameValueCollection query) {
+    static long Bytes(System.Collections.Specialized.NameValueCollection q, string name) {
+      var raw = q[name];
+      if (string.IsNullOrWhiteSpace(raw))
+        return 0;
+
+      // accepted as a plain byte count or as a size string, because the UI sends MiB and a hand-run
+      // curl is far more likely to say "20MiB" than to have done the multiplication
+      return long.TryParse(raw, out var plain) ? Math.Max(0, plain) : Math.Max(0, SizeSpec.ParseBytes(raw));
+    }
+
+    static int Number(System.Collections.Specialized.NameValueCollection q, string name)
+      => int.TryParse(q[name], out var value) && value > 0 ? value : 0;
+
+    return new() {
+      MaxIops = Number(query, "maxIops"),
+      MaxThroughput = Bytes(query, "maxThroughput"),
+      ReadThroughput = Bytes(query, "readThroughput"),
+      WriteThroughput = Bytes(query, "writeThroughput"),
+      BackgroundThroughput = Bytes(query, "backgroundThroughput"),
+      TimeoutMs = Number(query, "timeoutMs"),
+      ReadTimeoutMs = Number(query, "readTimeoutMs"),
+      WriteTimeoutMs = Number(query, "writeTimeoutMs"),
+      BackgroundTimeoutMs = Number(query, "backgroundTimeoutMs"),
+    };
+  }
 
   private static object _Failure(string error) => new { ok = false, error };
 
@@ -890,6 +932,11 @@ internal sealed class ServeCommand(
 
   /// <summary>After a settings change: asks a running mount to reload live; otherwise it lands on the next mount.</summary>
   private string _ApplyLive(PoolRef pool) {
+    // the manifest just changed, so the cached discovery describes the pool as it WAS; without this
+    // the dashboard shows the old setting for up to the cache's lifetime and the change reads as
+    // having been ignored
+    this._InvalidateDiscovery();
+
     if (mountRegistry.Find(pool.PoolId.ToString()) == null)
       return "saved — takes effect on the next mount";
 

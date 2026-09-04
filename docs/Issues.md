@@ -578,33 +578,76 @@ dropped from about 46 minutes to under 20. Two lessons, both cheap:
   could only fail — several hundred file reads and as many exceptions per `status`, and per each of
   the hundred polls one `unmount` makes. It now only considers files named for a pool id.
 
-### Open: a landing zone absorbs nothing on Windows — the burst runs at the CAPACITY tier's pace
+### Per-kind I/O limits, so a disk can be left usable for everything else
 
-Found by giving the tiering claim a control instead of an absolute bar: the same burst written to a
-pool that is only the slow tier, on the same machine, moments earlier. Both sides then pay the same
-journal, staging and fsync costs, so what is left is the tier. Measured on the CI runners:
+`maxThroughput` was one number covering every operation, which is the right default and a blunt
+instrument. The three kinds of work a pool does compete for a disk on completely different terms: a
+READ is what an application is blocked on, a WRITE is what it is blocked on to be safe, and
+BACKGROUND — a landing-zone drain, a duplication heal, a media exchange — moves far more data than
+either and nobody is waiting for it. Holding the last one down while leaving the first two alone is
+most of what "leave some of this disk for something else" means, and it could not be expressed.
 
-| landing zone over capacity | through the landing zone | straight to capacity |
-| --- | ---: | ---: |
-| RAM over SD card — Linux | 115 MiB/s | 30 MiB/s |
-| RAM over cloud — Linux | 61 MiB/s | 11 MiB/s |
-| RAM over SD card — **Windows** | **22.5 MiB/s** | 23.4 MiB/s |
-| RAM over cloud — **Windows** | **9.8 MiB/s** | 10.4 MiB/s |
-| SSD over SD card — **Windows** | **22.5 MiB/s** | 23.3 MiB/s |
-| HDD over cloud — **Windows** | **3.8 MiB/s** | 3.6 MiB/s |
+Three shapes now, and the advanced dialog offers exactly those: **none**; **simple**, one rate for
+everything including the pool's own copying; or **advanced**, a separate rate for reads, writes and
+healing/exchanging. Operations per second sits alongside them, because a seek-bound disk runs out of
+those before it runs out of bandwidth.
 
-On Linux the fast tier is doing exactly what it is for. On Windows it is worth nothing: every pairing
-lands within a few percent of writing straight to the slow disk, which is the one outcome a landing
-zone exists to prevent. The bursts are small enough that the drainer has barely started, so this is
-the INTAKE being paced by the capacity tier rather than a drain competing with it.
+**Time limits, in the same three shapes**, and they mean something narrower than the word usually
+does: a limit is a target, and the time limit is the promise that honouring it costs no more than
+this. Past it the operation proceeds having paid what it could. That is deliberate — it means a rate
+typed in wrong can slow a pool down and can never wedge it, and an operator who mistypes a number has
+a way back that does not involve unmounting. It bounds the QUEUEING only; device I/O already in
+flight cannot be cancelled on a synchronous handle, and claiming otherwise would be a guarantee the
+engine cannot keep.
 
-Not diagnosed further, because it needs a Windows machine to instrument and this pass had none —
-what is established is that the effect is real, reproducible across four pairings and two capacity
-speeds, and specific to that platform. Note that
-`TieringEndToEndTests.Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` passes
-on Windows, so files DO land on the fast tier there; whatever paces the write is downstream of
-placement. The scenario is held back on Windows with the measurements in its skip reason rather than
-weakened, so it keeps failing honestly on Linux if the gain ever disappears there too.
+Two details worth keeping:
+
+- **Each kind gets its own token bucket, and every bucket refills whether or not it is being spent.**
+  A shared bucket would make three rates meaningless the moment more than one was set — a heal at its
+  own generous rate would spend the credit a read was about to need. And refilling only the bucket in
+  use would make a kind that goes quiet pay for its own idleness when it came back.
+- **Older manifests keep meaning what they meant.** `maxIops`/`maxThroughput` read as the simple
+  shape, the detailed block is written beside them rather than instead of them, and the two are kept
+  in step so nothing that only knows the old shape can read a manifest and be misled by it.
+
+Settable from the dashboard per member, applied to a RUNNING pool — which is the situation the whole
+setting exists for, since the disk you need to ease off is rarely one you can take offline.
+
+### Withdrawn: "a landing zone absorbs nothing on Windows" was the host, not the product
+
+Recorded in this file one pass ago as an open defect, on measurements that were real and a conclusion
+that was wrong. Withdrawn here rather than quietly deleted, because how it was settled is the useful
+part.
+
+The measurement stands: on the Windows runner a tiered pool absorbed a burst at its capacity tier's
+pace across four pairings, where Linux showed a 4-6x gain. What was missing was WHY, and a rate
+cannot say — so a companion scenario was added that needs no clock and asks a different question:
+where did the data physically land? It answered `fast tier: False, capacity: True`.
+
+That is `ChoosePrimaryTarget` doing exactly what it should. It offers a new file to the fast tier only
+while that tier is below its own low watermark (75% by default) and falls back to capacity otherwise,
+because filling a nearly-full fast tier is how a landing zone stops working. A GitHub Windows runner's
+system disk sits past that mark, so the pool declined to use the landing zone and wrote straight to
+capacity — correctly, and with no defect anywhere in it.
+
+Both scenarios now state that precondition and skip when it is absent, on any platform, with the
+used fraction in the reason. The blanket "held back on Windows" they carried was a wrong diagnosis
+wearing the clothes of a known issue.
+
+**And the rate half is now `[Explicit]`, like the rest of the benchmarks.** A 32 MiB burst takes a
+second or two, and at that size the driver, the journal and the fsync are most of it — so on a shared
+runner the number says more about the machine than about the tier. Across several CI runs the same
+comparison read 115, 46 and 17 MiB/s against controls of 30, 30 and 23; the last puts the tiered pool
+BELOW a single slow member, which is not something the pool did. Chasing that with ever-looser bars
+was fitting a test to a machine. The half that needs no clock — that new data lands on the fast tier —
+stays in the battery, where it is worth having.
+
+**What the episode did surface, and it is worth keeping**:
+`TieringEndToEndTests.Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` has
+been green on Windows throughout, and could not have caught any of this. It computes
+`landedOnFastTier` and then only ever ASSERTS `drainedToCapacity`, mentioning the first in the
+failure message of the second. A file that went straight to capacity and never touched the landing
+zone satisfies it. The scenario that found this is the first to assert where new data actually goes.
 
 ### The pool's own bulk copies ignored the rate limit set on the disk they were writing to
 

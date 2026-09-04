@@ -226,10 +226,12 @@ public class BrownoutEndToEndTests {
     const int files = 12;
     const int size = 2 * 1024 * 1024;
 
-    // establish that placement DOES use both members when both are healthy, otherwise "they all went
-    // to member 0" afterwards would prove nothing about the brownout
-    for (var file = 0; file < files; ++file)
-      File.WriteAllBytes(pool.PathTo($"before{file}.bin"), _Payload(size, 2300 + file));
+    // Established with a CONCURRENT burst, because that is the only time placement's load term does
+    // anything: files written one after another leave nothing in flight to break the tie, so free
+    // space decides and every one of them can legitimately land on the same member. Asserting a
+    // split after sequential writes asked the design for a guarantee it does not make — and on a
+    // runner whose two members have identical free space it duly came back 12 / 0.
+    Parallel.For(0, files, file => File.WriteAllBytes(pool.PathTo($"before{file}.bin"), _Payload(size, 2300 + file)));
 
     var beforeSplit = _CountPerMember(pool, "before", files);
     beforeSplit.Should().OnlyContain(count => count > 0,
@@ -242,9 +244,7 @@ public class BrownoutEndToEndTests {
     _Collapse(pool, victim);
 
     var stopwatch = Stopwatch.StartNew();
-    for (var file = 0; file < files; ++file)
-      File.WriteAllBytes(pool.PathTo($"after{file}.bin"), _Payload(size, 2400 + file));
-
+    Parallel.For(0, files, file => File.WriteAllBytes(pool.PathTo($"after{file}.bin"), _Payload(size, 2400 + file)));
     stopwatch.Stop();
 
     var afterSplit = _CountPerMember(pool, "after", files);

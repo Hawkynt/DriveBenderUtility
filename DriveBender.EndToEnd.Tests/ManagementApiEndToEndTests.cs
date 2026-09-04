@@ -21,12 +21,39 @@ namespace DivisonM.EndToEnd.Tests;
 public class ManagementApiEndToEndTests {
 
   private ManagementDaemon _daemon = null!;
+  private string _poolName = "";
+  private string _root = "";
 
   [OneTimeSetUp]
-  public void StartDaemon() => this._daemon = ManagementDaemon.Start();
+  public void StartDaemon() {
+    this._daemon = ManagementDaemon.Start();
+
+    // a real pool for the endpoints that act ON one. It is never mounted: everything asserted here
+    // is manifest state the daemon reads and writes, and mounting would drag the driver into an
+    // API test for nothing.
+    this._root = Path.Combine(Path.GetTempPath(), "dbe2e-api-" + Guid.NewGuid().ToString("N"));
+    var members = new[] { Path.Combine(this._root, "m0"), Path.Combine(this._root, "m1") };
+    foreach (var member in members)
+      Directory.CreateDirectory(member);
+
+    this._poolName = "e2eapi" + Guid.NewGuid().ToString("N")[..8];
+    DbMount.RunExpectingSuccess(TimeSpan.FromMinutes(2),
+      "pool-create", "-n", this._poolName, "-m", members[0], "-m", members[1]);
+  }
 
   [OneTimeTearDown]
-  public void StopDaemon() => this._daemon?.Dispose();
+  public void StopDaemon() {
+    this._daemon?.Dispose();
+    if (this._poolName.Length > 0)
+      DbMount.ForgetPool(this._poolName);
+
+    try {
+      if (Directory.Exists(this._root))
+        Directory.Delete(this._root, true);
+    } catch (Exception) {
+      // teardown is best effort
+    }
+  }
 
   [Test]
   [Category("HappyPath")]
@@ -64,6 +91,107 @@ public class ManagementApiEndToEndTests {
     pools.ValueKind.Should().Be(JsonValueKind.Array);
     frame.TryGetProperty("jobs", out var jobs).Should().BeTrue("running jobs ride the same frame the live feed ships");
     jobs.ValueKind.Should().Be(JsonValueKind.Array);
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void MemberLimits_GivenEachShapeInTurn_ThenTheDashboardReportsWhatWasSet() {
+    // The three shapes the advanced dialog offers, through the endpoint it posts to. Worth covering
+    // here rather than only in the engine, because the useful part of this feature is that an
+    // operator can change it from the UI on a pool that is running — the limit exists precisely for
+    // the disk you cannot take offline right now.
+    var member = _FirstMember(out var poolId);
+
+    // ADVANCED — a separate rate per kind of work, and per-kind time limits
+    this._daemon.PostJson($"api/pool/member-limits?pool={poolId}&member={member}"
+                          + "&readThroughput=209715200&writeThroughput=104857600&backgroundThroughput=10485760"
+                          + "&maxIops=500&readTimeoutMs=250&backgroundTimeoutMs=2000");
+
+    var limits = this._LimitsOf(member, l => l.GetProperty("readThroughput").GetInt64() > 0);
+    limits.GetProperty("readThroughput").GetInt64().Should().Be(200L * 1024 * 1024);
+    limits.GetProperty("writeThroughput").GetInt64().Should().Be(100L * 1024 * 1024);
+    limits.GetProperty("backgroundThroughput").GetInt64().Should().Be(10L * 1024 * 1024,
+      "healing and exchanging is the one an operator most wants to hold down on its own");
+    limits.GetProperty("maxIops").GetInt32().Should().Be(500);
+    limits.GetProperty("readTimeoutMs").GetInt32().Should().Be(250);
+    limits.GetProperty("backgroundTimeoutMs").GetInt32().Should().Be(2000);
+
+    // SIMPLE — one rate covering everything, background work included
+    this._daemon.PostJson($"api/pool/member-limits?pool={poolId}&member={member}&maxThroughput=52428800&timeoutMs=400");
+    limits = this._LimitsOf(member, l => l.GetProperty("maxThroughput").GetInt64() > 0);
+    limits.GetProperty("maxThroughput").GetInt64().Should().Be(50L * 1024 * 1024);
+    limits.GetProperty("readThroughput").GetInt64().Should().Be(0,
+      "the simple shape sets one rate and leaves the per-kind ones unset, so they fall back to it");
+    limits.GetProperty("timeoutMs").GetInt32().Should().Be(400);
+
+    // NONE — switching the limit off has to CLEAR it, not leave the old numbers behind
+    this._daemon.PostJson($"api/pool/member-limits?pool={poolId}&member={member}");
+    limits = this._LimitsOf(member, l => l.GetProperty("maxThroughput").GetInt64() == 0 && l.GetProperty("maxIops").GetInt32() == 0);
+    foreach (var field in new[] { "maxThroughput", "readThroughput", "writeThroughput", "backgroundThroughput" })
+      limits.GetProperty(field).GetInt64().Should().Be(0, $"'{field}' must be cleared when limits are turned off");
+
+    limits.GetProperty("maxIops").GetInt32().Should().Be(0);
+    limits.GetProperty("timeoutMs").GetInt32().Should().Be(0);
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void MemberLimits_GivenAnUnknownMember_ThenItIsRefusedRatherThanSilentlyIgnored() {
+    var _ = _FirstMember(out var poolId);
+    var response = this._daemon.Post($"api/pool/member-limits?pool={poolId}&member={Guid.NewGuid()}&maxThroughput=1048576");
+    var body = JsonDocument.Parse(response.Content.ReadAsStringAsync().GetAwaiter().GetResult()).RootElement;
+
+    body.GetProperty("ok").GetBoolean().Should().BeFalse(
+      "a limit posted at a member that does not exist must say so — silently accepting it would "
+      + "leave an operator believing a disk had been eased off when nothing had changed");
+  }
+
+  /// <summary>The first member of the fixture pool, waiting for discovery to notice the pool at all.</summary>
+  private string _FirstMember(out string poolId) {
+    var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+    while (true) {
+      foreach (var pool in this._daemon.GetJson("api/pools").GetProperty("pools").EnumerateArray())
+        if (pool.GetProperty("name").GetString() == this._poolName) {
+          poolId = pool.GetProperty("id").GetString()!;
+          return pool.GetProperty("members")[0].GetProperty("id").GetString()!;
+        }
+
+      if (DateTime.UtcNow > deadline)
+        throw new TimeoutException($"The daemon never listed pool '{this._poolName}'");
+
+      Thread.Sleep(500);
+    }
+  }
+
+  /// <summary>
+  /// The limits the dashboard reports for a member, once they match what was just set.
+  ///
+  /// Waits for the VALUE rather than for the property to exist: the daemon caches discovery for a
+  /// few seconds, so a read straight after a write returns the old numbers — and a helper that
+  /// returned the first thing it saw would assert against them and fail for a reason that has
+  /// nothing to do with whether the write worked.
+  /// </summary>
+  private JsonElement _LimitsOf(string memberId, Func<JsonElement, bool> until) {
+    var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+    JsonElement last = default;
+    var sawAny = false;
+
+    while (DateTime.UtcNow < deadline) {
+      foreach (var pool in this._daemon.GetJson("api/pools").GetProperty("pools").EnumerateArray())
+        foreach (var member in pool.GetProperty("members").EnumerateArray())
+          if (member.GetProperty("id").GetString() == memberId && member.TryGetProperty("limits", out var found)) {
+            last = found.Clone();
+            sawAny = true;
+            if (until(last))
+              return last;
+          }
+
+      Thread.Sleep(250);
+    }
+
+    throw new TimeoutException(sawAny
+      ? $"The dashboard never reported the limits that were just set for member '{memberId}'; it last said {last}"
+      : $"The dashboard never reported limits for member '{memberId}' at all");
   }
 
   [Test]
