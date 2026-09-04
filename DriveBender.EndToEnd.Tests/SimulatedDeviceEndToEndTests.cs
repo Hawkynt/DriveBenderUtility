@@ -123,6 +123,19 @@ public class SimulatedDeviceEndToEndTests {
         + $"absorbs at the fast tier's pace cannot be told apart from one that does not without at "
         + $"least {neededSpread:F0}x between them.");
 
+    // And the HOST has to be able to demonstrate it. The bar below is an absolute byte rate, so on a
+    // machine that cannot write that fast through its own filesystem the scenario measures the
+    // runner rather than the pool — which is exactly what happened on a CI worker, where 32 MiB
+    // through the driver did not reach the 24 MiB/s this pairing asks for. A cheap probe of the
+    // temp directory settles whether the claim is demonstrable here before it is asserted.
+    var bar = slow.MaxThroughput * 1.5;
+    var hostRate = StorageDevices.ProbeWriteRate(Path.GetTempPath(), 4 * 1024 * 1024);
+    if (hostRate > 0 && hostRate < bar * 2)
+      Assert.Ignore(
+        $"this host writes at about {hostRate / (1024 * 1024):F0} MiB/s, which is too close to the "
+        + $"{bar / (1024 * 1024):F0} MiB/s this pairing would have to beat — the measurement would be "
+        + $"of the machine, not of the landing zone.");
+
     using var pool = MountedPool.Create(members: 2, landingZones: 1, storageKinds: [fast, slow]);
 
     // sized against the SLOW tier: big enough that writing through to it could not possibly keep up
@@ -134,7 +147,7 @@ public class SimulatedDeviceEndToEndTests {
     stopwatch.Stop();
 
     var rate = size / stopwatch.Elapsed.TotalSeconds;
-    rate.Should().BeGreaterThan(slow.MaxThroughput * 1.5,
+    rate.Should().BeGreaterThan(bar,
       $"a landing zone exists so the slow tier is BEHIND the write rather than in it: {fast} over "
       + $"{slow} absorbed {size / (1024 * 1024)} MiB at {rate / (1024 * 1024):F0} MiB/s against the "
       + $"capacity tier's own {slow.MaxThroughput / (1024 * 1024)} MiB/s."

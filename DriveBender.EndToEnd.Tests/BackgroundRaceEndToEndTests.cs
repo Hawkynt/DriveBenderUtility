@@ -61,6 +61,38 @@ public class BackgroundRaceEndToEndTests {
       + $"the file.{Environment.NewLine}{pool.DescribeMembers()}");
   }
 
+  /// <summary>
+  /// A duplicated pool with a whole-file copy DEMONSTRABLY in flight to the slow member.
+  ///
+  /// The background copy is arranged rather than hoped for. Waiting for the drainer to pick a file
+  /// up depends on which tier placement chose and on when the drain scheduler next runs, and those
+  /// differ enough between platforms that the same sleep caught the copy mid-flight on one and long
+  /// after it had finished on the other. Emptying a member behind the pool's back and handing it
+  /// back OWES a heal, which starts promptly and has the whole file to move at the member's crawl.
+  /// </summary>
+  private static MountedPool _WithAHealInFlight(string name, byte[] content) {
+    var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk,
+      storageKinds: [StorageKind.Ram, _SLOW]);
+
+    try {
+      File.WriteAllBytes(pool.PathTo(name), content);
+      MountedPool.WaitUntil(() => pool.PhysicalCopies(name).Count >= 2, TimeSpan.FromMinutes(4))
+        .Should().BeTrue($"the file must start fully duplicated.{Environment.NewLine}{pool.DescribeMembers()}");
+
+      pool.Eject(1);
+      foreach (var candidate in Directory.EnumerateFiles(pool.StoragePaths[1], name, SearchOption.AllDirectories))
+        File.Delete(candidate);
+
+      pool.Restore(1);
+      Thread.Sleep(_INTO_THE_COPY);
+      _RequireStillCopying(pool, 1, name, content.Length);
+      return pool;
+    } catch {
+      pool.Dispose();
+      throw;
+    }
+  }
+
   private static byte[] _Payload(int length, int seed) {
     var content = new byte[length];
     new Random(seed).NextBytes(content);
@@ -83,25 +115,20 @@ public class BackgroundRaceEndToEndTests {
 
   [Test]
   [Category("EdgeCase")]
-  [Description("A file deleted while the drainer is still copying it down to capacity storage stays deleted, rather than reappearing when the copy lands.")]
-  public void Delete_WhileTheDrainerIsStillCopying_ThenTheFileDoesNotComeBack() {
-    // A drain is read-from-landing, write-to-capacity, then drop the landing copy. Deleting the file
-    // in the middle of that leaves an in-flight write with nowhere legitimate to land: if it lands
-    // anyway, the user's delete is undone by the pool's own housekeeping, and the file is back.
-    using var pool = MountedPool.Create(members: 2, landingZones: 1, storageKinds: [StorageKind.Ram, _SLOW]);
+  [Description("A file deleted while the pool is still copying it stays deleted, rather than reappearing when the copy lands.")]
+  public void Delete_WhileACopyIsStillInFlight_ThenTheFileDoesNotComeBack() {
+    // Deleting a file while the pool is part way through copying it leaves an in-flight write with
+    // nowhere legitimate to land. If it lands anyway, the user's delete is undone by the pool's own
+    // housekeeping and the file is back — on the next mount if not immediately.
+    using var pool = _WithAHealInFlight("doomed.bin", _Payload(_SIZE, 3001));
 
-    File.WriteAllBytes(pool.PathTo("doomed.bin"), _Payload(_SIZE, 3001));
-
-    // let the drainer notice and start, then interrupt it PART WAY through
-    Thread.Sleep(_INTO_THE_COPY);
-    _RequireStillCopying(pool, 1, "doomed.bin", _SIZE);
     File.Delete(pool.PathTo("doomed.bin"));
 
     // give the interrupted copy every chance to land after the fact
     Thread.Sleep(25000);
 
     File.Exists(pool.PathTo("doomed.bin")).Should().BeFalse(
-      $"a deleted file must not be resurrected by a drain that was already in flight."
+      $"a deleted file must not be resurrected by a copy that was already in flight."
       + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
 
     _EveryTraceOf(pool, "doomed.bin").Should().BeEmpty(
@@ -118,27 +145,20 @@ public class BackgroundRaceEndToEndTests {
 
   [Test]
   [Category("EdgeCase")]
-  [Description("A file renamed while the drainer is copying it ends under exactly one name, with its content intact.")]
-  public void Rename_WhileTheDrainerIsStillCopying_ThenItEndsUnderExactlyOneName() {
-    using var pool = MountedPool.Create(members: 2, landingZones: 1, storageKinds: [StorageKind.Ram, _SLOW]);
-
+  [Description("A file renamed while the pool is still copying it ends under exactly one name, with its content intact.")]
+  public void Rename_WhileACopyIsStillInFlight_ThenItEndsUnderExactlyOneName() {
     var content = _Payload(_SIZE, 3100);
-    File.WriteAllBytes(pool.PathTo("oldname.bin"), content);
+    using var pool = _WithAHealInFlight("oldname.bin", content);
 
-    Thread.Sleep(_INTO_THE_COPY);
-    _RequireStillCopying(pool, 1, "oldname.bin", _SIZE);
     File.Move(pool.PathTo("oldname.bin"), pool.PathTo("newname.bin"));
-    Thread.Sleep(20000);
+    Thread.Sleep(25000);
 
-    var oldExists = File.Exists(pool.PathTo("oldname.bin"));
-    var newExists = File.Exists(pool.PathTo("newname.bin"));
-
-    newExists.Should().BeTrue(
+    File.Exists(pool.PathTo("newname.bin")).Should().BeTrue(
       $"the rename was acknowledged, so the file must be at its new name."
       + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
 
-    oldExists.Should().BeFalse(
-      $"and it must not ALSO still be at the old one — a drain finishing under the old name leaves "
+    File.Exists(pool.PathTo("oldname.bin")).Should().BeFalse(
+      $"and it must not ALSO still be at the old one — a copy finishing under the old name leaves "
       + $"the user with two files where they made one.{Environment.NewLine}{pool.DescribeMembers()}");
 
     File.ReadAllBytes(pool.PathTo("newname.bin")).Should().Equal(content,

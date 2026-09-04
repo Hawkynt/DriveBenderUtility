@@ -36,8 +36,22 @@ public sealed class MemberSmartCache(ISmartMonitor smart, TimeSpan? interval = n
   /// the same unresponsive device.
   /// </summary>
   public void RefreshInBackground(IReadOnlyList<IVolumeIO> members, Func<IVolumeIO, string> deviceOf) {
-    if (!smart.IsSupported || members.Count == 0)
+    if (members.Count == 0)
       return;
+
+    // With no smartctl there is nothing to ask, but there is still something to SAY: every member
+    // gets an Unknown reading carrying the reason. Publishing nothing at all left the snapshot
+    // silent about health, which reads downstream as "no information" rather than "we looked and
+    // could not tell" — and those want different words in front of an operator.
+    if (!smart.IsSupported) {
+      foreach (var member in members)
+        if (member.IsOnline)
+          this._byMember[member.MemberId] = SmartStatus.Unavailable(member.DisplayName, "smartctl is not installed");
+        else
+          this._byMember.TryRemove(member.MemberId, out _);
+
+      return;
+    }
 
     if (this._clock() - this._lastSweep < this._interval)
       return;
