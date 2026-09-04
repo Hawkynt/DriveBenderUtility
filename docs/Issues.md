@@ -578,6 +578,34 @@ dropped from about 46 minutes to under 20. Two lessons, both cheap:
   could only fail — several hundred file reads and as many exceptions per `status`, and per each of
   the hundred polls one `unmount` makes. It now only considers files named for a pool id.
 
+### Open: a landing zone absorbs nothing on Windows — the burst runs at the CAPACITY tier's pace
+
+Found by giving the tiering claim a control instead of an absolute bar: the same burst written to a
+pool that is only the slow tier, on the same machine, moments earlier. Both sides then pay the same
+journal, staging and fsync costs, so what is left is the tier. Measured on the CI runners:
+
+| landing zone over capacity | through the landing zone | straight to capacity |
+| --- | ---: | ---: |
+| RAM over SD card — Linux | 115 MiB/s | 30 MiB/s |
+| RAM over cloud — Linux | 61 MiB/s | 11 MiB/s |
+| RAM over SD card — **Windows** | **22.5 MiB/s** | 23.4 MiB/s |
+| RAM over cloud — **Windows** | **9.8 MiB/s** | 10.4 MiB/s |
+| SSD over SD card — **Windows** | **22.5 MiB/s** | 23.3 MiB/s |
+| HDD over cloud — **Windows** | **3.8 MiB/s** | 3.6 MiB/s |
+
+On Linux the fast tier is doing exactly what it is for. On Windows it is worth nothing: every pairing
+lands within a few percent of writing straight to the slow disk, which is the one outcome a landing
+zone exists to prevent. The bursts are small enough that the drainer has barely started, so this is
+the INTAKE being paced by the capacity tier rather than a drain competing with it.
+
+Not diagnosed further, because it needs a Windows machine to instrument and this pass had none —
+what is established is that the effect is real, reproducible across four pairings and two capacity
+speeds, and specific to that platform. Note that
+`TieringEndToEndTests.Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` passes
+on Windows, so files DO land on the fast tier there; whatever paces the write is downstream of
+placement. The scenario is held back on Windows with the measurements in its skip reason rather than
+weakened, so it keeps failing honestly on Linux if the gain ever disappears there too.
+
 ### The pool's own bulk copies ignored the rate limit set on the disk they were writing to
 
 Found by trying to build a race against the drainer and failing to: a 24 MiB file copied onto a
