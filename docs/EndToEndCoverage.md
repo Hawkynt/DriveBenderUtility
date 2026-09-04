@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33905770602](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33905770602).
+Generated from run: [33909672377](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33909672377).
 
-156 scenarios — 138 passing on at least one target, 2 failing.
+156 scenarios — 139 passing on at least one target, 1 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -28,7 +28,7 @@ Generated from run: [33905770602](https://github.com/Hawkynt/DriveBenderUtility/
 | Boundary | `Sizes_GivenFilesOnTheCacheAndBlockBoundaries_ThenEachRoundTripsExactly` | Files sized exactly on and either side of the page, buffer and block boundaries round-trip byte for byte. | pass | pass |
 | Boundary | `Sparse_GivenAWriteFarBeyondTheEnd_ThenTheHoleReadsAsZeroes` | Writing far past the end of a file leaves a hole that reads as zeroes, and the bytes written land at the right offset. | pass | pass |
 | Boundary | `Truncate_GivenAFileIsShrunkThenGrown_ThenTheOldContentDoesNotResurface` | A file shrunk and grown again reads as zeroes in the re-exposed region, never the content that used to be there. | pass | pass |
-| Brownout | `Brownout_GivenOneOfTwoCapacityMembersCollapses_ThenNewFilesGoToTheHealthyOne` | With two capacity members and one collapsed, new files are placed on the healthy one rather than spread evenly into the wall. | **FAIL** | pass |
+| Brownout | `Brownout_GivenOneOfTwoCapacityMembersCollapses_ThenNewFilesGoToTheHealthyOne` | With two capacity members and one collapsed, new files are placed on the healthy one rather than spread evenly into the wall. | pass | pass |
 | Brownout | `Brownout_GivenSomeoneTriesToWeakenTheAckFloor_ThenThePoolRefusesToMount` | Weakening a duplicated write's ack floor to one copy is refused outright, so the pacing above cannot be configured away by accident. | pass | pass |
 | Brownout | `Brownout_GivenTheDefaultAckPolicy_ThenADuplicatedWriteIsPacedByTheSickCopy` | Under the default ack policy a duplicated write IS paced by its slowest copy — the durability promise costs exactly that. | pass | pass |
 | Brownout | `Brownout_GivenThePrimaryCopysMemberCollapses_ThenReadsAreServedFromTheHealthyCopy` | The member holding the primary copy collapses to a crawl: reads must be served from the healthy copy instead of crawling with it. | pass | pass |
@@ -112,7 +112,7 @@ Generated from run: [33905770602](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(SSD over HDD)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(SSD over HDD) | pass | pass |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(SSD over SD card)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(SSD over SD card) | pass | pass |
 | SimulatedDevice | `Throttle_GivenAMemberLimitedToAByteRate_ThenTheMountIsHeldToIt` | A member the manifest limits to a byte rate really is held to it through a real mount, rather than the limit being decoration. | pass | pass |
-| SimulatedDevice | `Throttle_GivenNoLimit_ThenTheSamePoolIsFarFaster` | The same pool without the limit is far faster, so the limit is what the previous scenario measured and not the host. | pass | pass |
+| SimulatedDevice | `Throttle_GivenNoLimit_ThenTheSamePoolIsFarFaster` | The same pool without the limit is far faster, so the limit is what the previous scenario measured and not the host. | **FAIL** | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(HDD over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(HDD over cloud) | skipped | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(RAM over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(RAM over cloud) | skipped | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(RAM over SD card)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(RAM over SD card) | skipped | pass |
@@ -120,7 +120,7 @@ Generated from run: [33905770602](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(SSD over SD card)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(SSD over SD card) | skipped | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(HDD over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Runs At The Fast Tiers Pace(HDD over cloud) | skipped | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(RAM over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Runs At The Fast Tiers Pace(RAM over cloud) | skipped | pass |
-| SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(RAM over SD card)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Runs At The Fast Tiers Pace(RAM over SD card) | skipped | **FAIL** |
+| SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(RAM over SD card)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Runs At The Fast Tiers Pace(RAM over SD card) | skipped | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(SSD over HDD)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Runs At The Fast Tiers Pace(SSD over HDD) | skipped | skipped |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(SSD over SD card)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Runs At The Fast Tiers Pace(SSD over SD card) | skipped | pass |
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(HDD over cloud)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(HDD over cloud) | pass | pass |
