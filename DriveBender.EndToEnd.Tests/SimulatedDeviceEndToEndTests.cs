@@ -96,6 +96,38 @@ public class SimulatedDeviceEndToEndTests {
 
   #region tiering across storage that is genuinely unequal
 
+  /// <summary>
+  /// Skips unless the landing zone actually has room to be one.
+  ///
+  /// <c>ChoosePrimaryTarget</c> offers a new file to the fast tier only while that tier is below its
+  /// own low watermark (75% by default) and falls back to capacity otherwise — deliberately, because
+  /// filling a nearly-full fast tier is how a landing zone stops working. So on a host whose disk is
+  /// already past that mark the pool declines to use it, every tiering claim below is false, and
+  /// nothing is wrong. That is exactly what happens on a CI worker, whose system disk runs at over
+  /// 80% used, and it is why the burst there lands on the capacity tier.
+  /// </summary>
+  private static void _RequireTheFastTierHasRoom(StorageKind fast) {
+    var where = fast.Path ?? Path.GetTempPath();
+    double used;
+    try {
+      var drive = new DriveInfo(OperatingSystem.IsWindows() ? Path.GetPathRoot(where)! : where);
+      if (drive.TotalSize <= 0)
+        return; // cannot tell; let the scenario run rather than skip on a failed probe
+
+      used = 1.0 - drive.AvailableFreeSpace / (double)drive.TotalSize;
+    } catch (Exception) {
+      return;
+    }
+
+    const double lowWatermark = 0.75; // tiers.fast.lowWatermark
+    if (used > lowWatermark)
+      Assert.Ignore(
+        $"the landing zone would sit on '{where}', which is {used * 100:F0}% used — past the fast "
+        + $"tier's {lowWatermark * 100:F0}% low watermark, so the pool correctly refuses to place new "
+        + "data there and no tiering claim can be demonstrated on this host.");
+  }
+
+
   /// <summary>Fast tier in front of slow capacity, across the range of speeds a real pool meets.</summary>
   private static IEnumerable<TestCaseData> _TieringPairs() {
     yield return new TestCaseData(StorageKind.Ram, StorageKind.SimulatedSdCard).SetName("{m}(RAM over SD card)");
@@ -116,21 +148,13 @@ public class SimulatedDeviceEndToEndTests {
     // it read 186 MiB/s against the capacity tier's 140, which IS faster and is not convincingly so.
     // Skipping is the honest answer; lowering the bar until this pairing passed would have made the
     // scenario agree with itself on every pairing while distinguishing nothing.
-    // HELD BACK on Windows, where the claim does not currently hold. Measured on the CI runner with
-    // the control below, which pays exactly the same overheads: 32 MiB absorbed at 22.5 MiB/s
-    // through a landing zone against 23.4 MiB/s written straight to the capacity tier; 12 MiB at
-    // 9.8 against 10.4; and with a slower capacity tier, 3.8 against 3.6. The same scenarios on
-    // Linux read 115 against 30 and 61 against 11. A tiered pool on the WinFsp path is therefore
-    // being paced by its CAPACITY tier, which is the one thing a landing zone exists to prevent —
-    // and the burst never even reaches the size where the fast tier would have to drain.
-    //
-    // Not weakened to pass, and not deleted: it runs and must keep passing on Linux, and this is
-    // recorded in docs/Issues.md so the Windows half is a known defect rather than a green tick.
-    if (OperatingSystem.IsWindows())
-      Assert.Ignore(
-        "Held back on Windows: a tiered pool absorbs a burst at its CAPACITY tier's pace there "
-        + "(22.5 MiB/s against 23.4 writing straight to the slow tier), where Linux shows a 4-6x "
-        + "gain. See docs/Issues.md.");
+    // The landing zone has to have room to BE one; see _RequireTheFastTierHasRoom. This replaced a
+    // blanket hold-back on Windows, which was the wrong diagnosis: the burst was landing on the
+    // capacity tier there because the runner's system disk sits past the fast tier's low watermark
+    // and the pool was correctly declining to fill it, not because tiering is broken on that
+    // platform. The companion scenario above is what settled it, by asking where the data went
+    // instead of how fast it got there.
+    _RequireTheFastTierHasRoom(fast);
 
     const double neededSpread = 4.0;
     if (fast.MaxThroughput > 0 && fast.MaxThroughput < slow.MaxThroughput * neededSpread)
@@ -188,6 +212,8 @@ public class SimulatedDeviceEndToEndTests {
     // fault is in placement; if it IS, placement is fine and whatever paces the write sits
     // downstream of it. Either answer narrows the search, and neither depends on how fast the
     // machine happens to be.
+    _RequireTheFastTierHasRoom(fast);
+
     using var pool = MountedPool.Create(members: 2, landingZones: 1, storageKinds: [fast, slow]);
 
     var size = (int)Math.Min(slow.MaxThroughput * 2, 16 * 1024 * 1024);

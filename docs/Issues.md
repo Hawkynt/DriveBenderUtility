@@ -613,38 +613,33 @@ Two details worth keeping:
 Settable from the dashboard per member, applied to a RUNNING pool — which is the situation the whole
 setting exists for, since the disk you need to ease off is rarely one you can take offline.
 
-### Open: a landing zone absorbs nothing on Windows — the burst runs at the CAPACITY tier's pace
+### Withdrawn: "a landing zone absorbs nothing on Windows" was the host, not the product
 
-Found by giving the tiering claim a control instead of an absolute bar: the same burst written to a
-pool that is only the slow tier, on the same machine, moments earlier. Both sides then pay the same
-journal, staging and fsync costs, so what is left is the tier. Measured on the CI runners:
+Recorded in this file one pass ago as an open defect, on measurements that were real and a conclusion
+that was wrong. Withdrawn here rather than quietly deleted, because how it was settled is the useful
+part.
 
-| landing zone over capacity | through the landing zone | straight to capacity |
-| --- | ---: | ---: |
-| RAM over SD card — Linux | 115 MiB/s | 30 MiB/s |
-| RAM over cloud — Linux | 61 MiB/s | 11 MiB/s |
-| RAM over SD card — **Windows** | **22.5 MiB/s** | 23.4 MiB/s |
-| RAM over cloud — **Windows** | **9.8 MiB/s** | 10.4 MiB/s |
-| SSD over SD card — **Windows** | **22.5 MiB/s** | 23.3 MiB/s |
-| HDD over cloud — **Windows** | **3.8 MiB/s** | 3.6 MiB/s |
+The measurement stands: on the Windows runner a tiered pool absorbed a burst at its capacity tier's
+pace across four pairings, where Linux showed a 4-6x gain. What was missing was WHY, and a rate
+cannot say — so a companion scenario was added that needs no clock and asks a different question:
+where did the data physically land? It answered `fast tier: False, capacity: True`.
 
-On Linux the fast tier is doing exactly what it is for. On Windows it is worth nothing: every pairing
-lands within a few percent of writing straight to the slow disk, which is the one outcome a landing
-zone exists to prevent. The bursts are small enough that the drainer has barely started, so this is
-the INTAKE being paced by the capacity tier rather than a drain competing with it.
+That is `ChoosePrimaryTarget` doing exactly what it should. It offers a new file to the fast tier only
+while that tier is below its own low watermark (75% by default) and falls back to capacity otherwise,
+because filling a nearly-full fast tier is how a landing zone stops working. A GitHub Windows runner's
+system disk sits past that mark, so the pool declined to use the landing zone and wrote straight to
+capacity — correctly, and with no defect anywhere in it.
 
-A timing-free companion scenario now runs on BOTH platforms and reports where the burst physically
-landed. It asserts only what needs no clock — that new data goes to the landing zone — so whichever
-way it falls on Windows it narrows the search: if the burst is not on the fast tier the fault is in
-placement, and if it is, placement is fine and whatever paces the write sits downstream of it.
+Both scenarios now state that precondition and skip when it is absent, on any platform, with the
+used fraction in the reason. The blanket "held back on Windows" they carried was a wrong diagnosis
+wearing the clothes of a known issue.
 
-Not diagnosed further than that, because it needs a Windows machine to instrument and this pass had none —
-what is established is that the effect is real, reproducible across four pairings and two capacity
-speeds, and specific to that platform. Note that
-`TieringEndToEndTests.Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` passes
-on Windows, so files DO land on the fast tier there; whatever paces the write is downstream of
-placement. The scenario is held back on Windows with the measurements in its skip reason rather than
-weakened, so it keeps failing honestly on Linux if the gain ever disappears there too.
+**What the episode did surface, and it is worth keeping**:
+`TieringEndToEndTests.Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` has
+been green on Windows throughout, and could not have caught any of this. It computes
+`landedOnFastTier` and then only ever ASSERTS `drainedToCapacity`, mentioning the first in the
+failure message of the second. A file that went straight to capacity and never touched the landing
+zone satisfies it. The scenario that found this is the first to assert where new data actually goes.
 
 ### The pool's own bulk copies ignored the rate limit set on the disk they were writing to
 
