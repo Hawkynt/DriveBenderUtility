@@ -46,6 +46,22 @@ public sealed record PoolMemberDefinition {
   [JsonConverter(typeof(ByteSizeJsonConverter))]
   public long MaxThroughput { get; init; }
 
+  /// <summary>
+  /// The full per-kind limit set (§6.4). Null on a manifest written before it existed, and on any
+  /// pool that only ever needed the simple one rate — <see cref="EffectiveLimits"/> folds the two
+  /// together so nothing downstream has to know which shape it is reading.
+  /// </summary>
+  [JsonPropertyName("limits")] public MemberLimits? Limits { get; init; }
+
+  /// <summary>
+  /// What this member is actually held to: the detailed block when it is there, otherwise the
+  /// legacy pair, which means the same thing as a simple one-rate-for-everything limit.
+  /// </summary>
+  [JsonIgnore]
+  public MemberLimits EffectiveLimits => this.Limits is { } detailed && detailed.Any
+    ? detailed with { MaxIops = detailed.MaxIops > 0 ? detailed.MaxIops : this.MaxIops }
+    : MemberLimits.Simple(this.MaxIops, this.MaxThroughput);
+
   /// <summary>Indirect OS-credential-store reference for network members — never a plaintext secret (SEC-CRED).</summary>
   [JsonPropertyName("credential")] public string? Credential { get; init; }
 

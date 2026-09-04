@@ -135,8 +135,20 @@ public sealed class VolumeQueues {
   /// operation (a block read, a block write) and is never held across a call back into the
   /// engine, so admission can never be part of a cycle.
   /// </summary>
-  public Admission Enter(IVolumeIO volume, long bytes = 0) {
-    this._Throttle(volume, bytes);
+  public Admission Enter(IVolumeIO volume, long bytes = 0) => this.Enter(volume, IoKind.Write, bytes);
+
+  /// <summary>
+  /// Waits for room at the device behind <paramref name="volume"/>, holding it to whatever its
+  /// manifest allows for this KIND of operation.
+  ///
+  /// The kind matters because the three compete for a disk on different terms: a read is what an
+  /// application is blocked on, a write is what it is blocked on to be safe, and background work is
+  /// the pool's own housekeeping, which moves far more data than either and which nobody is waiting
+  /// for. An operator who wants to leave a disk usable for something else needs to hold the last one
+  /// down without touching the first two.
+  /// </summary>
+  public Admission Enter(IVolumeIO volume, IoKind kind, long bytes) {
+    this._Throttle(volume, kind, bytes);
     var gate = this._GateFor(volume);
     return gate.Wait(_ADMISSION_TIMEOUT) ? new(gate) : new(null); // over-subscribe rather than stall
   }
@@ -155,11 +167,20 @@ public sealed class VolumeQueues {
   /// itself. Combined with load-aware placement, a throttled member simply receives less work: its
   /// in-flight count stays high, and new files go elsewhere.
   /// </summary>
-  private void _Throttle(IVolumeIO volume, long bytes) {
+  private void _Throttle(IVolumeIO volume, IoKind kind, long bytes) {
     if (!this._throttles.TryGetValue(volume.MemberId, out var throttle))
       return;
 
-    var wait = throttle.Reserve(bytes);
+    var wait = throttle.Reserve(kind, bytes);
+
+    // A limit is a target; the delay cap is the promise that honouring it costs no more than this.
+    // Past the cap the operation proceeds having paid what it could, so a limit set far too low can
+    // slow a pool down and can never wedge it. It bounds the QUEUEING only — device I/O already in
+    // flight cannot be cancelled on a synchronous handle, and pretending otherwise would be a
+    // guarantee the engine cannot keep.
+    if (throttle.DelayCapFor(kind) is { } cap && wait > cap)
+      wait = cap;
+
     this._RecordWait(volume.MemberId, wait);
     if (wait > TimeSpan.Zero)
       Thread.Sleep(wait);
@@ -194,15 +215,19 @@ public sealed class VolumeQueues {
   private readonly ConcurrentDictionary<Guid, MemberThrottle> _throttles = new();
 
   /// <summary>Applies per-member rate limits; a member absent from the map is unlimited.</summary>
-  public void SetThrottles(IEnumerable<(Guid MemberId, int MaxIops, long MaxThroughput)> limits) {
+  public void SetThrottles(IEnumerable<(Guid MemberId, MemberLimits Limits)> limits) {
     this._throttles.Clear();
     // the recorded cost describes the limits that were in force; a member whose limit was just
     // lifted must not go on being avoided for a history that no longer applies
     this._throttleWaitMs.Clear();
-    foreach (var (memberId, maxIops, maxThroughput) in limits)
-      if (maxIops > 0 || maxThroughput > 0)
-        this._throttles[memberId] = new(maxIops, maxThroughput);
+    foreach (var (memberId, member) in limits)
+      if (member.Any)
+        this._throttles[memberId] = new(member);
   }
+
+  /// <summary>The simple shape, kept because most callers and every older manifest still speak it.</summary>
+  public void SetThrottles(IEnumerable<(Guid MemberId, int MaxIops, long MaxThroughput)> limits)
+    => this.SetThrottles(limits.Select(l => (l.MemberId, MemberLimits.Simple(l.MaxIops, l.MaxThroughput))));
 
   /// <summary>
   /// A pair of token buckets — one counting operations, one counting bytes.
@@ -212,29 +237,54 @@ public sealed class VolumeQueues {
   /// fixed window: a window lets a caller spend the whole allowance instantly and then stall for
   /// the remainder, which reads to a user as a stutter rather than a limit.
   /// </summary>
-  private sealed class MemberThrottle(int maxIops, long maxThroughput) {
+  private sealed class MemberThrottle(MemberLimits limits) {
     private readonly Lock _lock = new();
-    private double _operations = maxIops;
-    private double _bytes = maxThroughput;
+    private double _operations = limits.MaxIops;
+
+    // One byte bucket PER KIND. Sharing a single bucket would make the three rates meaningless the
+    // moment more than one of them was set: a heal at its own generous rate would spend the credit a
+    // read was about to need, and the read's limit would describe nothing.
+    private readonly double[] _bytes = [
+      limits.ThroughputFor(IoKind.Read),
+      limits.ThroughputFor(IoKind.Write),
+      limits.ThroughputFor(IoKind.Background),
+    ];
+
     private long _lastTicks = Environment.TickCount64;
 
-    public TimeSpan Reserve(long bytes) {
+    public TimeSpan? DelayCapFor(IoKind kind) => limits.DelayCapFor(kind);
+
+    public TimeSpan Reserve(IoKind kind, long bytes) {
+      var rate = limits.ThroughputFor(kind);
+      var index = (int)kind;
+
       lock (this._lock) {
         var now = Environment.TickCount64;
         var elapsed = Math.Max(0, now - this._lastTicks) / 1000.0;
         this._lastTicks = now;
 
         var wait = 0.0;
-        if (maxIops > 0) {
-          this._operations = Math.Min(maxIops, this._operations + elapsed * maxIops) - 1;
+
+        // operations are counted whatever their kind: a seek is a seek, and a disk that runs out of
+        // them does not care what the caller wanted
+        if (limits.MaxIops > 0) {
+          this._operations = Math.Min(limits.MaxIops, this._operations + elapsed * limits.MaxIops) - 1;
           if (this._operations < 0)
-            wait = Math.Max(wait, -this._operations / maxIops);
+            wait = Math.Max(wait, -this._operations / limits.MaxIops);
         }
 
-        if (maxThroughput > 0 && bytes > 0) {
-          this._bytes = Math.Min(maxThroughput, this._bytes + elapsed * maxThroughput) - bytes;
-          if (this._bytes < 0)
-            wait = Math.Max(wait, -this._bytes / (double)maxThroughput);
+        // every bucket refills, not just the one being spent, or a kind that goes quiet for a while
+        // would come back with no credit and pay for its own idleness
+        for (var each = 0; each < this._bytes.Length; ++each) {
+          var eachRate = limits.ThroughputFor((IoKind)each);
+          if (eachRate > 0)
+            this._bytes[each] = Math.Min(eachRate, this._bytes[each] + elapsed * eachRate);
+        }
+
+        if (rate > 0 && bytes > 0) {
+          this._bytes[index] -= bytes;
+          if (this._bytes[index] < 0)
+            wait = Math.Max(wait, -this._bytes[index] / (double)rate);
         }
 
         return TimeSpan.FromSeconds(wait);

@@ -179,6 +179,38 @@ public class SimulatedDeviceEndToEndTests {
 
   [TestCaseSource(nameof(_TieringPairs))]
   [Category("EdgeCase")]
+  [Description("A burst written to a tiered pool lands on the FAST tier, which is the timing-free half of what a landing zone promises.")]
+  public void Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(
+    StorageKind fast, StorageKind slow) {
+    // The rate half of this claim is held back on Windows, where a tiered pool absorbs at its
+    // capacity tier's pace. This is the half that needs no clock, and it runs everywhere — so it
+    // says which of the two possible causes is at work. If the burst is NOT on the fast tier, the
+    // fault is in placement; if it IS, placement is fine and whatever paces the write sits
+    // downstream of it. Either answer narrows the search, and neither depends on how fast the
+    // machine happens to be.
+    using var pool = MountedPool.Create(members: 2, landingZones: 1, storageKinds: [fast, slow]);
+
+    var size = (int)Math.Min(slow.MaxThroughput * 2, 16 * 1024 * 1024);
+    var content = _Payload(size, 913);
+    File.WriteAllBytes(pool.PathTo("lands.bin"), content);
+
+    // read back through the mount first: a placement question is only interesting if the data is right
+    File.ReadAllBytes(pool.PathTo("lands.bin")).Should().Equal(content, "the burst must round-trip");
+
+    // where it physically is, RIGHT NOW — before the drainer has had time to move it down
+    var onFastTier = File.Exists(Path.Combine(pool.MemberPaths[0], "lands.bin"));
+    var onCapacity = File.Exists(Path.Combine(pool.MemberPaths[1], "lands.bin"));
+    TestContext.Out.WriteLine(
+      $"[tiering] {fast} over {slow}: {size / (1024 * 1024)} MiB landed — fast tier: {onFastTier}, capacity: {onCapacity}");
+
+    onFastTier.Should().BeTrue(
+      $"new data goes to the landing zone and drains down later (FR-LZ-DRAIN); finding it on the "
+      + $"capacity tier instead would mean placement never used the fast tier at all."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+  }
+
+  [TestCaseSource(nameof(_TieringPairs))]
+  [Category("EdgeCase")]
   [Description("Everything the fast tier absorbed reaches the slow capacity tier byte-for-byte when the drainer moves it down.")]
   public void Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(StorageKind fast, StorageKind slow) {
     using var pool = MountedPool.Create(members: 2, landingZones: 1, storageKinds: [fast, slow]);

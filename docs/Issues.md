@@ -578,6 +578,41 @@ dropped from about 46 minutes to under 20. Two lessons, both cheap:
   could only fail — several hundred file reads and as many exceptions per `status`, and per each of
   the hundred polls one `unmount` makes. It now only considers files named for a pool id.
 
+### Per-kind I/O limits, so a disk can be left usable for everything else
+
+`maxThroughput` was one number covering every operation, which is the right default and a blunt
+instrument. The three kinds of work a pool does compete for a disk on completely different terms: a
+READ is what an application is blocked on, a WRITE is what it is blocked on to be safe, and
+BACKGROUND — a landing-zone drain, a duplication heal, a media exchange — moves far more data than
+either and nobody is waiting for it. Holding the last one down while leaving the first two alone is
+most of what "leave some of this disk for something else" means, and it could not be expressed.
+
+Three shapes now, and the advanced dialog offers exactly those: **none**; **simple**, one rate for
+everything including the pool's own copying; or **advanced**, a separate rate for reads, writes and
+healing/exchanging. Operations per second sits alongside them, because a seek-bound disk runs out of
+those before it runs out of bandwidth.
+
+**Time limits, in the same three shapes**, and they mean something narrower than the word usually
+does: a limit is a target, and the time limit is the promise that honouring it costs no more than
+this. Past it the operation proceeds having paid what it could. That is deliberate — it means a rate
+typed in wrong can slow a pool down and can never wedge it, and an operator who mistypes a number has
+a way back that does not involve unmounting. It bounds the QUEUEING only; device I/O already in
+flight cannot be cancelled on a synchronous handle, and claiming otherwise would be a guarantee the
+engine cannot keep.
+
+Two details worth keeping:
+
+- **Each kind gets its own token bucket, and every bucket refills whether or not it is being spent.**
+  A shared bucket would make three rates meaningless the moment more than one was set — a heal at its
+  own generous rate would spend the credit a read was about to need. And refilling only the bucket in
+  use would make a kind that goes quiet pay for its own idleness when it came back.
+- **Older manifests keep meaning what they meant.** `maxIops`/`maxThroughput` read as the simple
+  shape, the detailed block is written beside them rather than instead of them, and the two are kept
+  in step so nothing that only knows the old shape can read a manifest and be misled by it.
+
+Settable from the dashboard per member, applied to a RUNNING pool — which is the situation the whole
+setting exists for, since the disk you need to ease off is rarely one you can take offline.
+
 ### Open: a landing zone absorbs nothing on Windows — the burst runs at the CAPACITY tier's pace
 
 Found by giving the tiering claim a control instead of an absolute bar: the same burst written to a
@@ -598,7 +633,12 @@ lands within a few percent of writing straight to the slow disk, which is the on
 zone exists to prevent. The bursts are small enough that the drainer has barely started, so this is
 the INTAKE being paced by the capacity tier rather than a drain competing with it.
 
-Not diagnosed further, because it needs a Windows machine to instrument and this pass had none —
+A timing-free companion scenario now runs on BOTH platforms and reports where the burst physically
+landed. It asserts only what needs no clock — that new data goes to the landing zone — so whichever
+way it falls on Windows it narrows the search: if the burst is not on the fast tier the fault is in
+placement, and if it is, placement is fine and whatever paces the write sits downstream of it.
+
+Not diagnosed further than that, because it needs a Windows machine to instrument and this pass had none —
 what is established is that the effect is real, reproducible across four pairings and two capacity
 speeds, and specific to that platform. Note that
 `TieringEndToEndTests.Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` passes

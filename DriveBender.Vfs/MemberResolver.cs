@@ -21,6 +21,9 @@ public sealed record PoolMember(
   /// <summary>Rate limits for this storage, null meaning unlimited (see the manifest for why).</summary>
   public int MaxIops { get; init; }
   public long MaxThroughput { get; init; }
+
+  /// <summary>Every knob this member is held to, per kind of operation; never null.</summary>
+  public MemberLimits Limits { get; init; } = MemberLimits.None;
 }
 
 /// <summary>
@@ -62,6 +65,7 @@ public sealed class MemberResolver(IHostEnvironment host, ManifestStore store, I
       Label = definition.Label,
       MaxIops = definition.MaxIops,
       MaxThroughput = definition.MaxThroughput,
+      Limits = definition.EffectiveLimits,
     };
   }
 
@@ -77,6 +81,7 @@ public sealed class MemberResolver(IHostEnvironment host, ManifestStore store, I
       PathChanged = pathChanged,
       MaxIops = definition.MaxIops,
       MaxThroughput = definition.MaxThroughput,
+      Limits = definition.EffectiveLimits,
     };
   }
 

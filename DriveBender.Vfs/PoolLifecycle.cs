@@ -157,6 +157,46 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     return store.Save(updated);
   }
 
+  /// <summary>
+  /// Sets what a member may be asked to do, per kind of operation (§6.4).
+  ///
+  /// Written to the manifest rather than applied in memory, because the point of the setting is that
+  /// it survives — an operator who has told the pool to leave a disk some room means it to still be
+  /// true after a remount. A mounted pool picks it up live; nothing has to be unmounted to ease off
+  /// a disk that is struggling right now, which is the situation the setting exists for.
+  /// </summary>
+  public PoolManifest SetMemberLimits(PoolManifest manifest, Guid memberId, MemberLimits limits) {
+    if (manifest.IsVirtual)
+      throw new ManifestException("Adopt the native pool first (pool adopt) before editing its members");
+
+    var member = manifest.FindMember(memberId)
+                 ?? throw new ManifestException($"Pool '{manifest.Name}' has no member '{memberId}'");
+
+    foreach (var (what, value) in new (string, long)[] {
+               ("maxIops", limits.MaxIops), ("maxThroughput", limits.MaxThroughput),
+               ("readThroughput", limits.ReadThroughput), ("writeThroughput", limits.WriteThroughput),
+               ("backgroundThroughput", limits.BackgroundThroughput),
+               ("timeoutMs", limits.TimeoutMs), ("readTimeoutMs", limits.ReadTimeoutMs),
+               ("writeTimeoutMs", limits.WriteTimeoutMs), ("backgroundTimeoutMs", limits.BackgroundTimeoutMs),
+             })
+      if (value < 0)
+        throw new ManifestException($"'{what}' cannot be negative (got {value})");
+
+    // the legacy pair stays in step with the block, so a manifest stays readable by anything that
+    // only knows the old shape — and so the two can never disagree about the simple rate
+    var updated = manifest with {
+      Members = [.. manifest.Members.Select(m => m.MemberId == memberId
+        ? m with { Limits = limits.Any ? limits : null, MaxIops = limits.MaxIops, MaxThroughput = limits.MaxThroughput }
+        : m)],
+    };
+
+    DriveBender.Logger(limits.Any
+      ? $"Member '{member.Label ?? member.Path}' of pool '{manifest.Name}' is now rate-limited"
+      : $"Member '{member.Label ?? member.Path}' of pool '{manifest.Name}' is no longer rate-limited");
+
+    return store.Save(updated);
+  }
+
   /// <summary>Removes a member from the manifest; its data stays untouched — only our sidecars are removed.</summary>
   public PoolManifest RemoveMember(PoolManifest manifest, Guid memberId) {
     var member = manifest.FindMember(memberId)
