@@ -55,11 +55,19 @@ public sealed record StorageKind(string Name, string? Path, int MaxIops, long Ma
   /// </summary>
   public static IReadOnlyList<StorageKind> RealDevices {
     get {
-      var kinds = new List<StorageKind> { Ram with { Name = $"{System.IO.Path.GetTempPath()} (real)" } };
+      var kinds = new List<StorageKind> { Ram with { Name = "temp directory" } };
       foreach (var device in StorageDevices.Fastest)
-        // the whole path, not its last segment: "/var/tmp" and "/tmp" both end in "tmp", and a case
-        // named for the wrong one of those is worse than a long name
-        kinds.Add(Real($"{device.Path} ({device.WriteMiBPerSecond:F0} MiB/s)", device.Path));
+        // The path, and NOTHING MEASURED. A parameterised scenario's name becomes its identity —
+        // it is what the generated coverage matrix lists and what any history is keyed on — so a
+        // measured rate in it renames the case on every run. That is not cosmetic: CI regenerates
+        // the matrix from the results and commits it when the content changed, so a name that
+        // changes every run means a fresh commit every run, which resets the branch's checks and
+        // never converges. The rate belongs in the scenario's OUTPUT, where it is evidence rather
+        // than identity.
+        //
+        // The whole path rather than its last segment, because "/var/tmp" and "/tmp" both end in
+        // "tmp" and a case named for the wrong one of those is worse than a long name.
+        kinds.Add(Real(device.Path, device.Path));
 
       return kinds;
     }
