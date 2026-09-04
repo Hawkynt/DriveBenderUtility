@@ -180,7 +180,15 @@ public class SimulatedDeviceEndToEndTests {
 
   [TestCaseSource(nameof(_TieringPairs))]
   [Category("Performance")]
-  [Description("A write burst that fits the landing zone is absorbed at the FAST tier's pace, whatever the capacity tier behind it costs.")]
+  [Explicit("Benchmark: a 32 MiB burst takes a second or two, and at that size the driver, the "
+            + "journal and the fsync are most of it — so on a shared runner the number says more "
+            + "about the machine than the tier. Measured there across several runs it read 115, 46 "
+            + "and 17 MiB/s against controls of 30, 30 and 23; the last of those puts the tiered "
+            + "pool BELOW a single slow member, which is not a thing the pool did. Run it "
+            + "deliberately on a quiet machine and read the printed numbers. The half of this claim "
+            + "that needs no clock — that new data lands on the fast tier — is next door and stays "
+            + "in the battery.")]
+  [Description("Prices a write burst absorbed through a landing zone against the same burst written straight to the capacity tier.")]
   public void Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(
     StorageKind fast, StorageKind slow) {
     // The claim needs headroom to be visible. Against a capacity tier at 140 MiB/s, a landing zone

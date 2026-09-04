@@ -634,6 +634,14 @@ Both scenarios now state that precondition and skip when it is absent, on any pl
 used fraction in the reason. The blanket "held back on Windows" they carried was a wrong diagnosis
 wearing the clothes of a known issue.
 
+**And the rate half is now `[Explicit]`, like the rest of the benchmarks.** A 32 MiB burst takes a
+second or two, and at that size the driver, the journal and the fsync are most of it — so on a shared
+runner the number says more about the machine than about the tier. Across several CI runs the same
+comparison read 115, 46 and 17 MiB/s against controls of 30, 30 and 23; the last puts the tiered pool
+BELOW a single slow member, which is not something the pool did. Chasing that with ever-looser bars
+was fitting a test to a machine. The half that needs no clock — that new data lands on the fast tier —
+stays in the battery, where it is worth having.
+
 **What the episode did surface, and it is worth keeping**:
 `TieringEndToEndTests.Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` has
 been green on Windows throughout, and could not have caught any of this. It computes
