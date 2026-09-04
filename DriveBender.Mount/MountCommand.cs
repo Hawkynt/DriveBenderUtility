@@ -139,6 +139,7 @@ internal static class MountCommand {
       var config = ConfigResolver.ResolveEffective(globalJson, manifest.Defaults?.GetRawText());
       fs.ReloadConfig(config);
       fs.UpdateMemberRoles(manifest.Members.ToDictionary(m => m.MemberId, m => m.Role)); // tier changes act on new writes immediately
+      fs.UpdateMemberLimits(manifest.Members.Select(m => (m.MemberId, m.MaxIops, m.MaxThroughput)));
 
       // raising the duplication level owes new copies — hand that to the background heal job
       // (it converges incrementally via the scheduler) instead of a blocking RestorePool that
@@ -284,6 +285,7 @@ internal static class MountCommand {
     var entry = new MountEntry { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = backend, StartedUtc = DateTime.UtcNow.ToString("O") };
     registry.Register(entry);
     var metrics = new MetricsPublisher(host);
+    var smartCache = new MemberSmartCache(new SmartctlMonitor());
     using (mountHost) {
       var scheduler = fs.CreateScheduler();
       using var stop = new ManualResetEventSlim();
@@ -300,7 +302,10 @@ internal static class MountCommand {
         // must never take the driver-event loop down with it (process-isolation hardening)
         try {
           scheduler.Pump();
-          metrics.Publish(fs, entry, ios); // live snapshot for the serve daemon (§6.13)
+          // SMART is sampled on its own thread and only every few minutes; this hands the publish
+          // whatever was last learned rather than shelling out to smartctl on the pump
+          smartCache.RefreshInBackground(ios, m => m.PhysicalVolumeId);
+          metrics.Publish(fs, entry, ios, smartCache.Current); // live snapshot for the serve daemon (§6.13)
           if (registry.ConsumeReload(pool.PoolId)) // the daemon changed settings — apply them live
             currentConfig = _ReloadLive(host, store, fs, pool, ios) ?? currentConfig;
           foreach (var (opId, op) in registry.ConsumeOps(pool.PoolId)) { // manager-filed pool work runs HERE, in the pool's process
@@ -360,6 +365,7 @@ internal static class MountCommand {
 
     var fuseEntry = new MountEntry { PoolId = pool.PoolId, Name = pool.Name, Target = target, ProcessId = Environment.ProcessId, Backend = "fuse", StartedUtc = DateTime.UtcNow.ToString("O") };
     var fuseMetrics = new MetricsPublisher(host);
+    var fuseSmart = new MemberSmartCache(new SmartctlMonitor());
     var fuseConfig = config;
     var fuseAdvisor = new AutoTierAdvisor();
     var fuseTick = 0L;
@@ -368,7 +374,8 @@ internal static class MountCommand {
       stopRequested: () => registry.StopRequested(pool.PoolId),
       onUnmounted: () => { registry.Unregister(pool.PoolId); fuseMetrics.Remove(pool.PoolId); },
       onTick: () => {
-        fuseMetrics.Publish(fs, fuseEntry, ios);
+        fuseSmart.RefreshInBackground(ios, m => m.PhysicalVolumeId);
+        fuseMetrics.Publish(fs, fuseEntry, ios, fuseSmart.Current);
         if (registry.ConsumeReload(pool.PoolId))
           fuseConfig = _ReloadLive(host, store, fs, pool, ios) ?? fuseConfig;
         foreach (var (opId, op) in registry.ConsumeOps(pool.PoolId)) {

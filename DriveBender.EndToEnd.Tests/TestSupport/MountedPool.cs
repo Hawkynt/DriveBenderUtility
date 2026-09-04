@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Text;
+using NUnit.Framework;
 
 namespace DivisonM.EndToEnd.Tests.TestSupport;
 
@@ -26,13 +27,23 @@ public sealed class MountedPool : IDisposable {
   public string PoolName { get; }
   public string MountPath { get; }
   public IReadOnlyList<string> MemberPaths { get; }
+
+  /// <summary>
+  /// The REAL storage behind each member, in member order — the directory the member's link points
+  /// at. Usually a folder beside the link under <see cref="Root"/>, but a member can be placed on
+  /// another device entirely, and then it is over there.
+  /// </summary>
+  public IReadOnlyList<string> StoragePaths { get; }
+
   public string Root { get; }
 
-  private MountedPool(string poolName, string root, IReadOnlyList<string> members, string mountTarget, string mountPath,
+  private MountedPool(string poolName, string root, IReadOnlyList<string> members, IReadOnlyList<string> storages,
+    string mountTarget, string mountPath,
     string? mountDirectory, Process mountProcess, StringBuilder stdout, StringBuilder stderr) {
     this.PoolName = poolName;
     this.Root = root;
     this.MemberPaths = members;
+    this.StoragePaths = storages;
     this.MountPath = mountPath;
     this._mountDirectory = mountDirectory;
     this._mountProcess = mountProcess;
@@ -61,8 +72,27 @@ public sealed class MountedPool : IDisposable {
   /// </summary>
   /// <param name="poolDefaults">JSON for the manifest's "defaults" block, or null for the built-ins.</param>
   /// <param name="landingZones">How many of the members form the fast tier, taken from the front.</param>
-  public static MountedPool Create(int members = 2, string? poolDefaults = null, int landingZones = 0) {
+  /// <param name="storageDevices">
+  /// Where each member's real storage is put, by member index. A null entry (or a short list) means
+  /// "beside the link, on whatever device the temp directory is on", which is what every ordinary
+  /// scenario wants. Naming a directory on ANOTHER device is what lets a scenario price a genuinely
+  /// heterogeneous pool — a fast landing zone with slow capacity behind it — rather than two folders
+  /// on one disk, which can only price the code path.
+  /// </param>
+  /// <param name="storageKinds">
+  /// What kind of storage each member sits on, by index — a real device, a simulated one, or both.
+  /// A kind with a path puts the member's storage on that device; a kind with a rate limit has the
+  /// pool hold the member to it. This is how a scenario builds a pool whose tiers are genuinely
+  /// unequal without needing the hardware to be.
+  /// </param>
+  public static MountedPool Create(int members = 2, string? poolDefaults = null, int landingZones = 0,
+    IReadOnlyList<string?>? storageDevices = null, IReadOnlyList<StorageKind?>? storageKinds = null) {
     DriverPrerequisite.RequireAvailable();
+
+    // a kind may carry a device as well as a limit; the explicit device list still wins where given
+    if (storageKinds != null && storageDevices == null)
+      storageDevices = [.. Enumerable.Range(0, members)
+        .Select(i => i < storageKinds.Count ? storageKinds[i]?.Path : null)];
 
     var poolName = "e2e" + Guid.NewGuid().ToString("N")[..10];
     var root = Path.Combine(Path.GetTempPath(), "dbe2e-" + Guid.NewGuid().ToString("N"));
@@ -71,16 +101,41 @@ public sealed class MountedPool : IDisposable {
     // removing the link detaches the storage without touching the files behind it, so a disk can
     // be pulled from under LIVE I/O — which renaming the directory cannot do, because Windows
     // refuses to rename a directory that has open files beneath it. Junctions need no privileges.
-    var memberPaths = new List<string>();
-    for (var i = 0; i < members; ++i) {
-      var storage = Path.Combine(root, $"store{i}");
-      var member = Path.Combine(root, $"m{i}");
-      Directory.CreateDirectory(storage);
-      _Link(member, storage);
-      memberPaths.Add(member);
-    }
+    // the root has to exist before the first LINK is made inside it. It used to appear as a side
+    // effect of creating "root/store0"; a member whose storage lives on another device creates
+    // nothing here, and the link then failed with a directory-not-found that named the link rather
+    // than the missing parent.
+    Directory.CreateDirectory(root);
 
-    var (target, path, createdDirectory) = _ChooseMountTarget(root);
+    var memberPaths = new List<string>();
+    var storagePaths = new List<string>();
+    string target, path;
+    string? createdDirectory;
+    try {
+      for (var i = 0; i < members; ++i) {
+        var device = storageDevices != null && i < storageDevices.Count ? storageDevices[i] : null;
+        // an off-device storage gets its own uniquely named folder, because that device is shared
+        // with whatever else is on it and outlives this pool
+        var storage = device == null
+          ? Path.Combine(root, $"store{i}")
+          : Path.Combine(device, $"dbe2e-{Path.GetFileName(root)[6..]}-{i}");
+
+        var member = Path.Combine(root, $"m{i}");
+        Directory.CreateDirectory(storage);
+        storagePaths.Add(storage); // recorded BEFORE the link, so a failed link still gets cleaned up
+        _Link(member, storage);
+        memberPaths.Add(member);
+      }
+
+      (target, path, createdDirectory) = _ChooseMountTarget(root);
+    } catch {
+      // storage on ANOTHER device is not under the root, so removing the root would leave it there
+      foreach (var storage in storagePaths)
+        _TryDelete(storage);
+
+      _TryDelete(root);
+      throw;
+    }
 
     var arguments = new List<string> { "pool-create", "-n", poolName };
     for (var i = 0; i < memberPaths.Count; ++i) {
@@ -92,14 +147,23 @@ public sealed class MountedPool : IDisposable {
       DbMount.RunExpectingSuccess(_CLI_TIMEOUT, [.. arguments]);
       if (poolDefaults != null)
         DbMount.SetPoolDefaults(poolName, poolDefaults);
+
+      // rate limits go on BEFORE the first mount: they are read from the manifest when the engine
+      // builds its members, so setting them under a live pool would change nothing
+      for (var i = 0; storageKinds != null && i < memberPaths.Count && i < storageKinds.Count; ++i)
+        if (storageKinds[i] is { IsThrottled: true } kind)
+          DbMount.SetMemberLimits(poolName, memberPaths[i], kind.MaxIops, kind.MaxThroughput);
     } catch {
       DbMount.ForgetPool(poolName);
+      foreach (var storage in storagePaths)
+        _TryDelete(storage);
+
       _TryDelete(root);
       throw;
     }
 
     var mountProcess = DbMount.Start(["mount", "--manifest", poolName, "-t", target, "--foreground"], out var stdout, out var stderr);
-    var pool = new MountedPool(poolName, root, memberPaths, target, path, createdDirectory, mountProcess, stdout, stderr);
+    var pool = new MountedPool(poolName, root, memberPaths, storagePaths, target, path, createdDirectory, mountProcess, stdout, stderr);
     try {
       pool._WaitUntilMounted();
       return pool;
@@ -370,7 +434,7 @@ public sealed class MountedPool : IDisposable {
   /// is how a test can prove a write did NOT reach a disk that was away.
   /// </summary>
   public IReadOnlyList<byte[]> CopiesOnDetachedStorage(int memberIndex, string relativePath) {
-    var storage = Path.Combine(this.Root, $"store{memberIndex}");
+    var storage = this.StoragePaths[memberIndex];
     var primary = Path.Combine(storage, relativePath.Replace('/', Path.DirectorySeparatorChar));
     var parent = Path.GetDirectoryName(primary);
     var shadow = parent == null ? null : Path.Combine(parent, "FOLDER.DUPLICATE.$DRIVEBENDER", Path.GetFileName(primary));
@@ -404,7 +468,7 @@ public sealed class MountedPool : IDisposable {
   public void Eject(int memberIndex) {
     var member = this.MemberPaths[memberIndex];
     _Unlink(member);
-    this._ejected[member] = Path.Combine(this.Root, $"store{memberIndex}");
+    this._ejected[member] = this.StoragePaths[memberIndex];
 
     // the engine probes reachability on a ~1s cache, so an operation issued in the very next
     // millisecond can still be routed at the member that just vanished. Loss is documented as
@@ -442,6 +506,90 @@ public sealed class MountedPool : IDisposable {
         Thread.Sleep(250);
       }
   }
+
+  /// <summary>
+  /// Makes a member FAIL every operation while still being there — the dying disk, as opposed to
+  /// the pulled one.
+  ///
+  /// The two are different failures and the engine treats them differently: a member that vanishes
+  /// is filtered out of placement by the online probe and costs nothing afterwards, while a member
+  /// that answers every request with an error stays in the rotation and has to be routed around one
+  /// failure at a time. That second case is where a pool-wide stall comes from, and only this can
+  /// produce it. Revoking the permission bits on the storage root is the closest a test without root
+  /// can get: the path still exists, so the member is still "online", and every open beneath it
+  /// fails the way a disk with a dead controller does.
+  ///
+  /// Handles the engine already has stay valid — POSIX checks permission at open — so a member is
+  /// most convincingly crippled just after a remount, when nothing is held open.
+  /// </summary>
+  public bool Cripple(int memberIndex) {
+    if (OperatingSystem.IsWindows())
+      return false; // an ACL denial would be the equivalent, and needs a different apparatus
+
+    try {
+      var storage = this.StoragePaths[memberIndex];
+      File.SetUnixFileMode(storage, UnixFileMode.None);
+      this._crippled[memberIndex] = true;
+      return (File.GetUnixFileMode(storage) & UnixFileMode.UserRead) == 0;
+    } catch (Exception) {
+      return false; // a filesystem without permission bits (vfat, say) cannot be crippled this way
+    }
+  }
+
+  /// <summary>
+  /// Makes a member READ-ONLY while leaving it perfectly readable — the way a filesystem that hits
+  /// an I/O error remounts itself.
+  ///
+  /// This is a third failure shape, and the one most likely to be met in the field. A member that
+  /// vanishes is filtered out by the online probe; one that fails everything is routed around by the
+  /// fault cooldown; a member that answers every READ correctly and refuses every WRITE does neither
+  /// — it looks healthy to anything that only reads, and it is still holding the pool's data, so it
+  /// must keep being read from while nothing new is placed on it.
+  /// </summary>
+  public bool MakeReadOnly(int memberIndex) {
+    if (OperatingSystem.IsWindows())
+      return false; // a deny-write ACL is the equivalent and needs a different apparatus
+
+    try {
+      var storage = this.StoragePaths[memberIndex];
+      const UnixFileMode readable = UnixFileMode.UserRead | UnixFileMode.UserExecute
+                                    | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                                    | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+
+      // the whole tree, not just the root: the engine writes into subfolders it has already opened
+      foreach (var directory in Directory.EnumerateDirectories(storage, "*", SearchOption.AllDirectories))
+        File.SetUnixFileMode(directory, readable);
+
+      File.SetUnixFileMode(storage, readable);
+      this._crippled[memberIndex] = true; // Dispose restores it either way
+      return (File.GetUnixFileMode(storage) & UnixFileMode.UserWrite) == 0;
+    } catch (Exception) {
+      return false; // a filesystem without permission bits (vfat) cannot be made read-only this way
+    }
+  }
+
+  /// <summary>Gives a crippled member its permissions back, the way a controller reset would.</summary>
+  public void Uncripple(int memberIndex) {
+    if (!this._crippled.Remove(memberIndex, out _))
+      return;
+
+    try {
+      const UnixFileMode writable = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                                    | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                                    | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+
+      var storage = this.StoragePaths[memberIndex];
+      File.SetUnixFileMode(storage, writable);
+      // a read-only member had its whole tree stripped, so the whole tree is restored — otherwise
+      // the temp root cannot be removed and every later run inherits the leftovers
+      foreach (var directory in Directory.EnumerateDirectories(storage, "*", SearchOption.AllDirectories))
+        File.SetUnixFileMode(directory, writable);
+    } catch (Exception) {
+      // best effort; Dispose tries again
+    }
+  }
+
+  private readonly Dictionary<int, bool> _crippled = [];
 
   /// <summary>
   /// Unmounts cleanly and mounts again at the same target — the durability boundary a user
@@ -492,30 +640,43 @@ public sealed class MountedPool : IDisposable {
     this._mountProcess.WaitForExit(15_000);
     this._mountProcess.Dispose();
 
-    // a FUSE mount whose server was killed leaves a stale entry the kernel still routes at; the
-    // lazy unmount detaches it so the same mountpoint can be used again
-    if (!OperatingSystem.IsWindows())
-      foreach (var (file, arguments) in new[] {
-                 ("fusermount3", new[] { "-u", "-z" }),
-                 ("fusermount", ["-u", "-z"]),
-                 ("umount", ["-l"]),
-               }) {
-        if (!_IsMountPoint(this.MountPath))
-          break;
-
-        try {
-          var startInfo = new ProcessStartInfo { FileName = file, UseShellExecute = false, CreateNoWindow = true };
-          foreach (var argument in arguments)
-            startInfo.ArgumentList.Add(argument);
-
-          startInfo.ArgumentList.Add(this.MountPath);
-          Process.Start(startInfo)?.WaitForExit(15_000);
-        } catch (Exception) {
-          // that tool is not installed; try the next
-        }
-      }
-
+    this._DetachStaleMount();
     this._StartMount();
+  }
+
+  /// <summary>
+  /// Detaches a FUSE mount whose server is gone.
+  ///
+  /// Killing the mount process does not remove the kernel's mount entry: the mountpoint stays in
+  /// <c>/proc/mounts</c> and answers every access with "transport endpoint is not connected" until
+  /// something unmounts it. Nothing did, on any path but a deliberate crash — so every pool this
+  /// harness built left one behind, and a day of runs left the machine carrying dozens of dead
+  /// mounts and the directories under them, which also stopped the temp root from being removed.
+  /// The lazy flavour is the one that works here, because the entry being detached is already dead.
+  /// </summary>
+  private void _DetachStaleMount() {
+    if (OperatingSystem.IsWindows())
+      return;
+
+    foreach (var (file, arguments) in new[] {
+               ("fusermount3", new[] { "-u", "-z" }),
+               ("fusermount", ["-u", "-z"]),
+               ("umount", ["-l"]),
+             }) {
+      if (!_IsMountPoint(this.MountPath))
+        return;
+
+      try {
+        var startInfo = new ProcessStartInfo { FileName = file, UseShellExecute = false, CreateNoWindow = true };
+        foreach (var argument in arguments)
+          startInfo.ArgumentList.Add(argument);
+
+        startInfo.ArgumentList.Add(this.MountPath);
+        Process.Start(startInfo)?.WaitForExit(15_000);
+      } catch (Exception) {
+        // that tool is not installed; try the next
+      }
+    }
   }
 
   private void _StartMount() {
@@ -547,21 +708,52 @@ public sealed class MountedPool : IDisposable {
 
     this._disposed = true;
 
+    // a storage root with its permissions revoked cannot be enumerated, let alone deleted
+    foreach (var member in this._crippled.Keys.ToArray())
+      this.Uncripple(member);
+
+    // Teardown is timed and reported when it drags, because a slow one is invisible otherwise: it
+    // is charged to whichever scenario happened to own the pool, so a minute spent here reads as a
+    // slow TEST rather than a slow unmount, and a whole suite can be paced by it without anyone
+    // seeing why.
+    var teardown = Stopwatch.StartNew();
+    var verb = TimeSpan.Zero;
+    var refusal = "";
+    var killed = false;
     try {
       // ask for a CLEAN unmount first: it flushes owed copies and detaches properly, which is
       // what the teardown assertions about on-disk state depend on
-      if (!this._mountProcess.HasExited)
-        DbMount.Run(_UNMOUNT_TIMEOUT, "unmount", this.PoolName);
+      if (!this._mountProcess.HasExited) {
+        var started = teardown.Elapsed;
+        var result = DbMount.Run(_UNMOUNT_TIMEOUT, "unmount", this.PoolName);
+        verb = teardown.Elapsed - started;
+
+        // A FAILED unmount used to be discarded here, and that is how a product defect hid inside
+        // the harness for the length of a suite: the verb answered "No mounted pool matches" and
+        // exited non-zero, the pool stayed mounted, and the only visible symptom was that teardown
+        // took the full timeout and then killed the process — which reads as a slow test.
+        if (!result.Succeeded)
+          refusal = $", and the unmount verb REFUSED with exit {result.ExitCode}: {result.Output.Trim()}";
+      }
     } catch (Exception) {
       // fall through to the kill below
     }
 
     try {
-      if (!this._mountProcess.WaitForExit((int)_UNMOUNT_TIMEOUT.TotalMilliseconds))
+      if (!this._mountProcess.WaitForExit((int)_UNMOUNT_TIMEOUT.TotalMilliseconds)) {
         DbMount.KillTree(this._mountProcess);
+        killed = true;
+      }
     } catch (Exception) {
       DbMount.KillTree(this._mountProcess);
+      killed = true;
     }
+
+    teardown.Stop();
+    if (teardown.Elapsed > TimeSpan.FromSeconds(5) || refusal.Length > 0)
+      TestContext.Out.WriteLine(
+        $"[teardown] pool '{this.PoolName}' took {teardown.Elapsed.TotalSeconds:F1}s to shut down "
+        + $"(unmount verb {verb.TotalSeconds:F1}s{(killed ? ", then the process had to be killed" : "")}{refusal}).");
 
     foreach (var (member, storage) in this._ejected.ToArray())
       try {
@@ -573,10 +765,17 @@ public sealed class MountedPool : IDisposable {
 
     DbMount.ForgetPool(this.PoolName); // no CLI verb deregisters a pool; the registry entry is ours to remove
     this._mountProcess.Dispose();
+    this._DetachStaleMount(); // the kernel entry outlives the killed server; without this it accumulates
     if (this._mountDirectory != null)
       _TryDelete(this._mountDirectory);
 
     _TryDelete(this.Root);
+
+    // storage placed on ANOTHER device is not under Root, so removing the root leaves it behind —
+    // on a small removable disk that is a few runs away from filling it up
+    foreach (var storage in this.StoragePaths)
+      if (!storage.StartsWith(this.Root, StringComparison.Ordinal))
+        _TryDelete(storage);
   }
 
   private static void _TryDelete(string path) {

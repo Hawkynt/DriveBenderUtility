@@ -285,6 +285,15 @@ public sealed class MountRegistry(IHostEnvironment host) {
   public IReadOnlyList<MountEntry> List() {
     var entries = new List<MountEntry>();
     foreach (var file in host.EnumerateFiles(this._Directory, "*.json")) {
+      // A mount entry is named for its pool id and nothing else. The same directory is the whole
+      // cross-process channel, so `*.json` also matches every `<pool>.metrics.json` snapshot and
+      // every relayed-operation file in it — each of which was then read off disk and thrown at a
+      // deserializer that could only fail. A machine that had mounted a few hundred pools was
+      // paying several hundred file reads and as many exceptions for every `status`, and for each
+      // of the hundred polls one `unmount` makes.
+      if (!Guid.TryParse(Path.GetFileNameWithoutExtension(file), out _))
+        continue;
+
       MountEntry? entry;
       try {
         entry = JsonSerializer.Deserialize<MountEntry>(host.ReadAllText(file));

@@ -71,6 +71,33 @@ public class DriveLossPolicyTests {
   }
 
   [Test]
+  [Category("Exception")]
+  public void RetainMetadata_GivenAFileNeverStattedAfterItWasWritten_WhenItsOnlyMemberIsLost_ThenItIsNotReportedAsEmpty() {
+    // The scenario above WARMS the shadow namespace with a listing before pulling the member, and
+    // that warm-up is load-bearing: the shadow entry is recorded with length 0 when the file is
+    // CREATED and refreshed only by a stat that misses the metadata cache. A file that is written,
+    // closed and never looked at again therefore carries a remembered length of zero — and once its
+    // member is gone, retain-metadata answers the stat from that. The caller is then told the file
+    // exists and is empty, so a whole-file read returns NOTHING and succeeds, which is the one
+    // failure shape a storage pool must never produce: no error, no bytes, and an application that
+    // believes it.
+    var fs = this._CreateFs("retain-metadata", duplication: 1);
+    var content = new byte[] { 7, 7, 7, 7, 7 };
+    _CreateWithContent(fs, "unstatted.bin", content);
+
+    var holder = new[] { this._volume1, this._volume2 }.Single(v => v.FileExists("unstatted.bin", false));
+    holder.IsOnline = false;
+    fs.PollMembers();
+
+    // Either answer is defensible — the true length, or "not found" because no copy is reachable.
+    // A length of zero is the one that is not: it is a claim about content that is false.
+    var act = () => fs.GetAttributes("unstatted.bin");
+    if (act.Should().NotThrow().Which is { } meta)
+      meta.Length.Should().Be(content.Length,
+        "a file whose member is gone may be reported as missing or at its true size, never as empty");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public void DiscardInaccessible_GivenMemberHoldingOnlyCopyLost_WhenListed_ThenEntryDropped() {
     var fs = this._CreateFs("discard-inaccessible", duplication: 1);

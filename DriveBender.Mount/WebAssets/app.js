@@ -289,9 +289,43 @@ function credPayload(kind, v) {
   }
 }
 
+// One storage's state, as the dashboard paints it. The daemon already resolved the precedence
+// (evacuating and detached outrank whatever SMART thinks of a disk on its way out), so this only
+// has to describe what the colour MEANS — the tooltip is where an operator finds out why.
+const MEMBER_STATES = {
+  healthy:   { title: "Healthy", note: "" },
+  aging:     { title: "Aging — worth watching", note: "" },
+  warning:   { title: "Degraded — plan a replacement", note: "" },
+  failing:   { title: "FAILING — get the data off it", note: "" },
+  detached:  { title: "Detached — this storage is not connected", note: "" },
+  replacing: { title: "Being replaced — its data is moving to another disk", note: "" },
+  unknown:   { title: "Health unknown — SMART could not be read", note: "" },
+};
+
+function memberStateOf(m) {
+  const state = (m.state || (m.online ? "unknown" : "detached")).toLowerCase();
+  return MEMBER_STATES[state] ? state : "unknown";
+}
+
+/// A one-line reason for anything that is not plainly healthy, from the drive's own counters.
+function memberHealthNote(m) {
+  const bits = [];
+  if (m.pendingSectors > 0) bits.push(`${m.pendingSectors} sector(s) pending`);
+  if (m.reallocatedSectors > 0) bits.push(`${m.reallocatedSectors} reallocated`);
+  if (m.mediaErrors > 0) bits.push(`${m.mediaErrors} media error(s)`);
+  if (m.percentUsed >= 75) bits.push(`${m.percentUsed}% life used`);
+  if (m.sparePercent != null && m.sparePercent < 20) bits.push(`${m.sparePercent}% spare left`);
+  if (m.temperatureC >= 50) bits.push(`${m.temperatureC} °C`);
+  return bits.join(" · ");
+}
+
 function memberRow(pool, m) {
   const row = el("div", "member");
-  row.innerHTML = `<span class="status ${m.online ? "" : "off"}"></span>
+  const state = memberStateOf(m);
+  const meta = MEMBER_STATES[state];
+  // the tooltip carries the drive's own words: the model, and whatever smartctl actually said
+  const tip = [meta.title, m.model, m.healthDetail].filter(Boolean).join(" — ");
+  row.innerHTML = `<span class="status st-${state}" title="${esc(tip)}"></span>
     <span>${esc(m.label || m.path)}</span>${m.network ? '<span class="badge info">remote</span>' : ""}`;
   if (pool.source === "manifest") {
     // live tier reconfiguration: switching the role reflows new writes immediately on a mounted pool
@@ -320,6 +354,14 @@ function memberRow(pool, m) {
       alert("Failed: " + (j.error || ""));
   };
   row.appendChild(scatter);
+
+  // why it is not green, in the drive's own numbers — only when there is something to say, so a
+  // healthy pool stays quiet and an operator's eye is drawn to the row that changed
+  const note = memberHealthNote(m);
+  if (state !== "healthy" && (note || state === "replacing" || state === "detached")) {
+    const severity = state === "failing" ? "bad" : state === "warning" || state === "aging" ? "warn" : "";
+    row.appendChild(el("div", "healthnote " + severity, esc(note || meta.title)));
+  }
 
   // fill level: how full this storage's volume is (used vs free)
   if (m.bytesTotal > 0) {
@@ -392,8 +434,16 @@ function patchCard(c, pool) {
 
   updateFlowmap(fm, pool);
 
+  // The legend appears only when some storage is NOT plainly healthy. A permanent key would be
+  // noise on a pool that is fine, and the colours are only worth explaining at the moment one of
+  // them changes and somebody has to decide what it means.
+  const shownStates = [...new Set((pool.members || []).map(memberStateOf))].filter(x => x !== "healthy");
+  const legendHtml = shownStates.length === 0 ? "" : `<div class="legend">${
+    shownStates.map(x => `<span><i class="status st-${x}"></i>${esc(MEMBER_STATES[x].title)}</span>`).join("")}</div>`;
+
   const bottomHtml = `
     <div class="members"></div>
+    ${legendHtml}
     ${pool.warnings && pool.warnings.length ? `<div class="warnings">${pool.warnings.map(w => "<div>⚠ " + esc(w) + "</div>").join("")}</div>` : ""}
     ${m ? `<div class="activity">${(m.activity && m.activity.length ? m.activity.slice(0,10).map(a => {
       const icon = ({Read:"📖",Write:"✍️",Drain:"⬇️",Duplicate:"🔁",Rebalance:"⚖️",RemoteTransfer:"☁️",CacheAdmit:"📥",CacheEvict:"📤",Recovery:"🩹",Scrub:"🔬",TrashMove:"🗑️"})[a.kind] || "•";

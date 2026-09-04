@@ -39,17 +39,25 @@ public sealed class JobRegistry(Func<DateTime>? clock = null) {
     private object? _result;
     private long _finishedTicks; // written LAST — readers treat it as the completion fence
 
-    internal Job(string id, string kind, string pool, DateTime startedUtc, bool cancellable) {
+    internal Job(string id, string kind, string pool, DateTime startedUtc, bool cancellable, string subject = "") {
       this.Id = id;
       this.Kind = kind;
       this.Pool = pool;
       this.StartedUtc = startedUtc;
       this.Cancellable = cancellable;
+      this.Subject = subject;
     }
 
     public string Id { get; }
     public string Kind { get; }
     public string Pool { get; }
+
+    /// <summary>
+    /// What inside the pool this job is acting ON — a member id, for the operations that target
+    /// one. The dashboard uses it to mark that storage as being evacuated while the work runs, so
+    /// a disk having its data moved off it does not look like an ordinary healthy member.
+    /// </summary>
+    public string Subject { get; }
     public DateTime StartedUtc { get; }
 
     /// <summary>
@@ -123,9 +131,9 @@ public sealed class JobRegistry(Func<DateTime>? clock = null) {
   /// work is handed a cancellation token and a progress sink; a cancelled job reports as such
   /// rather than as a crash.
   /// </summary>
-  public Job Start(string kind, string pool, Func<CancellationToken, Action<JobProgress>, object> work, bool cancellable = true) {
+  public Job Start(string kind, string pool, Func<CancellationToken, Action<JobProgress>, object> work, bool cancellable = true, string subject = "") {
     this.Prune();
-    var job = new Job(Guid.NewGuid().ToString("N"), kind, pool, this._clock(), cancellable);
+    var job = new Job(Guid.NewGuid().ToString("N"), kind, pool, this._clock(), cancellable, subject);
     this._jobs[job.Id] = job;
 
     new Thread(() => {

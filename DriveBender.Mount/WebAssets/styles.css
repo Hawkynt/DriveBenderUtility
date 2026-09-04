@@ -92,8 +92,35 @@ main { padding: 22px; max-width: 1200px; margin: 0 auto; }
 /* flow-map node fill level: used = dodgerblue, free = white */
 .flowmap .filltrack { fill: #fff; }
 .flowmap .nodefill { fill: dodgerblue; transition: width .6s; }
-.member .status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.member .status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: 0 0 auto; }
 .member .status.off { background: var(--bad); }
+
+/* Storage state at a glance. The severity ramp is the familiar one (green → yellow → orange → red)
+   so it needs no legend to be read the right way round, and the two states that are NOT about
+   health sit outside it deliberately: grey for a disk that is not there to judge, violet for one
+   whose data is being moved off it. A ring rather than a fill marks "no reading available", so
+   "we cannot tell" never looks like "we checked and it is fine". */
+.member .status.st-healthy   { background: var(--ok); }
+.member .status.st-aging     { background: #d4c000; }
+.member .status.st-warning   { background: #e8912a; }
+.member .status.st-failing   { background: var(--bad); box-shadow: 0 0 0 3px rgba(248,81,73,.22); }
+.member .status.st-detached  { background: #6b7684; }
+.member .status.st-replacing { background: #a970ff; box-shadow: 0 0 0 3px rgba(169,112,255,.20); }
+.member .status.st-unknown   { background: transparent; border: 1.5px solid #6b7684; }
+
+/* a failing disk should catch the eye across the room; a slow pulse, and none at all for
+   anyone who has asked the system to stop animating things */
+@keyframes memberalarm { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+.member .status.st-failing { animation: memberalarm 1.8s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .member .status.st-failing { animation: none; } }
+
+.member .healthnote { color: var(--muted); font-size: 10.5px; flex-basis: 100%; margin-top: -2px; }
+.member .healthnote.bad { color: var(--bad); }
+.member .healthnote.warn { color: var(--warn-text); }
+
+.legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; font-size: 10.5px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 4px; }
+.legend i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 
 .spark { width: 100%; height: 44px; display: block; margin-top: 4px; }
 .spark path.area { fill: rgba(74,163,255,.12); }
