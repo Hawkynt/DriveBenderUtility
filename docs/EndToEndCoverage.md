@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33869182297](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33869182297).
+Generated from run: [33898253003](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33898253003).
 
-149 scenarios — 132 passing on at least one target, 0 failing.
+156 scenarios — 139 passing on at least one target, 5 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -70,6 +70,8 @@ Generated from run: [33869182297](https://github.com/Hawkynt/DriveBenderUtility/
 | ManagementApi | `Assets_GivenAFreshBrowser_ThenThePageAndItsScriptAndStylesAreServed` | Given AFresh Browser , then The Page And Its Script And Styles Are Served | pass | pass |
 | ManagementApi | `Job_GivenAnUnknownTicket_ThenItIsReportedRatherThanHanging` | Given An Unknown Ticket , then It Is Reported Rather Than Hanging | pass | pass |
 | ManagementApi | `LongOperation_GivenTheDriverInstallEndpoint_ThenItAnswersImmediatelyWithATicket` | Given The Driver Install Endpoint , then It Answers Immediately With ATicket | pass | pass |
+| ManagementApi | `MemberLimits_GivenAnUnknownMember_ThenItIsRefusedRatherThanSilentlyIgnored` | Given An Unknown Member , then It Is Refused Rather Than Silently Ignored | pass | pass |
+| ManagementApi | `MemberLimits_GivenEachShapeInTurn_ThenTheDashboardReportsWhatWasSet` | Given Each Shape In Turn , then The Dashboard Reports What Was Set | pass | pass |
 | ManagementApi | `PoolLifecycle_GivenCreateThenForget_ThenTheDashboardReflectsBothWithoutAMount` | Given Create , then Forget , then The Dashboard Reflects Both Without AMount | pass | pass |
 | ManagementApi | `Pools_GivenTheDashboardFrame_ThenItIsWellFormedAndCarriesTheJobList` | Given The Dashboard Frame , then It Is Well Formed And Carries The Job List | pass | pass |
 | ManagementApi | `Prereqs_GivenThisMachine_ThenTheDriverStatusIsReportedHonestly` | Given This Machine , then The Driver Status Is Reported Honestly | pass | pass |
@@ -111,6 +113,11 @@ Generated from run: [33869182297](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(SSD over SD card)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(SSD over SD card) | pass | pass |
 | SimulatedDevice | `Throttle_GivenAMemberLimitedToAByteRate_ThenTheMountIsHeldToIt` | A member the manifest limits to a byte rate really is held to it through a real mount, rather than the limit being decoration. | pass | pass |
 | SimulatedDevice | `Throttle_GivenNoLimit_ThenTheSamePoolIsFarFaster` | The same pool without the limit is far faster, so the limit is what the previous scenario measured and not the host. | pass | pass |
+| SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(HDD over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(HDD over cloud) | **FAIL** | pass |
+| SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(RAM over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(RAM over cloud) | **FAIL** | pass |
+| SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(RAM over SD card)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(RAM over SD card) | **FAIL** | pass |
+| SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(SSD over HDD)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(SSD over HDD) | **FAIL** | pass |
+| SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(SSD over SD card)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(SSD over SD card) | **FAIL** | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(HDD over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Runs At The Fast Tiers Pace(HDD over cloud) | skipped | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(RAM over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Runs At The Fast Tiers Pace(RAM over cloud) | skipped | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstRunsAtTheFastTiersPace(RAM over SD card)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Runs At The Fast Tiers Pace(RAM over SD card) | skipped | pass |
