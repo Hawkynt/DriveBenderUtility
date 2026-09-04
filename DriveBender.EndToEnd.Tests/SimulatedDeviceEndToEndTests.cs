@@ -62,6 +62,20 @@ public class SimulatedDeviceEndToEndTests {
     return stopwatch.Elapsed.TotalSeconds <= 0 ? 0 : size / stopwatch.Elapsed.TotalSeconds;
   });
 
+  /// <summary>
+  /// The limit the two premise scenarios use — deliberately far below anything a machine that can
+  /// run this suite at all will manage.
+  ///
+  /// It started as the SD-card profile's 16 MiB/s, and a CI worker that wrote at 7 MiB/s skipped
+  /// them. That was the guard behaving correctly and the CHOICE OF LIMIT being wrong, and it cost
+  /// more than a skip: whether these two run then depends on how fast the runner happens to be that
+  /// day, so the generated coverage matrix flips between "pass" and "skipped" run to run, CI commits
+  /// the regenerated matrix onto the branch each time, and the branch's checks never settle. A skip
+  /// that varies with the weather is not a property of the test. At this rate the guard is a
+  /// backstop for a pathological host rather than something that fires in normal service.
+  /// </summary>
+  private const long _PREMISE_LIMIT = 2 * 1024 * 1024;
+
   /// <summary>Skips unless this machine can outrun the limit a scenario is about to impose.</summary>
   private static void _RequireTheHostOutrunsTheLimit(long limit) {
     var host = _hostRate.Value;
@@ -76,12 +90,13 @@ public class SimulatedDeviceEndToEndTests {
   [Category("Performance")]
   [Description("A member the manifest limits to a byte rate really is held to it through a real mount, rather than the limit being decoration.")]
   public void Throttle_GivenAMemberLimitedToAByteRate_ThenTheMountIsHeldToIt() {
-    var limit = StorageKind.SimulatedSdCard.MaxThroughput; // 16 MiB/s
+    var limit = _PREMISE_LIMIT;
     _RequireTheHostOutrunsTheLimit(limit);
 
     var size = (int)(limit * (_THROTTLE_SECONDS + 1)); // one second of it is the bucket's burst
 
-    using var pool = MountedPool.Create(members: 1, storageKinds: [StorageKind.SimulatedSdCard]);
+    using var pool = MountedPool.Create(members: 1,
+      storageKinds: [new("premise (simulated)", null, 0, limit)]);
     var content = _Payload(size, 901);
 
     var stopwatch = Stopwatch.StartNew();
@@ -106,7 +121,7 @@ public class SimulatedDeviceEndToEndTests {
   [Category("Performance")]
   [Description("The same pool without the limit is far faster, so the limit is what the previous scenario measured and not the host.")]
   public void Throttle_GivenNoLimit_ThenTheSamePoolIsFarFaster() {
-    var limit = StorageKind.SimulatedSdCard.MaxThroughput;
+    var limit = _PREMISE_LIMIT;
     _RequireTheHostOutrunsTheLimit(limit);
 
     var host = _hostRate.Value;
