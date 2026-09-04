@@ -35,7 +35,18 @@ public static class WholeFilePublisher {
   /// on the engine's own bounded threads rather than the shared pool, for the same reason every
   /// other remote read does (see <see cref="BlockingIoScheduler"/>).
   /// </param>
-  public static long CopyCounted(Stream source, Stream destination, int bufferSize = CopyBufferSize, bool blockingSource = false) {
+  /// <param name="admit">
+  /// Called with each chunk's size just before it is written, so the pool's own bulk transfers pass
+  /// through the SAME per-device admission and rate limit as everything else.
+  ///
+  /// They did not, and that made <c>maxThroughput</c> miss the case it exists for. The limit is
+  /// applied in <see cref="VolumeQueues.Enter"/>, which the engine's block paths call and this one
+  /// never did — so a member the operator had told the pool to go easy on was still saturated by the
+  /// pool's own drains, heals and media moves, which are the largest thing it ever does to a disk.
+  /// Measured: a 24 MiB heal onto a member limited to 1 MiB/s completed in under six seconds.
+  /// </param>
+  public static long CopyCounted(Stream source, Stream destination, int bufferSize = CopyBufferSize, bool blockingSource = false,
+    Action<long>? admit = null) {
     // A rented array is at LEAST the size asked for and routinely LARGER — the pool rounds up to
     // its bucket. So its Length is never the size we asked for, and using it would make the
     // transfer size depend on pool internals rather than on `bufferSize`, silently ignoring what
@@ -52,6 +63,7 @@ public static class WholeFilePublisher {
         // and no reason to pay for a thread. That covers every small file and every in-memory
         // source, which is most of the callers by count.
         pending = filled == bufferSize ? _ReadAhead(source, back, bufferSize, blockingSource) : null;
+        admit?.Invoke(filled); // waits out the destination's rate limit before the chunk lands
         destination.Write(front, 0, filled);
         total += filled;
         if (pending == null)
@@ -118,14 +130,15 @@ public static class WholeFilePublisher {
   /// a previous interrupted publish can never leave a corrupt tail (SAFE-ATOMIC). Size is
   /// verified after publication; a mismatch throws before the caller completes its intent.
   /// </summary>
-  public static void PublishStream(IVolumeIO member, string normalizedPath, bool shadow, Func<Stream> openSource, long? expectedLength = null, bool blockingSource = false) {
+  public static void PublishStream(IVolumeIO member, string normalizedPath, bool shadow, Func<Stream> openSource, long? expectedLength = null, bool blockingSource = false,
+    Action<long>? admit = null) {
     long written;
     if ((member.Caps & BackendCaps.AtomicRename) != 0) {
       var temp = normalizedPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
       using (var source = openSource())
       using (var stream = member.OpenWrite(temp, shadow, true)) {
         stream.SetLength(0); // never inherit a stale temp's tail
-        written = CopyCounted(source, stream, blockingSource: blockingSource);
+        written = CopyCounted(source, stream, blockingSource: blockingSource, admit: admit);
         stream.Flush();
       }
 
@@ -138,7 +151,7 @@ public static class WholeFilePublisher {
     using (var source = openSource())
     using (var stream = member.OpenWrite(normalizedPath, shadow, true)) {
       stream.SetLength(0);
-      written = CopyCounted(source, stream, blockingSource: blockingSource);
+      written = CopyCounted(source, stream, blockingSource: blockingSource, admit: admit);
       stream.Flush();
     }
 
@@ -157,10 +170,11 @@ public static class WholeFilePublisher {
   /// the whole file flows through a fixed buffer, temp + atomic rename on the target, never
   /// buffered in RAM — so a 40 GB file relocates in 1 MiB steps (SAFE-BIGFILE).
   /// </summary>
-  public static void CopyBetween(IVolumeIO source, string sourcePath, bool sourceShadow, IVolumeIO target, string targetPath, bool targetShadow) {
+  public static void CopyBetween(IVolumeIO source, string sourcePath, bool sourceShadow, IVolumeIO target, string targetPath, bool targetShadow,
+    Action<long>? admit = null) {
     var expected = source.Stat(sourcePath, sourceShadow)?.Length;
     PublishStream(target, targetPath, targetShadow, () => source.OpenRead(sourcePath, sourceShadow), expected,
-      blockingSource: source.BlocksCallingThread);
+      blockingSource: source.BlocksCallingThread, admit: admit);
   }
 
   /// <summary>A member can hold an acknowledged durable copy only when its flush is a real durability barrier (SAFE-REMOTE).</summary>

@@ -109,6 +109,74 @@ public class WebUiEndToEndTests {
   }
 
   [Test]
+  [Category("EdgeCase")]
+  public void Assets_GivenEveryStateTheDaemonCanReport_ThenTheShippedStylesheetPaintsIt() {
+    // The daemon decides the state and the stylesheet gives it a colour, and nothing connects the
+    // two but a string. A state with no rule renders as the default dot — a healthy-looking green
+    // for a drive that may be failing — and no test of either half would notice. Asserted against
+    // the SERVED asset, so it is the stylesheet the user actually gets.
+    var css = this._daemon.Get("styles.css");
+    css.EnsureSuccessStatusCode();
+    var text = css.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+    foreach (var state in new[] { "healthy", "aging", "warning", "failing", "detached", "replacing", "unknown" })
+      text.Should().Contain($".st-{state}",
+        $"the daemon can report '{state}', so the shipped stylesheet has to know how to paint it");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public async Task Dashboard_GivenSmartCannotBeRead_ThenStorageIsMarkedUnknownRatherThanFailing() {
+    // The health colours are only worth having if they are believed, and the fastest way to make
+    // them worthless is to cry wolf. smartctl cannot open a raw device without privileges, which is
+    // the ordinary case for a daemon a user starts — and the parser used to read the resulting
+    // "no smart_status" as the drive having FAILED its own assessment, so every storage on such a
+    // machine would light up red. This asserts the honest answer instead: unknown is a state of its
+    // own, drawn as an outline rather than a fill, and never the alarm colour.
+    var (page, errors) = await this._OpenDashboardAsync();
+
+    var dot = page.Locator("#pools .card .member .status").First;
+    await dot.WaitForAsync(new() { Timeout = 30_000, State = WaitForSelectorState.Attached });
+
+    var classes = await page.EvalOnSelectorAllAsync<string[]>(
+      "#pools .card .member .status", "els => els.map(e => e.className)");
+
+    classes.Should().NotBeEmpty("every storage row must carry a state dot");
+    foreach (var className in classes) {
+      className.Should().Contain("st-", $"the dot must carry a resolved state, got '{className}'");
+      className.Should().NotContain("st-failing",
+        "no drive on this machine is failing; reporting one because SMART could not be READ is the "
+        + "false alarm that makes the whole indicator worthless");
+    }
+
+    errors.Should().BeEmpty("the page must render the health states without script errors");
+    await page.CloseAsync();
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Api_GivenTheDashboardFrame_ThenEveryMemberCarriesAResolvedState() {
+    // The precedence lives in the daemon, not the browser, so it is asserted where it is decided:
+    // every member reports exactly one state, and it is one the UI knows how to paint.
+    // the daemon caches discovery, so a pool created moments ago takes a beat to appear — the
+    // browser scenarios wait for the card for the same reason
+    var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+    var states = new List<string?>();
+    while (DateTime.UtcNow < deadline && states.Count == 0) {
+      foreach (var pool in this._daemon.GetJson("api/pools").GetProperty("pools").EnumerateArray())
+        foreach (var member in pool.GetProperty("members").EnumerateArray())
+          states.Add(member.GetProperty("state").GetString());
+
+      if (states.Count == 0)
+        Thread.Sleep(500);
+    }
+
+    states.Should().NotBeEmpty("the fixture pool has members, so there was something to check");
+    foreach (var state in states)
+      state.Should().BeOneOf("healthy", "aging", "warning", "failing", "detached", "replacing", "unknown");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public async Task Dashboard_WhenTheLiveStreamConnects_ThenTheIndicatorReportsItAsLive() {
     var (page, errors) = await this._OpenDashboardAsync();

@@ -511,6 +511,403 @@ halving that to a durable quorum with the mirror written behind it would remove 
 flushes a create pays. That is a genuine durability trade — a journal on one disk is a journal that
 one disk loss destroys — so it belongs to whoever owns the risk, not to a performance pass.
 
+### A file that lost its disk was reported as EXISTING AND EMPTY, and the read succeeded
+
+Found by putting pool members on genuinely different physical devices for the first time — a fast
+internal disk in front of a 119 MiB SD card — and then pulling one of them at an awkward moment.
+The scenario that caught it interrupts a landing-zone drain, but the defect has nothing to do with
+tiering and everything to do with what `retain-metadata` remembers.
+
+**The defect.** `PoolFileSystem.Create` records the new path in the shadow namespace with a length
+of ZERO, which is true at that instant. The only thing that ever refreshed it was a stat that MISSED
+the metadata cache (`_GetAttributesLocked`), because the cache-hit path returns before the record is
+touched. So a file that is written, closed and never stat'd again keeps a remembered length of zero
+for its whole life. That number is invisible while any copy is reachable — and it is exactly the one
+`retain-metadata` answers with when none is (§10 SAFE-DEGRADE). Lose the disk under such a file and
+the pool reports it as existing and empty, so `File.ReadAllBytes` returns NO BYTES AND SUCCEEDS.
+
+That is the worst shape this product can fail in. An error tells the application something is wrong;
+a short success tells it the file is simply that small, and the emptiness gets written onward.
+
+Observed through a real mount as the sequence `FileNotFoundException, FileNotFoundException,
+FileNotFoundException, 0, 8388608` while a disk came back under an 8 MiB file — the zero sitting
+between the honest refusals and the correct answer.
+
+**Why the existing cover did not catch it.** `RetainMetadata_GivenMemberHoldingOnlyCopyLost_...`
+lists the directory before pulling the member, under the comment `// warm the shadow namespace`.
+That warm-up is load-bearing: it forces the uncached stat that records the real length, and without
+it the same assertion reads 0 instead of 3. The test was documenting the workaround rather than the
+behaviour.
+
+**Fixed** by refreshing the remembered size when a WRITE handle closes (`Close` and
+`MarkApplicationClosed`, so the Windows deferred-close path is covered too). Once per write handle
+rather than once per write is what keeps it off the hot path — a close already flushes and may
+publish a staged file, so one stat beside that is noise. Pinned from both sides: a unit guard that
+writes a file, never stats it, pulls its only member and refuses a length of zero; and an end-to-end
+guard that fails if any read SUCCEEDS with fewer bytes than the file holds while a disk returns.
+
+### `dbmount unmount` refused a pool that was plainly mounted, and left it mounted
+
+Reproduced 8 times out of 8, then 0 out of 6 after the fix.
+
+Mount a pool and unmount it straight away, and the unmount answers `No mounted pool matches '<name>'`,
+exits 2, and the pool STAYS MOUNTED with its process still serving it. `dbmount status` does not
+list it either. Wait a second and both work.
+
+**The cause is a platform asymmetry, the third of that shape in this file.** Both verbs look the pool
+up in the cross-process mount registry. The Windows host registers its entry INLINE, the moment its
+`Mount()` call returns. The Linux host cannot — libfuse offers no "you are mounted now" callback — so
+it registers from the background pump the first time it sees the mount in `/proc/mounts`, and that
+pump first fired one second after start. Between "the filesystem works" and "the tooling knows it
+exists" there was therefore a window of up to a second, and mount-then-unmount is the shortest script
+anyone writes. The pump now polls at 50 ms until it has registered and reverts to one second
+afterwards, so the window is a twentieth of what it was and no longer straddles a plausible command.
+
+**What it cost, which is the part worth keeping.** The end-to-end harness hit this on nearly every
+pool it built: its teardown asked for a clean unmount, DISCARDED the failure, then waited out the
+full 60-second timeout and killed the process. So the defect presented as "some tests are slow" and
+nothing else — the same 17 scenarios take **1m0s where they took 9m53s**, and the whole battery
+dropped from about 46 minutes to under 20. Two lessons, both cheap:
+
+- The harness now reports a teardown that drags AND the exit code of the unmount it asked for. A
+  discarded error is how a product defect hides inside a test harness for a whole session.
+- Every killed mount process leaves its `.mountlock` (which relies on `DeleteOnClose`) and its
+  `.metrics.json` behind, because nothing gets to clean up. This machine had accumulated **874** such
+  files. `MountRegistry.List` globs `*.json` in that directory, which also matches every
+  `<pool>.metrics.json` snapshot, so each one was read off disk and thrown at a deserializer that
+  could only fail — several hundred file reads and as many exceptions per `status`, and per each of
+  the hundred polls one `unmount` makes. It now only considers files named for a pool id.
+
+### Open: a landing zone absorbs nothing on Windows — the burst runs at the CAPACITY tier's pace
+
+Found by giving the tiering claim a control instead of an absolute bar: the same burst written to a
+pool that is only the slow tier, on the same machine, moments earlier. Both sides then pay the same
+journal, staging and fsync costs, so what is left is the tier. Measured on the CI runners:
+
+| landing zone over capacity | through the landing zone | straight to capacity |
+| --- | ---: | ---: |
+| RAM over SD card — Linux | 115 MiB/s | 30 MiB/s |
+| RAM over cloud — Linux | 61 MiB/s | 11 MiB/s |
+| RAM over SD card — **Windows** | **22.5 MiB/s** | 23.4 MiB/s |
+| RAM over cloud — **Windows** | **9.8 MiB/s** | 10.4 MiB/s |
+| SSD over SD card — **Windows** | **22.5 MiB/s** | 23.3 MiB/s |
+| HDD over cloud — **Windows** | **3.8 MiB/s** | 3.6 MiB/s |
+
+On Linux the fast tier is doing exactly what it is for. On Windows it is worth nothing: every pairing
+lands within a few percent of writing straight to the slow disk, which is the one outcome a landing
+zone exists to prevent. The bursts are small enough that the drainer has barely started, so this is
+the INTAKE being paced by the capacity tier rather than a drain competing with it.
+
+Not diagnosed further, because it needs a Windows machine to instrument and this pass had none —
+what is established is that the effect is real, reproducible across four pairings and two capacity
+speeds, and specific to that platform. Note that
+`TieringEndToEndTests.Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` passes
+on Windows, so files DO land on the fast tier there; whatever paces the write is downstream of
+placement. The scenario is held back on Windows with the measurements in its skip reason rather than
+weakened, so it keeps failing honestly on Linux if the gain ever disappears there too.
+
+### The pool's own bulk copies ignored the rate limit set on the disk they were writing to
+
+Found by trying to build a race against the drainer and failing to: a 24 MiB file copied onto a
+member held to 1 MiB/s finished in under six seconds.
+
+`maxThroughput` is applied in `VolumeQueues.Enter`, which the engine's BLOCK paths call.
+`WholeFilePublisher` streams straight into the member and never went near it — so the drain, the
+heal, the media move and every other whole-file transfer bypassed the limit completely. That is
+precisely backwards: the setting exists because "a pool is rarely the only thing using a disk", and
+the pool's own background copying is the largest thing it ever does to one. An operator who told the
+pool to go easy on a member still had it saturated by drains and heals.
+
+`CopyCounted` now takes an admission hook and the drain and heal paths pass it, so a bulk chunk waits
+out the destination's limit exactly as a block write does. Pinned from both sides by the scenarios
+below, which could not exist before it: they need the copy to still be RUNNING when the foreground
+operation lands, and it never was.
+
+Still unwired, and deliberately: `MediaLifecycle` (scatter, replace), `PoolRecovery`, `PoolTrash` and
+the integrity quarantine build their own copies without a queue to hand. Those are operator-initiated
+one-off operations rather than continuous background load, so they matter less and threading the
+queue into each of them is a wider change than this pass should make.
+
+### Three races against the pool's own background work, none of which could be tested before
+
+The drainer and the healer copy a whole file while the application is free to delete it, rename it or
+overwrite it. Every one of those is a chance to resurrect something the user deleted, leave a file
+under two names or none, or finish a copy of the OLD content over a newer write and call the pool
+converged. The engine handles all three correctly — and that could not be shown until the throttle
+fix above made the copies slow enough to interrupt.
+
+Each scenario asserts its own premise before racing: the destination must NOT yet hold the complete
+file, or the copy it means to interrupt has already finished and the test proves nothing. The first
+version of the file had exactly that fault — a 12 MiB copy against a 6 MiB/s limit whose bucket
+holds a second of credit was over in about a second, and all three scenarios passed while testing a
+pool with nothing in flight.
+
+- **Deleted mid-drain**: stays deleted, with no trace left on any member. A copy the pool still
+  believes in is a file that comes back on the next mount.
+- **Renamed mid-drain**: ends under exactly one name, with its content intact — not under both.
+- **Overwritten mid-heal**: both copies end on the NEW content. This is the one that would actually
+  lose data: a healer finishing after an overwrite leaves the older version on the member it was
+  healing, the pool believes it is fully duplicated so nothing reconciles it, and which version a
+  read gets is a coin toss.
+
+### SMART said every disk was FAILING on any machine without root
+
+`smartctl` cannot open a raw device unprivileged, which is the ordinary case for a daemon a user
+starts. It still answers with well-formed JSON — an error in `smartctl.messages`, a non-zero
+`exit_status`, and no `smart_status` object at all — and the parser read that missing field as
+`passed: false`, i.e. as the drive having FAILED its own self-assessment. So every member of every
+pool on such a machine was reported as a dying disk.
+
+That is the worst direction for a health signal to be wrong in: indistinguishable from the real
+thing, fired on hardware that is fine, and once it has cried wolf nobody believes the one that
+matters. A drive that could not be ASKED is now `Unknown`, carrying smartctl's own words so "no
+smartctl" can be told from "not allowed".
+
+**And NVMe was invisible.** Health lived entirely in ATA attribute ids 5 and 197, and NVMe keeps
+none of it there — it has `nvme_smart_health_information_log`. A drive at 96% of its rated endurance,
+below its own spare threshold and logging media errors parsed as perfectly `Healthy`, which on
+modern hardware is most drives. `percentage_used`, `available_spare` against the drive's own
+`available_spare_threshold`, `media_errors` and `critical_warning` are all read now, and the drive's
+stated thresholds are used where it states them.
+
+`DiskHealth` gained an `Aging` step between `Healthy` and `Warning`, so the four-colour ramp the
+dashboard needs is a real distinction rather than a UI invention: aging is wear that is normal and
+worth watching, warning is degradation that has already happened, failing is get-the-data-off-it.
+
+### Storage health is now visible where a user would look
+
+The dashboard drew one dot per member, green for online and red for not — so a disk answering every
+request while its spare blocks ran out looked exactly like a healthy one until it stopped answering
+at all, which is far too late to be told.
+
+Each member now carries ONE state, resolved in the daemon so the precedence is stated once rather
+than reinvented in the browser: being evacuated or detached outranks anything SMART has to say about
+a disk that is on its way out anyway. Green healthy, yellow aging, orange degraded, red failing (with
+a slow pulse, and none for anyone who has asked for reduced motion), grey detached, violet being
+replaced, and a hollow ring for unknown — deliberately an outline rather than a fill, so "we cannot
+tell" never looks like "we checked and it is fine". A one-line reason from the drive's own counters
+sits under any row that is not green, the tooltip carries the model and smartctl's verdict, and a
+legend appears only when something is not healthy.
+
+Three things make it trustworthy rather than decorative:
+
+- **SMART is sampled off the hot path.** The metrics snapshot publishes every second and a smartctl
+  query is a process launch allowed ten seconds; sampling on that path would put one fork per member
+  per second in front of the timer the drain, the heal, the reload and the unmount request all share,
+  so one unresponsive drive would stall pool maintenance. `MemberSmartCache` samples every five
+  minutes on its own thread, never runs two sweeps at once, skips members that are offline, and turns
+  any failure into `Unknown` rather than letting it reach the pool.
+- **The state and the stylesheet cannot drift apart.** A state with no CSS rule would render as the
+  default dot — a healthy-looking green for a drive that may be failing — and neither half's tests
+  would notice. A scenario asserts every state the daemon can emit has a rule in the SERVED
+  stylesheet.
+- **The false alarm is pinned end to end.** A browser scenario asserts that on this machine, where
+  SMART genuinely cannot be read, no member renders as failing.
+
+**Verified against real drives, and the whole ramp end to end.** `smartctl -j -i -H -A` output
+captured from this machine's NVMe is kept as a parser fixture, because it settled two things the
+hand-written JSON could not: the drive has no `ata_smart_attributes` object AT ALL, so the old
+parser had literally nothing to read on hardware of this kind, and `model_name` appears only when
+`-i` is passed — which the query did not do, so every member was nameless in the report and the
+tooltip. Replaying that captured output through the shipped daemon walks the whole ramp:
+
+| what the drive reports | the dashboard shows |
+| --- | --- |
+| new, 0% used, 28 °C | healthy (green) |
+| 80% of rated endurance, 52 °C | aging (yellow) — "80% of rated endurance used; running at 52 °C" |
+| 93% used, 4 media errors | warning (orange) — "4 media error(s); 93% of rated endurance used" |
+| 4% spare against a 10% threshold | failing (red) — "…; 4% spare blocks left" |
+| member unplugged | detached (grey), which correctly outranks the failing reading underneath it |
+
+**A deployment limit worth stating plainly: SMART needs privileges.** `smartctl` cannot open a raw
+device unprivileged, so a daemon a user starts reports `Unknown` for every member — honestly, and
+with the reason in the tooltip, but it is still no health data. Getting real readings needs the
+service run with privilege, a capability granted to smartctl, or a udev rule; none of that is the
+pool's to arrange, and the honest Unknown state is what makes the limit visible instead of silently
+green. The three "could not read" cases now say WHICH they are — smartctl missing, not permitted, or
+timed out — because they call for three different actions and all three used to arrive as the same
+bare "SMART not available".
+
+**Not built, deliberately: the blue "online spare".** There is no spare concept in the product — no
+role, no manifest field, nothing that holds a disk in reserve and no rebuild that would claim one —
+so a blue dot would have been a colour with nothing behind it. It is a real feature (a role that
+placement must never target, and a trigger that promotes it when a member fails) and belongs in its
+own change.
+
+### A file could not be created when the chosen disk had gone read-only
+
+The failure real filesystems produce: ext4 hits a write error and remounts itself read-only. Such a
+member is not gone, so the online probe keeps it; it does not fail everything, so the fault cooldown
+never parks it; it reads perfectly and refuses every write.
+
+`Create` chose ONE placement target and failed outright if that member would not take the file, so
+roughly half of all new files died with a bare "access denied" while a perfectly writable member sat
+beside them. The write path has redirected around a storage that fails mid-write for some time
+(SAFE-DEGRADE); creation had no such path. It now retries, noting the fault — which sinks that member
+in the readiness order placement itself chooses by, so the retry lands elsewhere and so does every
+create after it until the member recovers. Mutation-checked: pinning the retry back to one attempt
+fails the scenario.
+
+**Still open, and it is a durability decision rather than a bug.** A DUPLICATED pool still refuses
+new files while a member is read-only, because it cannot make the second copy. The degraded-write
+path that exists for exactly this — "one lost drive degrades redundancy, not availability" — keys on
+a member being UNREACHABLE, and a read-only member is reachable. Extending it would mean accepting
+writes at a lower duplication than configured whenever a member merely refuses them, which weakens a
+guarantee under a condition the product currently treats as fatal. That is the owner's call, not a
+passing fix; the current behaviour is pinned so the decision is made deliberately.
+
+### A member that goes SLOW was almost invisible to the engine that was slowing it
+
+The resilience work so far breaks members cleanly: the disk vanishes, or it errors on every request.
+Both are easy to handle well because both are unambiguous. A drive that is merely DYING does neither
+— a controller retrying internally, a link renegotiated down, a NAS behind a saturated uplink. It
+answers every request correctly, eventually, so it never errors, never cools down, and nothing about
+it looks wrong except that it takes a hundred times longer. That case was not covered at all, and
+three separate things were wrong with it.
+
+**1. A live reload ignored the rate limits.** `maxIops`/`maxThroughput` were read once, when the
+engine built its members. A live reload re-read the config, the member roles and the duplication
+level, so everything else in the manifest could be changed under a mounted pool and this one thing
+silently could not — the setting whose entire purpose is the situation you cannot unmount for ("the
+pool is taking too much of that disk, ease off"). `UpdateMemberLimits` now applies them, beside the
+existing `UpdateMemberRoles`.
+
+**2. The pool could not see a member it was itself holding back.** The throttle waits in
+`VolumeQueues.Enter`, BEFORE the volume is touched, so a limited member performs each operation as
+briskly as ever and only the queue knows better. `MeasuredVolumeIO`'s latency EWMA therefore saw a
+perfectly healthy member. A genuinely slow DEVICE was always visible, because its latency is real and
+lands inside the measurement — but a member the pool was deliberately limiting was not, which made
+the documented promise beside that code ("a throttled member simply receives less work, and new files
+go elsewhere") false. `VolumeQueues` now keeps a decaying per-member average of what the limit is
+costing, and `_LoadScore` counts it.
+
+**3. The readiness score treated one queued operation as one second.** `inflight * 1000 + latency`
+made "one request outstanding on a healthy member" score exactly the same as "every operation on this
+member takes a full second". On a healthy pool that is harmless and it is what spreads load. With one
+member sick it is the whole problem: the fast member scored 1000 whenever it was momentarily busy,
+the permanently-slow one scored about the same, and a duplicated read kept being handed back to the
+slow copy. The score is now `(inflight + 1) x per-operation cost`, which keeps the load-spreading
+(idle members still separate by queue depth) and makes a slow member lose to a busy fast one.
+
+Measured through a real mount, 48 MiB read of a duplicated file with the member holding the PRIMARY
+copy collapsed to 1 MiB/s — serving it entirely from the sick member would take about 48s:
+
+| | 48 MiB duplicated read |
+| --- | ---: |
+| both members healthy | 0.04 s |
+| one member collapsed, as found | 8.02 s |
+| after ordering non-split reads by readiness | 7.00 s |
+| after the throttle became visible, and the score multiplied | **1.03 s** |
+
+So the answer to "do we recover using the other storage, or drop hard?" is: we now recover, and we
+did not before. Placement moved the same way and more sharply — a burst of 12 files split 6/6 across
+a healthy and a collapsed member before the fix and **11/1** after, the burst itself dropping from
+11.0 s to 1.1 s.
+
+**Writes are a different answer, and it is a deliberate one.** A duplicated write IS paced by its
+slowest copy: 8 MiB took 7.01 s with one member at 1 MiB/s, which is exactly that member's rate.
+That is `write.minCopiesBeforeAck` defaulting to 2 — an acknowledgement means the bytes are on both
+disks (SAFE-NOLOSS) — and it cannot be configured away, because the pool refuses to mount with an ack
+floor below the duplication level. The sanctioned escape is the RAM-ack opt-in
+(`write.policy: performance` + `acceptVolatileAck`), which took the same write in **0.01 s**. All
+three are pinned: the pacing, the refusal, and the opt-in.
+
+### What a failing member actually costs, measured across the whole matrix
+
+Six failure modes against seven kinds of storage — RAM, a simulated SSD, HDD, SD card and cloud
+endpoint, and the host's real devices — 42 cells, all green. The invariant in every cell is the same
+and holds: nothing acknowledged is lost, the mount survives, the cost is bounded. The numbers are the
+point, though, because "the pool survives a disk going" is a claim and "the worst operation cost
+72 ms" is an answer:
+
+| Failure | Worst single operation, across every storage kind |
+| --- | ---: |
+| member pulled, reads served from the survivor | 11–14 ms |
+| member pulled mid-write | 2 ms simulated, **72 ms** on the real SD card |
+| member present but erroring on every request | 18–21 ms |
+| power cut, pool restarted | 18–20 ms |
+| power cut with a member also missing | 18–22 ms |
+
+Two things are worth drawing out. **Failover costs milliseconds, not seconds** — well under the
+five-second fault cooldown, because a member that has genuinely gone is filtered out by the online
+probe and never tried at all; the cooldown is for the harder case where the disk is still THERE and
+failing, and even that costs about 20 ms per read. And **the storage underneath barely moves the
+number**: the only cell above 22 ms is the real SD card taking a write when it was pulled, which is
+the one case where slow hardware genuinely had more work in flight when it went.
+
+### A member reached through a symlink reported the WRONG disk as its failure domain
+
+Found while trying to measure two devices, and it is the reason the first attempt measured one.
+
+`HostEnvironment._GetPhysicalVolumeId` started from `Path.GetFullPath`, which does not follow
+reparse points, and then matched that path against `/proc/mounts`. A member reached through a
+symlink or a junction therefore reports the disk the LINK sits on rather than the storage it names.
+Two members linked from one filesystem onto two genuinely different disks collapse into a single
+failure domain, and everything keyed on that identity follows: placement declines to spread
+redundant copies across them (over-conservative, so safe but wasteful), the health report counts one
+independent domain where there are two, and — the part that costs throughput — `VolumeQueues` hands
+the pair the queue depth of ONE device, so the two disks take turns instead of working at once
+(§6.4, FR-PAR). Observed directly as `! Members '…/m0', '…/m1' share one physical volume` for a pool
+with one member on each NVMe drive.
+
+Fixed by resolving the reparse point before deriving the identity, on both platforms. The engine
+suite is unmoved by it (641 pass either way) because its members are ordinary directories; what it
+changes is any pool whose members are linked, which is exactly how removable and multi-disk layouts
+tend to be wired.
+
+### Measured on two real devices, which is what the scatter work could not do
+
+`docs/Performance.md` prices overlapped I/O honestly and says where it stops: its "2 copies" row
+shares one device, so it "prices the split's overhead rather than the gain", and the split "can only
+pay for itself on hardware that actually has two". Also worth stating plainly, because it changes how
+every earlier number reads: on this host **`/tmp` is tmpfs**, so a pool with both members in the temp
+directory has both of them in RAM. Those runs price the code path, not a disk.
+
+With members on two independent NVMe devices, 384 MiB read cold through a real mount, host page cache
+evicted per file with `posix_fadvise(DONTNEED)`, and the failure-domain fix above in place so the
+engine can actually see two devices — the same comparison, three times:
+
+| 384 MiB cold sequential read | spread over two devices | both copies on one |
+| --- | ---: | ---: |
+| quiet machine | 2,428 MiB/s | 2,260 MiB/s |
+| quiet machine, after the failure-domain fix | 2,714 MiB/s | 2,481 MiB/s |
+| inside the full battery, machine loaded | 1,508 MiB/s | 1,972 MiB/s |
+
+**So the honest answer is that this host cannot separate the two arrangements.** +7%, +9%, −24%: the
+sign tracks what else the machine was doing rather than which arrangement was used. Both figures sit
+at or below the engine's own cached-read ceiling (~2,470 MiB/s in the matrix), so neither is
+device-bound and the split is not what limits either of them. The first two runs, taken alone, would
+have gone into this file as "the split pays for itself by 1.09x" — which the third refutes.
+
+The scenario therefore asserts no ratio at all and is `[Explicit]`, like the performance matrix: it
+prints the numbers for someone running it deliberately on a quiet machine. An assertion tuned until
+all three of those runs passed would have been measuring nothing and reporting it in green.
+
+A write burst across a two-device tier DOES reach both disks, and that one IS asserted, because it
+does not depend on a clock: 8 files of 48 MiB landed 5 on one device and 3 on the other. Where the
+files land is the claim underneath the throughput and is the half a loaded machine cannot distort.
+An earlier version asserted the rate instead, read 156 MiB/s against a device probe that fluctuated
+between 125 and 171 MiB/s on the same hardware within the hour, and would have recorded "the tier
+does not combine" from what was really a noisy probe and an unlucky split.
+
+**The harness was leaving the machine littered, which is worth recording because it hid nothing and
+cost real disk anyway.** Killing a mount process does not remove the kernel's FUSE entry: the
+mountpoint stays in `/proc/mounts` answering "transport endpoint is not connected" until something
+detaches it, and only the deliberate-crash path ever did. A day of runs left **94** dead mounts and
+94 undeletable temp roots behind. `Dispose` now runs the same lazy detach, and a full battery
+finishes with zero of either.
+
+The eviction is not taken on trust: the same machinery measures the SD card at **14.4 MiB/s read**
+where an unevicted read of the same file reports 5.6 GB/s. A 400x gap is what a working eviction
+looks like, and without it every number above would be memory bandwidth.
+
+Genuinely different devices also make two things testable that a one-disk host cannot reach, and both
+behave correctly: a 119 MiB member filled right up refuses further writes cleanly, keeps the mount
+alive and leaves everything already stored byte-identical; and a member that is present but FAILS
+every operation (permissions revoked on its storage root, so the online probe still sees it) is routed
+around rather than waited on, which is the case the five-second fault cooldown exists for and which
+nothing exercised end to end before.
+
 ## Still open
 
 Two items that stood here are closed; they moved to "Closed, kept as a record" below rather than
@@ -699,6 +1096,44 @@ These now fail the build rather than needing to be re-found:
   pre-truncation object, and the range-free fallback stays correct.
 - `SyncBridgeTests` — blocking under an installed single-threaded synchronization context
   completes instead of deadlocking, and a provider failure surfaces as itself rather than wrapped.
+- `MemberFailureLatencyEndToEndTests` — what losing a disk COSTS, as opposed to whether it is
+  survived. A pool that answers correctly after a thirty-second pause has lost no data and is still
+  unusable. A member pulled mid-stream must leave every remaining chunk bounded; a member that is
+  still PRESENT and fails every operation (its storage root's permissions revoked, so the online
+  probe cannot simply drop it) must be routed around rather than waited on, which is the case the
+  five-second fault cooldown exists for and which nothing exercised end to end; a drain interrupted
+  by losing its target must leave the file on one tier or the other and never on neither, and no
+  read may SUCCEED with fewer bytes than the file holds while the disk comes back.
+- `BrownoutEndToEndTests` — the member that goes SLOW rather than away, applied LIVE without a
+  remount because that is how it happens. Reads must be served from the healthy copy instead of
+  crawling with the sick one; new files must stop being placed on it; throughput must come BACK when
+  it recovers, rather than the degradation latching. Its first scenario is the premise — a limit
+  lowered under a mounted pool has to take effect at all — and the write scenarios pin the durability
+  trade from all three sides: the pacing, the refusal to weaken the ack floor, and the RAM-ack opt-in
+  that is the sanctioned way out.
+- `StorageFailureMatrixEndToEndTests` — the cross product of every way a member can fail against
+  every kind of storage it can fail on: pulled and gone, pulled mid-write, pulled and returned,
+  present but erroring on every request, power cut, and power cut WITH a member also missing —
+  each against RAM, a simulated SSD/HDD/SD-card/cloud, and whatever real devices the host has. The
+  failures a product has to survive are not independent of the storage under them: a disk pulled
+  from a rate-limited tier has far more work still in flight when it goes. One invariant in every
+  cell — nothing acknowledged is lost, the mount survives, the cost is bounded — and the timings are
+  PRINTED, because "what happens when a disk goes" is a question with a number for an answer.
+- `SimulatedDeviceEndToEndTests` — the same tiering questions on storage of KNOWN speed, using the
+  product's own `maxIops`/`maxThroughput` member limits. Real devices are the honest evidence and a
+  poor experiment (a host has whatever disks it has, and CI has one); a limit is identical on every
+  machine and models hardware nobody has to hand. Its first two scenarios are the PREMISE, pinned
+  from both sides: a limited member really is held to its rate, and the same pool unlimited really is
+  far faster. Without both, every scenario built on a limit would pass while measuring an unlimited
+  disk.
+- `HeterogeneousDeviceEndToEndTests`, `MultiDeviceThroughputEndToEndTests` — pools spread over
+  storage of genuinely different speed, which is the only way the tiering claims can be falsified at
+  all. They self-ignore on a machine with one disk, and the slow device is found by MEASURING
+  candidates rather than by guessing from paths, because a second internal NVMe and a card reader
+  are both mounted under `/run/media` and are indistinguishable by name. Two things only real
+  hardware reaches: a member filled right up refuses further writes cleanly and keeps everything
+  already stored byte-identical, and a removable disk that comes and goes repeatedly leaves every
+  file whole with reads still bounded.
 - **`DriveBender.EndToEnd.Tests`** — the SHIPPED `dbmount` binary, with no project reference to the
   engine, on both targets in CI: a real pool mounted through WinFsp/Dokan or FUSE and driven
   through `System.IO`; the management API over HTTP; and the page itself in Chromium. This tier

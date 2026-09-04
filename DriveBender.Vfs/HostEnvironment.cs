@@ -263,7 +263,37 @@ public sealed class RealHostEnvironment : IHostEnvironment {
     }
   }
 
-  private string _GetPhysicalVolumeId(string fullPath) {
+  /// <summary>
+  /// Follows a reparse point to the storage it actually names.
+  ///
+  /// A member reached through a symlink or a junction lives on whatever disk the LINK sits on as far
+  /// as every path-based lookup is concerned, and the failure domain is then the wrong disk. On
+  /// Linux the mount source is found by matching the path against <c>/proc/mounts</c>, so a member
+  /// linked from one filesystem to another reports the FIRST one — two members on two genuinely
+  /// different disks collapse into a single domain. Everything keyed on that identity then behaves
+  /// as if there were one device: placement declines to spread redundant copies across them, the
+  /// health report counts one failure domain where there are two, and <see cref="Engine.VolumeQueues"/>
+  /// hands the pair the queue depth of ONE device, so two disks take turns instead of working at
+  /// once (§6.4, FR-PAR).
+  /// </summary>
+  private static string _ResolveReparsePoint(string fullPath) {
+    try {
+      if (Directory.Exists(fullPath))
+        return Directory.ResolveLinkTarget(fullPath, returnFinalTarget: true)?.FullName ?? fullPath;
+
+      if (File.Exists(fullPath))
+        return File.ResolveLinkTarget(fullPath, returnFinalTarget: true)?.FullName ?? fullPath;
+    } catch (IOException) {
+      // a dangling or circular link: the path as given is the best answer available
+    } catch (UnauthorizedAccessException) {
+      // not ours to resolve
+    }
+
+    return fullPath;
+  }
+
+  private string _GetPhysicalVolumeId(string path) {
+    var fullPath = _ResolveReparsePoint(path);
     if (OperatingSystem.IsWindows()) {
       var mountPoint = new StringBuilder(520);
       if (NativeMethods.GetVolumePathName(fullPath, mountPoint, mountPoint.Capacity)) {

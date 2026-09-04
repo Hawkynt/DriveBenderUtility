@@ -197,6 +197,106 @@ public static class DbMount {
     throw new FileNotFoundException($"No registry manifest for pool '{poolName}' under '{directory}'");
   }
 
+  /// <summary>
+  /// Sets a member's rate limits (<c>maxIops</c>, <c>maxThroughput</c>) in the pool's manifest.
+  ///
+  /// These are the product's own way of saying "this storage is only this fast" — a mechanical drive
+  /// shared with something else, a cloud endpoint with a rate limit — and they are the only way to
+  /// put a pool on storage of KNOWN, REPEATABLE speed. Real devices are better evidence and worse
+  /// experiments: a machine has whatever disks it has, they differ between hosts, and their measured
+  /// rate wanders with whatever else is running. A limit is the same on every machine and every run.
+  ///
+  /// There is no CLI verb for them, so the registry manifest is edited directly and BEFORE the pool
+  /// is mounted, exactly as <see cref="SetPoolDefaults"/> does.
+  /// </summary>
+  public static void SetMemberLimits(string poolName, string memberPath, int maxIops, long maxThroughput) {
+    var directory = PoolRegistryDirectory;
+    foreach (var path in Directory.EnumerateFiles(directory, "*.json")) {
+      var text = File.ReadAllText(path);
+      if (!text.Contains($"\"{poolName}\"", StringComparison.Ordinal))
+        continue;
+
+      var manifest = System.Text.Json.Nodes.JsonNode.Parse(text)!.AsObject();
+      var members = manifest["members"]?.AsArray()
+                    ?? throw new InvalidOperationException($"Manifest for '{poolName}' has no members array");
+
+      var matched = false;
+      foreach (var member in members) {
+        if (member is not System.Text.Json.Nodes.JsonObject entry)
+          continue;
+
+        // the manifest records the path the pool was created with, which is the member LINK
+        if (!string.Equals(entry["path"]?.GetValue<string>(), memberPath, StringComparison.Ordinal))
+          continue;
+
+        entry["maxIops"] = maxIops;
+        entry["maxThroughput"] = maxThroughput;
+        matched = true;
+      }
+
+      if (!matched)
+        throw new InvalidOperationException(
+          $"No member '{memberPath}' in the manifest for '{poolName}'; it holds "
+          + string.Join(", ", members.Select(m => m?["path"]?.GetValue<string>() ?? "?")));
+
+      manifest["version"] = (manifest["version"]?.GetValue<int>() ?? 1) + 1; // highest version wins on mount
+      File.WriteAllText(path, manifest.ToJsonString(new() { WriteIndented = true }));
+      return;
+    }
+
+    throw new FileNotFoundException($"No registry manifest for pool '{poolName}' under '{directory}'");
+  }
+
+  /// <summary>The pool id recorded in a pool's registry manifest.</summary>
+  public static Guid PoolIdOf(string poolName) {
+    foreach (var path in Directory.EnumerateFiles(PoolRegistryDirectory, "*.json")) {
+      var text = File.ReadAllText(path);
+      if (!text.Contains($"\"{poolName}\"", StringComparison.Ordinal))
+        continue;
+
+      var manifest = System.Text.Json.Nodes.JsonNode.Parse(text)!.AsObject();
+      if (manifest["poolId"]?.GetValue<Guid>() is { } id)
+        return id;
+    }
+
+    throw new FileNotFoundException($"No registry manifest for pool '{poolName}' under '{PoolRegistryDirectory}'");
+  }
+
+  /// <summary>
+  /// Asks a MOUNTED pool to re-read its manifest, the way the management UI does when a setting is
+  /// changed under a running pool.
+  ///
+  /// There is no CLI verb for it — only the daemon files this request — so the marker is written
+  /// straight into the cross-process channel directory, in the same documented shape and for the
+  /// same reason the manifest itself is edited directly here: standing up the whole management
+  /// stack to flip one setting would drag it into a driver test.
+  /// </summary>
+  public static void RequestLiveReload(string poolName) {
+    var mounts = Path.Combine(Path.GetDirectoryName(PoolRegistryDirectory)!, "mounts");
+    Directory.CreateDirectory(mounts);
+    File.WriteAllText(Path.Combine(mounts, $"{PoolIdOf(poolName):D}.reload"), DateTime.UtcNow.ToString("O"));
+  }
+
+  /// <summary>
+  /// The live metrics snapshot the MOUNT process publishes for a pool, or null before the first one.
+  ///
+  /// This is the mount's own view — free space, latency, member health — written to the channel
+  /// directory once a second for the management daemon to read. Going to it directly lets a scenario
+  /// assert what the ENGINE observed without standing up the daemon in between.
+  /// </summary>
+  public static System.Text.Json.JsonElement? TryReadMetrics(string poolName) {
+    try {
+      var mounts = Path.Combine(Path.GetDirectoryName(PoolRegistryDirectory)!, "mounts");
+      var path = Path.Combine(mounts, $"{PoolIdOf(poolName):D}.metrics.json");
+      if (!File.Exists(path))
+        return null;
+
+      return System.Text.Json.JsonDocument.Parse(File.ReadAllText(path)).RootElement.Clone();
+    } catch (Exception) {
+      return null; // a half-written snapshot is read again on the next poll
+    }
+  }
+
   /// <summary>Removes a test pool's registry entry by name; never throws, cleanup must not fail a run.</summary>
   public static void ForgetPool(string poolName) {
     try {

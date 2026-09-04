@@ -322,6 +322,23 @@ public static class LinuxFuseMountHost {
   public static bool IsFuseAvailable() => OperatingSystem.IsLinux() && File.Exists("/dev/fuse");
 
   /// <summary>Mounts and blocks until the filesystem is unmounted (umount/fusermount3, Ctrl+C, or a registry stop request).</summary>
+  /// <summary>
+  /// How long the pool can be mounted and USABLE while <c>dbmount status</c> and
+  /// <c>dbmount unmount</c> still believe it does not exist.
+  ///
+  /// The registry entry is what those two verbs look the pool up in, and on this platform it is
+  /// written from the pump the first time the mount is seen in <c>/proc/mounts</c> — the Windows
+  /// host registers inline, the moment its own Mount() call returns, and has no such window. At a
+  /// one-second poll the window was long enough to hit constantly: mount a pool and unmount it
+  /// straight away and the unmount answers "No mounted pool matches", exits non-zero, and LEAVES IT
+  /// MOUNTED — with the process still serving it. A script that mounts, does its work and unmounts
+  /// simply fails, and the end-to-end harness hit it on nearly every pool it built.
+  /// </summary>
+  private static readonly TimeSpan _AWAITING_MOUNT_TICK = TimeSpan.FromMilliseconds(50);
+
+  /// <summary>Once registered there is nothing to race, and the pump is back to its ordinary cadence.</summary>
+  private static readonly TimeSpan _REGISTERED_TICK = TimeSpan.FromSeconds(1);
+
   public static int Run(PoolFileSystem fs, string target, bool readOnly, Action? onMounted = null, Func<bool>? stopRequested = null, Action? onUnmounted = null, Action? onTick = null) {
     FuseAdapter.NativeUid = _GetId("-u");
     FuseAdapter.NativeGid = _GetId("-g");
@@ -358,12 +375,16 @@ public static class LinuxFuseMountHost {
         DriveBender.Logger($"[Warning]background pump tick failed: {e.Message}");
       } finally {
         try {
-          pump?.Change(TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan);
+          // Until the mount is REGISTERED the tick is the only thing that can register it, so it
+          // runs often; afterwards once a second is plenty. libfuse offers no "you are mounted now"
+          // callback, so noticing it is a poll, and the poll interval IS the window during which
+          // the pool is usable but invisible to `dbmount status` and `dbmount unmount`.
+          pump?.Change(registered ? _REGISTERED_TICK : _AWAITING_MOUNT_TICK, Timeout.InfiniteTimeSpan);
         } catch (ObjectDisposedException) {
           // the mount is shutting down and the timer is already gone
         }
       }
-    }, null, TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan);
+    }, null, _AWAITING_MOUNT_TICK, Timeout.InfiniteTimeSpan);
 
     using var pumpLifetime = pump;
 

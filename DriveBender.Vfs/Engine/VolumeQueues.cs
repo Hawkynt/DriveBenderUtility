@@ -160,8 +160,35 @@ public sealed class VolumeQueues {
       return;
 
     var wait = throttle.Reserve(bytes);
+    this._RecordWait(volume.MemberId, wait);
     if (wait > TimeSpan.Zero)
       Thread.Sleep(wait);
+  }
+
+  /// <summary>
+  /// What a member's rate limit is currently costing per operation, as a decaying average in
+  /// milliseconds — so the engine's readiness order can SEE a member it is itself holding back.
+  ///
+  /// The wait happens here, before the volume is touched, which means it is invisible to the
+  /// latency EWMA that <see cref="MeasuredVolumeIO"/> keeps: a member limited to a crawl performs
+  /// each operation as briskly as ever, it is simply made to wait first. So the readiness score saw
+  /// a perfectly healthy member and kept sending it half of every duplicated read by rotation, each
+  /// block then costing the full wait. Measured: a 48 MiB read of a duplicated file took 0.04s with
+  /// both members healthy and 7.0s with one held to 1 MiB/s, with an untouched copy beside it.
+  ///
+  /// This closes that gap for the limits the pool applies ITSELF. A genuinely slow DEVICE was
+  /// always visible, because its latency is real and lands inside the measurement.
+  /// </summary>
+  public double ThrottleWaitMsFor(Guid memberId)
+    => this._throttleWaitMs.TryGetValue(memberId, out var wait) ? wait : 0.0;
+
+  private readonly ConcurrentDictionary<Guid, double> _throttleWaitMs = new();
+
+  /// <summary>Exponential moving average, so the cost decays once a member stops being held back.</summary>
+  private void _RecordWait(Guid memberId, TimeSpan wait) {
+    const double alpha = 0.25;
+    var sample = wait.TotalMilliseconds;
+    this._throttleWaitMs.AddOrUpdate(memberId, sample, (_, previous) => previous + alpha * (sample - previous));
   }
 
   private readonly ConcurrentDictionary<Guid, MemberThrottle> _throttles = new();
@@ -169,6 +196,9 @@ public sealed class VolumeQueues {
   /// <summary>Applies per-member rate limits; a member absent from the map is unlimited.</summary>
   public void SetThrottles(IEnumerable<(Guid MemberId, int MaxIops, long MaxThroughput)> limits) {
     this._throttles.Clear();
+    // the recorded cost describes the limits that were in force; a member whose limit was just
+    // lifted must not go on being avoided for a history that no longer applies
+    this._throttleWaitMs.Clear();
     foreach (var (memberId, maxIops, maxThroughput) in limits)
       if (maxIops > 0 || maxThroughput > 0)
         this._throttles[memberId] = new(maxIops, maxThroughput);

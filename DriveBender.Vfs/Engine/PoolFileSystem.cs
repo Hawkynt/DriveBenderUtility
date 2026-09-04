@@ -132,11 +132,55 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     return false;
   }
 
-  /// <summary>Readiness score: a recent failure sinks a member outright, then queued work, then measured latency — lower is readier.</summary>
-  private double _LoadScore(IVolumeIO volume)
-    => (this._IsCoolingDown(volume.MemberId) ? 1_000_000.0 : 0.0)
-       + (this._memberLoad.TryGetValue(volume.MemberId, out var inflight) ? inflight : 0) * 1000.0
-       + (volume is MeasuredVolumeIO { Samples: > 0 } measured ? measured.AverageLatencyMs : 0.0);
+  /// <summary>
+  /// Readiness score: a recent failure sinks a member outright, then queued work, then what it
+  /// actually costs to use — lower is readier.
+  ///
+  /// The cost term is two things added together because a member can be slow in two ways the engine
+  /// learns about differently. A slow DEVICE shows up in the measured latency, which is real time
+  /// spent inside the volume. A member the pool is deliberately RATE-LIMITING does not: the wait is
+  /// imposed before the volume is touched, so its operations look as brisk as anything else's and
+  /// only the queue knows better. Leaving that out meant a member limited to a crawl was ranked
+  /// equal to a healthy one and kept drawing half of every duplicated read.
+  /// </summary>
+  /// <summary>
+  /// The admission hook the pool's own whole-file transfers pass their chunks through, so a drain or
+  /// a heal is held to the destination member's rate limit exactly as a block write is.
+  ///
+  /// <see cref="WholeFilePublisher"/> streams straight into the member, so it never reached
+  /// <see cref="VolumeQueues.Enter"/> and no limit applied — which made the largest thing the pool
+  /// ever does to a disk the one thing that ignored the operator's "go easy on this member".
+  /// Measured before the fix: a 24 MiB heal onto a member limited to 1 MiB/s finished in under six
+  /// seconds.
+  /// </summary>
+  private Action<long> _AdmitBulkTo(IVolumeIO target)
+    => bytes => this._queues.Enter(target, bytes).Dispose();
+
+  private double _LoadScore(IVolumeIO volume) {
+    if (this._IsCoolingDown(volume.MemberId))
+      return 1_000_000.0;
+
+    var inflight = this._memberLoad.TryGetValue(volume.MemberId, out var queued) ? queued : 0;
+
+    // What one more operation here is expected to cost: everything already queued, plus this one,
+    // each taking what an operation on this member currently takes.
+    //
+    // The queue used to be weighted at a flat 1000 and the cost added beside it, which made "one
+    // operation already in flight" exactly as bad as "every operation here takes a second". On a
+    // healthy pool that is harmless — the cost term is ~0 and the queue orders the members, which is
+    // what spreads load. It stops being harmless the moment one member is genuinely slow: a healthy
+    // member with a single request outstanding scored 1000 and a member costing a full second per
+    // block scored about the same, so a duplicated read kept being handed back to the slow one every
+    // time the fast one was momentarily busy. Multiplying instead of adding keeps the load-spreading
+    // (idle members still separate by queue depth, via the epsilon) and makes a slow member lose to
+    // a busy fast one, which is the whole point of having two copies.
+    const double perOperationFloorMs = 1.0;
+    var perOperation = perOperationFloorMs
+                       + (volume is MeasuredVolumeIO { Samples: > 0 } measured ? measured.AverageLatencyMs : 0.0)
+                       + this._queues.ThrottleWaitMsFor(volume.MemberId);
+
+    return (inflight + 1) * perOperation;
+  }
   private readonly ShadowNamespace _shadow = new();
 
   // FR-PAR / §6.4: how wide a request may fan out across the storages behind it, and how much
@@ -240,6 +284,22 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._placement.InvalidateAll();
     this._activity.Publish(ActivityKind.Recovery, "", reason: "member roles reloaded");
     DriveBender.Logger("Member roles reloaded live");
+  }
+
+  /// <summary>
+  /// Applies the manifest's per-member rate limits (<c>maxIops</c>, <c>maxThroughput</c>) to a
+  /// RUNNING pool.
+  ///
+  /// These were read once, when the engine built its members, and a live reload did not touch them —
+  /// it reloaded the config, the member roles and the duplication level, so everything ELSE the
+  /// manifest says could be changed under a mounted pool and this one thing silently could not. The
+  /// setting exists precisely for the situation you cannot unmount for ("the pool is taking too much
+  /// of that disk, ease off"), which made it the least useful thing to require a remount.
+  /// </summary>
+  public void UpdateMemberLimits(IEnumerable<(Guid MemberId, int MaxIops, long MaxThroughput)> limits) {
+    this._queues.SetThrottles(limits);
+    this._activity.Publish(ActivityKind.Recovery, "", reason: "member rate limits reloaded");
+    DriveBender.Logger("Member rate limits reloaded live");
   }
 
   private void _OnMemberLost(IVolumeIO member) {
@@ -673,21 +733,53 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return handleForExisting;
     }
 
-    var target = this._placement.ChoosePrimaryTarget(0)
-                 ?? throw new PoolFsException(PoolFsError.NoSpace, "No pool member can take the new file");
-
     // staged temp-name lifecycle needs an atomic rename on every member to publish; members
     // without it (whole-file remote backends) fall back to writing the final name in place
     var staged = this._Online.All(m => (m.Caps & BackendCaps.AtomicRename) != 0);
     var physical = staged ? _StagedNameOf(normalized) : normalized;
-
-    var sequence = this._journal.LogIntent(JournalOp.Create, physical, memberId: target.MemberId);
     var parent = PoolPaths.GetParent(normalized);
-    if (parent.Length > 0)
-      target.EnsureFolder(parent, false);
 
-    using (var stream = target.OpenWrite(physical, false, true))
-      stream.Flush();
+    // A new file used to commit to the FIRST member placement offered and fail outright if that
+    // member would not take it. Which is fine when a member is either working or gone — and wrong
+    // for the way storage most often breaks in the field: a filesystem that hits a write error
+    // remounts itself READ-ONLY. Such a member is reachable, reads perfectly, and refuses every
+    // write, so placement kept choosing it and roughly half of all new files failed with a bare
+    // "access denied" while a perfectly writable member sat beside it. The write path has redirected
+    // around a storage that fails mid-write for some time (SAFE-DEGRADE); creation had no such path.
+    //
+    // Noting the fault is what does the routing: a member that has just failed sinks to the back of
+    // the readiness order, which is the same order placement chooses by, so the retry lands
+    // somewhere else and so does every create after it until the member recovers.
+    var attempts = Math.Max(1, this._members.Count);
+    IVolumeIO? target = null;
+    PoolFsException? refusal = null;
+    long sequence = 0;
+    for (var attempt = 0; attempt < attempts; ++attempt) {
+      target = this._placement.ChoosePrimaryTarget(0);
+      if (target == null)
+        break;
+
+      sequence = this._journal.LogIntent(JournalOp.Create, physical, memberId: target.MemberId);
+      try {
+        if (parent.Length > 0)
+          target.EnsureFolder(parent, false);
+
+        using (var stream = target.OpenWrite(physical, false, true))
+          stream.Flush();
+
+        refusal = null;
+        break;
+      } catch (PoolFsException e) {
+        this._journal.Complete(sequence, JournalOp.Create); // this member is not taking the file after all
+        this._NoteMemberFault(target.MemberId);
+        this._placement.InvalidateAll(); // the next choice must not come from a cached placement
+        refusal = e;
+        target = null;
+      }
+    }
+
+    if (target == null)
+      throw refusal ?? new PoolFsException(PoolFsError.NoSpace, "No pool member can take the new file");
 
     this._integrity.RecordWholeFile(target, physical, false, []);
     this._EnsureShadows(physical, []);
@@ -730,7 +822,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       var parent = PoolPaths.GetParent(normalized);
       target.EnsureFolder(parent, true);
-      WholeFilePublisher.CopyBetween(sourceVol, normalized, sourceShadow, target, normalized, true);
+      WholeFilePublisher.CopyBetween(sourceVol, normalized, sourceShadow, target, normalized, true,
+        admit: this._AdmitBulkTo(target));
       this._activity.Publish(ActivityKind.Duplicate, normalized, size,
         fromMember: sourceVol.DisplayName, toMember: target.DisplayName,
         reason: $"duplication level {duplication}");
@@ -1123,18 +1216,43 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// chain plus a sort buffer plus an array, every time) is now: nothing at all when there is one
   /// copy or no split, and a stable insertion sort over a handful of indices when there is.
   /// </summary>
+  /// <summary>A duplication level is small; beyond this the scores go on the heap with the order.</summary>
+  private const int _MAX_STACK_COPIES = 8;
+
   private int[] _OrderCopiesForBlock(IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit) {
     var count = copies.Count;
     if (count <= 1)
       return _IdentityOrder(count);
 
-    // Without a split the rotation is skipped — mirrorReadSplitThreshold governs whether reads
-    // are spread across copies, and this is not the place to overrule it. A member that just
-    // FAILED still has to sink to the back, though, split or no split: otherwise a large read
-    // tries the dying disk first for every one of its blocks and pays the driver timeout each
-    // time, with a healthy copy sitting right beside it.
-    if (!mirrorSplit && !this._AnyCoolingDown(copies))
-      return _IdentityOrder(count);
+    // Without a split the rotation is skipped — mirrorReadSplitThreshold governs whether reads are
+    // SPREAD across copies, and this is not the place to overrule it. Which copy is tried FIRST is a
+    // different question, and the answer has to be "the readiest one" even when there is no split.
+    //
+    // It used to be "copies[0], always". A member that had just FAILED was sunk to the back, because
+    // a dying disk tried first for every block of a large read costs a driver timeout every time.
+    // But a member does not have to fail to be ruinous: one that merely got SLOW — a controller
+    // retrying internally, a link renegotiated down, a rate limit the pool was asked to respect —
+    // answers every request correctly and eventually, so it never errors, never cools down, and was
+    // therefore tried first for every block forever. Measured through a real mount: a 48 MiB read of
+    // a duplicated file took 0.15s with both members healthy and 8.02s with the primary's member
+    // held to 1 MiB/s, against 0.15s available from the untouched copy sitting beside it. That is
+    // duplication making the pool slower, which is precisely backwards.
+    //
+    // The scores are computed either way now; what the fast path avoids is the ALLOCATION, and it
+    // still avoids it whenever the copies are already in the right order — which is every read on a
+    // healthy pool, because equal scores compare as ordered.
+    if (!mirrorSplit && count <= _MAX_STACK_COPIES) {
+      Span<double> quick = stackalloc double[count];
+      var ordered = true;
+      for (var i = 0; i < count; ++i) {
+        quick[i] = this._LoadScore(copies[i].Volume);
+        if (i > 0 && quick[i] < quick[i - 1])
+          ordered = false;
+      }
+
+      if (ordered)
+        return _IdentityOrder(count);
+    }
 
     var order = new int[count];
     var scores = new double[count];
@@ -1971,7 +2089,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           target.EnsureFolder(parent, false);
 
         // streamed drain — the file is copied through a fixed buffer, never held in RAM (SAFE-BIGFILE)
-        WholeFilePublisher.CopyBetween(landing, path, false, target, path, false);
+        WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
+          admit: this._AdmitBulkTo(target));
 
         // TOCTOU guard (SAFE-NOLOSS): between the initial check and here, a foreground write could
         // have opened, rewritten and closed this file. If it is now open/dirty, or its size/mtime
@@ -2112,7 +2231,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // promote: the shadow's member gets a primary so the file survives shadow-container loss
       var survivor = copies[0];
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: survivor.Volume.MemberId);
-      WholeFilePublisher.CopyBetween(survivor.Volume, normalized, true, survivor.Volume, normalized, false);
+      WholeFilePublisher.CopyBetween(survivor.Volume, normalized, true, survivor.Volume, normalized, false,
+        admit: this._AdmitBulkTo(survivor.Volume));
       survivor.Volume.Delete(normalized, true);
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
       this._activity.Publish(ActivityKind.Recovery, normalized, size, toMember: survivor.Volume.DisplayName, reason: "primary restored from surviving shadow");
@@ -2126,7 +2246,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: target.MemberId);
       target.EnsureFolder(PoolPaths.GetParent(normalized), true);
-      WholeFilePublisher.CopyBetween(source.Volume, normalized, source.Shadow, target, normalized, true);
+      WholeFilePublisher.CopyBetween(source.Volume, normalized, source.Shadow, target, normalized, true,
+        admit: this._AdmitBulkTo(target));
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
       this._activity.Publish(ActivityKind.Duplicate, normalized, size,
         fromMember: source.Volume.DisplayName, toMember: target.DisplayName,
@@ -2206,23 +2327,62 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// application that wrote the file keeps running.
   /// </summary>
   public void MarkApplicationClosed(NodeHandle handle) {
+    var wrote = this._handles.TryGet(handle) is { } open && (open.Access & AccessMode.Write) != 0;
     this._handles.MarkApplicationClosed(handle);
 
     // publication hangs off "no application still has it open", which is exactly what just changed
     var path = this._handles.TryGetPath(handle);
-    if (path != null && this._staging.ContainsKey(path) && !this._handles.IsOpen(path))
+    if (path == null)
+      return;
+
+    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path))
       this._PublishStaged(path);
+
+    if (wrote)
+      this._RememberSettledSize(path);
   }
 
   public void Close(NodeHandle handle) {
     var open = this._handles.Get(handle);
     var path = open.File.Path;
+    var wrote = (open.Access & AccessMode.Write) != 0;
     this._handles.Close(handle);
 
     // last handle gone: publish the staged temp to its final name — the atomic rename is the
     // LAST action before the Create journal intent completes (FR-STAGED-WRITE)
     if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path))
       this._PublishStaged(path);
+
+    if (wrote)
+      this._RememberSettledSize(path);
+  }
+
+  /// <summary>
+  /// Brings the shadow namespace's remembered size for a path up to what the file actually became.
+  ///
+  /// The shadow entry is recorded when a file is CREATED, and at that moment its length is zero.
+  /// Only a stat that MISSES the metadata cache ever refreshes it, so a file that is written, closed
+  /// and never looked at again keeps a remembered length of zero for its whole life. That number is
+  /// invisible until it is the only one left — and then it is the one `retain-metadata` answers
+  /// with, so losing the disk under such a file reports it as EXISTING AND EMPTY. A whole-file read
+  /// then returns no bytes and SUCCEEDS, which is the worst shape a storage pool can fail in: the
+  /// application is not told anything went wrong and writes the emptiness onward.
+  ///
+  /// Doing this once per write handle rather than once per write is what keeps it off the hot path —
+  /// a close already flushes and may publish, so one stat beside that is noise.
+  /// </summary>
+  private void _RememberSettledSize(string normalized) {
+    try {
+      using var lease = this._handles.AcquireRead(normalized);
+      if (this._StatUncached(normalized) is not { } settled)
+        return; // deleted, or its member left before we got here — the old entry is no worse
+
+      var logical = this._OverlayMeta(normalized, settled);
+      this._shadow.Record(normalized,
+        new(logical.IsDirectory ? NodeKind.Directory : NodeKind.File, logical.Length, logical.LastWriteTimeUtc));
+    } catch (PoolFsException) {
+      // remembering a size is best effort; it must never turn a successful close into a failure
+    }
   }
 
   /// <summary>

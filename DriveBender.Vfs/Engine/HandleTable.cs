@@ -228,6 +228,16 @@ public sealed class HandleTable {
       return this._files.TryGetValue(normalizedPath, out var file) && file.AppHandleCount > 0;
   }
 
+  /// <summary>
+  /// The open handle, or null when it is already gone — for callers that ask about a handle the
+  /// adapter may legitimately send twice (a cleanup after a close), where a stale handle is an
+  /// ordinary answer rather than an error.
+  /// </summary>
+  public OpenHandle? TryGet(NodeHandle handle) {
+    lock (this._lock)
+      return this._handles.TryGetValue(handle.Value, out var open) ? open : null;
+  }
+
   /// <summary>The path a handle refers to, or null when it is already gone.</summary>
   public string? TryGetPath(NodeHandle handle) {
     lock (this._lock)

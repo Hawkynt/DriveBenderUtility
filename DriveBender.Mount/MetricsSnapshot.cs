@@ -17,6 +17,28 @@ public sealed record MemberLatencyRow(Guid MemberId, double AvgMs, long Samples)
 public sealed record MemberSpaceRow(Guid MemberId, bool Online, long BytesFree, long BytesTotal);
 
 /// <summary>
+/// One member's device health, as last sampled from SMART.
+///
+/// Carried in the live snapshot so the dashboard can colour a storage by how much life it has left
+/// rather than only by whether it is reachable — a disk that is answering every request while its
+/// spare blocks run out looks identical to a healthy one until it does not answer at all, which is
+/// far too late to be told. <see cref="Health"/> is the enum's name, so the wire format stays
+/// readable and a new severity does not silently renumber the old ones.
+/// </summary>
+public sealed record MemberHealthRow(
+  Guid MemberId,
+  string Health,
+  string? Detail,
+  int? TemperatureCelsius,
+  int? PercentUsed,
+  int? SparePercent,
+  long? ReallocatedSectors,
+  long? PendingSectors,
+  long? MediaErrors,
+  int? PowerOnHours,
+  string? Model);
+
+/// <summary>
 /// A mounted pool's live metrics + recent activity, published each second by the mount
 /// process to the config dir so the <c>serve</c> daemon can stream it to the web UI
 /// without hosting the engine itself (§6.13 the GUI talks to the daemon over a local API).
@@ -44,6 +66,7 @@ public sealed record MetricsSnapshot {
   public IReadOnlyList<ActivityRow> RecentActivity { get; init; } = [];
   public IReadOnlyList<MemberLatencyRow> MemberLatencies { get; init; } = [];
   public IReadOnlyList<MemberSpaceRow> MemberSpace { get; init; } = [];
+  public IReadOnlyList<MemberHealthRow> MemberHealth { get; init; } = [];
 }
 
 /// <summary>Writes/reads the per-pool metrics snapshot files the daemon aggregates.</summary>
@@ -52,7 +75,8 @@ public sealed class MetricsPublisher(IHostEnvironment host) {
   private string _Directory => Path.Combine(host.ConfigRoot, "mounts");
   private string _Path(Guid poolId) => Path.Combine(this._Directory, $"{poolId:D}.metrics.json");
 
-  public void Publish(PoolFileSystem fs, MountEntry entry, IReadOnlyList<IVolumeIO>? members = null) {
+  public void Publish(PoolFileSystem fs, MountEntry entry, IReadOnlyList<IVolumeIO>? members = null,
+    IReadOnlyDictionary<Guid, SmartStatus>? health = null) {
     var metrics = fs.GetMetrics();
     var stats = fs.StatFs();
     var snapshot = new MetricsSnapshot {
@@ -81,6 +105,12 @@ public sealed class MetricsPublisher(IHostEnvironment host) {
       MemberSpace = members == null
         ? []
         : [.. members.Select(m => new MemberSpaceRow(m.MemberId, m.IsOnline, m.IsOnline ? m.BytesFree : 0, m.IsOnline ? m.BytesTotal : 0))],
+      MemberHealth = health == null
+        ? []
+        : [.. health.Select(h => new MemberHealthRow(h.Key, h.Value.Health.ToString(), h.Value.Detail,
+          h.Value.TemperatureCelsius, h.Value.PercentageUsed, h.Value.AvailableSparePercent,
+          h.Value.ReallocatedSectors, h.Value.PendingSectors, h.Value.MediaErrors,
+          h.Value.PowerOnHours, h.Value.Model))],
     };
 
     try {

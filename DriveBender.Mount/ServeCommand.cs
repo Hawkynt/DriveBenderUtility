@@ -239,11 +239,13 @@ internal sealed class ServeCommand(
           break;
         case "/api/pool/remove-member" when request.HttpMethod == "POST":
           this._WriteJson(context, _Guard(() => this._MediaOpJob("remove-media", this._RequirePool(request),
-            ["pool-remove-media", this._RequirePool(request), "--member", request.QueryString["member"] ?? ""])));
+            ["pool-remove-media", this._RequirePool(request), "--member", request.QueryString["member"] ?? ""],
+            subject: request.QueryString["member"] ?? "")));
           break;
         case "/api/pool/replace-media" when request.HttpMethod == "POST":
           this._WriteJson(context, _Guard(() => this._MediaOpJob("replace-media", this._RequirePool(request),
-            ["pool-replace-media", this._RequirePool(request), "--old", request.QueryString["old"] ?? "", "--new", request.QueryString["new"] ?? ""])));
+            ["pool-replace-media", this._RequirePool(request), "--old", request.QueryString["old"] ?? "", "--new", request.QueryString["new"] ?? ""],
+            subject: request.QueryString["old"] ?? "")));
           break;
         case "/api/pool/delete" when request.HttpMethod == "POST":
           this._WriteJson(context, this._Delete(request, purge: false));
@@ -341,6 +343,11 @@ internal sealed class ServeCommand(
         var snapshot = mounted.ContainsKey(pool.PoolId) ? this._metrics.TryRead(pool.PoolId) : null;
         // mounted → the POOL reports each storage's live space; unmounted → the slow discovery probe
         var liveSpace = snapshot?.MemberSpace.ToDictionary(s => s.MemberId) ?? [];
+        var liveHealth = snapshot?.MemberHealth.ToDictionary(h => h.MemberId) ?? [];
+        // a member whose data is being evacuated is neither healthy nor broken; it is on its way out
+        var evacuating = this._jobs.Running()
+          .Where(j => j.Kind is "remove-media" or "replace-media" && j.Subject.Length > 0)
+          .Select(j => j.Subject).ToHashSet(StringComparer.OrdinalIgnoreCase);
         return new {
           id = pool.PoolId,
           name = pool.Name,
@@ -360,6 +367,7 @@ internal sealed class ServeCommand(
             var hasLive = liveSpace.TryGetValue(m.MemberId, out var live);
             var free = hasLive ? live!.BytesFree : discoveredSpace.TryGetValue(m.MemberId, out var f) ? f.free : 0;
             var total = hasLive ? live!.BytesTotal : discoveredSpace.TryGetValue(m.MemberId, out var t) ? t.total : 0;
+            var smart = liveHealth.GetValueOrDefault(m.MemberId);
             return new {
               id = m.MemberId,
               path = m.ResolvedPath,
@@ -369,6 +377,22 @@ internal sealed class ServeCommand(
               network = m.Network,
               bytesFree = free,
               bytesTotal = total,
+              // ONE state for the dashboard to colour by, resolved here rather than in the browser
+              // so the precedence is stated once: being evacuated or gone outranks anything SMART
+              // has to say about a disk that is on its way out anyway.
+              state = !m.Online ? "detached"
+                : evacuating.Contains(m.MemberId.ToString()) ? "replacing"
+                : (smart?.Health ?? "unknown").ToLowerInvariant(),
+              health = smart?.Health?.ToLowerInvariant() ?? "unknown",
+              healthDetail = smart?.Detail,
+              temperatureC = smart?.TemperatureCelsius,
+              percentUsed = smart?.PercentUsed,
+              sparePercent = smart?.SparePercent,
+              reallocatedSectors = smart?.ReallocatedSectors,
+              pendingSectors = smart?.PendingSectors,
+              mediaErrors = smart?.MediaErrors,
+              powerOnHours = smart?.PowerOnHours,
+              model = smart?.Model,
             };
           }),
           metrics = snapshot == null ? null : new {
@@ -525,8 +549,8 @@ internal sealed class ServeCommand(
   private object _StartUnstoppableJob(string kind, Func<object> work, string pool = "")
     => this._StartJob(kind, (_, _) => work(), pool, cancellable: false);
 
-  private object _StartJob(string kind, Func<CancellationToken, Action<JobRegistry.JobProgress>, object> work, string pool = "", bool cancellable = true) {
-    var job = this._jobs.Start(kind, pool, work, cancellable);
+  private object _StartJob(string kind, Func<CancellationToken, Action<JobRegistry.JobProgress>, object> work, string pool = "", bool cancellable = true, string subject = "") {
+    var job = this._jobs.Start(kind, pool, work, cancellable, subject);
     return new { ok = true, result = new { jobId = job.Id, kind, state = "running", job.Cancellable } };
   }
 
@@ -575,6 +599,7 @@ internal sealed class ServeCommand(
       jobId = job.Id,
       job.Kind,
       job.Pool,
+      job.Subject,
       runningSeconds = (int)(now - job.StartedUtc).TotalSeconds,
       job.Progress,
       job.Completed,
@@ -692,7 +717,7 @@ internal sealed class ServeCommand(
   /// (and a daemon thread) open for up to thirty minutes, showing a dead spinner that any proxy
   /// or client timeout would throw away, and which nothing could cancel or reopen.
   /// </summary>
-  private object _MediaOpJob(string kind, string poolRef, string[] workerArgs) {
+  private object _MediaOpJob(string kind, string poolRef, string[] workerArgs, string subject = "") {
     var pool = this._Discover(poolRef);
     if (mountRegistry.Find(pool.PoolId.ToString()) != null)
       throw new ManifestException("unmount the pool first — media operations rearrange the members' files and must not race the live mount");
@@ -704,7 +729,7 @@ internal sealed class ServeCommand(
         throw new ManifestException(output.Length > 0 ? output : "the media operation failed — check the daemon log");
 
       return "ok";
-    }), pool.PoolId.ToString());
+    }), pool.PoolId.ToString(), subject: subject);
   }
 
   /// <summary>Spawns a short-lived dbmount worker and returns its full output + exit code.</summary>
