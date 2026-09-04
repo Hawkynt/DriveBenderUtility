@@ -123,35 +123,39 @@ public class SimulatedDeviceEndToEndTests {
         + $"absorbs at the fast tier's pace cannot be told apart from one that does not without at "
         + $"least {neededSpread:F0}x between them.");
 
-    // And the HOST has to be able to demonstrate it. The bar below is an absolute byte rate, so on a
-    // machine that cannot write that fast through its own filesystem the scenario measures the
-    // runner rather than the pool — which is exactly what happened on a CI worker, where 32 MiB
-    // through the driver did not reach the 24 MiB/s this pairing asks for. A cheap probe of the
-    // temp directory settles whether the claim is demonstrable here before it is asserted.
-    var bar = slow.MaxThroughput * 1.5;
-    var hostRate = StorageDevices.ProbeWriteRate(Path.GetTempPath(), 4 * 1024 * 1024);
-    if (hostRate > 0 && hostRate < bar * 2)
-      Assert.Ignore(
-        $"this host writes at about {hostRate / (1024 * 1024):F0} MiB/s, which is too close to the "
-        + $"{bar / (1024 * 1024):F0} MiB/s this pairing would have to beat — the measurement would be "
-        + $"of the machine, not of the landing zone.");
-
-    using var pool = MountedPool.Create(members: 2, landingZones: 1, storageKinds: [fast, slow]);
-
-    // sized against the SLOW tier: big enough that writing through to it could not possibly keep up
+    // sized against the SLOW tier: big enough that writing through to it could not keep up
     var size = (int)(slow.MaxThroughput * 2);
     var content = _Payload(size, 903);
+
+    // The CONTROL is the same burst written to a pool that is only the slow tier. Comparing against
+    // an absolute byte rate instead looked reasonable and was not: at these sizes the fixed costs of
+    // a write through the driver — the journal, the staged temp, an fsync per copy — are a large
+    // part of the time, so on a slower machine the tiered pool missed a bar it should clear while
+    // nothing was wrong with it. Both sides of this comparison pay those costs.
+    double throughTheSlowTier;
+    using (var control = MountedPool.Create(members: 1, storageKinds: [slow])) {
+      var clock = Stopwatch.StartNew();
+      File.WriteAllBytes(control.PathTo("burst.bin"), content);
+      clock.Stop();
+      throughTheSlowTier = size / clock.Elapsed.TotalSeconds;
+    }
+
+    using var pool = MountedPool.Create(members: 2, landingZones: 1, storageKinds: [fast, slow]);
 
     var stopwatch = Stopwatch.StartNew();
     File.WriteAllBytes(pool.PathTo("burst.bin"), content);
     stopwatch.Stop();
 
     var rate = size / stopwatch.Elapsed.TotalSeconds;
-    rate.Should().BeGreaterThan(bar,
+    TestContext.Out.WriteLine(
+      $"[tiering] {fast} over {slow}: {rate / (1024 * 1024):F1} MiB/s through the landing zone, "
+      + $"{throughTheSlowTier / (1024 * 1024):F1} MiB/s writing straight to the capacity tier.");
+
+    rate.Should().BeGreaterThan(throughTheSlowTier * 2,
       $"a landing zone exists so the slow tier is BEHIND the write rather than in it: {fast} over "
-      + $"{slow} absorbed {size / (1024 * 1024)} MiB at {rate / (1024 * 1024):F0} MiB/s against the "
-      + $"capacity tier's own {slow.MaxThroughput / (1024 * 1024)} MiB/s."
-      + $"{Environment.NewLine}{pool.MountLog}");
+      + $"{slow} absorbed {size / (1024 * 1024)} MiB at {rate / (1024 * 1024):F1} MiB/s, against "
+      + $"{throughTheSlowTier / (1024 * 1024):F1} MiB/s for the same burst written straight to "
+      + $"{slow} on this machine.{Environment.NewLine}{pool.MountLog}");
 
     File.ReadAllBytes(pool.PathTo("burst.bin")).Should().Equal(content,
       "absorbing a burst quickly is worthless if the bytes are not the user's bytes");
