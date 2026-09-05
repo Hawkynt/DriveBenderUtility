@@ -132,7 +132,20 @@ public class FolderRenameRaceEndToEndTests {
 
     renamer.Join(TimeSpan.FromMinutes(1)).Should().BeTrue($"the renamer must not hang.{Environment.NewLine}{pool.MountLog}");
 
-    // the race has to have actually happened, or this proves nothing
+    // The race has to have actually happened, or this proves nothing.
+    //
+    // On Windows it cannot be constructed this way at all: the OS refuses to rename a directory
+    // while files beneath it are open, and with writers hammering four children there is always a
+    // handle. Every attempt is declined before the pool ever sees it, which is why this comes back
+    // with zero renames there rather than with a race the engine declined to lose data to. Worth
+    // saying rather than skipping silently — it also means the window the note describes is far
+    // harder to reach on that platform, because the rename that would open it mostly cannot start.
+    if (renames == 0 && OperatingSystem.IsWindows())
+      Assert.Ignore(
+        "Windows refuses to rename a directory while files beneath it are open, so every rename in "
+        + $"this scenario was declined by the OS ({acknowledgedWrites} writes were taken meanwhile). "
+        + "The race cannot be built here; it runs on Linux, where POSIX allows the rename.");
+
     renames.Should().BeGreaterThan(5, "the folder must really have moved repeatedly");
     acknowledgedWrites.Should().BeGreaterThan(5, "and writes must really have been taken while it did");
 

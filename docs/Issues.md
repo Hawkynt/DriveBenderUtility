@@ -1026,7 +1026,13 @@ being deleted, because what they cost is the point.
    real mount — the case the note says the stress suite misses because it races file renames only.
    Its oracle is the one that matters and needs no timing: a write the pool ACKNOWLEDGED must be
    findable afterwards, and a file must hold ONE version rather than a blend of two. Several
-   thousand acknowledged writes across dozens of renames later, nothing was lost. That does not
+   thousand acknowledged writes across dozens of renames later, nothing was lost.
+
+   One thing the guard turned up on its own: **on Windows the race cannot be built at all.** The OS
+   refuses to rename a directory while files beneath it are open, so with writers hammering four
+   children every attempt is declined before the pool ever sees it — the scenario came back with
+   zero renames there and now skips with that reason. Which also says the window is far harder to
+   reach on that platform, because the rename that would open it mostly cannot start. That does not
    prove the window cannot open — a race that does not reproduce is not a race that cannot happen,
    and the reasoning about the missing child lease still stands — but the risk is no longer
    unobserved, and anything that makes it real from here fails a test instead of quietly losing a
