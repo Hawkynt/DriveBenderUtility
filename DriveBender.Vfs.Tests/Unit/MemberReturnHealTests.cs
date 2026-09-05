@@ -46,6 +46,51 @@ public class MemberReturnHealTests {
     => volume.GetContent(path, false) ?? volume.GetContent(path, true);
 
   [Test]
+  [Category("Exception")]
+  public void Quiesce_GivenAFileStaysOpenAndOwesACopy_ThenTheSchedulerStillRunsDry() {
+    // A file that is open when the healer reaches it cannot be healed right then, and it is put
+    // back on the queue so it is not forgotten. That re-queue must not be reported as PROGRESS:
+    // Quiesce pumps until every job runs dry, so a job that keeps saying "I did something" about a
+    // file it keeps deferring never lets it stop. Not a wedge — Quiesce has a safety limit and
+    // escapes after a hundred thousand rounds — but it burns them all to achieve nothing, and it
+    // comes back reporting that work is still pending when the pool is in fact as settled as it can
+    // get. The return value is what this asserts, because it distinguishes the two exactly: true
+    // means the jobs ran dry, false means the limit did.
+    var fs = this._CreateFs();
+
+    // written while the second member is away, so it owes a copy the moment it returns
+    this._volume2.IsOnline = false;
+    fs.PollMembers();
+    _CreateWithContent(fs, "held.bin", [4, 5, 6]);
+
+    // the handle is taken BEFORE the member returns, so the healer meets an open file every time
+    var handle = fs.Open("held.bin", AccessMode.ReadWrite, ShareMode.Read | ShareMode.Write);
+    try {
+      this._volume2.IsOnline = true;
+      fs.PollMembers();
+
+      var scheduler = fs.CreateScheduler();
+      var settled = Task.Run(() => scheduler.Quiesce());
+      settled.Wait(TimeSpan.FromSeconds(30)).Should().BeTrue("Quiesce must return at all");
+      settled.Result.Should().BeTrue(
+        "the jobs must RUN DRY, not spin on a file they keep deferring until the safety limit stops "
+        + "them. Reporting a deferral as progress is what makes the difference, and it costs a "
+        + "hundred thousand wasted rounds on every clean unmount that meets an open file.");
+
+      fs.HealPending.Should().BeTrue(
+        "the copy is still owed — reporting the pool as settled would lose it silently, which is what "
+        + "dropping the file from the queue used to do");
+    } finally {
+      fs.Close(handle);
+    }
+
+    // once the handle is gone the deferred heal completes on its own
+    fs.CreateScheduler().Quiesce();
+    this._AnyCopy(this._volume2, "held.bin").Should().Equal(new byte[] { 4, 5, 6 },
+      "the file the healer kept deferring is duplicated once it is closed");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public void Write_GivenMemberOfflineDuringWrite_WhenItReturns_ThenDuplicationHealsWithoutAnyExplicitOp() {
     var fs = this._CreateFs();
