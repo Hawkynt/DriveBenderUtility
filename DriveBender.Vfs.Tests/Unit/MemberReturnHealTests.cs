@@ -47,6 +47,68 @@ public class MemberReturnHealTests {
 
   [Test]
   [Category("Exception")]
+  public void OwedSync_GivenTheFlushFailsOnOneCopy_ThenTheOwedWritesAreNotDiscarded() {
+    // The write buffer is the ONLY record of what a lagging copy still needs. FlushPath drains it
+    // first and writes to the copies second, with nothing in between to put the ops back — so one
+    // error on one member (a full disk, a bad sector, a member dropping between the resolve and the
+    // open) takes the owed writes with it, and nothing re-queues them.
+    //
+    // Three members at duplication three, because that is where the pool defers on purpose: the ack
+    // floor is two reachable copies, so a write is acknowledged once two have it and the third is
+    // owed. Every member stays online throughout, so none of the repairs that a member RETURNING
+    // triggers can stand in for the thing being asked about here.
+    var volume3 = new FakeVolumeIO(Guid.NewGuid(), "v3", "PHYS-3", capacity: 1L << 20);
+    var cache = new CacheInstance("od" + Guid.NewGuid().ToString("N"),
+      new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
+    var fs = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2), new(volume3)], cache,
+      ConfigResolver.ResolveEffective(null,
+        """{ "duplication": 3, "placement": { "shadowNeverSamePhysical": false }, "trash": { "enabled": false } }"""));
+    fs.Mount(new(@"X:\"));
+
+    // the handle stays OPEN: closing it flushes, and the question here is what happens to owed ops
+    // that are still owed when a flush of them fails
+    var handle = fs.Create("report.doc", NodeKind.File, CreateFlags.None);
+    fs.Write(handle, [1, 1, 1], 0, WriteMode.Normal);
+
+    fs.WriteBuffer.IsDirty("report.doc").Should().BeTrue(
+      "with three copies and an ack floor of two, the third is owed — or this scenario has nothing "
+      + "to lose and proves nothing");
+
+    // the flush of what is owed fails on one member
+    foreach (var volume in new[] { this._volume1, this._volume2, volume3 })
+      volume.FailNext(VolumeOp.OpenWrite, PoolFsError.IoError);
+
+    var flush = () => fs.FlushPath("report.doc");
+    flush.Should().Throw<PoolFsException>("a copy could not be written");
+
+    fs.WriteBuffer.IsDirty("report.doc").Should().BeTrue(
+      "a flush that FAILED must not have consumed the only record of what is still owed. Dropping "
+      + "it leaves copies disagreeing with nothing left to notice: the pool reports itself fully "
+      + "duplicated, and which version a read gets depends on which copy it picks.");
+
+    // and once whatever went wrong has passed, the retry actually lands them
+    foreach (var volume in new[] { this._volume1, this._volume2, volume3 })
+      volume.ClearFaults();
+
+    fs.FlushPath("report.doc");
+    fs.WriteBuffer.IsDirty("report.doc").Should().BeFalse("the retry succeeded, so nothing is owed any more");
+
+    // the content lands under its real name at Close: until then it lives in the staging file, so
+    // this is where the bytes the failed flush was carrying can finally be looked at
+    fs.Close(handle);
+
+    var holders = new[] { this._volume1, this._volume2, volume3 }
+      .Where(v => this._AnyCopy(v, "report.doc") != null)
+      .ToArray();
+
+    holders.Length.Should().BeGreaterThanOrEqualTo(2, "the write was acknowledged on at least the ack floor");
+    foreach (var volume in holders)
+      this._AnyCopy(volume, "report.doc").Should().Equal(new byte[] { 1, 1, 1 },
+        "every copy carries the write that the first flush failed to deliver");
+  }
+
+  [Test]
+  [Category("Exception")]
   public void Quiesce_GivenAFileStaysOpenAndOwesACopy_ThenTheSchedulerStillRunsDry() {
     // A file that is open when the healer reaches it cannot be healed right then, and it is put
     // back on the queue so it is not forgotten. That re-queue must not be reported as PROGRESS:

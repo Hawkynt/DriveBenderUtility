@@ -211,13 +211,63 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
   }
 
   /// <summary>Removes and returns the pending image for application; the caller must complete the returned journal sequences.</summary>
-  public (IReadOnlyList<PendingOp> ops, IReadOnlyList<long> journalSequences, int durableCopies)? Drain(string path) {
+  public (IReadOnlyList<PendingOp> ops, IReadOnlyList<long> journalSequences, int durableCopies, DateTime firstStagedUtc)? Drain(string path) {
     lock (this._lock) {
       if (!this._files.Remove(path, out var buffer))
         return null;
 
       cache.ReleaseWrite(buffer.ReservedBytes);
-      return ([.. buffer.Ops], [.. buffer.OpenJournalSequences], buffer.DurableCopies);
+      return ([.. buffer.Ops], [.. buffer.OpenJournalSequences], buffer.DurableCopies, buffer.FirstStagedUtc);
+    }
+  }
+
+  /// <summary>
+  /// Puts a drained buffer back, for a flush that drained it and then could not complete.
+  ///
+  /// Draining is destructive and the buffer is the ONLY record of what a lagging copy still needs,
+  /// so a copy that could not be written — a full disk, a bad sector, a member that dropped between
+  /// the resolve and the open — used to take the owed writes with it. Nothing re-queued them: the
+  /// copies were left disagreeing, and the pool went on reporting itself fully duplicated, which is
+  /// the state it is least able to notice.
+  ///
+  /// <paramref name="firstStagedUtc"/> is carried over rather than reset, so a write that keeps
+  /// failing to flush still ages towards its <c>maxDefer</c> cap instead of having the clock wound
+  /// back on every attempt.
+  ///
+  /// Partial success needs no special handling: the ops are idempotent — an offset and its bytes —
+  /// so a copy that already took them simply takes them again on the retry, and until then the
+  /// buffer keeps covering reads, which is what it does for any owed write.
+  /// </summary>
+  public void Restore(string path, IReadOnlyList<PendingOp> ops, IReadOnlyList<long> journalSequences,
+    int durableCopies, DateTime firstStagedUtc) {
+    if (ops.Count == 0 && journalSequences.Count == 0)
+      return;
+
+    lock (this._lock) {
+      // a write that landed while the flush was failing owns the path now, and it is NEWER — the
+      // restored ops would roll it back, which is the one thing the buffer must never do
+      if (this._files.ContainsKey(path))
+        return;
+
+      var buffer = new FileBuffer {
+        FirstStagedUtc = firstStagedUtc,
+        State = durableCopies == 0 ? DirtyState.RamBuffered : DirtyState.Landed,
+        DurableCopies = durableCopies,
+      };
+
+      foreach (var op in ops) {
+        buffer.Ops.Add(op);
+        if (op.Data is { } data) {
+          // Re-reserved where the budget allows, and simply not counted where it does not. The
+          // bytes are already held in memory either way; refusing to restore them because the
+          // accounting is full would discard them, which is the fault being fixed.
+          if (cache.TryReserveWrite(data.Length))
+            buffer.ReservedBytes += data.Length;
+        }
+      }
+
+      buffer.OpenJournalSequences.AddRange(journalSequences);
+      this._files[path] = buffer;
     }
   }
 

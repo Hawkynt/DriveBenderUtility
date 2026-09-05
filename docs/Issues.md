@@ -684,6 +684,37 @@ out the destination's limit exactly as a block write does. Pinned from both side
 below, which could not exist before it: they need the copy to still be RUNNING when the foreground
 operation lands, and it never was.
 
+### A failed flush threw away the only record of what a copy still owed
+
+The same drop-instead-of-retry fault as the heal queue's, one layer down, and this one loses bytes
+rather than a copy.
+
+`FlushPath` drains the write buffer and then writes the drained ops to each copy. `Drain` is
+destructive — it removes the entry and releases its cache reservation — and there was no try/catch
+between the two. So one unwritable member took the owed writes with it: a full disk, a bad sector,
+or a member that dropped between `ResolveCopies` and `OpenWrite`. Nothing re-queued them. The copies
+were left disagreeing, and the pool went on reporting itself fully duplicated, which is the state it
+is least equipped to notice — the healer only creates copies that are MISSING, and a stale copy that
+is present and the right length is invisible to it until the next scheduled scrub.
+
+The buffer now takes the drained ops back on failure, carrying `FirstStagedUtc` over rather than
+resetting it, so a write that keeps failing still ages towards its `maxDefer` cap instead of having
+the clock wound back on every attempt. Partial success needs nothing special: an op is an offset and
+its bytes, so a copy that already took them takes them again, and the buffer keeps covering reads in
+the meantime exactly as it does for any owed write.
+
+The journal intent opened for the failed attempt goes back with them rather than being completed. It
+has to stay open — the write did not reach every copy, which is what it records — but handing it to
+the restored buffer is what gets it CLOSED later. Left behind, each failed attempt would strand one
+more intent that nothing ever completes, so the journal would grow without bound and every future
+mount would replay them.
+
+Two false starts on the way to seeing it, both worth remembering: a member going offline and coming
+back does not exercise this, because the quick scan its return triggers repairs the divergence
+anyway; and neither does a closed file, because `Close` flushes. It takes three members at
+duplication three — where the ack floor of two leaves the third genuinely owed — with the handle
+still open.
+
 ### The heal re-queue turned a clean unmount into a hundred thousand wasted rounds
 
 Introduced by the previous fix and caught before it shipped, which is the only reason it is written

@@ -2073,7 +2073,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (drained == null)
       return;
 
-    var (ops, journalSequences, _) = drained.Value;
+    var (ops, journalSequences, durableCopies, firstStagedUtc) = drained.Value;
     var dataName = this._DataName(normalized); // a staging file's owed blocks land in its temp physical
     if (ops.Count > 0) {
       var copies = this._placement.ResolveCopies(dataName);
@@ -2081,19 +2081,36 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         ? this._journal.LogIntent(JournalOp.Write, dataName)
         : 0;
 
-      foreach (var copy in copies) {
-        using var stream = copy.Volume.OpenWrite(dataName, copy.Shadow, false);
-        foreach (var op in ops) {
-          if (op.TruncateLength is { } truncateLength) {
-            stream.SetLength(truncateLength);
-            continue;
+      try {
+        foreach (var copy in copies) {
+          using var stream = copy.Volume.OpenWrite(dataName, copy.Shadow, false);
+          foreach (var op in ops) {
+            if (op.TruncateLength is { } truncateLength) {
+              stream.SetLength(truncateLength);
+              continue;
+            }
+
+            stream.Seek(op.Offset, SeekOrigin.Begin);
+            stream.Write(op.Data!, 0, op.Data!.Length);
           }
 
-          stream.Seek(op.Offset, SeekOrigin.Begin);
-          stream.Write(op.Data!, 0, op.Data!.Length);
+          stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
         }
-
-        stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+      } catch {
+        // The drain above is destructive, and this buffer is the only record of what these copies
+        // still need. One unwritable member — a full disk, a bad sector, one that dropped between
+        // the resolve and the open — must not take the owed writes with it: put them back so the
+        // owed-sync tries again.
+        //
+        // The intent opened for this attempt goes back WITH them rather than being completed. It
+        // has to stay open, because the write did not reach every copy and that is precisely what
+        // it records — but handing it to the restored buffer is what gets it closed later. Left
+        // behind instead, each failed attempt would strand one more intent that nothing ever
+        // completes: the journal grows without bound and every future mount replays them.
+        this._writeBuffer.Restore(normalized, ops,
+          volatileSequence != 0 ? [.. journalSequences, volatileSequence] : journalSequences,
+          durableCopies, firstStagedUtc);
+        throw;
       }
 
       if (volatileSequence != 0)
