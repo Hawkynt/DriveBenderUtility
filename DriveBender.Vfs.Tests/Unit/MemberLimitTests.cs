@@ -109,6 +109,131 @@ public class MemberLimitTests {
 
   [Test]
   [Category("EdgeCase")]
+  public void Pace_GivenACopyBetweenTwoMembers_ThenBothEndsAreCharged() {
+    // A copy is not something one disk does. Charging only the receiving member reads the limit as
+    // "how fast may this be written to", when an operator sets it to mean "leave this disk some
+    // room for everything else" — and the disk an exchange EMPTIES is under just as much load, and
+    // is very often the limited one, because it is the tired member being evacuated.
+    var source = new FakeVolumeIO(Guid.NewGuid(), "source", "PHYS-S", capacity: 1L << 30);
+    var target = new FakeVolumeIO(Guid.NewGuid(), "target", "PHYS-T", capacity: 1L << 30);
+    var charged = new List<(Guid member, long bytes)>();
+
+    WholeFilePublisher.Pace((m, b) => charged.Add((m.MemberId, b)), source, target)!(4096);
+
+    charged.Should().Equal([(source.MemberId, 4096L), (target.MemberId, 4096L)],
+      "the chunk cost both disks the same work, so it must be charged to both");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Pace_GivenBothEndsAreTheSameMember_ThenItIsChargedOnce() {
+    // promoting a shadow in place copies within one member; charging it twice would quietly halve
+    // the rate the operator asked for, on the one operation where the accounting is easiest to get
+    // wrong and hardest to notice
+    var member = new FakeVolumeIO(Guid.NewGuid(), "m", "PHYS-M", capacity: 1L << 30);
+    var charged = 0L;
+
+    WholeFilePublisher.Pace((_, b) => charged += b, member, member)!(4096);
+
+    charged.Should().Be(4096, "one disk did the work once");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Pace_GivenTheSlowerEndIsTheSource_ThenTheCopyRunsAtItsRate() {
+    // the point of charging both: a copy proceeds at the slower of the two allowances, so a limit
+    // on either end is a real bound on the copy rather than a suggestion
+    var source = new FakeVolumeIO(Guid.NewGuid(), "slow-source", "PHYS-S", capacity: 1L << 30);
+    var target = new FakeVolumeIO(Guid.NewGuid(), "fast-target", "PHYS-T", capacity: 1L << 30);
+    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    queues.SetThrottles([
+      (source.MemberId, new MemberLimits { BackgroundThroughput = 1 * _MIB }),
+      (target.MemberId, MemberLimits.None),
+    ]);
+
+    var pace = WholeFilePublisher.Pace((m, b) => queues.Enter(m, IoKind.Background, b).Dispose(), source, target)!;
+    pace(1 * _MIB); // spends the source's burst
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+    pace(1 * _MIB);
+    stopwatch.Stop();
+
+    stopwatch.Elapsed.Should().BeGreaterThan(TimeSpan.FromMilliseconds(500),
+      "an unlimited target cannot buy the copy out of the source's limit");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Replace_GivenALimitedMember_ThenTheExchangeIsChargedForWhatItMoves() {
+    // "a fixed rate for all operations, even heal and exchange" (§6.4). An exchange reads one disk
+    // end to end and writes another flat out, for hours, while the pool stays in use — it is the
+    // single operation an operator most wants held down, and it used to be entirely unmetered.
+    var old = new FakeVolumeIO(Guid.NewGuid(), "old", "PHYS-O", capacity: 1L << 20);
+    var replacement = new FakeVolumeIO(Guid.NewGuid(), "new", "PHYS-N", capacity: 1L << 20);
+    old.Seed("docs/a.bin", false, new byte[4096]);
+    old.Seed("docs/b.bin", false, new byte[2048]);
+
+    var charged = new Dictionary<Guid, long>();
+    var journal = new Journal(new MemberJournalStore([old, replacement]));
+    new MediaLifecycle([old, replacement], journal, 1,
+      admit: (m, b) => charged[m.MemberId] = charged.GetValueOrDefault(m.MemberId) + b)
+      .Replace(old.MemberId, replacement);
+
+    charged.Should().ContainKey(old.MemberId, "the disk being emptied did the reading")
+      .And.ContainKey(replacement.MemberId, "and the one receiving did the writing");
+    charged[old.MemberId].Should().Be(4096 + 2048, "every byte moved off it was accounted for");
+    charged[replacement.MemberId].Should().Be(4096 + 2048);
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Quiesce_GivenBackgroundWorkThatNeverFinishes_ThenItGivesUpAtTheBudget() {
+    // A clean unmount quiesces the scheduler, and housekeeping runs at whatever rate the operator
+    // allowed it. Unbounded, throttling a member costs the ability to shut down cleanly: the
+    // unmount request times out, the process is killed, and the next mount replays the journal.
+    // Nothing acknowledged is at stake — durability is the filesystem's Unmount, which runs after
+    // this regardless — so the right answer past the budget is to stop waiting.
+    var scheduler = new BackgroundScheduler([new EndlessJob()]);
+    var budget = TimeSpan.FromMilliseconds(500);
+
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+    var finished = scheduler.Quiesce(budget);
+    stopwatch.Stop();
+
+    finished.Should().BeFalse("work was still pending, and saying otherwise would hide it from the log");
+    stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(5),
+      "a job that never runs out of work must not be able to hold the unmount open");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Quiesce_GivenTheWorkFinishes_ThenItReportsSoWithoutSpendingTheBudget() {
+    var scheduler = new BackgroundScheduler([new FiniteJob(3)]);
+
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+    var finished = scheduler.Quiesce(TimeSpan.FromSeconds(30));
+    stopwatch.Stop();
+
+    finished.Should().BeTrue("the jobs ran out of work, which is the normal case");
+    stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(5), "and it returns as soon as they do");
+  }
+
+  /// <summary>Housekeeping that always has more to do — a drain held to a crawl, in effect.</summary>
+  private sealed class EndlessJob : IBackgroundJob {
+    public string Name => "endless";
+    public bool RunOnce() {
+      Thread.Sleep(20);
+      return true;
+    }
+  }
+
+  private sealed class FiniteJob(int units) : IBackgroundJob {
+    private int _left = units;
+    public string Name => "finite";
+    public bool RunOnce() => this._left-- > 0;
+  }
+
+  [Test]
+  [Category("EdgeCase")]
   public void EffectiveLimits_GivenOnlyTheLegacyPair_ThenItReadsAsASimpleRate() {
     // older manifests carry maxIops/maxThroughput and no limits block; they must keep meaning
     // exactly what they always did

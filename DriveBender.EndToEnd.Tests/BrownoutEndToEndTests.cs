@@ -223,7 +223,10 @@ public class BrownoutEndToEndTests {
   public void Brownout_GivenOneOfTwoCapacityMembersCollapses_ThenNewFilesGoToTheHealthyOne() {
     using var pool = MountedPool.Create(members: 2, poolDefaults: _SMALL_CACHE_SPREAD);
 
-    const int files = 12;
+    // ODD, so the two members cannot come back tied. The assertion is a strict inequality — the
+    // healthy member must take MORE — and with an even count a dead heat fails it while actually
+    // showing placement doing nothing wrong. Windows CI produced exactly that: 6 / 6.
+    const int files = 13;
     const int size = 2 * 1024 * 1024;
 
     // Established with a CONCURRENT burst, because that is the only time placement's load term does
@@ -231,7 +234,13 @@ public class BrownoutEndToEndTests {
     // space decides and every one of them can legitimately land on the same member. Asserting a
     // split after sequential writes asked the design for a guarantee it does not make — and on a
     // runner whose two members have identical free space it duly came back 12 / 0.
-    Parallel.For(0, files, file => File.WriteAllBytes(pool.PathTo($"before{file}.bin"), _Payload(size, 2300 + file)));
+    //
+    // The degree of parallelism is stated rather than inherited. Parallel.For sizes itself from the
+    // core count, so on a two-core runner barely two files are ever in flight and the load term has
+    // next to nothing to weigh — the burst this scenario depends on quietly became a trickle, and
+    // the result drifted with the shape of the host rather than the behaviour under test.
+    var burst = new ParallelOptions { MaxDegreeOfParallelism = files };
+    Parallel.For(0, files, burst, file => File.WriteAllBytes(pool.PathTo($"before{file}.bin"), _Payload(size, 2300 + file)));
 
     var beforeSplit = _CountPerMember(pool, "before", files);
     beforeSplit.Should().OnlyContain(count => count > 0,
@@ -244,7 +253,7 @@ public class BrownoutEndToEndTests {
     _Collapse(pool, victim);
 
     var stopwatch = Stopwatch.StartNew();
-    Parallel.For(0, files, file => File.WriteAllBytes(pool.PathTo($"after{file}.bin"), _Payload(size, 2400 + file)));
+    Parallel.For(0, files, burst, file => File.WriteAllBytes(pool.PathTo($"after{file}.bin"), _Payload(size, 2400 + file)));
     stopwatch.Stop();
 
     var afterSplit = _CountPerMember(pool, "after", files);

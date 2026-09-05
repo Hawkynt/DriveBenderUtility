@@ -13,6 +13,10 @@ namespace DivisonM.Mount;
 /// </summary>
 internal static class MountCommand {
 
+  /// <summary>How often the stop watcher looks for an unmount request; a file-exists check, so it can be brisk.</summary>
+  private static readonly TimeSpan _STOP_POLL = TimeSpan.FromMilliseconds(250);
+
+
   public static int Run(IHostEnvironment host, ManifestStore store, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, MountOptions options) {
     // key any failure report by the requested pool id so the launching daemon can read the real
     // reason even when this child was elevated (its stderr can't be captured across the UAC boundary)
@@ -227,7 +231,7 @@ internal static class MountCommand {
     try {
       var duplication = Math.Max(1, config.Duplication ?? 1);
       var allowSamePhysical = config.Placement?.ShadowNeverSamePhysical == false;
-      var media = new MediaLifecycle(ios, fs.Journal, duplication, allowSamePhysical);
+      var media = new MediaLifecycle(ios, fs.Journal, duplication, allowSamePhysical, fs.AdmitBulk);
       switch (op) {
         case "health" or "health-deep" or "fix": {
           var service = new HealthService(ios, new SmartctlMonitor(), fs.Integrity, media);
@@ -316,8 +320,6 @@ internal static class MountCommand {
           }
           if (++tick % 30 == 0 && currentConfig.Placement?.AutoLandingZone == true)
             _AutoTier(host, store, fs, pool, ios, advisor);
-          if (registry.StopRequested(pool.PoolId)) // another dbmount asked for a clean unmount
-            stop.Set();
         } catch (Exception e) {
           DriveBender.Logger($"[Warning]background pump tick failed: {e.Message}");
         } finally {
@@ -326,6 +328,23 @@ internal static class MountCommand {
         }
       }, null, TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan);
       using var pumpHandle = pump;
+
+      // A DEDICATED watcher, not a step in the pump tick, which is where this check used to live.
+      //
+      // The pump is deliberately non-reentrant: it re-arms only at the END of each tick. One unit of
+      // its work is a whole file, so a drain down a member held to 64 KiB/s keeps a single tick busy
+      // for minutes — and the stop check sat AFTER that work, so the unmount request was not even
+      // NOTICED until the copy the operator had throttled finished. The verb waited twenty seconds,
+      // reported the mount still active, and the process had to be killed. Rate-limiting a disk must
+      // not cost the ability to shut down cleanly, and this poll is far too cheap to be behind the
+      // work it has to interrupt.
+      using var stopWatcher = new Timer(_ => {
+        if (!registry.StopRequested(pool.PoolId))
+          return;
+
+        fs.AbortBackgroundWork(); // a copy already in flight stops at its next chunk
+        stop.Set();
+      }, null, _STOP_POLL, _STOP_POLL);
 
       Console.WriteLine($"Pool mounted at '{target}'. Press Ctrl+C or run 'dbmount unmount {target}' to unmount.");
       Console.CancelKeyPress += (_, e) => {
@@ -336,7 +355,12 @@ internal static class MountCommand {
 
       Console.WriteLine("Unmounting (flushing dirty state)…");
       unmountAction();
-      scheduler.Quiesce();
+      // Housekeeping only, and bounded: a throttled member must not be able to hold the unmount
+      // open. What is left behind is journalled and resumes on the next mount.
+      if (!scheduler.Quiesce(BackgroundScheduler.UnmountBudget, fs.AbortBackgroundWork))
+        DriveBender.Logger(
+          $"[Warning]Unmounting with background work still pending after {BackgroundScheduler.UnmountBudget.TotalSeconds:F0}s "
+          + "(a member's rate limit, or a slow disk) — it is journalled and resumes on the next mount.");
       fs.Unmount(); // clean unmount flushes everything (FR-CLEAN-UNMOUNT)
       registry.Unregister(pool.PoolId);
       metrics.Remove(pool.PoolId);

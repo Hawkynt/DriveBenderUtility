@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33923936744](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33923936744).
+Generated from run: [33968846896](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33968846896).
 
-156 scenarios — 135 passing on at least one target, 0 failing.
+167 scenarios — 146 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -35,6 +35,9 @@ Generated from run: [33923936744](https://github.com/Hawkynt/DriveBenderUtility/
 | Brownout | `Brownout_GivenTheVolatileAckOptIn_ThenTheWriteIsNotPacedByTheSickCopy` | The RAM-ack opt-in is the sanctioned way out: the write is taken at memory speed and both copies converge behind it. | pass | pass |
 | Brownout | `Brownout_WhenAMembersLimitIsLoweredLive_ThenItTakesEffectWithoutARemount` | A rate limit lowered on a mounted pool takes effect without a remount, rather than being ignored until the next mount. | pass | pass |
 | Brownout | `Brownout_WhenTheMemberRecovers_ThenThroughputComesBack` | When the collapsed member recovers, the pool's throughput comes back rather than staying degraded. | pass | pass |
+| DrainCrash | `Crash_GivenADrainWasInFlight_ThenNoStagingFileIsExposed` | A crash mid-drain leaves no half-written staging file visible to the user after the pool comes back. | pass | pass |
+| DrainCrash | `Crash_GivenADrainWasInFlight_ThenTheFileSurvivesWholeOnOneTier` | The power goes off while the drainer is copying a file down to capacity: the file comes back whole, on one tier or the other. | pass | pass |
+| DrainCrash | `Recovery_GivenOnePathOnTwoMembers_ThenThePoolServesItOnceAndWhole` | The same file left on two members, as a crash between a relocation's copy and its delete leaves it: the pool serves one entry, not two. | pass | pass |
 | Driver | `Append_GivenRepeatedOpens_ThenTheFileGrowsMonotonically` | Given Repeated Opens , then The File Grows Monotonically | pass | pass |
 | Driver | `Concurrency_GivenManyReadersAndWritersThroughTheOs_ThenNoFileIsCorrupted` | Given Many Readers And Writers Through The Os , then No File Is Corrupted | pass | pass |
 | Driver | `Directories_GivenATreeCreatedThroughTheOs_ThenItEnumeratesAndRemoves` | Given ATree Created Through The Os , then It Enumerates And Removes | pass | pass |
@@ -52,6 +55,7 @@ Generated from run: [33923936744](https://github.com/Hawkynt/DriveBenderUtility/
 | Durability | `Crash_GivenFilesWereWrittenAndClosed_ThenEveryByteSurvivesThePowerCut` | A power cut after files were written and closed: every byte is still there after the pool comes back. | pass | pass |
 | Durability | `Crash_GivenStagedWritesWereInterrupted_ThenNoInternalFileIsExposedToTheUser` | A power cut leaves half-written staging files on the members; none of them may show up in the pool as if they were the user's. | pass | pass |
 | Durability | `Divergence_GivenEachMemberTookAWriteWhileTheOtherWasAway_ThenOneWholeVersionIsServed` | Each member took a write while the other was away: the pool serves one whole version, never a mixture of the two. | pass | pass |
+| FolderRenameRace | `RenameFolder_WhileAChildIsBeingWritten_ThenNoAcknowledgedWriteIsLost` | A folder renamed under files that are being written: no write the pool acknowledged may go missing. | skipped | pass |
 | HeterogeneousDevice | `Duplication_GivenOneCopyOnEachDevice_ThenBothCopiesAreWhole` | A file mirrored across a fast and a slow disk is byte-identical on both, whichever of them took it first. | skipped | skipped |
 | HeterogeneousDevice | `Duplication_GivenOneCopyOnEachDevice_ThenReadsAreNotHeldToTheSlowDisksPace` | With one copy on a fast disk and one on a slow one, reading the file is not held to the slow disk's pace. | skipped | skipped |
 | HeterogeneousDevice | `Health_GivenAMemberOnARealDevice_ThenItsSmartStateReachesTheSnapshot` | A member on a real block device reports that device's SMART health into the live snapshot the dashboard reads. | skipped | skipped |
@@ -80,6 +84,7 @@ Generated from run: [33923936744](https://github.com/Hawkynt/DriveBenderUtility/
 | MemberFailureLatency | `Eject_GivenEveryMemberGoesAndOneComesBack_ThenItsContentIsServedAgain` | Every member goes away and one comes back: its content is served again rather than the pool staying dark. | pass | pass |
 | MemberFailureLatency | `Eject_WhileALargeReadIsStreaming_ThenEveryRemainingChunkStillArrivesPromptly` | A member pulled while a large read is streaming: every remaining chunk still arrives promptly and the content is whole. | pass | pass |
 | MemberFailureLatency | `Eject_WhileTheDrainerIsMovingAFileDown_ThenTheFileIsNeverLost` | The capacity disk is pulled while the drainer is moving a file down to it: the file is on one tier or the other, never on neither, and comes back whole. | pass | pass |
+| MemberFailureLatency | `Mount_GivenThePoolIsAlreadyMounted_ThenASecondMountIsRefused` | A pool already mounted refuses to be mounted a second time, because two engines over one member set corrupt each other. | pass | pass |
 | MemberFailureLatency | `ReadOnly_GivenADuplicatedPool_ThenEverythingStoredIsStillServedPromptly` | A DUPLICATED pool whose member goes read-only keeps serving every stored byte promptly, which is the half that must never regress. | skipped | pass |
 | MemberFailureLatency | `ReadOnly_GivenTheChosenMemberRefusesWrites_ThenNewFilesGoToOneThatDoesNot` | An UNDUPLICATED pool whose placement target goes read-only still takes new files, by putting them on a member that can accept them. | skipped | pass |
 | MemberFailureLatency | `Unmount_GivenItIsAskedForTheMomentThePoolIsUsable_ThenItSucceedsAndTheMountIsGone` | A pool unmounted immediately after it comes up really unmounts, rather than the verb reporting a pool it cannot find. | pass | pass |
@@ -111,6 +116,8 @@ Generated from run: [33923936744](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(RAM over SD card)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(RAM over SD card) | pass | pass |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(SSD over HDD)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(SSD over HDD) | pass | pass |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(SSD over SD card)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(SSD over SD card) | pass | pass |
+| SimulatedDevice | `Limits_GivenBackgroundIsStarvedOnTheLandingZone_ThenTheApplicationIsNotHeldToIt` | Starving the pool's own background copying does not starve the application: writes stay fast while the drain crawls. | pass | pass |
+| SimulatedDevice | `Read_GivenTheFileIsMidDrain_ThenItIsServedAtOnceRatherThanAtTheDrainsPace` | A file stays readable at full speed while the pool is relocating it, even when that relocation is throttled to a crawl. | pass | pass |
 | SimulatedDevice | `Throttle_GivenAMemberLimitedToAByteRate_ThenTheMountIsHeldToIt` | A member the manifest limits to a byte rate really is held to it through a real mount, rather than the limit being decoration. | pass | pass |
 | SimulatedDevice | `Throttle_GivenNoLimit_ThenTheSamePoolIsFarFaster` | The same pool without the limit is far faster, so the limit is what the previous scenario measured and not the host. | pass | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(HDD over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(HDD over cloud) | skipped | pass |
@@ -128,6 +135,7 @@ Generated from run: [33923936744](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(RAM over SD card)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(RAM over SD card) | pass | pass |
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(SSD over HDD)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(SSD over HDD) | pass | pass |
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(SSD over SD card)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(SSD over SD card) | pass | pass |
+| SimulatedDevice | `Unmount_GivenBackgroundWorkIsStarved_ThenThePoolStillComesDownCleanly` | A pool whose background work is throttled to a crawl still unmounts cleanly, instead of having to be killed. | pass | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(RAM + RAM)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(RAM + RAM) | skipped | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(RAM + SD card)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(RAM + SD card) | skipped | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(real: temp directory + D:\)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(real: temp directory + D:\) | skipped | not run |
@@ -162,6 +170,9 @@ Generated from run: [33923936744](https://github.com/Hawkynt/DriveBenderUtility/
 | Tiering | `Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` | New data lands on the fast tier first, then the drainer moves it down to capacity storage on its own. | pass | pass |
 | Tiering | `Tiering_GivenALandingZone_ThenWritesAreAcceptedAndReadBackIntact` | A landing-zone pool accepts writes and serves them back correctly through the mount. | pass | pass |
 | Tiering | `Tiering_WhileTheMoverIsRelocatingFiles_ThenTheyStayReadableAndWritable` | Tiering is transparent: a file stays readable AND writable throughout, including while the mover is relocating it. | pass | pass |
+| Trash | `Trash_GivenAFileWasTrashed_ThenItsNameCanBeUsedAgainAtOnce` | A trashed file's name is free again immediately: creating a new file at the same path is not confused by the deleted one. | pass | pass |
+| Trash | `Trash_GivenItIsEnabled_ThenADeletedFilesBytesAreKeptIntact` | With the trash on, a deleted file leaves the pool but its bytes are kept, whole, on a member. | pass | pass |
+| Trash | `Trash_GivenItIsOff_ThenADeleteIsPermanent` | With the trash off — the default — a delete really is permanent and leaves nothing behind. | pass | pass |
 | WebUi | `Api_GivenTheDashboardFrame_ThenEveryMemberCarriesAResolvedState` | Given The Dashboard Frame , then Every Member Carries AResolved State | pass | pass |
 | WebUi | `Assets_GivenEveryStateTheDaemonCanReport_ThenTheShippedStylesheetPaintsIt` | Given Every State The Daemon Can Report , then The Shipped Stylesheet Paints It | pass | pass |
 | WebUi | `Dashboard_GivenSmartCannotBeRead_ThenStorageIsMarkedUnknownRatherThanFailing` | Given Smart Cannot Be Read , then Storage Is Marked Unknown Rather Than Failing | pass | pass |

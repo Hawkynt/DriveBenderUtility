@@ -578,6 +578,24 @@ dropped from about 46 minutes to under 20. Two lessons, both cheap:
   could only fail — several hundred file reads and as many exceptions per `status`, and per each of
   the hundred polls one `unmount` makes. It now only considers files named for a pool id.
 
+### Open: the trash can take a file but nothing shipped can give it back
+
+`trash.enabled` moves a deleted file's bytes into a hidden per-member trash tree instead of destroying
+them (FR-TRASH, §6.14), and that half works — newly covered end to end: the file leaves the namespace,
+its bytes are kept whole on a member, its name is free again at once, and with the setting off (the
+default) a delete really is permanent and leaves nothing behind.
+
+The other half is not reachable. `PoolFileSystem.RestoreFromTrash` and `PoolTrash.List` exist and are
+unit-tested, and **nothing in the shipped binary calls either** — no CLI verb, no daemon endpoint, no
+UI. The only production callers of the trash are the delete path that fills it and the maintenance job
+that purges it on a retention policy. So an operator who turns it on gets a feature that consumes disk,
+quietly ages its contents out, and offers no way to recover anything; and they turned it on precisely
+because they wanted an undelete.
+
+Reported rather than built, because it is a user-facing surface rather than a fix: the engine work is
+already done and tested, so what is missing is a list-and-restore endpoint and somewhere in the
+dashboard to show it.
+
 ### Per-kind I/O limits, so a disk can be left usable for everything else
 
 `maxThroughput` was one number covering every operation, which is the right default and a blunt
@@ -666,10 +684,149 @@ out the destination's limit exactly as a block write does. Pinned from both side
 below, which could not exist before it: they need the copy to still be RUNNING when the foreground
 operation lands, and it never was.
 
-Still unwired, and deliberately: `MediaLifecycle` (scatter, replace), `PoolRecovery`, `PoolTrash` and
-the integrity quarantine build their own copies without a queue to hand. Those are operator-initiated
-one-off operations rather than continuous background load, so they matter less and threading the
-queue into each of them is a wider change than this pass should make.
+### The limit bound the disk being written to, and not the one being read
+
+Follow-up to the above, and the same mistake one level down. `_AdmitBulkTo(target)` charged the
+receiving member for every chunk and the source for nothing — so a limit set on a member bounded
+what could be written *to* it, and said nothing about what could be read *from* it.
+
+That is the wrong half. An operator does not cap a member to protect its write path; they cap it to
+leave the disk some capacity for everything else on the machine. And in the operations that move the
+most data, the limited member is usually the source: the landing zone a drain empties, the tired
+member an exchange is evacuating. Under the old accounting, telling the pool to go easy on a dying
+disk and then asking it to replace that disk read the disk flat out anyway.
+
+`WholeFilePublisher.Pace` now charges both ends, so a copy runs at the slower of the two allowances
+and a limit on either end is a real bound. A copy whose ends are the same member — promoting a
+shadow in place — is charged once; charging it twice would silently halve the rate that was asked
+for, on the operation where the accounting is least visible.
+
+### Reading a file the pool was moving waited for the whole move
+
+Tiering is documented as transparent — "a file stays readable AND writable throughout, including
+while the mover is relocating it" — and there is a scenario asserting it. It passed because a drain
+of a small file on tmpfs is over in milliseconds.
+
+It is not transparent. `DrainOneLandingFile` took the path's exclusive WRITE lease and held it
+across the entire copy; a foreground read takes a READ lease on the same path. So every read of a
+file blocked for exactly as long as the pool took to relocate it. Eight megabytes down a member held
+to 64 KiB/s: **126.8 seconds during which the file could not be read through the mount.** The same
+shape arrives without any limit at all — a large file onto a slow capacity disk — which is the
+ordinary case this feature exists for.
+
+Safety never rested on that lease. It rests on the TOCTOU guard after the copy, which re-validates
+size, mtime, dirty and open state and throws the copy away if anything moved; holding the lease
+across the copy only made that guard look like belt-and-braces. What has to be exclusive is the
+window between re-validating and deleting the landing original, and that is now exactly what is
+held: the pre-image is taken under a lease, the copy runs under none, and a fresh lease covers the
+swap. Failing to get that second lease is itself a reason to discard, so the file simply drains on a
+later pump.
+
+126.8s before, 0.0s after, deterministic both ways. The three background races — delete, rename and
+overwrite against the drainer and healer — are what would catch a safety regression here, and all
+three still pass.
+
+A note on how this was nearly got wrong, because it cost an hour: the first round of before/after
+measurements ran against a **stale binary**. The harness runs the shipped `dbmount`, and building
+only the test project left the previous one in place, so a revert appeared to change nothing and the
+diagnosis looked disproven. It was not; every measurement above was retaken after a full solution
+build. Incremental builds are not evidence when the thing under test is a separate executable.
+
+### A throttled member made the pool impossible to unmount cleanly
+
+Two independent causes, found by a scenario that starved background work and then simply shut down.
+
+The first is the one that mattered. The stop request was checked at the END of the background pump
+tick, and that tick is deliberately non-reentrant — it re-arms only once it finishes. One unit of
+the pump's work is a whole file, so a drain down a member held to 64 KiB/s kept a single tick busy
+for minutes, and the unmount request was not *noticed* until the copy the operator had throttled
+completed. `dbmount unmount` waited twenty seconds, reported the mount still active, exited 1, and
+the process had to be killed — throwing away the clean shutdown and making the next mount replay the
+journal. A rate limit is a statement about how fast a disk may be worked, not about whether the pool
+may stop. The check now lives in a dedicated watcher that the pump cannot starve.
+
+The second is `Quiesce`, which clean unmount uses to settle housekeeping and which had no time bound
+at all. A deadline alone does not fix it — it is only checked between units, and a unit is a whole
+file — so the budget expiring also signals the copy in flight to stop at its next chunk. Abandoning
+is safe and is preferred over finishing at full speed, which would be bounded only by the size of
+the file and would ignore the limit that was set. What is dropped is journalled: the intent stays
+incomplete, the staging file is orphaned, and the next mount reconciles both — the same state a
+power cut mid-drain leaves, which the scenarios above cover. Nothing acknowledged is involved;
+durability is `PoolFileSystem.Unmount`, which runs afterwards on the foreground path this does not
+touch.
+
+Measured: 98 seconds with a forced kill, then 18 seconds with a clean unmount. The unmount itself
+went from refused-after-20s to 0.8s.
+
+### The brownout placement scenario asked for a burst and did not arrange one
+
+Failed once on Windows with a dead heat, 6 / 6, having passed 2 / 10 on the same platform a run
+earlier. Two things made it fragile, neither of them the product.
+
+Its own comment says the load term only means anything while writes are IN FLIGHT together — but
+the burst used `Parallel.For` with the default degree of parallelism, which is sized from the core
+count. On a two-core runner barely two files overlap, the load signal has almost nothing to weigh,
+and the outcome tracks the shape of the host instead of the behaviour under test. The degree is now
+stated explicitly, so the burst is a burst everywhere.
+
+The file count was also even, against a strict "the healthy member must take more" assertion, so a
+tie failed while showing placement doing nothing wrong. Odd count now; a dead heat is not a possible
+outcome.
+
+### The drainer scenarios tested the runner, not the drainer
+
+All three failed on Windows CI with the same complaint: no staging file ever appeared. Not a defect
+— placement declines a landing zone once it is past its low watermark, and a CI runner's nearly-full
+disk is past it permanently, so every write went straight to capacity and there was never a drain to
+catch.
+
+The first fix was to skip on that basis, which is wrong for a reason worth writing down: it makes
+the suite's own results depend on the host's free space, and a skip that flips between runs is
+exactly what stopped the generated coverage matrix from converging earlier in this work. These pools
+now raise the fast tier's watermarks in their own defaults, so the landing zone is chosen on any
+host and the scenario tests the drainer instead of the runner. The premise guard stays as a net that
+should never fire.
+
+### Nothing cut the power under the drainer
+
+The durability suite kills the mount under foreground writes, and thoroughly. Nothing killed it
+under the pool's own relocation, which fails differently: a drain copies a whole file down a tier
+and only then removes the original, so a crash lands either mid-copy (a half-written staging file on
+capacity, the good one still on the fast tier) or between the copy and the delete (one path, two
+members, identical bytes). The second is where recovery has to choose, and choosing wrong either
+drops the data or leaves the pool showing the file twice for good.
+
+Three scenarios now cover it. Both crash cases hold the landing zone's BACKGROUND rate — and only
+that rate — to 1 MiB/s before anything is written, which is what makes them assertable rather than
+hopeful: eight megabytes at one per second is eight seconds on any machine, so unlike a race against
+the host there is no runner fast enough to close the window. First attempt did it the other way
+round, limiting after the write, and both scenarios passed in five seconds having crashed after the
+drain had already finished — green, and testing nothing. They take twelve seconds now and a
+half-written file is observed every time.
+
+The third does not race at all. One path present on two members is a state every relocation the pool
+performs passes through, so it is simply built with the pool unmounted rather than won by timing.
+
+The engine handled all three; no defect here. Worth having because the alternative was believing it.
+
+### …and the administrative copies were not metered at all
+
+`MediaLifecycle` (scatter, replace, restore), `PoolRecovery`, `PoolTrash` and the integrity
+quarantine each built their own copies with no queue to hand. This was written up as a deliberate
+deferral — "operator-initiated one-off operations rather than continuous background load, so they
+matter less" — and that reasoning does not survive contact with what the setting is for.
+
+An exchange is the largest thing this software ever does to two disks: it reads one end to end and
+writes another flat out, for hours, while the pool stays mounted and in use. It is not a lesser case
+than a drain, it is the case. And the spec the limits were built to (§6.4) says the simple rate
+covers "all operations, even heal and exchange" — so the one shape an operator can express in a
+single number was the one shape the code did not honour. Worse, `PoolOpsCommand` runs these verbs
+against an *unmounted* pool, where there is no engine to borrow a limiter from: the CLI, which is
+where a replace is usually started, ignored the limit even after the mounted daemon respected it.
+
+All four now take an admission callback. The mounted paths get the engine's; the CLI builds one from
+the same manifest the mount would read, so `dbmount pool replace-media` is held to the same rate the
+UI shows. Pinned by unit tests that count the bytes charged to each end of a real `Replace`.
 
 ### Three races against the pool's own background work, none of which could be tested before
 
@@ -1002,6 +1159,23 @@ being deleted, because what they cost is the point.
    physical file has since moved. Not reproduced end to end; the stress suite races file renames
    only, which is why it would not be caught. Fixing it needs a lock-ordering story for an unbounded
    set of children, which is why it is written down rather than attempted in passing.
+
+   **It now has an end-to-end guard, and the guard did not trip it.** `FolderRenameRaceEndToEndTests`
+   races four writers against a folder renamed back and forth underneath them, repeated, through a
+   real mount — the case the note says the stress suite misses because it races file renames only.
+   Its oracle is the one that matters and needs no timing: a write the pool ACKNOWLEDGED must be
+   findable afterwards, and a file must hold ONE version rather than a blend of two. Several
+   thousand acknowledged writes across dozens of renames later, nothing was lost.
+
+   One thing the guard turned up on its own: **on Windows the race cannot be built at all.** The OS
+   refuses to rename a directory while files beneath it are open, so with writers hammering four
+   children every attempt is declined before the pool ever sees it — the scenario came back with
+   zero renames there and now skips with that reason. Which also says the window is far harder to
+   reach on that platform, because the rename that would open it mostly cannot start. That does not
+   prove the window cannot open — a race that does not reproduce is not a race that cannot happen,
+   and the reasoning about the missing child lease still stands — but the risk is no longer
+   unobserved, and anything that makes it real from here fails a test instead of quietly losing a
+   file. The lock-ordering story for an unbounded set of children is still what a fix needs.
 
    **Half of this entry was wrong and is withdrawn.** It also claimed `HandleTable.RenameSubtree`
    repeats the defect fixed in `4ad2094` by re-keying children over any state already there. It does

@@ -165,8 +165,43 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// Measured before the fix: a 24 MiB heal onto a member limited to 1 MiB/s finished in under six
   /// seconds.
   /// </summary>
-  private Action<long> _AdmitBulkTo(IVolumeIO target)
-    => bytes => this._queues.Enter(target, IoKind.Background, bytes).Dispose();
+  /// <summary>
+  /// Charges one member for a chunk of the pool's own background copying, blocking until that
+  /// member's limits allow it. Handed to the media/recovery/trash paths so an administrative copy
+  /// is held to the same allowance as a drain (§6.4 "even heal and exchange").
+  /// </summary>
+  public void AdmitBulk(IVolumeIO member, long bytes) {
+    if (this._abortBackground)
+      throw new OperationCanceledException(
+        "the pool is shutting down; this background copy is journalled and resumes on the next mount");
+
+    this._queues.Enter(member, IoKind.Background, bytes).Dispose();
+  }
+
+  private volatile bool _abortBackground;
+
+  /// <summary>
+  /// Stops the pool's own copying at the next chunk boundary, for a shutdown that has waited long
+  /// enough (FR-CLEAN-UNMOUNT).
+  ///
+  /// A clean unmount quiesces the scheduler first, which is right on a healthy pool: the drain
+  /// finishes in well under a second and nothing is left over. But one unit of that work is a WHOLE
+  /// FILE, so a deadline between units cannot bound it — eight megabytes down a member held to
+  /// 64 KiB/s is over two minutes inside a single pump, the unmount request times out, and the
+  /// process is killed. Throttling a disk must not cost the ability to shut down.
+  ///
+  /// Abandoning is safe and is deliberately preferred over finishing at full speed, which would
+  /// only be bounded by the size of the file and would ignore the very limit the operator set. What
+  /// is dropped is a copy the journal already describes: the intent stays incomplete, the staging
+  /// file is orphaned, and the next mount reconciles both — the same state a power cut mid-drain
+  /// leaves, which is separately covered. Nothing acknowledged is involved; durability belongs to
+  /// <see cref="Unmount"/>, which runs afterwards and flushes on the foreground path this does not
+  /// touch.
+  /// </summary>
+  public void AbortBackgroundWork() => this._abortBackground = true;
+
+  private Action<long>? _AdmitBulkBetween(IVolumeIO source, IVolumeIO target)
+    => WholeFilePublisher.Pace(this.AdmitBulk, source, target);
 
   private double _LoadScore(IVolumeIO volume) {
     if (this._IsCoolingDown(volume.MemberId))
@@ -216,8 +251,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._journal = journal ?? new(new MemberJournalStore([.. members.Select(m => m.Io)]));
     this._clock = clock ?? (static () => DateTime.UtcNow);
     this._writeBuffer = new(cache, this._clock);
-    this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock);
-    this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest);
+    this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock, this.AdmitBulk);
+    this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest, this.AdmitBulk);
     this._activity = new(clock: this._clock);
     this._placement = new(
       poolId,
@@ -466,7 +501,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._journal.ReconcileMirrors();
 
     // recovery before serving: roll forward, reconcile, clean temps (FR-RECOVER)
-    var report = new PoolRecovery([.. this._Online], this._journal).Run();
+    var report = new PoolRecovery([.. this._Online], this._journal, this.AdmitBulk).Run();
     if (report.AnythingDone) {
       DriveBender.Logger($"Recovery: {report.RolledForward} rolled forward, {report.Reconciled} reconciled, {report.TempsRemoved} staging files removed");
       this._activity.Publish(ActivityKind.Recovery, "", report.RolledForward + report.Reconciled, reason: "journal replay on mount");
@@ -835,7 +870,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var parent = PoolPaths.GetParent(normalized);
       target.EnsureFolder(parent, true);
       WholeFilePublisher.CopyBetween(sourceVol, normalized, sourceShadow, target, normalized, true,
-        admit: this._AdmitBulkTo(target));
+        admit: this._AdmitBulkBetween(sourceVol, target));
       this._activity.Publish(ActivityKind.Duplicate, normalized, size,
         fromMember: sourceVol.DisplayName, toMember: target.DisplayName,
         reason: $"duplication level {duplication}");
@@ -2066,6 +2101,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// re-established, then the fast-tier original is freed. Returns false when nothing is
   /// drainable right now.
   /// </summary>
+  /// <summary>
+  /// How long the drainer waits for the exclusive window in which it re-validates and frees the
+  /// landing original. Short: losing the race costs one wasted copy and the file drains on a later
+  /// pump, whereas waiting long would put the pump back behind foreground work.
+  /// </summary>
+  private static readonly TimeSpan _DRAIN_SWAP_WAIT = TimeSpan.FromSeconds(5);
+
   public bool DrainOneLandingFile() {
     if (this._mountOptions == null)
       return false;
@@ -2075,22 +2117,42 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
           continue; // only clean, closed files move (the balancer rule of §6.10 applies here too)
 
-        // the checks above are TOCTOU on their own — hold the path exclusively for the whole
-        // copy-and-free sequence so a foreground write cannot land between the re-validation
-        // and the landing delete (SAFE-NOLOSS). A file a foreground op owns right now is
-        // skipped rather than waited on: the drainer must never stall the pump.
-        using var lease = this._handles.TryAcquireWrite(path, TimeSpan.Zero);
-        if (lease == null)
-          continue;
+        // The pre-image is taken under the lease; the COPY is not.
+        //
+        // Holding the path exclusively across the whole copy-and-free sequence is the obvious
+        // reading of SAFE-NOLOSS, and it was what this did — but a read lease is what serves a
+        // foreground read, so every read of a file blocked for as long as the pool took to relocate
+        // it. That is invisible while a drain is milliseconds and ruinous the moment it is not: a
+        // member held to 64 KiB/s made an eight-megabyte file unreadable through the mount for over
+        // two minutes, and a large file onto a slow disk does the same with no limit in sight.
+        // Tiering is supposed to be transparent, and a file that cannot be read while the pool
+        // moves it is not transparent, it is an outage on a timer.
+        //
+        // Safety does not rest on that lease and never did — it rests on the TOCTOU guard below,
+        // which re-validates under a FRESH lease and throws the copy away if anything moved. The
+        // lease across the copy only made that guard look like belt-and-braces. What must stay
+        // exclusive is the window between re-validating and deleting the landing original, which
+        // is now exactly what is held.
+        //
+        // A file a foreground op owns right now is skipped rather than waited on: the drainer must
+        // never stall the pump.
+        IVolumeIO? target;
+        FileMeta? before;
+        long size;
+        using (var probe = this._handles.TryAcquireWrite(path, TimeSpan.Zero)) {
+          if (probe == null)
+            continue;
 
-        if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
-          continue; // re-checked under the lease
+          if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
+            continue; // re-checked under the lease
 
-        var copies = this._placement.ResolveCopies(path);
-        var holders = copies.Select(c => c.Volume).ToArray();
-        var before = landing.Stat(path, false);
-        var size = before?.Length ?? 0;
-        var target = this._placement.ChooseDrainTarget(size, holders.Where(h => h.MemberId != landing.MemberId));
+          var copies = this._placement.ResolveCopies(path);
+          var holders = copies.Select(c => c.Volume).ToArray();
+          before = landing.Stat(path, false);
+          size = before?.Length ?? 0;
+          target = this._placement.ChooseDrainTarget(size, holders.Where(h => h.MemberId != landing.MemberId));
+        }
+
         if (target == null)
           continue;
 
@@ -2100,26 +2162,32 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         if (parent.Length > 0)
           target.EnsureFolder(parent, false);
 
-        // streamed drain — the file is copied through a fixed buffer, never held in RAM (SAFE-BIGFILE)
+        // streamed drain — the file is copied through a fixed buffer, never held in RAM
+        // (SAFE-BIGFILE), and with no lease held, so reads of it are served throughout
         WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
-          admit: this._AdmitBulkTo(target));
+          admit: this._AdmitBulkBetween(landing, target));
 
-        // TOCTOU guard (SAFE-NOLOSS): between the initial check and here, a foreground write could
-        // have opened, rewritten and closed this file. If it is now open/dirty, or its size/mtime
+        // TOCTOU guard (SAFE-NOLOSS): between the pre-image and here, a foreground write could have
+        // opened, rewritten and closed this file. If it is now open/dirty, or its size/mtime
         // changed, the copy we just made is stale — remove it and leave the landing original (the
         // authoritative new version) in place rather than deleting the only copy of fresh data.
-        var after = landing.Stat(path, false);
-        if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path)
-            || after is not { } stillThere || before is not { } was
-            || stillThere.Length != was.Length || stillThere.LastWriteTimeUtc != was.LastWriteTimeUtc) {
-          if (target.FileExists(path, false))
-            target.Delete(path, false);
-          this._journal.Complete(sequence, JournalOp.Drain);
-          continue; // try again on a later pump once the file settles
-        }
+        // Taken under a fresh exclusive lease, which also covers the delete that follows: failing to
+        // get one means a foreground op owns the path, which is itself a reason to discard.
+        using (var lease = this._handles.TryAcquireWrite(path, _DRAIN_SWAP_WAIT)) {
+          var after = landing.Stat(path, false);
+          if (lease == null
+              || this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path)
+              || after is not { } stillThere || before is not { } was
+              || stillThere.Length != was.Length || stillThere.LastWriteTimeUtc != was.LastWriteTimeUtc) {
+            if (target.FileExists(path, false))
+              target.Delete(path, false);
+            this._journal.Complete(sequence, JournalOp.Drain);
+            continue; // try again on a later pump once the file settles
+          }
 
-        landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
-        this._journal.Complete(sequence, JournalOp.Drain);
+          landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
+          this._journal.Complete(sequence, JournalOp.Drain);
+        }
         this._integrity.InvalidateFile(path);
         this._activity.Publish(ActivityKind.Drain, path, size, landing.DisplayName, target.DisplayName, "landing-zone drain");
 
@@ -2244,7 +2312,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var survivor = copies[0];
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: survivor.Volume.MemberId);
       WholeFilePublisher.CopyBetween(survivor.Volume, normalized, true, survivor.Volume, normalized, false,
-        admit: this._AdmitBulkTo(survivor.Volume));
+        admit: this._AdmitBulkBetween(survivor.Volume, survivor.Volume));
       survivor.Volume.Delete(normalized, true);
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
       this._activity.Publish(ActivityKind.Recovery, normalized, size, toMember: survivor.Volume.DisplayName, reason: "primary restored from surviving shadow");
@@ -2259,7 +2327,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: target.MemberId);
       target.EnsureFolder(PoolPaths.GetParent(normalized), true);
       WholeFilePublisher.CopyBetween(source.Volume, normalized, source.Shadow, target, normalized, true,
-        admit: this._AdmitBulkTo(target));
+        admit: this._AdmitBulkBetween(source.Volume, target));
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
       this._activity.Publish(ActivityKind.Duplicate, normalized, size,
         fromMember: source.Volume.DisplayName, toMember: target.DisplayName,

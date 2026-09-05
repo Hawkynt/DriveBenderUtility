@@ -15,6 +15,16 @@ public interface IBackgroundJob {
 /// </summary>
 public sealed class BackgroundScheduler(IReadOnlyList<IBackgroundJob> jobs) {
 
+  /// <summary>
+  /// How long a clean unmount waits for background housekeeping before shutting down anyway.
+  ///
+  /// Generous next to a healthy pool, which quiesces in well under a second, and short next to any
+  /// shutdown watchdog. It only bites when something is throttled or a disk is slow, which is
+  /// exactly when waiting indefinitely is the wrong answer. Lives here rather than in each host so
+  /// both adapters shut down on the same terms.
+  /// </summary>
+  public static readonly TimeSpan UnmountBudget = TimeSpan.FromSeconds(10);
+
   /// <summary>Runs at most <paramref name="maxUnits"/> units of work round-robin; returns the units actually worked.</summary>
   public int Pump(int maxUnits = 16) {
     var worked = 0;
@@ -32,17 +42,55 @@ public sealed class BackgroundScheduler(IReadOnlyList<IBackgroundJob> jobs) {
       } catch (PoolFsException e) {
         DriveBender.Logger($"[Warning]Background job '{job.Name}' failed a unit: {e.Message}");
         ++idle;
+      } catch (OperationCanceledException) {
+        // shutdown asked the copy to stop at its next chunk; the journal describes what was in
+        // flight and the next mount reconciles it (see PoolFileSystem.AbortBackgroundWork)
+        return worked;
       }
     }
 
     return worked;
   }
 
-  /// <summary>Pumps until no job has work left (used by clean unmount, FR-CLEAN-UNMOUNT).</summary>
-  public void Quiesce(int safetyLimit = 100_000) {
-    while (safetyLimit-- > 0 && this.Pump() > 0) {
-      // drain until idle
+  /// <summary>
+  /// Pumps until no job has work left, or until <paramref name="budget"/> runs out (clean unmount,
+  /// FR-CLEAN-UNMOUNT).
+  ///
+  /// The budget exists because this waits for HOUSEKEEPING, and housekeeping runs at whatever rate
+  /// the operator allowed it. Unbounded, a member held to 64 KiB/s with twenty megabytes still to
+  /// drain makes the pool take five and a half minutes to unmount — the request times out, the
+  /// process is killed, and the next mount replays the journal. Throttling a disk should not cost
+  /// the ability to shut down cleanly, and the two settings have no business being coupled.
+  ///
+  /// Nothing acknowledged is at stake. Durability is <see cref="PoolFileSystem.Unmount"/>'s job:
+  /// it publishes staged files and flushes every dirty path, and runs after this either way. What
+  /// gets abandoned here is a drain that has not happened yet or a copy not yet caught up — both
+  /// journalled, both resumed on the next mount, and both abandoned anyway by the kill this
+  /// prevents.
+  ///
+  /// The deadline alone is not enough, which is why <paramref name="abort"/> exists: one unit of
+  /// work is a WHOLE FILE, so a check between units cannot bound a copy that is itself minutes long.
+  /// When the budget runs out the abort is signalled, the copy in flight stops at its next chunk,
+  /// and the loop unwinds — see <see cref="PoolFileSystem.AbortBackgroundWork"/> for why abandoning
+  /// it is safe.
+  ///
+  /// Returns false when work was still pending at the deadline.
+  /// </summary>
+  public bool Quiesce(TimeSpan? budget = null, Action? abort = null, int safetyLimit = 100_000) {
+    var deadline = budget is { } limit ? DateTime.UtcNow + limit : DateTime.MaxValue;
+    using var giveUp = budget is { } window && abort != null
+      ? new Timer(_ => abort(), null, window, Timeout.InfiniteTimeSpan)
+      : null;
+
+    while (safetyLimit-- > 0) {
+      if (this.Pump() == 0)
+        return true; // nothing left to do
+
+      if (DateTime.UtcNow >= deadline)
+        return false;
     }
+
+    return false;
   }
 
 }

@@ -11,7 +11,12 @@ public sealed record RecoveryReport(int RolledForward, int Reconciled, int Temps
 /// times (SAFE-IDEMP). No acknowledged write is lost (SAFE-NOLOSS): an ack only ever
 /// happened after data was durable on the required copies, which replay never destroys.
 /// </summary>
-public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journal) {
+/// <param name="admit">
+/// Charges a member for a chunk of copying, blocking until its limits allow it; null for unmetered.
+/// Recovery resync moves whole files like any heal does, and an operator who capped a member did
+/// not mean "except on mount".
+/// </param>
+public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journal, Action<IVolumeIO, long>? admit = null) {
 
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
@@ -152,7 +157,8 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
         continue; // already converged
 
       // temp + atomic rename where supported, put-and-verify emulation otherwise (SAFE-ATOMIC, FR-CAP-ADAPT)
-      WholeFilePublisher.CopyBetween(winner.member, path, winner.shadow, member, path, shadow);
+      WholeFilePublisher.CopyBetween(winner.member, path, winner.shadow, member, path, shadow,
+        admit: WholeFilePublisher.Pace(admit, winner.member, member));
       changed = true;
     }
 

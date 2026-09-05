@@ -177,6 +177,39 @@ public static class WholeFilePublisher {
       blockingSource: source.BlocksCallingThread, admit: admit);
   }
 
+  /// <summary>
+  /// Turns a per-member admission callback into the per-chunk one <see cref="CopyBetween"/> takes,
+  /// charging BOTH ends of the copy.
+  ///
+  /// Charging only the target — which is what the drain and heal paths used to do — reads the
+  /// operator's limit as "how fast may this disk be written", when what they set it for is "leave
+  /// this disk some capacity for everything else". The disk an exchange empties, or the landing
+  /// zone a drain reads from, is under exactly as much load as the one receiving, and it is very
+  /// often the one that was limited: it is the tired member being evacuated. Charging both makes a
+  /// copy run at the slower of the two allowances, which is the only reading under which a limit
+  /// on a member actually bounds what that member does.
+  ///
+  /// A copy whose two ends are the same member (promoting a shadow in place) is charged once — the
+  /// alternative silently halves the rate the operator asked for.
+  ///
+  /// One consequence worth stating plainly: a delay cap bounds what EACH member's limiter may add,
+  /// so a chunk crossing two capped members can wait up to both caps. Each kept its own promise, and
+  /// the cap exists as a safety valve against a mistyped rate rather than as a latency guarantee, so
+  /// twice a bound that is already generous is the right trade against tracking a shared budget
+  /// across two independent limiters.
+  /// </summary>
+  public static Action<long>? Pace(Action<IVolumeIO, long>? admit, IVolumeIO source, IVolumeIO target) {
+    if (admit == null)
+      return null;
+
+    return source.MemberId == target.MemberId
+      ? bytes => admit(source, bytes)
+      : bytes => {
+        admit(source, bytes);
+        admit(target, bytes);
+      };
+  }
+
   /// <summary>A member can hold an acknowledged durable copy only when its flush is a real durability barrier (SAFE-REMOTE).</summary>
   public static bool CanSatisfyAckQuorum(IVolumeIO member) => (member.Caps & BackendCaps.DurableFlush) != 0;
 

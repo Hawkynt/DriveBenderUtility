@@ -133,6 +133,135 @@ public class SimulatedDeviceEndToEndTests {
       + "guard above has already skipped the hosts where it is not");
   }
 
+  [Test]
+  [Category("Performance")]
+  [Description("Starving the pool's own background copying does not starve the application: writes stay fast while the drain crawls.")]
+  public void Limits_GivenBackgroundIsStarvedOnTheLandingZone_ThenTheApplicationIsNotHeldToIt() {
+    // The whole reason the three kinds are separated (§6.4). An operator holds background work down
+    // to leave a disk usable for everything else; if that allowance leaked onto the write path the
+    // setting would be worse than useless, because the disk they were protecting would be the one
+    // that stopped responding.
+    const long starved = 64 * 1024; // per second — a rate at which the drain gets nowhere
+    const int files = 20;
+    const int size = 1024 * 1024;
+
+    using var pool = MountedPool.CreateTieredAlwaysLanding();
+    DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: starved);
+    DbMount.RequestLiveReload(pool.PoolName);
+    Thread.Sleep(2500); // the pump consumes the reload on its next tick
+
+    var written = new Dictionary<string, byte[]>();
+    var stopwatch = Stopwatch.StartNew();
+    for (var index = 0; index < files; ++index) {
+      var content = _Payload(size, 950 + index);
+      File.WriteAllBytes(pool.PathTo($"burst-{index}.bin"), content);
+      written[$"burst-{index}.bin"] = content;
+    }
+
+    stopwatch.Stop();
+
+    // An ABSOLUTE bound, not a ratio against an unthrottled run. Twenty megabytes at the starved
+    // rate would be five and a half minutes; anything under a minute cannot have been paid for out
+    // of that bucket on any host, so this catches the leak without betting on the machine's speed.
+    var atTheStarvedRate = TimeSpan.FromSeconds(files * (double)size / starved);
+    stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(60),
+      $"{files} MiB of application writes took {stopwatch.Elapsed.TotalSeconds:F1}s while background "
+      + $"work was held to {starved / 1024} KiB/s — at that rate the same bytes would need "
+      + $"{atTheStarvedRate.TotalSeconds:F0}s, so the background limit has leaked onto the write path "
+      + $"and is throttling the very application it exists to protect."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+
+    foreach (var (name, content) in written)
+      File.ReadAllBytes(pool.PathTo(name)).Should().Equal(content,
+        $"'{name}' was acknowledged while the drain was starved, and must still read back whole."
+        + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  [Description("A file stays readable at full speed while the pool is relocating it, even when that relocation is throttled to a crawl.")]
+  public void Read_GivenTheFileIsMidDrain_ThenItIsServedAtOnceRatherThanAtTheDrainsPace() {
+    // Tiering is supposed to be transparent. It was not: the drainer held the path's WRITE lease
+    // across its whole copy, and a foreground read takes a READ lease on the same path — so every
+    // read of a file blocked for exactly as long as the pool took to relocate it. Invisible while a
+    // drain is milliseconds, and an outage once it is not: eight megabytes down a member held to
+    // 64 KiB/s made the file unreadable through the mount for over two minutes.
+    //
+    // Measured both ways on clean builds: 126.8s with the lease held across the copy, 0.0s with it
+    // released. Deterministic, not a flake.
+    const long starved = 64 * 1024;
+
+    using var pool = MountedPool.CreateTieredAlwaysLanding();
+    DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: starved);
+    DbMount.RequestLiveReload(pool.PoolName);
+    Thread.Sleep(2500);
+
+    var content = _Payload(8 * 1024 * 1024, 980);
+    File.WriteAllBytes(pool.PathTo("relocating.bin"), content);
+    pool.RequireLandedOnFastTier("relocating.bin");
+
+    // the read has to happen while the copy is genuinely in flight, or it proves nothing
+    MountedPool.WaitUntil(() => pool.StagingFiles().Count > 0, TimeSpan.FromMinutes(2)).Should().BeTrue(
+      $"the drain must be under way for a read to race it.{Environment.NewLine}{pool.DescribeMembers()}");
+
+    var stopwatch = Stopwatch.StartNew();
+    var served = File.ReadAllBytes(pool.PathTo("relocating.bin"));
+    stopwatch.Stop();
+    TestContext.Out.WriteLine($"[tiering] read of a file mid-drain took {stopwatch.Elapsed.TotalSeconds:F1}s");
+
+    served.Should().Equal(content, "and it is the file, not a half-copied one");
+    stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(20),
+      $"reading a file the pool happens to be moving took {stopwatch.Elapsed.TotalSeconds:F0}s — at the "
+      + $"drain's {starved / 1024} KiB/s the whole copy is {8 * 1024 / (starved / 1024)}s, so the read is "
+      + $"waiting on the relocation instead of being served beside it."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  [Description("A pool whose background work is throttled to a crawl still unmounts cleanly, instead of having to be killed.")]
+  public void Unmount_GivenBackgroundWorkIsStarved_ThenThePoolStillComesDownCleanly() {
+    // Throttling a disk must not cost the ability to shut down. It did: the stop request was checked
+    // AFTER the background pump in the same non-reentrant tick, and one unit of that pump is a whole
+    // file — so a drain held to 64 KiB/s meant the unmount was not noticed for minutes. The verb
+    // waited twenty seconds, reported the mount still active, and the process had to be killed,
+    // which throws away the clean shutdown and makes the next mount replay the journal.
+    const long starved = 64 * 1024;
+
+    using var pool = MountedPool.CreateTieredAlwaysLanding();
+    DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: starved);
+    DbMount.RequestLiveReload(pool.PoolName);
+    Thread.Sleep(2500);
+
+    var content = _Payload(8 * 1024 * 1024, 970);
+    File.WriteAllBytes(pool.PathTo("pending.bin"), content);
+    pool.RequireLandedOnFastTier("pending.bin");
+
+    // enough to guarantee the drainer is mid-copy, which is the state that used to wedge the unmount
+    Thread.Sleep(3000);
+
+    // WhileUnmounted runs the real `dbmount unmount` verb and throws if it is refused, so this is
+    // the assertion; the timing only says it did not merely scrape in.
+    var stopwatch = Stopwatch.StartNew();
+    Action unmountCleanly = () => pool.WhileUnmounted(() => { });
+    unmountCleanly.Should().NotThrow(
+      $"a member's rate limit governs how fast the pool may copy, not whether it may stop."
+      + $"{Environment.NewLine}{pool.MountLog}");
+
+    stopwatch.Stop();
+    TestContext.Out.WriteLine($"[unmount] clean shutdown with background starved took {stopwatch.Elapsed.TotalSeconds:F1}s");
+    stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(45),
+      $"the unmount took {stopwatch.Elapsed.TotalSeconds:F0}s with background work starved — it must "
+      + $"abandon the copy it has not finished (journalled, and resumed on the next mount) rather "
+      + $"than wait it out at {starved / 1024} KiB/s.{Environment.NewLine}{pool.MountLog}");
+
+    var readBack = Stopwatch.StartNew();
+    var served = File.ReadAllBytes(pool.PathTo("pending.bin"));
+    readBack.Stop();
+    TestContext.Out.WriteLine($"[unmount] reading the file back after the abandoned drain took {readBack.Elapsed.TotalSeconds:F1}s");
+    served.Should().Equal(content, "and coming down without finishing the drain must not cost the file");
+  }
+
   #endregion
 
   #region tiering across storage that is genuinely unequal

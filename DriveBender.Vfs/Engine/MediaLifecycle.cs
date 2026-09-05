@@ -13,7 +13,13 @@ public sealed record MediaLifecycleReport(int FilesMoved, int CopiesCreated, int
 /// on one disk (bit-rot protection without disk-loss protection) — and only ever removes a
 /// copy once another exists (SAFE-DUP); safe to interrupt and resume.
 /// </summary>
-public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal journal, int duplicationLevel, bool allowSamePhysical = false) {
+/// <param name="admit">
+/// Charges a member for a chunk of copying, blocking until its limits allow it; null for unmetered.
+/// This is the path an operator most wants held down — scattering or replacing a member reads one
+/// disk end to end and writes another flat out, for hours, while the pool stays mounted and in use.
+/// </param>
+public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal journal, int duplicationLevel, bool allowSamePhysical = false,
+  Action<IVolumeIO, long>? admit = null) {
 
   private sealed record Copy(IVolumeIO Member, string Path, bool Shadow);
 
@@ -139,7 +145,8 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
           if (parent.Length > 0)
             target.EnsureFolder(parent, copy.Shadow);
 
-          WholeFilePublisher.CopyBetween(copy.Member, path, copy.Shadow, target, path, copy.Shadow);
+          WholeFilePublisher.CopyBetween(copy.Member, path, copy.Shadow, target, path, copy.Shadow,
+            admit: WholeFilePublisher.Pace(admit, copy.Member, target));
           journal.Complete(sequence, JournalOp.Rebalance);
           elsewhere.Add(new(target, path, copy.Shadow));
           ++moved;
@@ -176,7 +183,8 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
       if (parent.Length > 0)
         replacement.EnsureFolder(parent, shadow);
 
-      WholeFilePublisher.CopyBetween(old, path, shadow, replacement, path, shadow);
+      WholeFilePublisher.CopyBetween(old, path, shadow, replacement, path, shadow,
+        admit: WholeFilePublisher.Pace(admit, old, replacement));
       journal.Complete(sequence, JournalOp.Rebalance);
       old.Delete(path, shadow);
       ++moved;
@@ -216,7 +224,8 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
       // promote a shadow to primary when no primary survives (FixMissingPrimaries) — streamed
       if (!hasPrimary) {
         var sequence = journal.LogIntent(JournalOp.ShadowCreate, path, memberId: source.Member.MemberId);
-        WholeFilePublisher.CopyBetween(source.Member, path, true, source.Member, path, false);
+        WholeFilePublisher.CopyBetween(source.Member, path, true, source.Member, path, false,
+          admit: WholeFilePublisher.Pace(admit, source.Member, source.Member));
         source.Member.Delete(path, true);
         journal.Complete(sequence, JournalOp.ShadowCreate);
         copies[0] = source with { Shadow = false };
@@ -235,7 +244,8 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
         if (parent.Length > 0)
           target.EnsureFolder(parent, true);
 
-        WholeFilePublisher.CopyBetween(copies[0].Member, path, copies[0].Shadow, target, path, true);
+        WholeFilePublisher.CopyBetween(copies[0].Member, path, copies[0].Shadow, target, path, true,
+          admit: WholeFilePublisher.Pace(admit, copies[0].Member, target));
         journal.Complete(sequence, JournalOp.ShadowCreate);
         copies.Add(new(target, path, true));
         ++distinctDomains;
