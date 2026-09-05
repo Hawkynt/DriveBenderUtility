@@ -909,7 +909,17 @@ work off it, which is exactly the effect the scenario exists to observe. The ass
 an absolute majority on the healthy member, and where the baseline starts is a property of the host —
 free space, and which member won the first few ties. From 12 / 1 no amount of correct behaviour
 reaches a majority inside thirteen files. It now asserts the SHIFT: the healthy member's share must
-grow by at least three. Linux runs show +7, +7, +6; the Windows run that failed was +5.
+grow by at least three.
+
+And the run after THAT one showed the burst itself was wrong, in a way I had introduced. Setting the
+degree of parallelism to the file count looked like the way to guarantee concurrency, but placement
+chooses a target when a file is CREATED — so starting every file at once makes every decision before
+any work is in flight, and the load term has nothing to weigh. It came back 7 / 6 then 6 / 7, a shift
+of one file, on a run where the throttle was demonstrably biting (the burst took 13.5s).
+
+Four at a time out of twenty-one is the shape that exercises it: the first few go out blind and the
+rest are placed while a collapsed member is visibly struggling with what it already has. Shifts of
++12, +13, +12 locally, against a threshold of three.
 
 ### The drainer scenarios tested the runner, not the drainer
 
