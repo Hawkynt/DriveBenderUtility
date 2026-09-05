@@ -130,8 +130,31 @@ public static class WholeFilePublisher {
   /// a previous interrupted publish can never leave a corrupt tail (SAFE-ATOMIC). Size is
   /// verified after publication; a mismatch throws before the caller completes its intent.
   /// </summary>
-  public static void PublishStream(IVolumeIO member, string normalizedPath, bool shadow, Func<Stream> openSource, long? expectedLength = null, bool blockingSource = false,
-    Action<long>? admit = null) {
+  /// <param name="commit">
+  /// Invoked once the content is fully staged and immediately before it becomes visible, returning
+  /// the lock to hold across that final step — or null to abandon the publish, in which case the
+  /// staged copy is discarded and this returns false.
+  ///
+  /// This exists so a caller does not have to choose between correctness and availability. The
+  /// pool's background copies must not publish an image of a file that a foreground operation has
+  /// moved on from — deleted it, renamed it, overwritten it — and the obvious way to guarantee that
+  /// is to hold the path's exclusive lease across the whole copy. That also blocks every READ of
+  /// the file for as long as the copy takes, which is fine at a millisecond and an outage at a
+  /// minute: measured at 17.4 seconds for a read of a file the healer was duplicating, with an
+  /// untouched copy sitting on another member the entire time.
+  ///
+  /// Splitting the two is what the staging file was always for. The expensive part runs unlocked,
+  /// the caller re-validates under a fresh lock, and only the rename — which is instantaneous —
+  /// happens while anything is excluded. A source that moved on simply loses its staged copy.
+  ///
+  /// Backends WITHOUT atomic rename have no such split to make: the content becomes visible as it
+  /// is written, so there is no moment between "staged" and "published" to re-check in. The gate is
+  /// therefore taken BEFORE the copy there and held throughout, which is the old behaviour and the
+  /// only safe one when the destination cannot stage.
+  /// </param>
+  /// <returns>False when <paramref name="commit"/> declined to publish; true otherwise.</returns>
+  public static bool PublishStream(IVolumeIO member, string normalizedPath, bool shadow, Func<Stream> openSource, long? expectedLength = null, bool blockingSource = false,
+    Action<long>? admit = null, Func<IDisposable?>? commit = null) {
     long written;
     if ((member.Caps & BackendCaps.AtomicRename) != 0) {
       var temp = normalizedPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
@@ -142,12 +165,35 @@ public static class WholeFilePublisher {
         stream.Flush();
       }
 
-      member.AtomicReplace(temp, normalizedPath, shadow);
+      if (commit == null)
+        member.AtomicReplace(temp, normalizedPath, shadow);
+      else {
+        using var gate = commit();
+        if (gate == null) {
+          // the source moved on, or the path went active: the staged copy is stale, and publishing
+          // it would put an old image beside a newer one — or bring back a file that was deleted.
+          try {
+            member.Delete(temp, shadow);
+          } catch (PoolFsException) {
+            // a temp we cannot remove is orphaned, not dangerous — recovery sweeps these on mount
+          }
+
+          return false;
+        }
+
+        member.AtomicReplace(temp, normalizedPath, shadow);
+      }
+
       _VerifySize(member, normalizedPath, shadow, expectedLength ?? written, written);
-      return;
+      return true;
     }
 
-    // no atomic rename (FTP/WebDAV-style): put whole, then verify the object landed intact
+    // no atomic rename (FTP/WebDAV-style): put whole, then verify the object landed intact. There is
+    // no staging step here, so the gate has to cover the whole write or it covers nothing.
+    using var held = commit?.Invoke();
+    if (commit != null && held == null)
+      return false;
+
     using (var source = openSource())
     using (var stream = member.OpenWrite(normalizedPath, shadow, true)) {
       stream.SetLength(0);
@@ -156,6 +202,7 @@ public static class WholeFilePublisher {
     }
 
     _VerifySize(member, normalizedPath, shadow, expectedLength ?? written, written);
+    return true;
   }
 
   private static void _VerifySize(IVolumeIO member, string normalizedPath, bool shadow, long expected, long written) {
@@ -170,11 +217,11 @@ public static class WholeFilePublisher {
   /// the whole file flows through a fixed buffer, temp + atomic rename on the target, never
   /// buffered in RAM — so a 40 GB file relocates in 1 MiB steps (SAFE-BIGFILE).
   /// </summary>
-  public static void CopyBetween(IVolumeIO source, string sourcePath, bool sourceShadow, IVolumeIO target, string targetPath, bool targetShadow,
-    Action<long>? admit = null) {
+  public static bool CopyBetween(IVolumeIO source, string sourcePath, bool sourceShadow, IVolumeIO target, string targetPath, bool targetShadow,
+    Action<long>? admit = null, Func<IDisposable?>? commit = null) {
     var expected = source.Stat(sourcePath, sourceShadow)?.Length;
-    PublishStream(target, targetPath, targetShadow, () => source.OpenRead(sourcePath, sourceShadow), expected,
-      blockingSource: source.BlocksCallingThread, admit: admit);
+    return PublishStream(target, targetPath, targetShadow, () => source.OpenRead(sourcePath, sourceShadow), expected,
+      blockingSource: source.BlocksCallingThread, admit: admit, commit: commit);
   }
 
   /// <summary>
