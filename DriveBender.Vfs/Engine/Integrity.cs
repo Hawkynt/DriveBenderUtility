@@ -252,7 +252,8 @@ public sealed record IntegrityIssue(IntegrityIssueKind Kind, string Path, string
 /// (size, mtime) is a legitimate external edit — accepted and re-propagated; anything
 /// ambiguous is kept as a conflict. The last copy of any content is never overwritten.
 /// </summary>
-public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalEditPolicy editPolicy = ExternalEditPolicy.AcceptNewest) {
+public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalEditPolicy editPolicy = ExternalEditPolicy.AcceptNewest,
+  Action<IVolumeIO, long>? admit = null) {
 
   private readonly Dictionary<Guid, ChecksumDatabase> _databases = members.ToDictionary(m => m.MemberId, m => new ChecksumDatabase(m));
   private long _quarantineCounter;
@@ -640,7 +641,8 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     var quarantinePath = $"{PoolPaths.UtilityFolderName}/conflicts/{path}.{reason}.{this._quarantineToken}.{Interlocked.Increment(ref this._quarantineCounter)}";
     try {
       copy.Member.EnsureFolder(PoolPaths.GetParent(quarantinePath), false);
-      WholeFilePublisher.CopyBetween(copy.Member, path, copy.Shadow, copy.Member, quarantinePath, false);
+      WholeFilePublisher.CopyBetween(copy.Member, path, copy.Shadow, copy.Member, quarantinePath, false,
+        admit: WholeFilePublisher.Pace(admit, copy.Member, copy.Member));
     } catch (PoolFsException e) {
       DriveBender.Logger($"[Warning]Could not quarantine '{path}' on '{copy.Member.DisplayName}': {e.Message}");
     }
@@ -648,7 +650,8 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
 
   /// <summary>Overwrites a target copy with the source's content (streamed) and records the known hash — no re-read, no byte[].</summary>
   private void _Repair(CopyView source, CopyView target, string path) {
-    WholeFilePublisher.CopyBetween(source.Member, path, source.Shadow, target.Member, path, target.Shadow);
+    WholeFilePublisher.CopyBetween(source.Member, path, source.Shadow, target.Member, path, target.Shadow,
+      admit: WholeFilePublisher.Pace(admit, source.Member, target.Member));
     this.RecordHash(target.Member, path, target.Shadow, source.Hash);
   }
 

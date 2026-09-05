@@ -165,8 +165,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// Measured before the fix: a 24 MiB heal onto a member limited to 1 MiB/s finished in under six
   /// seconds.
   /// </summary>
-  private Action<long> _AdmitBulkTo(IVolumeIO target)
-    => bytes => this._queues.Enter(target, IoKind.Background, bytes).Dispose();
+  /// <summary>
+  /// Charges one member for a chunk of the pool's own background copying, blocking until that
+  /// member's limits allow it. Handed to the media/recovery/trash paths so an administrative copy
+  /// is held to the same allowance as a drain (§6.4 "even heal and exchange").
+  /// </summary>
+  public void AdmitBulk(IVolumeIO member, long bytes) => this._queues.Enter(member, IoKind.Background, bytes).Dispose();
+
+  private Action<long>? _AdmitBulkBetween(IVolumeIO source, IVolumeIO target)
+    => WholeFilePublisher.Pace(this.AdmitBulk, source, target);
 
   private double _LoadScore(IVolumeIO volume) {
     if (this._IsCoolingDown(volume.MemberId))
@@ -216,8 +223,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._journal = journal ?? new(new MemberJournalStore([.. members.Select(m => m.Io)]));
     this._clock = clock ?? (static () => DateTime.UtcNow);
     this._writeBuffer = new(cache, this._clock);
-    this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock);
-    this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest);
+    this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock, this.AdmitBulk);
+    this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest, this.AdmitBulk);
     this._activity = new(clock: this._clock);
     this._placement = new(
       poolId,
@@ -466,7 +473,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._journal.ReconcileMirrors();
 
     // recovery before serving: roll forward, reconcile, clean temps (FR-RECOVER)
-    var report = new PoolRecovery([.. this._Online], this._journal).Run();
+    var report = new PoolRecovery([.. this._Online], this._journal, this.AdmitBulk).Run();
     if (report.AnythingDone) {
       DriveBender.Logger($"Recovery: {report.RolledForward} rolled forward, {report.Reconciled} reconciled, {report.TempsRemoved} staging files removed");
       this._activity.Publish(ActivityKind.Recovery, "", report.RolledForward + report.Reconciled, reason: "journal replay on mount");
@@ -835,7 +842,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var parent = PoolPaths.GetParent(normalized);
       target.EnsureFolder(parent, true);
       WholeFilePublisher.CopyBetween(sourceVol, normalized, sourceShadow, target, normalized, true,
-        admit: this._AdmitBulkTo(target));
+        admit: this._AdmitBulkBetween(sourceVol, target));
       this._activity.Publish(ActivityKind.Duplicate, normalized, size,
         fromMember: sourceVol.DisplayName, toMember: target.DisplayName,
         reason: $"duplication level {duplication}");
@@ -2102,7 +2109,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
         // streamed drain — the file is copied through a fixed buffer, never held in RAM (SAFE-BIGFILE)
         WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
-          admit: this._AdmitBulkTo(target));
+          admit: this._AdmitBulkBetween(landing, target));
 
         // TOCTOU guard (SAFE-NOLOSS): between the initial check and here, a foreground write could
         // have opened, rewritten and closed this file. If it is now open/dirty, or its size/mtime
@@ -2244,7 +2251,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var survivor = copies[0];
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: survivor.Volume.MemberId);
       WholeFilePublisher.CopyBetween(survivor.Volume, normalized, true, survivor.Volume, normalized, false,
-        admit: this._AdmitBulkTo(survivor.Volume));
+        admit: this._AdmitBulkBetween(survivor.Volume, survivor.Volume));
       survivor.Volume.Delete(normalized, true);
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
       this._activity.Publish(ActivityKind.Recovery, normalized, size, toMember: survivor.Volume.DisplayName, reason: "primary restored from surviving shadow");
@@ -2259,7 +2266,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: target.MemberId);
       target.EnsureFolder(PoolPaths.GetParent(normalized), true);
       WholeFilePublisher.CopyBetween(source.Volume, normalized, source.Shadow, target, normalized, true,
-        admit: this._AdmitBulkTo(target));
+        admit: this._AdmitBulkBetween(source.Volume, target));
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
       this._activity.Publish(ActivityKind.Duplicate, normalized, size,
         fromMember: source.Volume.DisplayName, toMember: target.DisplayName,

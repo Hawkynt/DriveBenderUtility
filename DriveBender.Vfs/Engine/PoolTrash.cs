@@ -17,7 +17,8 @@ internal sealed record TrashInfo {
 /// copies, so they stay recoverable until retention or the size cap purges them
 /// oldest-first. Moves are journalled (SAFE-WAL).
 /// </summary>
-public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal, Func<DateTime> clock) {
+public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal, Func<DateTime> clock,
+  Action<IVolumeIO, long>? admit = null) {
 
   public const string TrashPrefix = PoolPaths.UtilityFolderName + "/trash";
 
@@ -76,7 +77,8 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   private void _MoveShadowIntoTrash(IVolumeIO member, string normalizedPath, string trashPath) {
     // a shadow copy cannot be renamed across the shadow/primary namespace in one step: stage +
     // publish, STREAMED so a multi-GB shadow copy never lands in RAM (SAFE-BIGFILE)
-    WholeFilePublisher.CopyBetween(member, normalizedPath, true, member, trashPath, false);
+    WholeFilePublisher.CopyBetween(member, normalizedPath, true, member, trashPath, false,
+      admit: WholeFilePublisher.Pace(admit, member, member));
     member.Delete(normalizedPath, true);
   }
 

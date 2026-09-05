@@ -684,10 +684,41 @@ out the destination's limit exactly as a block write does. Pinned from both side
 below, which could not exist before it: they need the copy to still be RUNNING when the foreground
 operation lands, and it never was.
 
-Still unwired, and deliberately: `MediaLifecycle` (scatter, replace), `PoolRecovery`, `PoolTrash` and
-the integrity quarantine build their own copies without a queue to hand. Those are operator-initiated
-one-off operations rather than continuous background load, so they matter less and threading the
-queue into each of them is a wider change than this pass should make.
+### The limit bound the disk being written to, and not the one being read
+
+Follow-up to the above, and the same mistake one level down. `_AdmitBulkTo(target)` charged the
+receiving member for every chunk and the source for nothing — so a limit set on a member bounded
+what could be written *to* it, and said nothing about what could be read *from* it.
+
+That is the wrong half. An operator does not cap a member to protect its write path; they cap it to
+leave the disk some capacity for everything else on the machine. And in the operations that move the
+most data, the limited member is usually the source: the landing zone a drain empties, the tired
+member an exchange is evacuating. Under the old accounting, telling the pool to go easy on a dying
+disk and then asking it to replace that disk read the disk flat out anyway.
+
+`WholeFilePublisher.Pace` now charges both ends, so a copy runs at the slower of the two allowances
+and a limit on either end is a real bound. A copy whose ends are the same member — promoting a
+shadow in place — is charged once; charging it twice would silently halve the rate that was asked
+for, on the operation where the accounting is least visible.
+
+### …and the administrative copies were not metered at all
+
+`MediaLifecycle` (scatter, replace, restore), `PoolRecovery`, `PoolTrash` and the integrity
+quarantine each built their own copies with no queue to hand. This was written up as a deliberate
+deferral — "operator-initiated one-off operations rather than continuous background load, so they
+matter less" — and that reasoning does not survive contact with what the setting is for.
+
+An exchange is the largest thing this software ever does to two disks: it reads one end to end and
+writes another flat out, for hours, while the pool stays mounted and in use. It is not a lesser case
+than a drain, it is the case. And the spec the limits were built to (§6.4) says the simple rate
+covers "all operations, even heal and exchange" — so the one shape an operator can express in a
+single number was the one shape the code did not honour. Worse, `PoolOpsCommand` runs these verbs
+against an *unmounted* pool, where there is no engine to borrow a limiter from: the CLI, which is
+where a replace is usually started, ignored the limit even after the mounted daemon respected it.
+
+All four now take an admission callback. The mounted paths get the engine's; the CLI builds one from
+the same manifest the mount would read, so `dbmount pool replace-media` is held to the same rate the
+UI shows. Pinned by unit tests that count the bytes charged to each end of a real `Replace`.
 
 ### Three races against the pool's own background work, none of which could be tested before
 

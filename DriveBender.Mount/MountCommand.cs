@@ -227,7 +227,7 @@ internal static class MountCommand {
     try {
       var duplication = Math.Max(1, config.Duplication ?? 1);
       var allowSamePhysical = config.Placement?.ShadowNeverSamePhysical == false;
-      var media = new MediaLifecycle(ios, fs.Journal, duplication, allowSamePhysical);
+      var media = new MediaLifecycle(ios, fs.Journal, duplication, allowSamePhysical, fs.AdmitBulk);
       switch (op) {
         case "health" or "health-deep" or "fix": {
           var service = new HealthService(ios, new SmartctlMonitor(), fs.Integrity, media);
