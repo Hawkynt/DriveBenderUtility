@@ -37,6 +37,17 @@ public class BackgroundRaceEndToEndTests {
   /// </summary>
   private static readonly StorageKind _SLOW = new("crawling (simulated)", null, 8, 1024 * 1024);
 
+  /// <summary>
+  /// Three copies on one disk: what the overwrite race needs to be constructible at all.
+  ///
+  /// A pool that owes a copy has fewer reachable copies than its duplication level, and the ack
+  /// floor is min(2, D) — so at D=2 a heal-owing file has one copy and every write to it is refused.
+  /// At D=3 the two survivors satisfy the floor while the third is still being healed, which is the
+  /// only state in which "a write lands mid-heal" is a thing that can happen.
+  /// </summary>
+  private const string _TRIPLICATED_ON_ONE_DISK =
+    """{ "duplication": 3, "placement": { "shadowNeverSamePhysical": false } }""";
+
   /// <summary>At the rate above this is roughly half a minute of copying, which is the race window.</summary>
   private const int _SIZE = 24 * 1024 * 1024;
 
@@ -90,6 +101,78 @@ public class BackgroundRaceEndToEndTests {
     } catch {
       pool.Dispose();
       throw;
+    }
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  [Description("A file stays readable at full speed while the healer is copying it to another member.")]
+  public void Read_WhileTheHealerIsCopying_ThenItIsServedAtOnceRatherThanAtTheCopysPace() {
+    // The same question the drainer already answered badly: does the pool's own whole-file copy
+    // make the file unreadable for as long as it runs? _HealOne takes the path's exclusive lease
+    // for its whole promote/copy sequence, and a foreground read takes a read lease on that path.
+    const string name = "healing.bin";
+    var content = _Payload(_SIZE, 4100);
+    using var pool = _WithAHealInFlight(name, content);
+
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+    var served = File.ReadAllBytes(pool.PathTo(name));
+    stopwatch.Stop();
+    TestContext.Out.WriteLine($"[heal] read of a file mid-heal took {stopwatch.Elapsed.TotalSeconds:F1}s");
+
+    served.Should().Equal(content, "and it is the file, not a half-copied one");
+    stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(10),
+      $"reading a file the pool happens to be duplicating took {stopwatch.Elapsed.TotalSeconds:F0}s. "
+      + $"There is a complete, untouched copy on the other member the whole time — a read has no "
+      + $"reason to wait for the copy to finish."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  [Description("A member returns having lost its copies: every file is still readable at once from the surviving copy, without waiting for the heal.")]
+  public void Read_GivenAReturnedMemberLostItsCopies_ThenEveryFileIsStillServedFromTheSurvivor() {
+    // The pool is duplicated, so every one of these exists complete on the other member the whole
+    // time. Losing a member's copies must therefore cost latency at worst, never an error — the
+    // healer restoring duplication is housekeeping, not a precondition for reading.
+    const int files = 6;
+    var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk,
+      storageKinds: [StorageKind.Ram, _SLOW]);
+
+    using (pool) {
+      var written = new Dictionary<string, byte[]>();
+      for (var index = 0; index < files; ++index) {
+        var content = _Payload(2 * 1024 * 1024, 4200 + index);
+        File.WriteAllBytes(pool.PathTo($"kept{index}.bin"), content);
+        written[$"kept{index}.bin"] = content;
+      }
+
+      foreach (var name in written.Keys)
+        MountedPool.WaitUntil(() => pool.PhysicalCopies(name).Count >= 2, TimeSpan.FromMinutes(4))
+          .Should().BeTrue($"'{name}' must start fully duplicated.{Environment.NewLine}{pool.DescribeMembers()}");
+
+      // the member goes away, loses everything it held, and comes back — a restored-from-blank disk
+      pool.Eject(1);
+      foreach (var candidate in Directory.EnumerateFiles(pool.StoragePaths[1], "kept*.bin", SearchOption.AllDirectories))
+        File.Delete(candidate);
+
+      pool.Restore(1);
+
+      // read at once, while the healer is still working through the backlog at the slow member's
+      // pace — most of these have not been touched by it yet
+      var failures = new List<string>();
+      foreach (var (name, content) in written)
+        try {
+          File.ReadAllBytes(pool.PathTo(name)).Should().Equal(content, $"'{name}' must read back whole");
+        } catch (Exception e) {
+          failures.Add($"{name}: {e.GetType().Name} {e.Message}");
+        }
+
+      failures.Should().BeEmpty(
+        $"every one of these has a complete copy on the surviving member, so none of them can fail "
+        + $"to be read merely because the other member came back empty and the heal has not caught "
+        + $"up yet.{Environment.NewLine}{string.Join(Environment.NewLine, failures)}"
+        + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
     }
   }
 
@@ -174,31 +257,39 @@ public class BackgroundRaceEndToEndTests {
     // the healer's write is allowed to land after the overwrite, the returning member ends up
     // holding the OLD content — and the pool believes it is fully duplicated, so nothing ever
     // reconciles it. Whichever copy is read next is then a coin toss between two versions.
-    using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk,
-      storageKinds: [StorageKind.Ram, _SLOW]);
+    //
+    // THREE members at duplication three, so the overwrite can actually happen. The ack floor is
+    // min(2, D) copies, and this scenario deliberately leaves the pool owing a copy — at duplication
+    // two that means ONE reachable copy, and the pool refuses the write outright rather than
+    // acknowledge something it cannot make durable twice. Which is correct, and it meant this
+    // scenario never ran its own race: the overwrite could only land once the heal had finished, so
+    // what it actually tested was an overwrite AFTER a heal. At duplication three the two surviving
+    // copies satisfy the floor, the write is taken, and the healer is still mid-copy when it lands.
+    using var pool = MountedPool.Create(members: 3, poolDefaults: _TRIPLICATED_ON_ONE_DISK,
+      storageKinds: [StorageKind.Ram, StorageKind.Ram, _SLOW]);
 
     var original = _Payload(_SIZE, 3200);
     File.WriteAllBytes(pool.PathTo("raced.bin"), original);
-    MountedPool.WaitUntil(() => pool.PhysicalCopies("raced.bin").Count >= 2, TimeSpan.FromMinutes(3))
+    MountedPool.WaitUntil(() => pool.PhysicalCopies("raced.bin").Count >= 3, TimeSpan.FromMinutes(3))
       .Should().BeTrue($"the file must start fully duplicated.{Environment.NewLine}{pool.DescribeMembers()}");
 
     // pull the slow member and delete its copy behind the pool's back, so its return owes a heal
-    pool.Eject(1);
-    foreach (var candidate in Directory.EnumerateFiles(pool.StoragePaths[1], "raced.bin", SearchOption.AllDirectories))
+    pool.Eject(2);
+    foreach (var candidate in Directory.EnumerateFiles(pool.StoragePaths[2], "raced.bin", SearchOption.AllDirectories))
       File.Delete(candidate);
 
-    pool.Restore(1);
+    pool.Restore(2);
 
     // the healer now has the whole file to copy at a crawl; overwrite it while it is doing so
     Thread.Sleep(_INTO_THE_COPY);
-    _RequireStillCopying(pool, 1, "raced.bin", _SIZE);
+    _RequireStillCopying(pool, 2, "raced.bin", _SIZE);
     var replacement = _Payload(_SIZE, 3201);
     File.WriteAllBytes(pool.PathTo("raced.bin"), replacement);
 
     // let everything settle: the heal finishes, owed copies drain, the pool calls itself converged
     var converged = MountedPool.WaitUntil(() => {
       var copies = pool.PhysicalCopies("raced.bin");
-      return copies.Count >= 2 && copies.All(c => c.content.SequenceEqual(replacement));
+      return copies.Count >= 3 && copies.All(c => c.content.SequenceEqual(replacement));
     }, TimeSpan.FromMinutes(4));
 
     var copies = pool.PhysicalCopies("raced.bin");

@@ -1546,7 +1546,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     return this._ReadBlockThroughCopies(path, copies, blockIndex, mirrorSplit, guardEpoch, expectedLength);
   }
 
-  private byte[] _ReadBlockThroughCopies(string path, IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit, long? guardEpoch, int expectedLength) {
+  private byte[] _ReadBlockThroughCopies(string path, IReadOnlyList<PhysicalCopy> copies, long blockIndex, bool mirrorSplit, long? guardEpoch, int expectedLength, bool reResolved = false) {
     var key = new PageKey(this._poolId, path, blockIndex);
 
     // readiness block routing (FR-MIRROR, FR-STRIPE-READY): a split read sends each block to the
@@ -1610,6 +1610,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._activity.Publish(ActivityKind.Recovery, path, bestShort.Length, fromMember: bestShortMember,
         reason: "every copy is behind at this block");
       return bestShort;
+    }
+
+    // Every copy in the list failed, which is as likely to mean the LIST is wrong as that the data
+    // is gone. A read resolves its copies once and then works through the file; the pool is free to
+    // rearrange those copies while it does — a promote turns a shadow into a primary, a drain frees
+    // the tier it came from, a media move relocates it — and a reader holding the previous list then
+    // asks every member for a file none of them has under that name any more. Re-resolve once and
+    // try again; the bytes are usually still there, just somewhere else.
+    if (!reResolved) {
+      this._placement.Invalidate(path);
+      var fresh = this._placement.ResolveCopies(path);
+      if (fresh.Count > 0 && !fresh.SequenceEqual(copies))
+        return this._ReadBlockThroughCopies(path, fresh, blockIndex, mirrorSplit, guardEpoch, expectedLength, reResolved: true);
     }
 
     throw lastError ?? new PoolFsException(PoolFsError.IoError, $"No copy of '{path}' could be read");
@@ -2277,44 +2290,86 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// (SAFE-DUP). Active files are skipped — they converge through the write path.
   /// </summary>
   private void _HealOne(string normalized) {
-    if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized))
+    if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized)) {
+      // Busy right now — but PUT IT BACK. Dropping it here means a file that merely happened to be
+      // open when the healer reached it is never healed at all, because nothing enumerates it again
+      // until the next full scan (a mount, or a member changing state). A file being written is
+      // exactly the kind that most wants its copies restored. The re-queue cannot grow without
+      // bound: one entry goes out and one comes back, and the guard above is a few dictionary
+      // lookups, so a permanently open file costs one cheap check per pump tick.
+      this._healQueue.Enqueue(normalized);
       return;
+    }
 
-    // hold the path for the whole promote/copy sequence: the guards above are a TOCTOU check,
-    // so without the lease a file that goes active right after them would be republished from a
-    // stale source over acknowledged data (SAFE-NOLOSS). Never wait — a busy file heals later.
-    using var lease = this._handles.TryAcquireWrite(normalized, TimeSpan.Zero);
-    if (lease == null)
-      return;
+    // The guards above are a TOCTOU check, so the pre-image is taken under the lease: without it a
+    // file that goes active right after them would be republished from a stale source over
+    // acknowledged data (SAFE-NOLOSS). Never wait — a busy file heals later.
+    //
+    // What the lease does NOT cover any more is the copying. It used to, and that made every read
+    // of a file wait for the pool to finish duplicating it: a read takes a read lease on the same
+    // path, so it queued behind the healer for the whole transfer — 17.4 seconds on a 24 MiB file
+    // to a member held to 1 MiB/s, with a complete untouched copy on another member the entire
+    // time. The promise the lease exists to keep is that no stale image is ever PUBLISHED, and that
+    // is kept where it belongs, at the publish: the copy streams into a staging file unlocked and
+    // the rename happens under a fresh lease that re-validates first (see the commit gate below).
+    IReadOnlyList<PhysicalCopy> copies;
+    PhysicalCopy? source;
+    int duplication;
+    List<IVolumeIO> holders;
+    bool hasPrimary;
+    long size;
+    using (var lease = this._handles.TryAcquireWrite(normalized, TimeSpan.Zero)) {
+      if (lease == null)
+        return;
 
-    if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized))
-      return; // re-checked under the lease
+      if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized))
+        return; // re-checked under the lease
 
-    var copies = this._placement.ResolveCopies(normalized);
-    if (copies.Count == 0)
-      return;
+      copies = this._placement.ResolveCopies(normalized);
+      if (copies.Count == 0)
+        return;
 
-    var duplication = this._placement.DuplicationLevelFor(PoolPaths.GetParent(normalized));
-    var holders = copies.Select(c => c.Volume).Distinct().ToList();
-    var hasPrimary = copies.Any(c => !c.Shadow);
-    if (hasPrimary && holders.Count >= duplication)
-      return;
+      duplication = this._placement.DuplicationLevelFor(PoolPaths.GetParent(normalized));
+      holders = copies.Select(c => c.Volume).Distinct().ToList();
+      hasPrimary = copies.Any(c => !c.Shadow);
+      if (hasPrimary && holders.Count >= duplication)
+        return;
 
-    // a readable source copy, chosen by failover — never materialised in RAM (SAFE-BIGFILE)
-    var source = copies.FirstOrDefault(c => _CanRead(c.Volume, normalized, c.Shadow));
-    if (source == null)
-      return;
+      // a readable source copy, chosen by failover — never materialised in RAM (SAFE-BIGFILE)
+      source = copies.FirstOrDefault(c => _CanRead(c.Volume, normalized, c.Shadow));
+      if (source == null)
+        return;
 
-    var size = _StatAnyCopy(copies, normalized)?.Length ?? 0;
+      size = _StatAnyCopy(copies, normalized)?.Length ?? 0;
+    }
 
     if (!hasPrimary) {
-      // promote: the shadow's member gets a primary so the file survives shadow-container loss
+      // Promote: the shadow's member gets a primary so the file survives shadow-container loss.
+      //
+      // This one keeps the lease across the whole sequence, on purpose. It is not a copy followed
+      // by a publish but a copy followed by a DELETE of the source shadow, and the two have to look
+      // atomic to anything else touching the path — a gate around the rename alone would leave the
+      // delete outside it. It is also the rare case (no primary survives at all) and the cheap one
+      // (both ends are the same member), so what it can block is bounded in a way the cross-member
+      // duplication below is not.
       var survivor = copies[0];
+      using var promoteLease = this._handles.TryAcquireWrite(normalized, TimeSpan.Zero);
+      if (promoteLease == null)
+        return; // went active; heals later
+
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: survivor.Volume.MemberId);
       WholeFilePublisher.CopyBetween(survivor.Volume, normalized, true, survivor.Volume, normalized, false,
         admit: this._AdmitBulkBetween(survivor.Volume, survivor.Volume));
       survivor.Volume.Delete(normalized, true);
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
+
+      // AT ONCE, not at the end of the heal. The promote has just moved this file's only copy from
+      // the shadow container to the primary, and the placement cache still describes the copy that
+      // was deleted a line ago. Anything reading in the meantime resolves to a file that is no
+      // longer there and fails — with the real, complete copy sitting beside it. The rest of this
+      // method can be a cross-member copy of many gigabytes at whatever rate the member allows, so
+      // "the end of the heal" is not a moment, it is minutes.
+      this._Invalidate(normalized);
       this._activity.Publish(ActivityKind.Recovery, normalized, size, toMember: survivor.Volume.DisplayName, reason: "primary restored from surviving shadow");
       source = survivor with { Shadow = false };
     }
@@ -2326,16 +2381,61 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: target.MemberId);
       target.EnsureFolder(PoolPaths.GetParent(normalized), true);
-      WholeFilePublisher.CopyBetween(source.Volume, normalized, source.Shadow, target, normalized, true,
-        admit: this._AdmitBulkBetween(source.Volume, target));
+      var from = source!;
+      var before = from.Volume.Stat(normalized, from.Shadow);
+      var published = WholeFilePublisher.CopyBetween(from.Volume, normalized, from.Shadow, target, normalized, true,
+        admit: this._AdmitBulkBetween(from.Volume, target),
+        commit: () => this._CommitHealedCopy(normalized, from, before));
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
+      if (!published) {
+        // The file moved on under us and the staged copy was dropped, so this file is STILL under
+        // its duplication level. Losing the race is not a reason to stop owing the copy: without
+        // re-queueing, an overwrite that happens to land mid-heal leaves the pool permanently
+        // short one copy while believing it converged.
+        this._healQueue.Enqueue(normalized);
+        break;
+      }
+
       this._activity.Publish(ActivityKind.Duplicate, normalized, size,
-        fromMember: source.Volume.DisplayName, toMember: target.DisplayName,
+        fromMember: from.Volume.DisplayName, toMember: target.DisplayName,
         reason: $"healed to duplication level {duplication}");
       holders.Add(target);
     }
 
     this._Invalidate(normalized);
+  }
+
+  /// <summary>
+  /// Decides whether a staged heal copy may be published, and holds the path exclusive while it is.
+  ///
+  /// Returns the lease to publish under, or null to discard the staged copy. Null on any sign that
+  /// the image is no longer current: the path went active (staged, dirty, or open — the write path
+  /// owns it and will duplicate it itself), the lease cannot be taken at once, or the source copy
+  /// changed size or mtime while it was being read. The last is the one that matters: a copy taken
+  /// from a file that has since been rewritten is exactly the "stale image published over
+  /// acknowledged data" the healer must never produce.
+  ///
+  /// Declining costs one wasted copy and nothing else — the file is still at its old duplication
+  /// level, and the next heal pass picks it up.
+  /// </summary>
+  private IDisposable? _CommitHealedCopy(string normalized, PhysicalCopy source, FileMeta? before) {
+    if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized))
+      return null;
+
+    var lease = this._handles.TryAcquireWrite(normalized, TimeSpan.Zero);
+    if (lease == null)
+      return null;
+
+    // re-checked under the lease, then the source itself
+    var after = source.Volume.Stat(normalized, source.Shadow);
+    if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized)
+        || after is not { } now || before is not { } was
+        || now.Length != was.Length || now.LastWriteTimeUtc != was.LastWriteTimeUtc) {
+      lease.Dispose();
+      return null;
+    }
+
+    return lease;
   }
 
   /// <summary>True when a copy is currently readable (member online and the file present) — a cheap failover probe.</summary>

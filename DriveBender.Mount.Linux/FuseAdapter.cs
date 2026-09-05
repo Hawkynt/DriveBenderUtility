@@ -17,7 +17,48 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
   private static string _ToPoolPath(ReadOnlyNativeMemory<byte> fileNamePtr)
     => FuseHelper.GetString(fileNamePtr).TrimStart('/');
 
-  private static PosixResult _Translate(PoolFsException e) => e.Error switch {
+  /// <summary>
+  /// Last resort for an exception the engine did not classify: log it and answer EIO.
+  ///
+  /// Every operation here used to catch <see cref="PoolFsException"/> and nothing else, so anything
+  /// the engine did not wrap — an <see cref="IOException"/> from a member's own file handle, a
+  /// disposed object, a null reference in a path the tests have not reached — was thrown straight
+  /// back through the libfuse callback into native code. That is an exception crossing a boundary
+  /// that cannot carry it: the outcome is undefined, the operation gets no defined errno, and
+  /// nothing at all is written down. A dying disk surfacing an IOException mid-read is not exotic.
+  ///
+  /// EIO is the honest answer — the filesystem could not complete the operation — and the log line
+  /// is the part that matters, because it is the only record of what actually happened.
+  /// </summary>
+  private static PosixResult _Unexpected(Exception e) {
+    DriveBender.Logger($"[Warning]Unhandled {e.GetType().Name} in a filesystem operation, answered EIO: {e}");
+    return PosixResult.EIO;
+  }
+
+  /// <summary>
+  /// Maps an engine error onto an errno, and LOGS the ones that are not part of normal operation.
+  ///
+  /// Everything below has a specific errno except the fallback, and the fallback is EIO — "the
+  /// filesystem could not do this and cannot tell you why". An application sees only that number,
+  /// so if the pool does not write down what it actually was, the reason is gone: the mount log
+  /// showed a healthy pool while reads were failing. The routine outcomes (a missing file, an
+  /// existing one, a non-empty directory) stay silent, because they are answers rather than faults.
+  /// </summary>
+  private static PosixResult _Translate(PoolFsException e) {
+    // The routine outcomes are ANSWERS, not faults: a missing file, one that already exists, a
+    // directory that is not empty. Everything else means the pool could not do what was asked, and
+    // most of those collapse into EIO — a number that tells the application nothing at all. If the
+    // pool does not write down what it actually was, the reason is gone: reads were failing here
+    // while the mount log showed a perfectly healthy pool, and finding out why took a debugger.
+    if (e.Error is not (PoolFsError.NotFound or PoolFsError.Exists or PoolFsError.NotEmpty
+        or PoolFsError.AccessDenied or PoolFsError.IsADirectory or PoolFsError.NotADirectory
+        or PoolFsError.InvalidArgument or PoolFsError.NotSupported))
+      DriveBender.Logger($"[Warning]{e.Error} surfaced to the application: {e.Message}");
+
+    return _Map(e);
+  }
+
+  private static PosixResult _Map(PoolFsException e) => e.Error switch {
     PoolFsError.NotFound => PosixResult.ENOENT,
     PoolFsError.AccessDenied => PosixResult.EACCES,
     PoolFsError.Exists => PosixResult.EEXIST,
@@ -69,6 +110,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -78,6 +121,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -87,6 +132,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return meta.IsDirectory ? PosixResult.Success : PosixResult.ENOTDIR;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -102,6 +149,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -120,6 +169,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -130,6 +181,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -154,6 +207,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -176,6 +231,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -188,6 +245,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -204,6 +263,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -219,6 +280,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -228,6 +291,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -237,6 +302,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -246,6 +313,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -255,6 +324,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 
@@ -281,6 +352,8 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
       return PosixResult.Success;
     } catch (PoolFsException e) {
       return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
     }
   }
 

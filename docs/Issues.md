@@ -684,6 +684,93 @@ out the destination's limit exactly as a block write does. Pinned from both side
 below, which could not exist before it: they need the copy to still be RUNNING when the foreground
 operation lands, and it never was.
 
+### Reading a file the healer was duplicating waited for the whole copy
+
+The same fault as the drainer's, in the other background copier, and found by looking for it there
+once the first one was fixed. `_HealOne` took the path's exclusive lease for its whole promote/copy
+sequence; a foreground read takes a read lease on that path. So every read of a file blocked for
+exactly as long as the pool took to duplicate it — **17.4 seconds** on a 24 MiB file to a member held
+to 1 MiB/s, with a complete untouched copy on another member the entire time.
+
+The drainer's fix does not transfer, though. There the lease was belt-and-braces over a re-validation
+that already existed; here it genuinely protects something — a file deleted, renamed or overwritten
+mid-copy must not have the old image published on top of it. Dropping the lease and nothing else
+turned three passing safety scenarios into failures, which is exactly what should have happened.
+
+What splits the two concerns is the staging file, which was already there. `WholeFilePublisher` now
+takes a COMMIT GATE: the copy streams into the temp unlocked, and immediately before the rename the
+caller is asked for the lock to publish under. The healer's gate re-checks that the path has not gone
+active and that the source has not changed size, mtime, or vanished; if any of that fails, the staged
+copy is discarded and the file heals later. Only the rename — instantaneous — happens while anything
+is excluded. Backends without atomic rename have no such split available, so the gate is taken before
+the copy there and held throughout, which is the old behaviour and the only safe one when the
+destination cannot stage.
+
+17.4s to 0.0s, with all four background races still passing.
+
+### The promote left the copy list describing a copy it had just deleted
+
+This is the one that was actually dangerous, and it only became visible once reads were allowed to
+run during a heal.
+
+When no primary survives, the healer promotes: it copies the surviving shadow to a primary on the
+same member and deletes the shadow. `ResolveCopies` is CACHED, and `_HealOne` invalidated it at the
+very end of the method — after a cross-member duplication copy that can run for minutes at a limited
+member's rate. In between, the cached list said "one copy, in the shadow container", the shadow had
+been deleted a few lines earlier, and the newly created primary was not in the list at all. A read
+landing there asked every copy it knew about, found none, and failed — with the complete file sitting
+right beside it on the same disk.
+
+Two fixes, because either alone leaves the class of fault open. The promote now invalidates as soon
+as it has rearranged the copies, rather than at the end of the heal. And `_ReadBlockThroughCopies`,
+on exhausting every copy it was given, re-resolves once and retries before failing: a read resolves
+its copy list once and then works through a whole file, while the pool is free to rearrange those
+copies underneath it — a promote, a drain freeing a tier, a media move. A reader holding the previous
+list should look again, not give up.
+
+### A file that was open when the healer reached it was never healed
+
+`_HealOne` skips a file that is staged, dirty or open — correctly, since the write path owns it. But
+it dropped it from the heal queue on the way out, and nothing enumerates it again until the next full
+scan: a mount, or a member changing state. So a file that merely happened to be busy at the moment
+the healer got to it stayed below its duplication level indefinitely, silently.
+
+It is put back now. The re-queue cannot grow without bound — one entry out, one back — and the guard
+is a few dictionary lookups, so a permanently open file costs one cheap check per pump tick. The same
+applies when the commit gate declines: losing the race is not a reason to stop owing the copy.
+
+### An error the application saw as EIO was written down nowhere
+
+Every FUSE handler caught `PoolFsException` and translated it, and translated silently. Most errors
+have a specific errno; the rest collapse into EIO, which tells an application only that the
+filesystem could not do the thing. With nothing logged, the reason was simply gone — during the work
+above, reads were failing through the mount while the mount log showed a healthy pool, and finding
+out why needed a debugger and a stack trace bolted on by hand.
+
+Non-routine outcomes are now logged with their real cause. Routine ones — a missing file, one that
+already exists, a non-empty directory — stay silent, because they are answers rather than faults.
+
+Separately, none of the sixteen operation handlers caught anything BUT `PoolFsException`. Anything
+the engine did not wrap — an `IOException` from a member's own handle, a disposed object, a null
+reference on a path the tests have not reached — was thrown straight back through the libfuse
+callback into native code, which is an exception crossing a boundary that cannot carry it: undefined
+behaviour, no errno, nothing written down. A dying disk surfacing an IOException mid-read is not an
+exotic scenario. They all have a last-resort handler now that logs and answers EIO.
+
+### The overwrite race scenario never ran its own race
+
+`Overwrite_WhileTheHealerIsCopyingTheOldContent` passed for four rounds without testing what it
+claimed. The ack floor is min(2, D) reachable copies, and the scenario deliberately leaves the pool
+owing a copy — so at duplication two that is ONE reachable copy, and the pool refuses the write
+outright rather than acknowledge something it cannot make durable twice. Correct, and it meant the
+overwrite could only land once the heal had finished and the lease was released: what the test
+actually exercised was an overwrite AFTER a heal.
+
+It only became visible when the lease stopped serialising it, at which point the write started
+failing with the refusal it had always deserved. Three members at duplication three now, where the
+two survivors satisfy the floor while the third is still being healed — the only state in which "a
+write lands mid-heal" is a thing that can happen at all.
+
 ### The limit bound the disk being written to, and not the one being read
 
 Follow-up to the above, and the same mistake one level down. `_AdmitBulkTo(target)` charged the
