@@ -758,6 +758,21 @@ touch.
 Measured: 98 seconds with a forced kill, then 18 seconds with a clean unmount. The unmount itself
 went from refused-after-20s to 0.8s.
 
+### The brownout placement scenario asked for a burst and did not arrange one
+
+Failed once on Windows with a dead heat, 6 / 6, having passed 2 / 10 on the same platform a run
+earlier. Two things made it fragile, neither of them the product.
+
+Its own comment says the load term only means anything while writes are IN FLIGHT together — but
+the burst used `Parallel.For` with the default degree of parallelism, which is sized from the core
+count. On a two-core runner barely two files overlap, the load signal has almost nothing to weigh,
+and the outcome tracks the shape of the host instead of the behaviour under test. The degree is now
+stated explicitly, so the burst is a burst everywhere.
+
+The file count was also even, against a strict "the healthy member must take more" assertion, so a
+tie failed while showing placement doing nothing wrong. Odd count now; a dead heat is not a possible
+outcome.
+
 ### The drainer scenarios tested the runner, not the drainer
 
 All three failed on Windows CI with the same complaint: no staging file ever appeared. Not a defect
