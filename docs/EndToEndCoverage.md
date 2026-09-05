@@ -7,14 +7,16 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33968846896](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33968846896).
+Generated from run: [33976678588](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33976678588).
 
-167 scenarios — 146 passing on at least one target, 0 failing.
+169 scenarios — 148 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
 | BackgroundRace | `Delete_WhileACopyIsStillInFlight_ThenTheFileDoesNotComeBack` | A file deleted while the pool is still copying it stays deleted, rather than reappearing when the copy lands. | pass | pass |
 | BackgroundRace | `Overwrite_WhileTheHealerIsCopyingTheOldContent_ThenBothCopiesEndOnTheNewOne` | A file overwritten while the healer is copying the OLD content to a returning member ends with both copies on the NEW content. | pass | pass |
+| BackgroundRace | `Read_GivenAReturnedMemberLostItsCopies_ThenEveryFileIsStillServedFromTheSurvivor` | A member returns having lost its copies: every file is still readable at once from the surviving copy, without waiting for the heal. | pass | pass |
+| BackgroundRace | `Read_WhileTheHealerIsCopying_ThenItIsServedAtOnceRatherThanAtTheCopysPace` | A file stays readable at full speed while the healer is copying it to another member. | pass | pass |
 | BackgroundRace | `Rename_WhileACopyIsStillInFlight_ThenItEndsUnderExactlyOneName` | A file renamed while the pool is still copying it ends under exactly one name, with its content intact. | pass | pass |
 | BitRot | `BitRot_GivenEveryCopyIsDamaged_ThenTheLossIsNotPassedOffAsGoodData` | Both copies rot differently: the pool must not silently hand back damaged data as if it were fine. | pass | pass |
 | BitRot | `BitRot_GivenOneCopyIsSilentlyDamaged_ThenTheIntactContentIsStillServed` | One copy rots silently: the pool still serves the intact content rather than the damaged bytes. _(held back: Reads are not verified against the checksum database, so a silently damaged copy is served even though an intact one sits on the other member. Not a quick fix: the database holds WHOLE-FILE hashes, and a read serves a block, so there is nothing to check a block against without per-block checksums - a format change with a real cost. A scrub detects and repairs the damage; the exposure is the window before one runs. See docs/Issues.md.)_ | skipped | skipped |
