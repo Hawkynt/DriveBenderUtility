@@ -578,6 +578,24 @@ dropped from about 46 minutes to under 20. Two lessons, both cheap:
   could only fail — several hundred file reads and as many exceptions per `status`, and per each of
   the hundred polls one `unmount` makes. It now only considers files named for a pool id.
 
+### Open: the trash can take a file but nothing shipped can give it back
+
+`trash.enabled` moves a deleted file's bytes into a hidden per-member trash tree instead of destroying
+them (FR-TRASH, §6.14), and that half works — newly covered end to end: the file leaves the namespace,
+its bytes are kept whole on a member, its name is free again at once, and with the setting off (the
+default) a delete really is permanent and leaves nothing behind.
+
+The other half is not reachable. `PoolFileSystem.RestoreFromTrash` and `PoolTrash.List` exist and are
+unit-tested, and **nothing in the shipped binary calls either** — no CLI verb, no daemon endpoint, no
+UI. The only production callers of the trash are the delete path that fills it and the maintenance job
+that purges it on a retention policy. So an operator who turns it on gets a feature that consumes disk,
+quietly ages its contents out, and offers no way to recover anything; and they turned it on precisely
+because they wanted an undelete.
+
+Reported rather than built, because it is a user-facing surface rather than a fix: the engine work is
+already done and tested, so what is missing is a list-and-restore endpoint and somewhere in the
+dashboard to show it.
+
 ### Per-kind I/O limits, so a disk can be left usable for everything else
 
 `maxThroughput` was one number covering every operation, which is the right default and a blunt
@@ -1002,6 +1020,17 @@ being deleted, because what they cost is the point.
    physical file has since moved. Not reproduced end to end; the stress suite races file renames
    only, which is why it would not be caught. Fixing it needs a lock-ordering story for an unbounded
    set of children, which is why it is written down rather than attempted in passing.
+
+   **It now has an end-to-end guard, and the guard did not trip it.** `FolderRenameRaceEndToEndTests`
+   races four writers against a folder renamed back and forth underneath them, repeated, through a
+   real mount — the case the note says the stress suite misses because it races file renames only.
+   Its oracle is the one that matters and needs no timing: a write the pool ACKNOWLEDGED must be
+   findable afterwards, and a file must hold ONE version rather than a blend of two. Several
+   thousand acknowledged writes across dozens of renames later, nothing was lost. That does not
+   prove the window cannot open — a race that does not reproduce is not a race that cannot happen,
+   and the reasoning about the missing child lease still stands — but the risk is no longer
+   unobserved, and anything that makes it real from here fails a test instead of quietly losing a
+   file. The lock-ordering story for an unbounded set of children is still what a fix needs.
 
    **Half of this entry was wrong and is withdrawn.** It also claimed `HandleTable.RenameSubtree`
    repeats the defect fixed in `4ad2094` by re-keying children over any state already there. It does

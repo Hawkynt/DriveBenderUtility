@@ -104,6 +104,48 @@ public class MemberFailureLatencyEndToEndTests {
   }
 
   [Test]
+  [Category("Exception")]
+  [Description("A pool already mounted refuses to be mounted a second time, because two engines over one member set corrupt each other.")]
+  public void Mount_GivenThePoolIsAlreadyMounted_ThenASecondMountIsRefused() {
+    // The engine's own words: "two engines over one member set race and corrupt each other, and the
+    // registry-entry check alone is TOCTOU-racy". The guard is an OS-level file lock, and an
+    // advisory lock that does not actually exclude would leave two mount processes writing the same
+    // members through two independent caches, two write buffers and two journals — which is the
+    // worst corruption this product could produce, and it would look fine until it did not.
+    //
+    // Nothing exercised it, and the lock behaves differently enough between platforms to be worth
+    // asking rather than assuming.
+    using var pool = MountedPool.Create(members: 2);
+    var content = _Payload(256 * 1024, 640);
+    File.WriteAllBytes(pool.PathTo("guarded.bin"), content);
+
+    // a SECOND mount of the same pool, at a target of its own so nothing else can refuse it first
+    var secondTarget = Path.Combine(pool.Root, "second-mount");
+    Directory.CreateDirectory(secondTarget);
+
+    var second = DbMount.Run(TimeSpan.FromSeconds(90), "mount", "--manifest", pool.PoolName,
+      "-t", secondTarget, "--foreground");
+
+    second.Succeeded.Should().BeFalse(
+      $"a pool that is already mounted must refuse a second engine over the same members."
+      + $"{Environment.NewLine}second mount said: {second.Output}");
+
+    second.Output.Should().Contain("already mounted",
+      "and it must say why, so the operator knows to unmount rather than go looking for a driver fault");
+
+    // the FIRST mount is untouched by the attempt, and still serving
+    pool.IsMountAlive.Should().BeTrue(
+      $"a refused second mount must not disturb the one that holds the lock.{Environment.NewLine}{pool.MountLog}");
+
+    File.ReadAllBytes(pool.PathTo("guarded.bin")).Should().Equal(content,
+      "and the data behind it must be exactly as it was");
+
+    // nothing of the refused attempt may be left attached
+    Directory.EnumerateFileSystemEntries(secondTarget).Should().BeEmpty(
+      "the refused mount must not have attached anything at its target");
+  }
+
+  [Test]
   [Category("EdgeCase")]
   [Description("A member pulled while a large read is streaming: every remaining chunk still arrives promptly and the content is whole.")]
   public void Eject_WhileALargeReadIsStreaming_ThenEveryRemainingChunkStillArrivesPromptly() {
