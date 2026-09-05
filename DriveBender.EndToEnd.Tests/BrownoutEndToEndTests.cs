@@ -264,10 +264,20 @@ public class BrownoutEndToEndTests {
       + $"{files} after split {string.Join(" / ", afterSplit)} (member {victim} collapsed to "
       + $"{_COLLAPSED_THROUGHPUT / _MIB} MiB/s), written in {stopwatch.Elapsed.TotalSeconds:F1}s.");
 
-    afterSplit[healthy].Should().BeGreaterThan(afterSplit[victim],
+    // The SHIFT, not an absolute majority. What placement promises is that a member accumulating
+    // outstanding work stops being chosen as often — it says nothing about where the baseline was,
+    // and the baseline is a property of the host: free space, and which member happened to win the
+    // first few ties. A runner that opened 12 / 1 cannot reach a majority on the other member
+    // inside thirteen files however well the load term works, so demanding one measures the disk
+    // the runner was given. It duly failed there at 7 / 6 — having moved five files off the sick
+    // member, which is the effect this scenario exists to see.
+    var shift = afterSplit[healthy] - beforeSplit[healthy];
+    shift.Should().BeGreaterThanOrEqualTo(3,
       $"placement weighs how much work a member already has outstanding, and a collapsed member "
-      + $"accumulates it — new files must therefore favour the healthy member. Split after the "
-      + $"brownout was {string.Join(" / ", afterSplit)} with member {victim} collapsed."
+      + $"accumulates it — new files must therefore move TOWARDS the healthy member. It held "
+      + $"{beforeSplit[healthy]} of {files} before the brownout and {afterSplit[healthy]} after, a "
+      + $"shift of {shift}. Split was {string.Join(" / ", beforeSplit)} then "
+      + $"{string.Join(" / ", afterSplit)}, with member {victim} collapsed."
       + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
 
     // and nothing was lost on the way

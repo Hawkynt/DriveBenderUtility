@@ -903,6 +903,14 @@ The file count was also even, against a strict "the healthy member must take mor
 tie failed while showing placement doing nothing wrong. Odd count now; a dead heat is not a possible
 outcome.
 
+That was still not enough, and the next Windows failure said why. It came back 7 / 6 — but the
+BEFORE split on that runner was 12 / 1, so collapsing the busy member had moved five files' worth of
+work off it, which is exactly the effect the scenario exists to observe. The assertion was asking for
+an absolute majority on the healthy member, and where the baseline starts is a property of the host —
+free space, and which member won the first few ties. From 12 / 1 no amount of correct behaviour
+reaches a majority inside thirteen files. It now asserts the SHIFT: the healthy member's share must
+grow by at least three. Linux runs show +7, +7, +6; the Windows run that failed was +5.
+
 ### The drainer scenarios tested the runner, not the drainer
 
 All three failed on Windows CI with the same complaint: no staging file ever appeared. Not a defect
