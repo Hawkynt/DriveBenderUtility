@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33958552861](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33958552861).
+Generated from run: [33959683540](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33959683540).
 
-161 scenarios — 140 passing on at least one target, 1 failing.
+161 scenarios — 140 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -52,7 +52,7 @@ Generated from run: [33958552861](https://github.com/Hawkynt/DriveBenderUtility/
 | Durability | `Crash_GivenFilesWereWrittenAndClosed_ThenEveryByteSurvivesThePowerCut` | A power cut after files were written and closed: every byte is still there after the pool comes back. | pass | pass |
 | Durability | `Crash_GivenStagedWritesWereInterrupted_ThenNoInternalFileIsExposedToTheUser` | A power cut leaves half-written staging files on the members; none of them may show up in the pool as if they were the user's. | pass | pass |
 | Durability | `Divergence_GivenEachMemberTookAWriteWhileTheOtherWasAway_ThenOneWholeVersionIsServed` | Each member took a write while the other was away: the pool serves one whole version, never a mixture of the two. | pass | pass |
-| FolderRenameRace | `RenameFolder_WhileAChildIsBeingWritten_ThenNoAcknowledgedWriteIsLost` | A folder renamed under files that are being written: no write the pool acknowledged may go missing. | **FAIL** | pass |
+| FolderRenameRace | `RenameFolder_WhileAChildIsBeingWritten_ThenNoAcknowledgedWriteIsLost` | A folder renamed under files that are being written: no write the pool acknowledged may go missing. | skipped | pass |
 | HeterogeneousDevice | `Duplication_GivenOneCopyOnEachDevice_ThenBothCopiesAreWhole` | A file mirrored across a fast and a slow disk is byte-identical on both, whichever of them took it first. | skipped | skipped |
 | HeterogeneousDevice | `Duplication_GivenOneCopyOnEachDevice_ThenReadsAreNotHeldToTheSlowDisksPace` | With one copy on a fast disk and one on a slow one, reading the file is not held to the slow disk's pace. | skipped | skipped |
 | HeterogeneousDevice | `Health_GivenAMemberOnARealDevice_ThenItsSmartStateReachesTheSnapshot` | A member on a real block device reports that device's SMART health into the live snapshot the dashboard reads. | skipped | skipped |
