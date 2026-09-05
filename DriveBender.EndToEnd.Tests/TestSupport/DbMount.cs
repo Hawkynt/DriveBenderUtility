@@ -209,7 +209,28 @@ public static class DbMount {
   /// There is no CLI verb for them, so the registry manifest is edited directly and BEFORE the pool
   /// is mounted, exactly as <see cref="SetPoolDefaults"/> does.
   /// </summary>
-  public static void SetMemberLimits(string poolName, string memberPath, int maxIops, long maxThroughput) {
+  public static void SetMemberLimits(string poolName, string memberPath, int maxIops, long maxThroughput)
+    => _EditMember(poolName, memberPath, entry => {
+      entry["maxIops"] = maxIops;
+      entry["maxThroughput"] = maxThroughput;
+    });
+
+  /// <summary>
+  /// The FINE-GRAINED shape (§6.4): a separate byte rate per kind of operation, written into the
+  /// member's <c>limits</c> block.
+  ///
+  /// What the simple pair cannot express, and what a tiering scenario needs: hold the pool's own
+  /// background copying to a crawl while leaving the application's reads and writes alone. Limiting
+  /// everything instead would make the setup write take as long as the drain it is trying to catch.
+  /// </summary>
+  public static void SetMemberThroughput(string poolName, string memberPath, long read = 0, long write = 0, long background = 0)
+    => _EditMember(poolName, memberPath, entry => entry["limits"] = new System.Text.Json.Nodes.JsonObject {
+      ["readThroughput"] = read,
+      ["writeThroughput"] = write,
+      ["backgroundThroughput"] = background,
+    });
+
+  private static void _EditMember(string poolName, string memberPath, Action<System.Text.Json.Nodes.JsonObject> edit) {
     var directory = PoolRegistryDirectory;
     foreach (var path in Directory.EnumerateFiles(directory, "*.json")) {
       var text = File.ReadAllText(path);
@@ -229,8 +250,7 @@ public static class DbMount {
         if (!string.Equals(entry["path"]?.GetValue<string>(), memberPath, StringComparison.Ordinal))
           continue;
 
-        entry["maxIops"] = maxIops;
-        entry["maxThroughput"] = maxThroughput;
+        edit(entry);
         matched = true;
       }
 

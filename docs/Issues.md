@@ -701,6 +701,28 @@ and a limit on either end is a real bound. A copy whose ends are the same member
 shadow in place — is charged once; charging it twice would silently halve the rate that was asked
 for, on the operation where the accounting is least visible.
 
+### Nothing cut the power under the drainer
+
+The durability suite kills the mount under foreground writes, and thoroughly. Nothing killed it
+under the pool's own relocation, which fails differently: a drain copies a whole file down a tier
+and only then removes the original, so a crash lands either mid-copy (a half-written staging file on
+capacity, the good one still on the fast tier) or between the copy and the delete (one path, two
+members, identical bytes). The second is where recovery has to choose, and choosing wrong either
+drops the data or leaves the pool showing the file twice for good.
+
+Three scenarios now cover it. Both crash cases hold the landing zone's BACKGROUND rate — and only
+that rate — to 1 MiB/s before anything is written, which is what makes them assertable rather than
+hopeful: eight megabytes at one per second is eight seconds on any machine, so unlike a race against
+the host there is no runner fast enough to close the window. First attempt did it the other way
+round, limiting after the write, and both scenarios passed in five seconds having crashed after the
+drain had already finished — green, and testing nothing. They take twelve seconds now and a
+half-written file is observed every time.
+
+The third does not race at all. One path present on two members is a state every relocation the pool
+performs passes through, so it is simply built with the pool unmounted rather than won by timing.
+
+The engine handled all three; no defect here. Worth having because the alternative was believing it.
+
 ### …and the administrative copies were not metered at all
 
 `MediaLifecycle` (scatter, replace, restore), `PoolRecovery`, `PoolTrash` and the integrity
