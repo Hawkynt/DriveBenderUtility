@@ -758,6 +758,20 @@ touch.
 Measured: 98 seconds with a forced kill, then 18 seconds with a clean unmount. The unmount itself
 went from refused-after-20s to 0.8s.
 
+### The drainer scenarios tested the runner, not the drainer
+
+All three failed on Windows CI with the same complaint: no staging file ever appeared. Not a defect
+— placement declines a landing zone once it is past its low watermark, and a CI runner's nearly-full
+disk is past it permanently, so every write went straight to capacity and there was never a drain to
+catch.
+
+The first fix was to skip on that basis, which is wrong for a reason worth writing down: it makes
+the suite's own results depend on the host's free space, and a skip that flips between runs is
+exactly what stopped the generated coverage matrix from converging earlier in this work. These pools
+now raise the fast tier's watermarks in their own defaults, so the landing zone is chosen on any
+host and the scenario tests the drainer instead of the runner. The premise guard stays as a net that
+should never fire.
+
 ### Nothing cut the power under the drainer
 
 The durability suite kills the mount under foreground writes, and thoroughly. Nothing killed it

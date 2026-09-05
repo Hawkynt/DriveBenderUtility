@@ -191,6 +191,12 @@ public static class WholeFilePublisher {
   ///
   /// A copy whose two ends are the same member (promoting a shadow in place) is charged once — the
   /// alternative silently halves the rate the operator asked for.
+  ///
+  /// One consequence worth stating plainly: a delay cap bounds what EACH member's limiter may add,
+  /// so a chunk crossing two capped members can wait up to both caps. Each kept its own promise, and
+  /// the cap exists as a safety valve against a mistyped rate rather than as a latency guarantee, so
+  /// twice a bound that is already generous is the right trade against tracking a shared budget
+  /// across two independent limiters.
   /// </summary>
   public static Action<long>? Pace(Action<IVolumeIO, long>? admit, IVolumeIO source, IVolumeIO target) {
     if (admit == null)

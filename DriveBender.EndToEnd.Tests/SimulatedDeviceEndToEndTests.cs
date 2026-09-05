@@ -145,7 +145,7 @@ public class SimulatedDeviceEndToEndTests {
     const int files = 20;
     const int size = 1024 * 1024;
 
-    using var pool = MountedPool.CreateTiered();
+    using var pool = MountedPool.CreateTieredAlwaysLanding();
     DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: starved);
     DbMount.RequestLiveReload(pool.PoolName);
     Thread.Sleep(2500); // the pump consumes the reload on its next tick
@@ -191,13 +191,14 @@ public class SimulatedDeviceEndToEndTests {
     // released. Deterministic, not a flake.
     const long starved = 64 * 1024;
 
-    using var pool = MountedPool.CreateTiered();
+    using var pool = MountedPool.CreateTieredAlwaysLanding();
     DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: starved);
     DbMount.RequestLiveReload(pool.PoolName);
     Thread.Sleep(2500);
 
     var content = _Payload(8 * 1024 * 1024, 980);
     File.WriteAllBytes(pool.PathTo("relocating.bin"), content);
+    pool.RequireLandedOnFastTier("relocating.bin");
 
     // the read has to happen while the copy is genuinely in flight, or it proves nothing
     MountedPool.WaitUntil(() => pool.StagingFiles().Count > 0, TimeSpan.FromMinutes(2)).Should().BeTrue(
@@ -227,13 +228,14 @@ public class SimulatedDeviceEndToEndTests {
     // which throws away the clean shutdown and makes the next mount replay the journal.
     const long starved = 64 * 1024;
 
-    using var pool = MountedPool.CreateTiered();
+    using var pool = MountedPool.CreateTieredAlwaysLanding();
     DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: starved);
     DbMount.RequestLiveReload(pool.PoolName);
     Thread.Sleep(2500);
 
     var content = _Payload(8 * 1024 * 1024, 970);
     File.WriteAllBytes(pool.PathTo("pending.bin"), content);
+    pool.RequireLandedOnFastTier("pending.bin");
 
     // enough to guarantee the drainer is mid-copy, which is the state that used to wedge the unmount
     Thread.Sleep(3000);

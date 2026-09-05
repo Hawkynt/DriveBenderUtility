@@ -180,6 +180,23 @@ public sealed class MountedPool : IDisposable {
   public static MountedPool CreateTiered() => Create(members: 2, landingZones: 1);
 
   /// <summary>
+  /// A tiered pool whose fast tier is accepted however full the HOST disk is.
+  ///
+  /// Placement declines a landing zone once it is past its low watermark, which is right, and which
+  /// on a CI runner with a nearly-full disk means every write goes straight to capacity and nothing
+  /// ever drains. Scenarios about the drainer then have no drain to observe — and skipping them on
+  /// that basis makes the suite's own results depend on the host's free space, which is precisely
+  /// the kind of run-to-run variation that stops a generated coverage matrix from ever converging.
+  ///
+  /// Raising the watermarks is not a workaround for a defect; it configures away a condition of the
+  /// host so the scenario tests the drainer rather than the runner.
+  /// </summary>
+  public static MountedPool CreateTieredAlwaysLanding() => Create(members: 2, landingZones: 1,
+    poolDefaults: """
+      { "tiers": { "fast": { "highWatermark": "100%", "lowWatermark": "99%" } } }
+      """);
+
+  /// <summary>
   /// Windows mounts at a drive letter (no elevation needed — only installing the driver is);
   /// Linux mounts at an empty directory we own.
   /// </summary>
@@ -327,6 +344,27 @@ public sealed class MountedPool : IDisposable {
   }
 
   /// <summary>The copies of a pool-relative file across every member, primary or shadow container.</summary>
+  /// <summary>
+  /// Skips the test unless the file really did land on the LANDING ZONE (member 0 of a tiered pool).
+  ///
+  /// Placement is free to decline the fast tier — and does, once that member is past its low
+  /// watermark, which on a CI runner's nearly-full disk is the normal state rather than the
+  /// exception. The write then goes straight to capacity, correctly, and there is simply nothing for
+  /// the drainer to move. Any scenario about interrupting, reading beside, or shutting down under a
+  /// drain has no drain to work with in that case, and should say so rather than fail as though the
+  /// pool had misbehaved.
+  /// </summary>
+  public void RequireLandedOnFastTier(string relativePath) {
+    if (File.Exists(Path.Combine(this.MemberPaths[0], relativePath.Replace('/', Path.DirectorySeparatorChar))))
+      return;
+
+    Assert.Ignore(
+      $"'{relativePath}' did not land on the landing zone, so no drain follows and this scenario has "
+      + $"nothing to observe. Placement declines a fast tier past its low watermark, which is what a "
+      + $"host with little free space looks like — correct behaviour, wrong conditions for this test."
+      + $"{Environment.NewLine}{this.DescribeMembers()}");
+  }
+
   /// <summary>
   /// Half-written staging files on the members — the pool's own bookkeeping mid-copy.
   ///

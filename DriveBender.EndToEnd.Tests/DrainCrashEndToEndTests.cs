@@ -68,11 +68,12 @@ public class DrainCrashEndToEndTests {
   [Category("EdgeCase")]
   [Description("The power goes off while the drainer is copying a file down to capacity: the file comes back whole, on one tier or the other.")]
   public void Crash_GivenADrainWasInFlight_ThenTheFileSurvivesWholeOnOneTier() {
-    using var pool = MountedPool.CreateTiered();
+    using var pool = MountedPool.CreateTieredAlwaysLanding();
     var content = _Payload(_SIZE, 31);
 
     _CrawlTheDrain(pool);
     File.WriteAllBytes(pool.PathTo("draining.bin"), content);
+    pool.RequireLandedOnFastTier("draining.bin");
 
     // Wait for a HALF-WRITTEN file on capacity — the copy in flight, not merely begun and not
     // finished. This is assertable rather than hoped for precisely because the rate was set rather
@@ -99,11 +100,12 @@ public class DrainCrashEndToEndTests {
   [Category("EdgeCase")]
   [Description("A crash mid-drain leaves no half-written staging file visible to the user after the pool comes back.")]
   public void Crash_GivenADrainWasInFlight_ThenNoStagingFileIsExposed() {
-    using var pool = MountedPool.CreateTiered();
+    using var pool = MountedPool.CreateTieredAlwaysLanding();
     var content = _Payload(_SIZE, 32);
 
     _CrawlTheDrain(pool);
     File.WriteAllBytes(pool.PathTo("staged.bin"), content);
+    pool.RequireLandedOnFastTier("staged.bin");
 
     MountedPool.WaitUntil(() => pool.StagingFiles().Count > 0, TimeSpan.FromMinutes(3)).Should().BeTrue(
       $"there has to BE a staging file to leak before its absence afterwards means anything."
