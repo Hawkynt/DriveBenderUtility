@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33976678588](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33976678588).
+Generated from run: [33988531942](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33988531942).
 
-169 scenarios — 148 passing on at least one target, 0 failing.
+169 scenarios — 148 passing on at least one target, 1 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -30,7 +30,7 @@ Generated from run: [33976678588](https://github.com/Hawkynt/DriveBenderUtility/
 | Boundary | `Sizes_GivenFilesOnTheCacheAndBlockBoundaries_ThenEachRoundTripsExactly` | Files sized exactly on and either side of the page, buffer and block boundaries round-trip byte for byte. | pass | pass |
 | Boundary | `Sparse_GivenAWriteFarBeyondTheEnd_ThenTheHoleReadsAsZeroes` | Writing far past the end of a file leaves a hole that reads as zeroes, and the bytes written land at the right offset. | pass | pass |
 | Boundary | `Truncate_GivenAFileIsShrunkThenGrown_ThenTheOldContentDoesNotResurface` | A file shrunk and grown again reads as zeroes in the re-exposed region, never the content that used to be there. | pass | pass |
-| Brownout | `Brownout_GivenOneOfTwoCapacityMembersCollapses_ThenNewFilesGoToTheHealthyOne` | With two capacity members and one collapsed, new files are placed on the healthy one rather than spread evenly into the wall. | pass | pass |
+| Brownout | `Brownout_GivenOneOfTwoCapacityMembersCollapses_ThenNewFilesGoToTheHealthyOne` | With two capacity members and one collapsed, new files are placed on the healthy one rather than spread evenly into the wall. | **FAIL** | pass |
 | Brownout | `Brownout_GivenSomeoneTriesToWeakenTheAckFloor_ThenThePoolRefusesToMount` | Weakening a duplicated write's ack floor to one copy is refused outright, so the pacing above cannot be configured away by accident. | pass | pass |
 | Brownout | `Brownout_GivenTheDefaultAckPolicy_ThenADuplicatedWriteIsPacedByTheSickCopy` | Under the default ack policy a duplicated write IS paced by its slowest copy — the durability promise costs exactly that. | pass | pass |
 | Brownout | `Brownout_GivenThePrimaryCopysMemberCollapses_ThenReadsAreServedFromTheHealthyCopy` | The member holding the primary copy collapses to a crawl: reads must be served from the healthy copy instead of crawling with it. | pass | pass |
