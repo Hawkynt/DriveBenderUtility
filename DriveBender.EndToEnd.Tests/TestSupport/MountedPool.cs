@@ -327,6 +327,17 @@ public sealed class MountedPool : IDisposable {
   }
 
   /// <summary>The copies of a pool-relative file across every member, primary or shadow container.</summary>
+  /// <summary>
+  /// Half-written staging files on the members — the pool's own bookkeeping mid-copy.
+  ///
+  /// The only honest way to know a background copy is IN FLIGHT rather than finished or not yet
+  /// started, which is what scenarios about interrupting one have to establish.
+  /// </summary>
+  public IReadOnlyList<string> StagingFiles()
+    => [.. this.MemberPaths
+      .Where(Directory.Exists)
+      .SelectMany(m => Directory.EnumerateFiles(m, "*.TEMP.$DRIVEBENDER", SearchOption.AllDirectories))];
+
   public IReadOnlyList<(string where, byte[] content)> PhysicalCopies(string relativePath) {
     var found = new List<(string, byte[])>();
     foreach (var member in this.MemberPaths) {

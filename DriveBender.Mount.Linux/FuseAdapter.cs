@@ -13,6 +13,7 @@ namespace DivisonM.Mount.Linux;
 /// </summary>
 public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
 
+
   private static string _ToPoolPath(ReadOnlyNativeMemory<byte> fileNamePtr)
     => FuseHelper.GetString(fileNamePtr).TrimStart('/');
 
@@ -339,6 +340,9 @@ public static class LinuxFuseMountHost {
   /// <summary>Once registered there is nothing to race, and the pump is back to its ordinary cadence.</summary>
   private static readonly TimeSpan _REGISTERED_TICK = TimeSpan.FromSeconds(1);
 
+  /// <summary>How often the stop watcher looks for an unmount request; a file-exists check, so it can be brisk.</summary>
+  private static readonly TimeSpan _STOP_POLL = TimeSpan.FromMilliseconds(250);
+
   public static int Run(PoolFileSystem fs, string target, bool readOnly, Action? onMounted = null, Func<bool>? stopRequested = null, Action? onUnmounted = null, Action? onTick = null) {
     FuseAdapter.NativeUid = _GetId("-u");
     FuseAdapter.NativeGid = _GetId("-g");
@@ -368,9 +372,6 @@ public static class LinuxFuseMountHost {
         if (registered)
           onTick?.Invoke(); // periodic metrics snapshot for the serve daemon
 
-        // another dbmount asked for a clean unmount → detach; libfuse returns from Mount()
-        if (stopRequested?.Invoke() == true)
-          Unmount(target);
       } catch (Exception e) {
         DriveBender.Logger($"[Warning]background pump tick failed: {e.Message}");
       } finally {
@@ -387,6 +388,24 @@ public static class LinuxFuseMountHost {
     }, null, _AWAITING_MOUNT_TICK, Timeout.InfiniteTimeSpan);
 
     using var pumpLifetime = pump;
+
+    // A DEDICATED watcher, not a step in the pump tick, which is where this check used to live.
+    //
+    // The pump is deliberately non-reentrant: it re-arms only at the END of each tick. One unit of
+    // its work is a whole file, so a drain down a member held to 64 KiB/s keeps a single tick busy
+    // for minutes — and the stop check sat AFTER that work, so the unmount request was not even
+    // NOTICED until the copy the operator had throttled finished. The verb waited twenty seconds,
+    // reported the mount still active, and the process had to be killed. Rate-limiting a disk must
+    // not cost the ability to shut down cleanly, and this poll is far too cheap to be behind the
+    // work it has to interrupt.
+    var detaching = 0;
+    using var stopWatcher = new Timer(_ => {
+      if (stopRequested?.Invoke() != true || Interlocked.Exchange(ref detaching, 1) != 0)
+        return;
+
+      fs.AbortBackgroundWork(); // a copy already in flight stops at its next chunk
+      Unmount(target); // libfuse returns from Mount()
+    }, null, _STOP_POLL, _STOP_POLL);
 
     Console.CancelKeyPress += (_, e) => {
       e.Cancel = true;
@@ -418,7 +437,12 @@ public static class LinuxFuseMountHost {
         }
       }
     } finally {
-      scheduler.Quiesce();
+      // Housekeeping only, and bounded: a throttled member must not be able to hold the unmount
+      // open. What is left behind is journalled and resumes on the next mount.
+      if (!scheduler.Quiesce(BackgroundScheduler.UnmountBudget, fs.AbortBackgroundWork))
+        DriveBender.Logger(
+          $"[Warning]Unmounting with background work still pending after {BackgroundScheduler.UnmountBudget.TotalSeconds:F0}s "
+          + "(a member's rate limit, or a slow disk) — it is journalled and resumes on the next mount.");
       fs.Unmount(); // clean unmount flushes everything (FR-CLEAN-UNMOUNT)
       onUnmounted?.Invoke();
     }

@@ -701,6 +701,63 @@ and a limit on either end is a real bound. A copy whose ends are the same member
 shadow in place — is charged once; charging it twice would silently halve the rate that was asked
 for, on the operation where the accounting is least visible.
 
+### Reading a file the pool was moving waited for the whole move
+
+Tiering is documented as transparent — "a file stays readable AND writable throughout, including
+while the mover is relocating it" — and there is a scenario asserting it. It passed because a drain
+of a small file on tmpfs is over in milliseconds.
+
+It is not transparent. `DrainOneLandingFile` took the path's exclusive WRITE lease and held it
+across the entire copy; a foreground read takes a READ lease on the same path. So every read of a
+file blocked for exactly as long as the pool took to relocate it. Eight megabytes down a member held
+to 64 KiB/s: **126.8 seconds during which the file could not be read through the mount.** The same
+shape arrives without any limit at all — a large file onto a slow capacity disk — which is the
+ordinary case this feature exists for.
+
+Safety never rested on that lease. It rests on the TOCTOU guard after the copy, which re-validates
+size, mtime, dirty and open state and throws the copy away if anything moved; holding the lease
+across the copy only made that guard look like belt-and-braces. What has to be exclusive is the
+window between re-validating and deleting the landing original, and that is now exactly what is
+held: the pre-image is taken under a lease, the copy runs under none, and a fresh lease covers the
+swap. Failing to get that second lease is itself a reason to discard, so the file simply drains on a
+later pump.
+
+126.8s before, 0.0s after, deterministic both ways. The three background races — delete, rename and
+overwrite against the drainer and healer — are what would catch a safety regression here, and all
+three still pass.
+
+A note on how this was nearly got wrong, because it cost an hour: the first round of before/after
+measurements ran against a **stale binary**. The harness runs the shipped `dbmount`, and building
+only the test project left the previous one in place, so a revert appeared to change nothing and the
+diagnosis looked disproven. It was not; every measurement above was retaken after a full solution
+build. Incremental builds are not evidence when the thing under test is a separate executable.
+
+### A throttled member made the pool impossible to unmount cleanly
+
+Two independent causes, found by a scenario that starved background work and then simply shut down.
+
+The first is the one that mattered. The stop request was checked at the END of the background pump
+tick, and that tick is deliberately non-reentrant — it re-arms only once it finishes. One unit of
+the pump's work is a whole file, so a drain down a member held to 64 KiB/s kept a single tick busy
+for minutes, and the unmount request was not *noticed* until the copy the operator had throttled
+completed. `dbmount unmount` waited twenty seconds, reported the mount still active, exited 1, and
+the process had to be killed — throwing away the clean shutdown and making the next mount replay the
+journal. A rate limit is a statement about how fast a disk may be worked, not about whether the pool
+may stop. The check now lives in a dedicated watcher that the pump cannot starve.
+
+The second is `Quiesce`, which clean unmount uses to settle housekeeping and which had no time bound
+at all. A deadline alone does not fix it — it is only checked between units, and a unit is a whole
+file — so the budget expiring also signals the copy in flight to stop at its next chunk. Abandoning
+is safe and is preferred over finishing at full speed, which would be bounded only by the size of
+the file and would ignore the limit that was set. What is dropped is journalled: the intent stays
+incomplete, the staging file is orphaned, and the next mount reconciles both — the same state a
+power cut mid-drain leaves, which the scenarios above cover. Nothing acknowledged is involved;
+durability is `PoolFileSystem.Unmount`, which runs afterwards on the foreground path this does not
+touch.
+
+Measured: 98 seconds with a forced kill, then 18 seconds with a clean unmount. The unmount itself
+went from refused-after-20s to 0.8s.
+
 ### Nothing cut the power under the drainer
 
 The durability suite kills the mount under foreground writes, and thoroughly. Nothing killed it

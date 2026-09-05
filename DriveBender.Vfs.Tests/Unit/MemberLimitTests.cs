@@ -185,6 +185,54 @@ public class MemberLimitTests {
   }
 
   [Test]
+  [Category("Exception")]
+  public void Quiesce_GivenBackgroundWorkThatNeverFinishes_ThenItGivesUpAtTheBudget() {
+    // A clean unmount quiesces the scheduler, and housekeeping runs at whatever rate the operator
+    // allowed it. Unbounded, throttling a member costs the ability to shut down cleanly: the
+    // unmount request times out, the process is killed, and the next mount replays the journal.
+    // Nothing acknowledged is at stake — durability is the filesystem's Unmount, which runs after
+    // this regardless — so the right answer past the budget is to stop waiting.
+    var scheduler = new BackgroundScheduler([new EndlessJob()]);
+    var budget = TimeSpan.FromMilliseconds(500);
+
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+    var finished = scheduler.Quiesce(budget);
+    stopwatch.Stop();
+
+    finished.Should().BeFalse("work was still pending, and saying otherwise would hide it from the log");
+    stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(5),
+      "a job that never runs out of work must not be able to hold the unmount open");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Quiesce_GivenTheWorkFinishes_ThenItReportsSoWithoutSpendingTheBudget() {
+    var scheduler = new BackgroundScheduler([new FiniteJob(3)]);
+
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+    var finished = scheduler.Quiesce(TimeSpan.FromSeconds(30));
+    stopwatch.Stop();
+
+    finished.Should().BeTrue("the jobs ran out of work, which is the normal case");
+    stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(5), "and it returns as soon as they do");
+  }
+
+  /// <summary>Housekeeping that always has more to do — a drain held to a crawl, in effect.</summary>
+  private sealed class EndlessJob : IBackgroundJob {
+    public string Name => "endless";
+    public bool RunOnce() {
+      Thread.Sleep(20);
+      return true;
+    }
+  }
+
+  private sealed class FiniteJob(int units) : IBackgroundJob {
+    private int _left = units;
+    public string Name => "finite";
+    public bool RunOnce() => this._left-- > 0;
+  }
+
+  [Test]
   [Category("EdgeCase")]
   public void EffectiveLimits_GivenOnlyTheLegacyPair_ThenItReadsAsASimpleRate() {
     // older manifests carry maxIops/maxThroughput and no limits block; they must keep meaning

@@ -64,12 +64,6 @@ public class DrainCrashEndToEndTests {
     return holders;
   }
 
-  /// <summary>Half-written staging files, which the user must never see and recovery must clear.</summary>
-  private static IReadOnlyList<string> _StagingFiles(MountedPool pool)
-    => [.. pool.MemberPaths
-      .Where(Directory.Exists)
-      .SelectMany(m => Directory.EnumerateFiles(m, "*.TEMP.$DRIVEBENDER", SearchOption.AllDirectories))];
-
   [Test]
   [Category("EdgeCase")]
   [Description("The power goes off while the drainer is copying a file down to capacity: the file comes back whole, on one tier or the other.")]
@@ -84,7 +78,7 @@ public class DrainCrashEndToEndTests {
     // finished. This is assertable rather than hoped for precisely because the rate was set rather
     // than measured: eight megabytes at one per second is eight seconds on any machine, so unlike a
     // race against the host's speed there is no fast runner on which the window closes.
-    var sawStaging = MountedPool.WaitUntil(() => _StagingFiles(pool).Count > 0, TimeSpan.FromMinutes(3));
+    var sawStaging = MountedPool.WaitUntil(() => pool.StagingFiles().Count > 0, TimeSpan.FromMinutes(3));
     sawStaging.Should().BeTrue(
       $"the drain must be caught mid-copy, or the crash lands somewhere this scenario is not about."
       + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
@@ -111,7 +105,7 @@ public class DrainCrashEndToEndTests {
     _CrawlTheDrain(pool);
     File.WriteAllBytes(pool.PathTo("staged.bin"), content);
 
-    MountedPool.WaitUntil(() => _StagingFiles(pool).Count > 0, TimeSpan.FromMinutes(3)).Should().BeTrue(
+    MountedPool.WaitUntil(() => pool.StagingFiles().Count > 0, TimeSpan.FromMinutes(3)).Should().BeTrue(
       $"there has to BE a staging file to leak before its absence afterwards means anything."
       + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
 
