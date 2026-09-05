@@ -1,6 +1,13 @@
 # PRD — DriveBender Pool Mount Driver
 
-> **Status:** Draft for implementation planning · **Owner:** Hawkynt · **Target repo:** `DriveBenderUtility`
+> **Status:** Implemented and shipping · **Owner:** Hawkynt · **Target repo:** `DriveBenderUtility`
+>
+> The driver this specifies is built and mounts through WinFsp on Windows and FUSE on Linux,
+> with both exercised end to end in CI. The document stays because section 8 is the reference
+> for the configuration schema and the README sends readers here for it; every key it declares
+> is live in the source. Note that the `FR-*` / `NFR-*` / `SAFE-*` / `CFG-*` / `TST-*`
+> identifiers are not cited anywhere outside this file, so they are a numbering of intent
+> rather than a traceable link to the tests.
 > **One-liner:** Mount a DriveBender pool — native *or* defined by a portable JSON manifest over arbitrary members (drive roots, subfolders, UNC, removable, remote FTP/SFTP/WebDAV) — as a live, read/write filesystem: a drive letter or directory junction on Windows, a mountpoint on Linux. A RAM→fast→capacity write cascade with configurable caching (global or per-pool, PrimoCache-style), read-ahead, multi-drive I/O acceleration, and write policies; managed from an awesome cross-platform GUI with live per-pool visualisation — all provably data-safe and fully unit-tested.
 
 This document is the authoritative product & engineering spec. It is written to be
