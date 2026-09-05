@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33959683540](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33959683540).
+Generated from run: [33962132619](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33962132619).
 
-161 scenarios — 140 passing on at least one target, 0 failing.
+164 scenarios — 143 passing on at least one target, 2 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -35,6 +35,9 @@ Generated from run: [33959683540](https://github.com/Hawkynt/DriveBenderUtility/
 | Brownout | `Brownout_GivenTheVolatileAckOptIn_ThenTheWriteIsNotPacedByTheSickCopy` | The RAM-ack opt-in is the sanctioned way out: the write is taken at memory speed and both copies converge behind it. | pass | pass |
 | Brownout | `Brownout_WhenAMembersLimitIsLoweredLive_ThenItTakesEffectWithoutARemount` | A rate limit lowered on a mounted pool takes effect without a remount, rather than being ignored until the next mount. | pass | pass |
 | Brownout | `Brownout_WhenTheMemberRecovers_ThenThroughputComesBack` | When the collapsed member recovers, the pool's throughput comes back rather than staying degraded. | pass | pass |
+| DrainCrash | `Crash_GivenADrainWasInFlight_ThenNoStagingFileIsExposed` | A crash mid-drain leaves no half-written staging file visible to the user after the pool comes back. | **FAIL** | pass |
+| DrainCrash | `Crash_GivenADrainWasInFlight_ThenTheFileSurvivesWholeOnOneTier` | The power goes off while the drainer is copying a file down to capacity: the file comes back whole, on one tier or the other. | **FAIL** | pass |
+| DrainCrash | `Recovery_GivenOnePathOnTwoMembers_ThenThePoolServesItOnceAndWhole` | The same file left on two members, as a crash between a relocation's copy and its delete leaves it: the pool serves one entry, not two. | pass | pass |
 | Driver | `Append_GivenRepeatedOpens_ThenTheFileGrowsMonotonically` | Given Repeated Opens , then The File Grows Monotonically | pass | pass |
 | Driver | `Concurrency_GivenManyReadersAndWritersThroughTheOs_ThenNoFileIsCorrupted` | Given Many Readers And Writers Through The Os , then No File Is Corrupted | pass | pass |
 | Driver | `Directories_GivenATreeCreatedThroughTheOs_ThenItEnumeratesAndRemoves` | Given ATree Created Through The Os , then It Enumerates And Removes | pass | pass |
