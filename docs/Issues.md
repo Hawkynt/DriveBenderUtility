@@ -684,6 +684,49 @@ out the destination's limit exactly as a block write does. Pinned from both side
 below, which could not exist before it: they need the copy to still be RUNNING when the foreground
 operation lands, and it never was.
 
+### The heal re-queue turned a clean unmount into a hundred thousand wasted rounds
+
+Introduced by the previous fix and caught before it shipped, which is the only reason it is written
+up here rather than as a defect found later.
+
+Putting a busy file back on the heal queue is right — dropping it was the bug. But `HealStep`
+returned true for anything it dequeued, so a deferral counted as PROGRESS, and `BackgroundScheduler.
+Quiesce` pumps until every job runs dry. One open file was therefore enough to keep it pumping. Not
+a wedge, because Quiesce has a hundred-thousand-round safety limit and escapes through it — but it
+burns all of them to achieve nothing and then reports that work is still pending, on every clean
+unmount that happens to meet an open handle.
+
+The signal is now "did the QUEUE ADVANCE", which is not the same as "was a copy made". Deciding a
+file needs nothing is progress: it leaves the queue one shorter. Only a path that was put back
+reports false. The first attempt at this returned false for both, which let Quiesce stop with
+sixty-odd paths of a freshly enumerated batch still waiting — caught by the churn test, which
+noticed the pool reporting itself settled while it was not.
+
+Pinned by a test that asserts Quiesce's RETURN VALUE rather than its timing: true means the jobs ran
+dry, false means the safety limit stopped them, and nothing else distinguishes the two.
+
+### The drain invalidated its copy list after letting go of the lease
+
+The promote's fault again, one line long. The drainer deletes the landing original inside the swap
+lease and then invalidates the placement cache after releasing it, so between those two a reader can
+resolve a list naming a file that was deleted a statement ago. The window is a few statements rather
+than the promote's minutes, which is a reason to think it harmless and not a reason to leave it: the
+read that lands in it fails just as completely. The invalidation now happens under the lease, beside
+the delete that makes it necessary.
+
+### Media operations on a mounted pool: looked for the same fault, did not find it
+
+`MediaLifecycle` talks to the volumes directly and knows nothing about the engine's caches, and the
+daemon runs it against a MOUNTED pool from the UI — `_RunPoolOp` starts a restore or a health fix on
+a background thread while reads are being served, and there is no invalidation call anywhere in that
+path. `PoolFileSystem` does not even expose one. Given what the promote turned out to be, that looked
+like the same defect with a wider blast radius.
+
+It is not. Two scenarios — scattering a member off a live pool, and a restore promoting a shadow
+whose primary had been lost — both leave the file readable and correctly sized through the mounted
+filesystem afterwards. Recorded as a negative result with the tests kept, because the reasoning that
+predicted a bug here was sound and the next person will have it too.
+
 ### Reading a file the healer was duplicating waited for the whole copy
 
 The same fault as the drainer's, in the other background copier, and found by looking for it there
@@ -859,6 +902,24 @@ stated explicitly, so the burst is a burst everywhere.
 The file count was also even, against a strict "the healthy member must take more" assertion, so a
 tie failed while showing placement doing nothing wrong. Odd count now; a dead heat is not a possible
 outcome.
+
+That was still not enough, and the next Windows failure said why. It came back 7 / 6 — but the
+BEFORE split on that runner was 12 / 1, so collapsing the busy member had moved five files' worth of
+work off it, which is exactly the effect the scenario exists to observe. The assertion was asking for
+an absolute majority on the healthy member, and where the baseline starts is a property of the host —
+free space, and which member won the first few ties. From 12 / 1 no amount of correct behaviour
+reaches a majority inside thirteen files. It now asserts the SHIFT: the healthy member's share must
+grow by at least three.
+
+And the run after THAT one showed the burst itself was wrong, in a way I had introduced. Setting the
+degree of parallelism to the file count looked like the way to guarantee concurrency, but placement
+chooses a target when a file is CREATED — so starting every file at once makes every decision before
+any work is in flight, and the load term has nothing to weigh. It came back 7 / 6 then 6 / 7, a shift
+of one file, on a run where the throttle was demonstrably biting (the burst took 13.5s).
+
+Four at a time out of twenty-one is the shape that exercises it: the first few go out blind and the
+rest are placed while a collapsed member is visibly struggling with what it already has. Shifts of
++12, +13, +12 locally, against a threshold of three.
 
 ### The drainer scenarios tested the runner, not the drainer
 

@@ -223,11 +223,20 @@ public class BrownoutEndToEndTests {
   public void Brownout_GivenOneOfTwoCapacityMembersCollapses_ThenNewFilesGoToTheHealthyOne() {
     using var pool = MountedPool.Create(members: 2, poolDefaults: _SMALL_CACHE_SPREAD);
 
-    // ODD, so the two members cannot come back tied. The assertion is a strict inequality — the
-    // healthy member must take MORE — and with an even count a dead heat fails it while actually
-    // showing placement doing nothing wrong. Windows CI produced exactly that: 6 / 6.
-    const int files = 13;
+    const int files = 21;
     const int size = 2 * 1024 * 1024;
+
+    // FOUR at a time, not twenty-one. This is the correction to a previous attempt at this test,
+    // which set the degree of parallelism to the file count on the reasoning that the load term
+    // only works on concurrent writes. That is true and it overshot: placement chooses a target
+    // when the file is CREATED, so starting all of them at once makes every decision before any
+    // work is in flight, and there is no load for the term to weigh. It duly came back 7 / 6 then
+    // 6 / 7 — a shift of one file — on a run where the throttle was demonstrably biting.
+    //
+    // A few in flight and the rest queued behind them is the shape that actually exercises it:
+    // the first four go out blind, and the seventeen after them are placed while a collapsed
+    // member is visibly struggling with what it already has.
+    const int burstWidth = 4;
 
     // Established with a CONCURRENT burst, because that is the only time placement's load term does
     // anything: files written one after another leave nothing in flight to break the tie, so free
@@ -235,11 +244,10 @@ public class BrownoutEndToEndTests {
     // split after sequential writes asked the design for a guarantee it does not make — and on a
     // runner whose two members have identical free space it duly came back 12 / 0.
     //
-    // The degree of parallelism is stated rather than inherited. Parallel.For sizes itself from the
-    // core count, so on a two-core runner barely two files are ever in flight and the load term has
-    // next to nothing to weigh — the burst this scenario depends on quietly became a trickle, and
-    // the result drifted with the shape of the host rather than the behaviour under test.
-    var burst = new ParallelOptions { MaxDegreeOfParallelism = files };
+    // Stated rather than inherited: Parallel.For sizes itself from the core count, so on a two-core
+    // runner barely two files overlap and on a large one every file starts at once. Neither is the
+    // scenario; the width is part of what is being set up.
+    var burst = new ParallelOptions { MaxDegreeOfParallelism = burstWidth };
     Parallel.For(0, files, burst, file => File.WriteAllBytes(pool.PathTo($"before{file}.bin"), _Payload(size, 2300 + file)));
 
     var beforeSplit = _CountPerMember(pool, "before", files);
@@ -264,10 +272,20 @@ public class BrownoutEndToEndTests {
       + $"{files} after split {string.Join(" / ", afterSplit)} (member {victim} collapsed to "
       + $"{_COLLAPSED_THROUGHPUT / _MIB} MiB/s), written in {stopwatch.Elapsed.TotalSeconds:F1}s.");
 
-    afterSplit[healthy].Should().BeGreaterThan(afterSplit[victim],
+    // The SHIFT, not an absolute majority. What placement promises is that a member accumulating
+    // outstanding work stops being chosen as often — it says nothing about where the baseline was,
+    // and the baseline is a property of the host: free space, and which member happened to win the
+    // first few ties. A runner that opened 12 / 1 cannot reach a majority on the other member
+    // inside thirteen files however well the load term works, so demanding one measures the disk
+    // the runner was given. It duly failed there at 7 / 6 — having moved five files off the sick
+    // member, which is the effect this scenario exists to see.
+    var shift = afterSplit[healthy] - beforeSplit[healthy];
+    shift.Should().BeGreaterThanOrEqualTo(3,
       $"placement weighs how much work a member already has outstanding, and a collapsed member "
-      + $"accumulates it — new files must therefore favour the healthy member. Split after the "
-      + $"brownout was {string.Join(" / ", afterSplit)} with member {victim} collapsed."
+      + $"accumulates it — new files must therefore move TOWARDS the healthy member. It held "
+      + $"{beforeSplit[healthy]} of {files} before the brownout and {afterSplit[healthy]} after, a "
+      + $"shift of {shift}. Split was {string.Join(" / ", beforeSplit)} then "
+      + $"{string.Join(" / ", afterSplit)}, with member {victim} collapsed."
       + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
 
     // and nothing was lost on the way

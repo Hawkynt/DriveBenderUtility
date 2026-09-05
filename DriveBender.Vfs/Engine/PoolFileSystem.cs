@@ -2200,11 +2200,18 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
           landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
           this._journal.Complete(sequence, JournalOp.Drain);
+
+          // STILL UNDER THE LEASE. The copy set changed the moment the landing original went away,
+          // and a reader resolving between that delete and the invalidation gets a list naming a
+          // file that is no longer there. The same ordering fault as the promote's, with a window
+          // of a few statements rather than minutes — which is a reason to think it harmless, not
+          // a reason to leave it: the read that lands in it fails just as completely.
+          this._integrity.InvalidateFile(path);
+          this._Invalidate(path);
         }
-        this._integrity.InvalidateFile(path);
+
         this._activity.Publish(ActivityKind.Drain, path, size, landing.DisplayName, target.DisplayName, "landing-zone drain");
 
-        this._Invalidate(path);
         this._EnsureShadows(path, this._placement.ResolveCopies(path));
         this._Invalidate(path);
         DriveBender.Logger($" - Drained '{path}' from '{landing.DisplayName}' to '{target.DisplayName}' ({size} bytes)");
@@ -2259,10 +2266,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._mountOptions == null || this.IsReadOnly)
       return false; // a read-only mount must not mutate members — an explicit repair op can
 
-    if (this._healQueue.TryDequeue(out var path)) {
-      this._HealOne(path);
-      return true;
-    }
+    if (this._healQueue.TryDequeue(out var path))
+      // Whether the QUEUE ADVANCED, which is not the same as whether a copy was made. Deciding a
+      // file needs nothing is progress — it leaves the queue one shorter — and reporting that as
+      // idle would let Quiesce stop with the rest of the batch still waiting. Only a path that was
+      // PUT BACK reports false: nothing moved, and saying otherwise would make Quiesce, which pumps
+      // until every job runs dry, spin on a file that is simply busy.
+      return this._HealOne(path);
 
     var scan = this._healScan;
     if (scan == null) {
@@ -2289,7 +2299,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// is gone, then creates missing copies via temp + atomic rename under a journalled intent
   /// (SAFE-DUP). Active files are skipped — they converge through the write path.
   /// </summary>
-  private void _HealOne(string normalized) {
+  private bool _HealOne(string normalized) {
     if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized)) {
       // Busy right now — but PUT IT BACK. Dropping it here means a file that merely happened to be
       // open when the healer reached it is never healed at all, because nothing enumerates it again
@@ -2298,7 +2308,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // bound: one entry goes out and one comes back, and the guard above is a few dictionary
       // lookups, so a permanently open file costs one cheap check per pump tick.
       this._healQueue.Enqueue(normalized);
-      return;
+      return false;
     }
 
     // The guards above are a TOCTOU check, so the pre-image is taken under the lease: without it a
@@ -2319,26 +2329,30 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     bool hasPrimary;
     long size;
     using (var lease = this._handles.TryAcquireWrite(normalized, TimeSpan.Zero)) {
-      if (lease == null)
-        return;
+      if (lease == null) {
+        this._healQueue.Enqueue(normalized); // somebody else holds it; still owed
+        return false;
+      }
 
-      if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized))
-        return; // re-checked under the lease
+      if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized)) {
+        this._healQueue.Enqueue(normalized); // re-checked under the lease, and it went active
+        return false;
+      }
 
       copies = this._placement.ResolveCopies(normalized);
       if (copies.Count == 0)
-        return;
+        return true; // gone (deleted while queued) — nothing owed, and the queue is one shorter
 
       duplication = this._placement.DuplicationLevelFor(PoolPaths.GetParent(normalized));
       holders = copies.Select(c => c.Volume).Distinct().ToList();
       hasPrimary = copies.Any(c => !c.Shadow);
       if (hasPrimary && holders.Count >= duplication)
-        return;
+        return true; // already whole — deciding that IS the work
 
       // a readable source copy, chosen by failover — never materialised in RAM (SAFE-BIGFILE)
       source = copies.FirstOrDefault(c => _CanRead(c.Volume, normalized, c.Shadow));
       if (source == null)
-        return;
+        return true; // no readable source right now; a member coming back re-scans anyway
 
       size = _StatAnyCopy(copies, normalized)?.Length ?? 0;
     }
@@ -2354,8 +2368,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // duplication below is not.
       var survivor = copies[0];
       using var promoteLease = this._handles.TryAcquireWrite(normalized, TimeSpan.Zero);
-      if (promoteLease == null)
-        return; // went active; heals later
+      if (promoteLease == null) {
+        this._healQueue.Enqueue(normalized); // went active; still owed, so put it back
+        return false;
+      }
+
 
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: survivor.Volume.MemberId);
       WholeFilePublisher.CopyBetween(survivor.Volume, normalized, true, survivor.Volume, normalized, false,
@@ -2403,6 +2420,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     this._Invalidate(normalized);
+    return true;
   }
 
   /// <summary>

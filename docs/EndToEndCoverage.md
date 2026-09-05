@@ -7,7 +7,7 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33976678588](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33976678588).
+Generated from run: [33991661503](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33991661503).
 
 169 scenarios — 148 passing on at least one target, 0 failing.
 
