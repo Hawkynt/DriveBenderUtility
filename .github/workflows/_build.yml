@@ -1,8 +1,8 @@
 name: Build artifacts
 
-# Produces two zips (net47 is Windows-only):
+# Produces two zips (the Console is net47, which publishes only on a Windows runner):
 #   * DriveBender-Console-win-<version>.zip
-#   * DriveBender-UI-win-<version>.zip
+#   * DriveBender-App-win-<version>.zip
 #
 # .NET Framework builds don't support --self-contained / --runtime like modern
 # .NET; we publish the framework-dependent output which needs .NET Framework 4.7
