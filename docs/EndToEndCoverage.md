@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34034365324](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34034365324).
+Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34039661270).
 
-177 scenarios — 156 passing on at least one target, 0 failing.
+180 scenarios — 159 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -103,6 +103,9 @@ Generated from run: [34034365324](https://github.com/Hawkynt/DriveBenderUtility/
 | MemberLoss | `Eject_GivenAMemberReturnsWhileIoIsInFlight_ThenNothingIsCorruptedOrStalled` | Given AMember Returns While Io Is In Flight , then Nothing Is Corrupted Or Stalled | pass | pass |
 | MemberLoss | `Eject_GivenAMemberVanishesDuringAWrite_ThenTheDataThatWasAcknowledgedIsIntact` | Given AMember Vanishes During AWrite , then The Data That Was Acknowledged Is Intact | pass | pass |
 | MemberLoss | `Eject_GivenEveryMemberIsGone_ThenOperationsFailCleanlyInsteadOfHanging` | Given Every Member Is Gone , then Operations Fail Cleanly Instead Of Hanging | pass | pass |
+| MetadataFidelity | `Permissions_GivenAFileIsMadePrivate_ThenItStaysPrivate` | Permissions set on a file in the pool are actually kept, rather than reported as set and discarded. | skipped | pass |
+| MetadataFidelity | `Permissions_WhenThePoolCopiesTheFile_ThenTheModeIsCarriedWithIt` | A file's permissions survive a remount and the pool's own duplication of it. | skipped | pass |
+| MetadataFidelity | `Preserving_GivenCpDashPCopiesIntoThePool_ThenModeAndTimeArriveWithIt` | cp -p into the pool preserves mode and modification time, as it does onto any other filesystem. | skipped | pass |
 | MetadataFidelity | `Timestamps_GivenAFileIsStamped_ThenTheMountReportsItBack` | A file's modification time survives a write and read back through the mount. | pass | pass |
 | MetadataFidelity | `Timestamps_WhenTheDrainerMovesTheFile_ThenItsModificationTimeIsUnchanged` | The drainer moving a file down a tier does not change its modification time. | pass | pass |
 | MetadataFidelity | `Timestamps_WhenTheHealerDuplicatesTheFile_ThenItsModificationTimeIsUnchanged` | A duplication heal creating a second copy does not change the file's modification time. | pass | pass |

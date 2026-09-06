@@ -302,7 +302,10 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     | BackendCaps.DurableFlush
     | BackendCaps.List
     | BackendCaps.Delete
-    | BackendCaps.Timestamps;
+    | BackendCaps.Timestamps
+    // only where the host filesystem actually has a mode to keep; claiming it on Windows would make
+    // the engine carry a permission it cannot store and report one it never set
+    | (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() ? BackendCaps.Permissions : BackendCaps.None);
 
   /// <summary>
   /// Capacity of the volume behind this member, or ZERO when it cannot be interrogated — the
@@ -514,11 +517,11 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     if (file.Exists)
       // while a pooled write handle is open, the handle's length is authoritative — NTFS
       // directory metadata (what FileInfo reads) lags behind write-through data
-      return new FileMeta(this._pool.TryGetWriteLength(path, out var live) ? live : file.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, file.Attributes);
+      return new FileMeta(this._pool.TryGetWriteLength(path, out var live) ? live : file.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, file.Attributes, _ModeOf(path));
 
     var directory = new DirectoryInfo(path);
     if (directory.Exists)
-      return new FileMeta(0, directory.CreationTimeUtc, directory.LastWriteTimeUtc, directory.Attributes);
+      return new FileMeta(0, directory.CreationTimeUtc, directory.LastWriteTimeUtc, directory.Attributes, _ModeOf(path));
 
     return null;
   });
@@ -539,6 +542,31 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
       FileInfo f => new VolumeEntry(f.Name, false, this._pool.TryGetWriteLength(f.FullName, out var live) ? live : f.Length, f.LastWriteTimeUtc),
       _ => new VolumeEntry(item.Name, true, 0, item.LastWriteTimeUtc),
     }).ToArray());
+  }
+
+  /// <summary>
+  /// The stored POSIX mode, or null off Unix where the concept does not apply.
+  ///
+  /// Read from the underlying file rather than kept beside it, because that is where it already
+  /// lives: the pool stores real files on real filesystems, so the mode persists, survives a
+  /// remount and is what an operator sees if they look at the member directly.
+  /// </summary>
+  private static UnixFileMode? _ModeOf(string path) {
+    if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS())
+      return null;
+
+    try {
+      return File.GetUnixFileMode(path);
+    } catch (Exception) {
+      return null; // an unreadable mode is not a reason to fail the stat the caller asked for
+    }
+  }
+
+  public void SetPermissions(string relativePath, bool shadow, UnixFileMode mode) {
+    if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS())
+      return;
+
+    this._Guard(() => File.SetUnixFileMode(this._Resolve(relativePath, shadow), mode));
   }
 
   public void SetTimestamps(string relativePath, bool shadow, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) => this._Guard(() => {
@@ -562,7 +590,10 @@ public sealed class LocalVolumeIOBackend(IHostEnvironment host) : IVolumeIOBacke
     | BackendCaps.DurableFlush
     | BackendCaps.List
     | BackendCaps.Delete
-    | BackendCaps.Timestamps;
+    | BackendCaps.Timestamps
+    // only where the host filesystem actually has a mode to keep; claiming it on Windows would make
+    // the engine carry a permission it cannot store and report one it never set
+    | (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() ? BackendCaps.Permissions : BackendCaps.None);
 
   public IVolumeIO Open(MemberDescriptor member, ICredentialResolver? credentials)
     => new LocalVolumeIO(member.MemberId, member.DisplayName, member.Path, host.GetVolumeIdentity(member.Path).PhysicalVolumeId);

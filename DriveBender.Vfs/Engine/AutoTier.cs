@@ -78,6 +78,13 @@ public sealed class MeasuredVolumeIO(IVolumeIO inner) : IVolumeIO {
   public IEnumerable<VolumeEntry> List(string relativeFolder, bool shadow) => inner.List(relativeFolder, shadow);
   public void SetTimestamps(string relativePath, bool shadow, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) => inner.SetTimestamps(relativePath, shadow, creationTimeUtc, lastWriteTimeUtc);
 
+  // Forwarded EXPLICITLY, like everything else here. This one has a default implementation on the
+  // interface — a no-op, so that a backend with no notion of permissions is unaffected — and a
+  // decorator that forwards Caps while inheriting that default is the worst of both: the member
+  // advertises that it keeps a mode and then quietly discards every one it is given. Which is
+  // exactly what happened, and it looked like the chmod never arriving.
+  public void SetPermissions(string relativePath, bool shadow, UnixFileMode mode) => inner.SetPermissions(relativePath, shadow, mode);
+
   /// <summary>Times the actual data movement — where a busy disk really shows.</summary>
   private sealed class MeasuredStream(Stream inner, MeasuredVolumeIO owner) : Stream {
     public override bool CanRead => inner.CanRead;

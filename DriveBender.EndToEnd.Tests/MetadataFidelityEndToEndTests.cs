@@ -197,4 +197,85 @@ public class MetadataFidelityEndToEndTests {
     _VerifyTree(pool, written, "after the pool rebuilt a member");
   }
 
+  [Test]
+  [Category("Exception")]
+  [Platform("Linux")]
+  [Description("Permissions set on a file in the pool are actually kept, rather than reported as set and discarded.")]
+  public void Permissions_GivenAFileIsMadePrivate_ThenItStaysPrivate() {
+    // chmod on the mount answered Success and stored nothing, while stat reported a hardcoded 0644.
+    // That combination is the dangerous one: a caller that sets a mode and checks it is told twice
+    // that everything is fine. Every general-purpose copy does exactly this — cp -p, rsync -a,
+    // tar -x, restic, borg all chmod after writing — so a restore from this pool hands back private
+    // files with world-readable modes, and nothing anywhere reported a problem.
+    using var pool = MountedPool.Create(members: 1);
+    var path = pool.PathTo("secret.key");
+    File.WriteAllBytes(path, _Payload(64, 91));
+
+    File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+    File.GetUnixFileMode(path).Should().Be(UnixFileMode.UserRead | UnixFileMode.UserWrite,
+      $"the mode was set through the mount and accepted. Answering a chmod with success and keeping "
+      + $"a fixed mode is worse than refusing it: a refusal is something a backup tool reports, and "
+      + $"this is something it cannot see."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  [Platform("Linux")]
+  [Description("A file's permissions survive a remount and the pool's own duplication of it.")]
+  public void Permissions_WhenThePoolCopiesTheFile_ThenTheModeIsCarriedWithIt() {
+    using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
+    var path = pool.PathTo("private.key");
+    File.WriteAllBytes(path, _Payload(4096, 92));
+    File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+    MountedPool.WaitUntil(() => pool.PhysicalCopies("private.key").Count >= 2, TimeSpan.FromMinutes(2))
+      .Should().BeTrue($"the file must be duplicated.{Environment.NewLine}{pool.DescribeMembers()}");
+
+    pool.Remount();
+
+    File.GetUnixFileMode(path).Should().Be(UnixFileMode.UserRead | UnixFileMode.UserWrite,
+      $"a mode that survives only until the pool is restarted, or until it copies the file to "
+      + $"another member, is not stored — it is remembered."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  [Platform("Linux")]
+  [Description("cp -p into the pool preserves mode and modification time, as it does onto any other filesystem.")]
+  public void Preserving_GivenCpDashPCopiesIntoThePool_ThenModeAndTimeArriveWithIt() {
+    // The tool, not the syscall. `cp -p` chmods, chowns and sets times, and a backup is a great
+    // many of exactly this. It also pins the chown behaviour from the other side: preserving
+    // ownership that is ALREADY the caller's own must keep succeeding, or every ordinary
+    // preserving copy starts failing on a pool it has no business failing on.
+    using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
+
+    var source = Path.Combine(Path.GetTempPath(), $"cp-src-{Guid.NewGuid():N}.bin");
+    try {
+      File.WriteAllBytes(source, _Payload(9000, 94));
+      File.SetUnixFileMode(source, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead);
+      File.SetLastWriteTimeUtc(source, _STAMP);
+
+      var destination = pool.PathTo("copied.bin");
+      using (var cp = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cp", ["-p", source, destination]) {
+        RedirectStandardError = true,
+      })!) {
+        var stderr = cp.StandardError.ReadToEnd();
+        cp.WaitForExit(60_000);
+        cp.ExitCode.Should().Be(0, $"a preserving copy into the pool must work: {stderr}{Environment.NewLine}{pool.MountLog}");
+      }
+
+      File.ReadAllBytes(destination).Should().Equal(File.ReadAllBytes(source), "the bytes arrive");
+      File.GetUnixFileMode(destination).Should().Be(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead,
+        $"and so does the mode — which is the whole point of -p."
+        + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+      File.GetLastWriteTimeUtc(destination).Should().BeCloseTo(_STAMP, TimeSpan.FromSeconds(1),
+        "and the modification time");
+    } finally {
+      File.Delete(source);
+    }
+  }
+
 }

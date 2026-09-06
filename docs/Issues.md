@@ -684,6 +684,55 @@ out the destination's limit exactly as a block write does. Pinned from both side
 below, which could not exist before it: they need the copy to still be RUNNING when the foreground
 operation lands, and it never was.
 
+### A scenario asserted a zero-width window and measured the scheduler instead
+
+`Unmount_GivenItIsAskedForTheMomentThePoolIsUsable` failed once on a loaded Windows runner and
+passed on a re-run of the same commit — flaky, and in a suite whose entire purpose is trust, which
+makes it a defect of its own.
+
+The window it guards is real but not zero. On Windows the mounting process writes its registry entry
+immediately after the driver returns a usable volume, and the harness learns the volume is usable
+from the operating system — two processes, so "immediately after" is not "atomically with". The
+scenario took no settling wait on purpose and therefore asserted a window of zero, which is stricter
+than the product needs to be and is decided by how busy the machine is.
+
+It now allows two seconds. That still catches the fault it exists for — an entry that never arrives,
+leaving a mounted pool the tooling can neither see nor unmount — without the suite's own result
+depending on runner load. Registering BEFORE the mount would close the window outright, and was not
+done: it would put an entry in the registry for a pool that is not yet usable, and an unmount racing
+an in-progress mount is a worse failure than a sub-millisecond blind spot nothing real can hit.
+
+### chmod answered "done" and threw the mode away
+
+The worst shape a gap can take. `ChMod` returned Success and stored nothing, while `GetAttr` reported
+a hardcoded 0644 for files and 0755 for directories. A caller that sets a mode and then checks it was
+told twice that all was well.
+
+Every general-purpose copy does exactly that — `cp -p`, `rsync -a`, `tar -x`, restic, borg all chmod
+after writing — so restoring from this pool handed back private files with world-readable modes and
+nothing anywhere reported a problem. `chmod 600 secret.key` succeeded and the file was 0644
+immediately, not merely after a restart.
+
+Permissions now live where the bytes already live: on the member's own filesystem. That is what makes
+them survive a remount, show up correctly if an operator looks at a member directly, and cost no new
+metadata store. The mode is applied to EVERY copy — private on one member and readable on another is
+private only until a read is served by the other one — carried across whole-file copies beside the
+timestamps, and reported by `GetAttr` in place of the fixed default, which is only used where the
+member genuinely cannot keep a mode.
+
+`ChOwn` is honest rather than implemented: a request that changes nothing succeeds, which is what
+keeps `cp -p` and `tar -x` working, and a request to hand the file to somebody else is refused with
+EPERM — the answer any filesystem gives an unprivileged caller, and one a backup tool reports rather
+than a success it will believe.
+
+**The bug inside the fix, which is the part worth remembering.** The new interface members were given
+default no-op implementations so backends with no notion of permissions — object stores, WebDAV —
+were unaffected. `MeasuredVolumeIO` decorates every member, forwards `Caps` from the volume it wraps,
+and inherited that default. So the member advertised that it keeps a mode and silently discarded
+every one it was given, and the symptom was identical to the chmod never arriving at all. A default
+interface implementation plus a decorator that forwards capabilities is a silent-failure generator:
+the capability is the wrapper's answer and the behaviour is the default's.
+
 ### Every drain and every heal silently reset the file's modification time
 
 Found by asking what a BACKUP needs that a filesystem test does not usually check.

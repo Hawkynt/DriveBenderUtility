@@ -48,7 +48,8 @@ public sealed record DirEntry(string Name, NodeKind Kind, long Length, DateTime 
 /// <summary>Pool aggregate for StatFs (FR-STAT): duplication-aware, reserve-adjusted, shared volumes de-duplicated.</summary>
 public sealed record FsStatistics(long BytesTotal, long BytesFree, int BlockSize);
 
-public sealed record FileMetaPatch(DateTime? CreationTimeUtc = null, DateTime? LastWriteTimeUtc = null, FileAttributes? Attributes = null);
+public sealed record FileMetaPatch(DateTime? CreationTimeUtc = null, DateTime? LastWriteTimeUtc = null, FileAttributes? Attributes = null,
+  UnixFileMode? Permissions = null);
 
 public sealed record MountOptions(string Target, bool ReadOnly = false, string? VolumeLabel = null);
 

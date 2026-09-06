@@ -83,8 +83,19 @@ public class MemberFailureLatencyEndToEndTests {
     try {
       // no settling wait on purpose: Create returns as soon as the OS can use the mount, which is
       // the earliest moment a user's next command could run
-      var status = DbMount.Run(TimeSpan.FromSeconds(30), "status");
-      status.Output.Should().Contain(pool.PoolName,
+      // Bounded rather than instant, and the bound is the point. The registry entry is written by
+      // the MOUNTING process the moment the driver hands it a usable volume — but the harness
+      // learns the volume is usable from the operating system, and those are two processes, so
+      // "immediately after" is not "atomically with". Asserting a zero window measured the
+      // scheduler: it failed once on a loaded Windows runner and passed on a re-run of the same
+      // commit. Two seconds still catches the fault this scenario exists for — an entry that never
+      // arrives, leaving a mounted pool the tooling cannot see or unmount — while not making the
+      // suite's own result depend on how busy the machine was.
+      var seen = MountedPool.WaitUntil(
+        () => DbMount.Run(TimeSpan.FromSeconds(30), "status").Output.Contains(pool.PoolName, StringComparison.Ordinal),
+        TimeSpan.FromSeconds(2));
+
+      seen.Should().BeTrue(
         $"a pool the OS is already serving must be visible to the tooling that manages it."
         + $"{Environment.NewLine}{pool.MountLog}");
 

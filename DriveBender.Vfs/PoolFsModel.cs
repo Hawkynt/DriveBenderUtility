@@ -26,7 +26,14 @@ public class PoolFsException(PoolFsError error, string message, Exception? inner
 }
 
 /// <summary>Metadata of one physical file as seen by an <see cref="IVolumeIO"/> backend.</summary>
-public readonly record struct FileMeta(long Length, DateTime CreationTimeUtc, DateTime LastWriteTimeUtc, FileAttributes Attributes) {
+/// <param name="Permissions">
+/// The POSIX mode, where the member's storage can hold one; null where it cannot (a cloud store, a
+/// WebDAV share, Windows). Nullable on purpose: "this backend has no opinion" and "this file is
+/// 0000" are different answers, and collapsing them would let a backend that cannot keep a mode
+/// silently claim one.
+/// </param>
+public readonly record struct FileMeta(long Length, DateTime CreationTimeUtc, DateTime LastWriteTimeUtc, FileAttributes Attributes,
+  UnixFileMode? Permissions = null) {
   public bool IsDirectory => (this.Attributes & FileAttributes.Directory) != 0;
 }
 

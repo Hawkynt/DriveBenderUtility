@@ -625,8 +625,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (copies.Count == 0)
       throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {path}");
 
-    foreach (var copy in copies)
+    foreach (var copy in copies) {
       copy.Volume.SetTimestamps(dataName, copy.Shadow, patch.CreationTimeUtc, patch.LastWriteTimeUtc);
+
+      // EVERY copy, not just the primary: a file that is private on one member and readable on
+      // another is private only until a read happens to be served by the other one
+      if (patch.Permissions is { } mode && (copy.Volume.Caps & BackendCaps.Permissions) != 0)
+        copy.Volume.SetPermissions(dataName, copy.Shadow, mode);
+    }
 
     this._cache.Metadata.InvalidatePath(this._poolId, normalized);
   }
