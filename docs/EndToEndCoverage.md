@@ -9,7 +9,7 @@ drifts the moment a test is added or starts failing, and then quietly misleads.
 
 Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34039661270).
 
-180 scenarios — 159 passing on at least one target, 1 failing.
+180 scenarios — 159 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -92,7 +92,7 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | MemberFailureLatency | `Mount_GivenThePoolIsAlreadyMounted_ThenASecondMountIsRefused` | A pool already mounted refuses to be mounted a second time, because two engines over one member set corrupt each other. | pass | pass |
 | MemberFailureLatency | `ReadOnly_GivenADuplicatedPool_ThenEverythingStoredIsStillServedPromptly` | A DUPLICATED pool whose member goes read-only keeps serving every stored byte promptly, which is the half that must never regress. | skipped | pass |
 | MemberFailureLatency | `ReadOnly_GivenTheChosenMemberRefusesWrites_ThenNewFilesGoToOneThatDoesNot` | An UNDUPLICATED pool whose placement target goes read-only still takes new files, by putting them on a member that can accept them. | skipped | pass |
-| MemberFailureLatency | `Unmount_GivenItIsAskedForTheMomentThePoolIsUsable_ThenItSucceedsAndTheMountIsGone` | A pool unmounted immediately after it comes up really unmounts, rather than the verb reporting a pool it cannot find. | **FAIL** | pass |
+| MemberFailureLatency | `Unmount_GivenItIsAskedForTheMomentThePoolIsUsable_ThenItSucceedsAndTheMountIsGone` | A pool unmounted immediately after it comes up really unmounts, rather than the verb reporting a pool it cannot find. | pass | pass |
 | MemberLoss | `Capacity_GivenAMemberIsPulledMidWrite_ThenTheReportedSpaceNeverCountsTheLostStorage` | A member pulled mid-write: the pool reports less free space afterwards and never claims the lost disk's capacity. | pass | skipped |
 | MemberLoss | `Capacity_GivenDuplicationIsOn_ThenStoringAFileCostsTwiceItsSize` | Duplication charges twice: storing N bytes with two copies consumes about 2N of the pool's free space. | pass | skipped |
 | MemberLoss | `Capacity_GivenTheMountedPool_ThenTheReportedSizeTracksTheStorageBehindIt` | Given The Mounted Pool , then The Reported Size Tracks The Storage Behind It | pass | skipped |
