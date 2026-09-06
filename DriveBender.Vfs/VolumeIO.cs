@@ -12,6 +12,9 @@ public enum BackendCaps {
   Delete = 32,
   Timestamps = 64,
   ServerCredentials = 128,
+
+  /// <summary>The member's storage keeps a POSIX mode, so one set on the pool survives on it.</summary>
+  Permissions = 256,
 }
 
 /// <summary>
@@ -96,6 +99,16 @@ public interface IVolumeIO {
   bool FolderExists(string relativeFolder, bool shadow);
   IEnumerable<VolumeEntry> List(string relativeFolder, bool shadow);
   void SetTimestamps(string relativePath, bool shadow, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc);
+
+  /// <summary>
+  /// Applies a POSIX mode to one copy, where the member's storage keeps one.
+  ///
+  /// Defaulted to a no-op so a backend with no notion of permissions — an object store, a WebDAV
+  /// share — is unaffected, and declares <see cref="BackendCaps.Permissions"/> only if it means it.
+  /// The engine asks every copy, so a duplicated file is not private on one member and readable on
+  /// another.
+  /// </summary>
+  void SetPermissions(string relativePath, bool shadow, UnixFileMode mode) { }
 }
 
 /// <summary>Descriptor a backend needs to open a member (path/URI, tuning, credential reference).</summary>

@@ -76,9 +76,15 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
     var stat = new FuseFileStat {
       st_size = meta.Length,
       st_nlink = meta.IsDirectory ? 2 : 1,
-      st_mode = meta.IsDirectory
-        ? PosixFileMode.Directory | PosixFileMode.OwnerAll | PosixFileMode.GroupReadExecute | PosixFileMode.OthersReadExecute
-        : PosixFileMode.Regular | PosixFileMode.OwnerReadWrite | PosixFileMode.GroupRead | PosixFileMode.OthersRead,
+      // the file's OWN mode where the member kept one, and the documented default only where it
+      // could not. Reporting a fixed mode over a stored one is how a chmod that was accepted, and
+      // applied, still reads back as 0644.
+      st_mode = (meta.IsDirectory ? PosixFileMode.Directory : PosixFileMode.Regular)
+        | (meta.Permissions is { } mode
+          ? (PosixFileMode)((int)mode & 0xFFF)
+          : meta.IsDirectory
+            ? PosixFileMode.OwnerAll | PosixFileMode.GroupReadExecute | PosixFileMode.OthersReadExecute
+            : PosixFileMode.OwnerReadWrite | PosixFileMode.GroupRead | PosixFileMode.OthersRead),
       st_blksize = 4096,
       st_blocks = (meta.Length + 511) / 512,
       st_uid = NativeUid,
@@ -364,9 +370,41 @@ public sealed class FuseAdapter(IPoolFileSystem pool) : IFuseOperations {
   public PosixResult IoCtl(ReadOnlyNativeMemory<byte> fileNamePtr, int cmd, nint arg, ref FuseFileInfo fileInfo, FuseIoctlFlags flags, nint data) => PosixResult.ENOTSUP;
   public PosixResult FAllocate(NativeMemory<byte> fileNamePtr, FuseAllocateMode mode, long offset, long length, ref FuseFileInfo fileInfo) => PosixResult.ENOTSUP;
 
-  // ownership/permissions passthrough is best-effort (FR-PERMS): the pool presents a documented default mode
-  public PosixResult ChMod(NativeMemory<byte> fileNamePtr, PosixFileMode mode) => PosixResult.Success;
-  public PosixResult ChOwn(NativeMemory<byte> fileNamePtr, int uid, int gid) => PosixResult.Success;
+  /// <summary>
+  /// Applies the mode to every copy of the file.
+  ///
+  /// This used to answer Success and store nothing, while <see cref="_ToStat"/> reported a fixed
+  /// 0644 — the pair of them being the dangerous part. A caller that sets a mode and checks it was
+  /// told twice that all was well, and every general-purpose copy does exactly that: cp -p, rsync
+  /// -a, tar -x, restic and borg all chmod after writing. Restoring from the pool handed back
+  /// private files with world-readable modes and nothing reported a problem.
+  /// </summary>
+  public PosixResult ChMod(NativeMemory<byte> fileNamePtr, PosixFileMode mode) {
+    try {
+      pool.SetAttributes(_ToPoolPath(fileNamePtr), new(Permissions: (UnixFileMode)((int)mode & 0xFFF)));
+      return PosixResult.Success;
+    } catch (PoolFsException e) {
+      return _Translate(e);
+    } catch (Exception e) {
+      return _Unexpected(e);
+    }
+  }
+
+  /// <summary>
+  /// Ownership, which this mount genuinely cannot change — and now says so.
+  ///
+  /// Every file is presented as belonging to the user who mounted the pool, because that is who the
+  /// process can act as; handing another uid to the members underneath would need privileges a FUSE
+  /// mount does not have. A request that changes nothing succeeds, which is what keeps `cp -p` and
+  /// `tar -x` working as themselves. A request to hand the file to somebody else is refused with
+  /// EPERM — the same answer any filesystem gives an unprivileged caller, and one a backup tool
+  /// knows how to report, rather than a success it will believe.
+  /// </summary>
+  public PosixResult ChOwn(NativeMemory<byte> fileNamePtr, int uid, int gid) {
+    var keepingUid = uid is -1 || uid == NativeUid;
+    var keepingGid = gid is -1 || gid == NativeGid;
+    return keepingUid && keepingGid ? PosixResult.Success : PosixResult.EPERM;
+  }
 
   public void Dispose() {
   }

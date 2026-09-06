@@ -239,6 +239,11 @@ public static class WholeFilePublisher {
       return;
 
     try {
+      // the mode first: a copy that is briefly world-readable before being stamped private is a
+      // window, and it is the publish's job not to open one
+      if (meta.Permissions is { } mode && (member.Caps & BackendCaps.Permissions) != 0)
+        member.SetPermissions(path, shadow, mode);
+
       member.SetTimestamps(path, shadow, meta.CreationTimeUtc, meta.LastWriteTimeUtc);
     } catch (PoolFsException e) {
       DriveBender.Logger($"[Warning]Could not carry '{path}' timestamps onto '{member.DisplayName}': {e.Message}");
