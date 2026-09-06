@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34034365324](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34034365324).
+Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34039661270).
 
-177 scenarios — 156 passing on at least one target, 0 failing.
+180 scenarios — 159 passing on at least one target, 1 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -92,7 +92,7 @@ Generated from run: [34034365324](https://github.com/Hawkynt/DriveBenderUtility/
 | MemberFailureLatency | `Mount_GivenThePoolIsAlreadyMounted_ThenASecondMountIsRefused` | A pool already mounted refuses to be mounted a second time, because two engines over one member set corrupt each other. | pass | pass |
 | MemberFailureLatency | `ReadOnly_GivenADuplicatedPool_ThenEverythingStoredIsStillServedPromptly` | A DUPLICATED pool whose member goes read-only keeps serving every stored byte promptly, which is the half that must never regress. | skipped | pass |
 | MemberFailureLatency | `ReadOnly_GivenTheChosenMemberRefusesWrites_ThenNewFilesGoToOneThatDoesNot` | An UNDUPLICATED pool whose placement target goes read-only still takes new files, by putting them on a member that can accept them. | skipped | pass |
-| MemberFailureLatency | `Unmount_GivenItIsAskedForTheMomentThePoolIsUsable_ThenItSucceedsAndTheMountIsGone` | A pool unmounted immediately after it comes up really unmounts, rather than the verb reporting a pool it cannot find. | pass | pass |
+| MemberFailureLatency | `Unmount_GivenItIsAskedForTheMomentThePoolIsUsable_ThenItSucceedsAndTheMountIsGone` | A pool unmounted immediately after it comes up really unmounts, rather than the verb reporting a pool it cannot find. | **FAIL** | pass |
 | MemberLoss | `Capacity_GivenAMemberIsPulledMidWrite_ThenTheReportedSpaceNeverCountsTheLostStorage` | A member pulled mid-write: the pool reports less free space afterwards and never claims the lost disk's capacity. | pass | skipped |
 | MemberLoss | `Capacity_GivenDuplicationIsOn_ThenStoringAFileCostsTwiceItsSize` | Duplication charges twice: storing N bytes with two copies consumes about 2N of the pool's free space. | pass | skipped |
 | MemberLoss | `Capacity_GivenTheMountedPool_ThenTheReportedSizeTracksTheStorageBehindIt` | Given The Mounted Pool , then The Reported Size Tracks The Storage Behind It | pass | skipped |
@@ -103,6 +103,9 @@ Generated from run: [34034365324](https://github.com/Hawkynt/DriveBenderUtility/
 | MemberLoss | `Eject_GivenAMemberReturnsWhileIoIsInFlight_ThenNothingIsCorruptedOrStalled` | Given AMember Returns While Io Is In Flight , then Nothing Is Corrupted Or Stalled | pass | pass |
 | MemberLoss | `Eject_GivenAMemberVanishesDuringAWrite_ThenTheDataThatWasAcknowledgedIsIntact` | Given AMember Vanishes During AWrite , then The Data That Was Acknowledged Is Intact | pass | pass |
 | MemberLoss | `Eject_GivenEveryMemberIsGone_ThenOperationsFailCleanlyInsteadOfHanging` | Given Every Member Is Gone , then Operations Fail Cleanly Instead Of Hanging | pass | pass |
+| MetadataFidelity | `Permissions_GivenAFileIsMadePrivate_ThenItStaysPrivate` | Permissions set on a file in the pool are actually kept, rather than reported as set and discarded. | skipped | pass |
+| MetadataFidelity | `Permissions_WhenThePoolCopiesTheFile_ThenTheModeIsCarriedWithIt` | A file's permissions survive a remount and the pool's own duplication of it. | skipped | pass |
+| MetadataFidelity | `Preserving_GivenCpDashPCopiesIntoThePool_ThenModeAndTimeArriveWithIt` | cp -p into the pool preserves mode and modification time, as it does onto any other filesystem. | skipped | pass |
 | MetadataFidelity | `Timestamps_GivenAFileIsStamped_ThenTheMountReportsItBack` | A file's modification time survives a write and read back through the mount. | pass | pass |
 | MetadataFidelity | `Timestamps_WhenTheDrainerMovesTheFile_ThenItsModificationTimeIsUnchanged` | The drainer moving a file down a tier does not change its modification time. | pass | pass |
 | MetadataFidelity | `Timestamps_WhenTheHealerDuplicatesTheFile_ThenItsModificationTimeIsUnchanged` | A duplication heal creating a second copy does not change the file's modification time. | pass | pass |
