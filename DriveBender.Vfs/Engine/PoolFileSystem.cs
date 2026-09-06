@@ -2299,13 +2299,30 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._healScan = scan = this._AllLogicalFiles().GetEnumerator();
     }
 
-    for (var enqueued = 0; enqueued < 64; ++enqueued) {
-      if (!scan.MoveNext()) {
-        this._healScan = null;
-        return true;
-      }
+    // Defensive, and deliberately so: I could not make this throw. Walking the members catches
+    // PoolFsException per folder and LocalVolumeIO materialises its listing inside its own guard,
+    // so a drive yanked mid-enumeration already surfaces as the handled kind. A remote backend is
+    // the plausible gap, and that is exactly the sort of thing this should not have to be right
+    // about — because the failure mode is disproportionate. The enumerator is the only record of
+    // where the scan had got to, and leaving a broken one in place would make every later call
+    // throw on the same object: the healer stops for the life of the mount, one warning per pump
+    // tick, with HealPending stuck true. Dropping it instead costs a rescan, and re-arming the
+    // request is what makes that rescan happen.
+    try {
+      for (var enqueued = 0; enqueued < 64; ++enqueued) {
+        if (!scan.MoveNext()) {
+          this._healScan = null;
+          scan.Dispose();
+          return true;
+        }
 
-      this._healQueue.Enqueue(scan.Current);
+        this._healQueue.Enqueue(scan.Current);
+      }
+    } catch {
+      this._healScan = null;
+      scan.Dispose();
+      Interlocked.Exchange(ref this._healScanRequested, 1); // start again rather than stop for good
+      throw;
     }
 
     return true;
@@ -2620,9 +2637,26 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return; // another thread published concurrently
 
     var stagedName = _StagedNameOf(normalized);
-    var copies = this._placement.ResolveCopies(stagedName);
-    foreach (var copy in copies)
-      copy.Volume.AtomicReplace(stagedName, normalized, copy.Shadow);
+    try {
+      var copies = this._placement.ResolveCopies(stagedName);
+      foreach (var copy in copies)
+        copy.Volume.AtomicReplace(stagedName, normalized, copy.Shadow);
+    } catch {
+      // The entry removed above is the only record that this path has a temp waiting to become
+      // real, and the rename is done once per copy — so one that throws (a member that dropped, a
+      // full disk, a bad sector) used to take that record with it. Some copies could already carry
+      // the final name and some still the temp, the create's intent stayed open, and nothing in the
+      // running pool would ever finish the job: a clean unmount published nothing, because the
+      // publish list no longer mentioned it.
+      //
+      // Put it back so the next Close, or the unmount, tries again. The retry is safe and needs no
+      // bookkeeping of its own: ResolveCopies lists the copies that still HAVE the staged name, so
+      // the ones already renamed are simply not in it — which is exactly why the cache has to be
+      // dropped here, the copy set having changed part-way through.
+      this._Invalidate(stagedName);
+      this._staging[normalized] = createSequence;
+      throw;
+    }
 
     this._integrity.RenameFile(stagedName, normalized);
     this._journal.Complete(createSequence, JournalOp.Create);
