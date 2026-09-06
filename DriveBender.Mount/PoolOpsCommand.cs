@@ -11,6 +11,10 @@ namespace DivisonM.Mount;
 /// </summary>
 internal static class PoolOpsCommand {
 
+  /// <summary>Refused: the operation was not attempted and nothing was changed.</summary>
+  private const int ExitError = 1;
+
+
   /// <summary>
   /// Charges a member for a chunk of copying against the limits its manifest entry carries.
   ///
@@ -77,7 +81,86 @@ internal static class PoolOpsCommand {
     }),
   });
 
-  public static int Health(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, PoolHealthOptions options) {
+  /// <summary>
+  /// Takes the pool's cross-process engine lock, or explains why the operation is refused.
+  ///
+  /// Mounting takes this same lock because "two engines over one member set race and corrupt each
+  /// other" — and every administrative verb below opens those members and rewrites those files
+  /// while never going near it. Running `pool-restore` against a mounted pool started a second
+  /// engine relocating copies, journalling to the same log and invalidating caches the first one
+  /// could not see. It reported success.
+  ///
+  /// Held for the whole operation rather than merely checked, so a mount cannot start half way
+  /// through either. Read-only verbs do not take it: reading a member while the mount serves from
+  /// it is what the mount already does for itself.
+  /// </summary>
+  private static IDisposable? _TakeEngineLock(MountRegistry registry, PoolRef pool) {
+    var held = registry.TryAcquireMountLock(pool.PoolId);
+    if (held == null)
+      Console.Error.WriteLine(
+        $"Pool '{pool.Name}' is mounted, so this would be a second engine writing the same members — refusing. "
+        + $"Unmount it first (dbmount unmount {pool.Name}), or run the operation from the manager, "
+        + $"which files it through the process that already owns the pool.");
+
+    return held;
+  }
+
+  /// <summary>
+  /// Hands an operation to the process that already owns a mounted pool, and waits for its answer.
+  ///
+  /// Refusing when the pool is mounted is correct and, on its own, a dead end: repairing bit rot or
+  /// restoring duplication is most wanted on a pool that is up and serving, and "unmount your backup
+  /// target first" is not an answer. The mount process already runs exactly these operations for the
+  /// manager, over a channel built for it — so the verb routes there instead of doing the work in a
+  /// second engine. Same command, same output, executed where it is safe.
+  ///
+  /// Returns null when nothing is mounted, which is the caller's signal to do the work itself.
+  /// </summary>
+  private static string? _RelayToMount(MountRegistry registry, PoolRef pool, string op, TimeSpan timeout) {
+    if (registry.Find(pool.Name) == null && registry.Find(pool.PoolId.ToString()) == null)
+      return null;
+
+    var id = Guid.NewGuid().ToString("N");
+    registry.RequestOp(pool.PoolId, id, op);
+    Console.WriteLine($"Pool '{pool.Name}' is mounted — running '{op}' inside the process that owns it.");
+
+    var deadline = DateTime.UtcNow + timeout;
+    while (DateTime.UtcNow < deadline) {
+      if (registry.TryTakeOpResult(pool.PoolId, id) is { } json)
+        return json;
+
+      Thread.Sleep(250);
+    }
+
+    registry.ClearOp(pool.PoolId, id);
+    throw new PoolFsException(PoolFsError.IoError,
+      $"The mounted pool '{pool.Name}' did not answer '{op}' within {timeout.TotalMinutes:F0} minutes.");
+  }
+
+  public static int Health(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, PoolHealthOptions options) {
+    // Only --fix writes; a plain check reads the members, which is what the mount is doing anyway.
+    IDisposable? exclusive = null;
+    if (options.Fix) {
+      var pools = provider.Discover();
+      var target = Guid.TryParse(options.Pool, out var id)
+        ? pools.FirstOrDefault(p => p.PoolId == id)
+        : pools.FirstOrDefault(p => p.Name.Equals(options.Pool, StringComparison.OrdinalIgnoreCase));
+
+      if (target != null) {
+        // always "fix": CheckAndCorrect already scrubs everything and reports DeepScan, whereas
+        // "health-deep" is the READ-ONLY deep check. Relaying --fix --deep to that one would have
+        // reported the rot in detail and repaired none of it.
+        if (_RelayToMount(registry, target, "fix", TimeSpan.FromHours(12)) is { } relayed) {
+          Console.WriteLine(relayed);
+          return 0;
+        }
+
+        if ((exclusive = _TakeEngineLock(registry, target)) == null)
+          return ExitError;
+      }
+    }
+
+    using var held = exclusive;
     var report = RunHealth(host, provider, remoteResolver, options.Pool, options.Fix, options.Deep);
     if (options.Json) {
       Console.WriteLine(HealthReportJson(report));
@@ -100,8 +183,17 @@ internal static class PoolOpsCommand {
     return report.Healthy ? 0 : 1;
   }
 
-  public static int Restore(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, PoolRestoreOptions options) {
+  public static int Restore(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, PoolRestoreOptions options) {
     var (pool, online, duplication, allowSamePhysical, admit) = _Open(host, provider, remoteResolver, options.Pool);
+    if (_RelayToMount(registry, pool, "restore", TimeSpan.FromHours(12)) is { } relayed) {
+      Console.WriteLine(relayed);
+      return 0;
+    }
+
+    using var exclusive = _TakeEngineLock(registry, pool);
+    if (exclusive == null)
+      return ExitError;
+
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
     var report = new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit).RestorePool();
@@ -114,8 +206,88 @@ internal static class PoolOpsCommand {
     return 0;
   }
 
-  public static int RemoveMedia(IHostEnvironment host, ManifestStore store, IPoolProvider provider, PoolLifecycle lifecycle, BackendMemberResolver remoteResolver, PoolRemoveMediaOptions options) {
+  /// <summary>
+  /// The recycle bin's three verbs (§6.14).
+  ///
+  /// The engine has held a trash since deletes were first journalled — it moves a deleted file
+  /// aside instead of unlinking it, keeps a sidecar saying where it came from, and applies a
+  /// retention and size policy in the background. None of it was reachable: no verb, no endpoint,
+  /// no screen. A recycle bin nobody can open is a disk-space cost with no benefit, and for a pool
+  /// used as a backup target it is the single most likely thing an operator needs in a hurry.
+  /// </summary>
+  public static int TrashList(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, PoolTrashListOptions options) {
+    var (pool, online, _, _, _) = _Open(host, provider, remoteResolver, options.Pool);
+    var ios = online.Select(m => m.io).ToArray();
+    var entries = new PoolTrash(ios, new Journal(new MemberJournalStore(ios)), () => DateTime.UtcNow).List();
+
+    if (options.Json) {
+      Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new {
+        ok = true,
+        entries = entries.Select(e => new { path = e.OriginalPath, deletedUtc = e.DeletedUtc, length = e.Length }),
+      }));
+      return 0;
+    }
+
+    if (entries.Count == 0) {
+      Console.WriteLine($"Pool '{pool.Name}': the recycle bin is empty.");
+      return 0;
+    }
+
+    Console.WriteLine($"Pool '{pool.Name}': {entries.Count} item(s) in the recycle bin.");
+    foreach (var entry in entries.OrderByDescending(e => e.DeletedUtc))
+      Console.WriteLine($"  {entry.DeletedUtc:yyyy-MM-dd HH:mm:ss}  {entry.Length,12:N0}  {entry.OriginalPath}");
+
+    return 0;
+  }
+
+  public static int TrashRestore(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, PoolTrashRestoreOptions options) {
+    var (pool, online, _, _, _) = _Open(host, provider, remoteResolver, options.Pool);
+    using var exclusive = _TakeEngineLock(registry, pool);
+    if (exclusive == null)
+      return ExitError;
+
+    var ios = online.Select(m => m.io).ToArray();
+    var trash = new PoolTrash(ios, new Journal(new MemberJournalStore(ios)), () => DateTime.UtcNow);
+    var normalized = PoolPaths.Normalize(options.Path);
+    if (trash.Restore(normalized) is not { } restored) {
+      Console.Error.WriteLine($"No recycle-bin entry for '{options.Path}' in pool '{pool.Name}'. Run pool-trash-list to see what is there.");
+      return ExitError;
+    }
+
+    // Restored as a single copy on the member that was holding it. Duplication is re-established by
+    // the healer on the next mount, or by pool-restore now — said plainly rather than left for the
+    // operator to discover that their recovered file is not yet redundant.
+    Console.WriteLine($"Restored '{restored.restoredPath}' to pool '{pool.Name}' from '{restored.member.DisplayName}'.");
+    Console.WriteLine("  It is back as a single copy; mounting the pool (or pool-restore) re-establishes its duplication level.");
+    return 0;
+  }
+
+  public static int TrashPurge(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, PoolTrashPurgeOptions options) {
+    var (pool, online, _, _, _) = _Open(host, provider, remoteResolver, options.Pool);
+    using var exclusive = _TakeEngineLock(registry, pool);
+    if (exclusive == null)
+      return ExitError;
+
+    var ios = online.Select(m => m.io).ToArray();
+    var config = ConfigResolver.ResolveEffective(
+      host.FileExists(System.IO.Path.Combine(host.ConfigRoot, "config.json")) ? host.ReadAllText(System.IO.Path.Combine(host.ConfigRoot, "config.json")) : null,
+      pool.Manifest.Defaults?.GetRawText());
+
+    var retention = DurationSpec.Parse(config.Trash?.Retention ?? "7d");
+    var total = ios.Where(io => io.BytesTotal > 0).Sum(io => io.BytesTotal);
+    var maxSize = SizeSpec.Parse(config.Trash?.MaxSize ?? "5%").ResolveBytes(total);
+    var purged = new PoolTrash(ios, new Journal(new MemberJournalStore(ios)), () => DateTime.UtcNow).Purge(retention, maxSize);
+
+    Console.WriteLine($"Pool '{pool.Name}': purged {purged} item(s) past a {retention} retention or a {maxSize:N0}-byte bin.");
+    return 0;
+  }
+
+  public static int RemoveMedia(IHostEnvironment host, ManifestStore store, IPoolProvider provider, PoolLifecycle lifecycle, BackendMemberResolver remoteResolver, MountRegistry registry, PoolRemoveMediaOptions options) {
     var (pool, online, duplication, allowSamePhysical, admit) = _Open(host, provider, remoteResolver, options.Member == null ? options.Pool : options.Pool);
+    using var exclusive = _TakeEngineLock(registry, pool);
+    if (exclusive == null)
+      return ExitError;
+
     var member = _FindMember(pool, options.Member);
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
@@ -126,8 +298,12 @@ internal static class PoolOpsCommand {
     return 0;
   }
 
-  public static int ReplaceMedia(IHostEnvironment host, ManifestStore store, IPoolProvider provider, PoolLifecycle lifecycle, BackendMemberResolver remoteResolver, PoolReplaceMediaOptions options) {
+  public static int ReplaceMedia(IHostEnvironment host, ManifestStore store, IPoolProvider provider, PoolLifecycle lifecycle, BackendMemberResolver remoteResolver, MountRegistry registry, PoolReplaceMediaOptions options) {
     var (pool, online, duplication, allowSamePhysical, admit) = _Open(host, provider, remoteResolver, options.Pool);
+    using var exclusive = _TakeEngineLock(registry, pool);
+    if (exclusive == null)
+      return ExitError;
+
     var oldMember = _FindMember(pool, options.Old);
 
     // the replacement is a fresh local member folder (created if missing)

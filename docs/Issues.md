@@ -684,6 +684,62 @@ out the destination's limit exactly as a block write does. Pinned from both side
 below, which could not exist before it: they need the copy to still be RUNNING when the foreground
 operation lands, and it never was.
 
+### Every drain and every heal silently reset the file's modification time
+
+Found by asking what a BACKUP needs that a filesystem test does not usually check.
+
+A publish writes bytes and renames, and a file created that way is stamped now. Nothing carried the
+source's timestamps across, so every whole-file copy the pool makes on its own schedule — a drain
+down a tier, a duplication heal, a media replace, a recovery resync — quietly reset the modification
+time of a file nobody had touched. Measured: a file stamped March 2019 came back stamped today,
+**2732 days out**, purely because the pool had moved it between tiers.
+
+That is disqualifying for the stated purpose. Everything that asks "what changed since last time" —
+an incremental backup, rsync, a build, a sync client — reads a whole rebalanced pool as changed. And
+`utimens` was wired, so the pool would faithfully hold a timestamp right up until it decided to
+relocate the file.
+
+It is also a correctness gain inside the engine, which resolves authoritative metadata and reconciles
+divergent copies by NEWEST mtime. A freshly healed copy used to win that comparison against the very
+original it had been copied from, on the strength of a timestamp that only meant "the pool touched
+this last".
+
+`PublishStream` now carries the source's creation and modification times, stamped on the staging file
+so the rename publishes something already correct rather than leaving a window under the real name
+with the wrong time. Gated on `BackendCaps.Timestamps` and tolerant of a backend that declines: a
+store that cannot hold a modification time is a limitation of that store, and failing the whole copy
+over it would trade a metadata gap for a data one.
+
+### Administrative verbs ran a second engine over a mounted pool's members
+
+Mounting takes a cross-process lock because "two engines over one member set race and corrupt each
+other", and a second mount is refused by it. Every administrative verb opens those same members and
+rewrites those same files, and none of them went near that lock.
+
+`dbmount pool-restore` against a live, mounted, serving pool ran to completion and reported success —
+a second engine relocating copies, journalling to the same log, and invalidating caches the first one
+could not see. `pool-remove-media`, `pool-replace-media` and `pool-health --fix` were the same.
+
+They take the lock now, for the whole operation rather than as a check, so a mount cannot start half
+way through either. Refusing names the pool, says why, and points at the two ways to proceed: unmount
+it, or run the operation from the manager, which files it through the process that already owns the
+pool. A plain `pool-health` still runs against a mounted pool, because reading a member while the
+mount serves from it is what the mount is doing anyway.
+
+### The recycle bin was built and unreachable
+
+`PoolTrash` has been there since deletes were first journalled: a delete moves the file aside instead
+of unlinking it, a sidecar records where it came from, and a background job applies the retention and
+size policy. `PoolFileSystem` exposes `RestoreFromTrash` and `PurgeTrash`. There was no verb, no
+endpoint and no screen — so the bin could be filled and never opened, which is a disk-space cost with
+no benefit, and for a pool used as a backup target it is the one thing an operator needs in a hurry.
+
+`pool-trash-list`, `pool-trash-restore` and `pool-trash-purge` now exist. Listing is read-only and
+works against a mounted pool; the two that write take the engine lock like every other mutating verb,
+so restoring is done with the pool unmounted and says so plainly when it is not. A restore comes back
+as a single copy and the output says that too, rather than leaving the operator to discover their
+recovered file is not yet redundant.
+
 ### A failed publish stranded a new file under its temp name for good
 
 Third instance of one shape, found by looking for it deliberately: state that exists in exactly one

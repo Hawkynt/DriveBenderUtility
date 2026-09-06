@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [33991661503](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/33991661503).
+Generated from run: [34034365324](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34034365324).
 
-169 scenarios — 148 passing on at least one target, 0 failing.
+177 scenarios — 156 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -37,6 +37,9 @@ Generated from run: [33991661503](https://github.com/Hawkynt/DriveBenderUtility/
 | Brownout | `Brownout_GivenTheVolatileAckOptIn_ThenTheWriteIsNotPacedByTheSickCopy` | The RAM-ack opt-in is the sanctioned way out: the write is taken at memory speed and both copies converge behind it. | pass | pass |
 | Brownout | `Brownout_WhenAMembersLimitIsLoweredLive_ThenItTakesEffectWithoutARemount` | A rate limit lowered on a mounted pool takes effect without a remount, rather than being ignored until the next mount. | pass | pass |
 | Brownout | `Brownout_WhenTheMemberRecovers_ThenThroughputComesBack` | When the collapsed member recovers, the pool's throughput comes back rather than staying degraded. | pass | pass |
+| ConcurrentEngineGuard | `Mounted_GivenAVerbTheMountCannotRun_ThenItRefusesAndExplains` | A verb the mount process cannot run refuses against a mounted pool, and says where to run it. | pass | pass |
+| ConcurrentEngineGuard | `Mounted_GivenRestoreIsRunFromTheCli_ThenItIsExecutedByTheOwningProcess` | An administrative verb run against a mounted pool is executed by the process that owns it, not by a second engine. | pass | pass |
+| ConcurrentEngineGuard | `Unmounted_GivenRestoreIsRunFromTheCli_ThenItProceeds` | The same verb runs normally once the pool is unmounted. | pass | pass |
 | DrainCrash | `Crash_GivenADrainWasInFlight_ThenNoStagingFileIsExposed` | A crash mid-drain leaves no half-written staging file visible to the user after the pool comes back. | pass | pass |
 | DrainCrash | `Crash_GivenADrainWasInFlight_ThenTheFileSurvivesWholeOnOneTier` | The power goes off while the drainer is copying a file down to capacity: the file comes back whole, on one tier or the other. | pass | pass |
 | DrainCrash | `Recovery_GivenOnePathOnTwoMembers_ThenThePoolServesItOnceAndWhole` | The same file left on two members, as a crash between a relocation's copy and its delete leaves it: the pool serves one entry, not two. | pass | pass |
@@ -100,6 +103,10 @@ Generated from run: [33991661503](https://github.com/Hawkynt/DriveBenderUtility/
 | MemberLoss | `Eject_GivenAMemberReturnsWhileIoIsInFlight_ThenNothingIsCorruptedOrStalled` | Given AMember Returns While Io Is In Flight , then Nothing Is Corrupted Or Stalled | pass | pass |
 | MemberLoss | `Eject_GivenAMemberVanishesDuringAWrite_ThenTheDataThatWasAcknowledgedIsIntact` | Given AMember Vanishes During AWrite , then The Data That Was Acknowledged Is Intact | pass | pass |
 | MemberLoss | `Eject_GivenEveryMemberIsGone_ThenOperationsFailCleanlyInsteadOfHanging` | Given Every Member Is Gone , then Operations Fail Cleanly Instead Of Hanging | pass | pass |
+| MetadataFidelity | `Timestamps_GivenAFileIsStamped_ThenTheMountReportsItBack` | A file's modification time survives a write and read back through the mount. | pass | pass |
+| MetadataFidelity | `Timestamps_WhenTheDrainerMovesTheFile_ThenItsModificationTimeIsUnchanged` | The drainer moving a file down a tier does not change its modification time. | pass | pass |
+| MetadataFidelity | `Timestamps_WhenTheHealerDuplicatesTheFile_ThenItsModificationTimeIsUnchanged` | A duplication heal creating a second copy does not change the file's modification time. | pass | pass |
+| MetadataFidelity | `Tree_GivenAWholeTreeIsWritten_ThenItSurvivesRemountAndRebalancingIntact` | A whole tree — empty files, empty folders, block-boundary sizes, deep paths, non-ASCII names — survives a remount and the pool's own rebalancing byte-for-byte and stamp-for-stamp. | pass | pass |
 | MultiDeviceThroughput | `Scatter_GivenAMirrorAcrossTwoDevices_ThenItReadsFasterThanTheSameMirrorOnOne` | Prices a mirror spread across two independent devices against the same mirror stacked on one. | skipped | skipped |
 | MultiDeviceThroughput | `Scatter_GivenATierOnTwoDevices_ThenTheBurstIsSpreadAcrossBoth` | A tier built from two independent devices spreads a write burst across both of them, which is the precondition for combining their throughput at all. | skipped | skipped |
 | PerformanceMatrix | `Large_RandomReadIops_AcrossTiersAndConcurrency` | Random 4 KiB read IOPS on a large file, from cache and from storage, single- and multi-threaded. | skipped | skipped |
@@ -172,6 +179,7 @@ Generated from run: [33991661503](https://github.com/Hawkynt/DriveBenderUtility/
 | Tiering | `Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` | New data lands on the fast tier first, then the drainer moves it down to capacity storage on its own. | pass | pass |
 | Tiering | `Tiering_GivenALandingZone_ThenWritesAreAcceptedAndReadBackIntact` | A landing-zone pool accepts writes and serves them back correctly through the mount. | pass | pass |
 | Tiering | `Tiering_WhileTheMoverIsRelocatingFiles_ThenTheyStayReadableAndWritable` | Tiering is transparent: a file stays readable AND writable throughout, including while the mover is relocating it. | pass | pass |
+| Trash | `Recover_GivenAFileWasDeleted_ThenItCanBeListedAndRestored` | A deleted file can be listed in the recycle bin and put back where it came from. | pass | pass |
 | Trash | `Trash_GivenAFileWasTrashed_ThenItsNameCanBeUsedAgainAtOnce` | A trashed file's name is free again immediately: creating a new file at the same path is not confused by the deleted one. | pass | pass |
 | Trash | `Trash_GivenItIsEnabled_ThenADeletedFilesBytesAreKeptIntact` | With the trash on, a deleted file leaves the pool but its bytes are kept, whole, on a member. | pass | pass |
 | Trash | `Trash_GivenItIsOff_ThenADeleteIsPermanent` | With the trash off — the default — a delete really is permanent and leaves nothing behind. | pass | pass |
