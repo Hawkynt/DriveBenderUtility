@@ -684,6 +684,37 @@ out the destination's limit exactly as a block write does. Pinned from both side
 below, which could not exist before it: they need the copy to still be RUNNING when the foreground
 operation lands, and it never was.
 
+### A failed publish stranded a new file under its temp name for good
+
+Third instance of one shape, found by looking for it deliberately: state that exists in exactly one
+place, discarded on an error path before the work that needs it has succeeded.
+
+A staged create writes its content under a temp name and renames every copy to the final one, and
+`_staging` is the only record that a path has a temp waiting to become real. `_PublishStagedLocked`
+removed that entry BEFORE the rename loop — so a rename that threw took the record with it. Some
+copies could already carry the final name and some still the temp, the create's journal intent stayed
+open, and nothing in the running pool would ever finish the job. Demonstrated end to end: a create
+whose renames fail once is not published even by a subsequent CLEAN UNMOUNT, because the publish list
+no longer mentions it.
+
+The entry goes back on failure now, so the next Close or the unmount tries again. The retry needs no
+bookkeeping of its own — `ResolveCopies` lists the copies that still HAVE the staged name, so the
+ones already renamed are simply absent from it, which is why the cache is dropped there too.
+
+Where the same shape was looked for and NOT found, since that is worth as much:
+
+* **Tombstone replay** does it correctly, and is worth reading as the model. It applies the change,
+  removes the member from the owed list only on success, catches per-member failures, and rewrites
+  the log with whatever is still owed — "a change that cannot be applied right now stays owed and
+  retries later", which is exactly the invariant the other three were missing.
+* **The heal scan's enumerator** could not be made to throw: the walk catches `PoolFsException` per
+  folder and `LocalVolumeIO` materialises its listing inside its own guard, so a drive yanked
+  mid-enumeration already arrives as the handled kind. It is guarded anyway, because the failure
+  mode is out of all proportion to the risk — the enumerator is the only record of where the scan
+  had reached, and a broken one left in place makes every later call throw on the same object, so
+  the healer stops for the life of the mount with `HealPending` stuck true. Dropping it costs a
+  rescan. It is also now disposed, which it never was.
+
 ### A failed flush threw away the only record of what a copy still owed
 
 The same drop-instead-of-retry fault as the heal queue's, one layer down, and this one loses bytes
