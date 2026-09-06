@@ -684,6 +684,24 @@ out the destination's limit exactly as a block write does. Pinned from both side
 below, which could not exist before it: they need the copy to still be RUNNING when the foreground
 operation lands, and it never was.
 
+### A scenario asserted a zero-width window and measured the scheduler instead
+
+`Unmount_GivenItIsAskedForTheMomentThePoolIsUsable` failed once on a loaded Windows runner and
+passed on a re-run of the same commit — flaky, and in a suite whose entire purpose is trust, which
+makes it a defect of its own.
+
+The window it guards is real but not zero. On Windows the mounting process writes its registry entry
+immediately after the driver returns a usable volume, and the harness learns the volume is usable
+from the operating system — two processes, so "immediately after" is not "atomically with". The
+scenario took no settling wait on purpose and therefore asserted a window of zero, which is stricter
+than the product needs to be and is decided by how busy the machine is.
+
+It now allows two seconds. That still catches the fault it exists for — an entry that never arrives,
+leaving a mounted pool the tooling can neither see nor unmount — without the suite's own result
+depending on runner load. Registering BEFORE the mount would close the window outright, and was not
+done: it would put an entry in the registry for a pool that is not yet usable, and an unmount racing
+an in-progress mount is a worse failure than a sub-millisecond blind spot nothing real can hit.
+
 ### chmod answered "done" and threw the mode away
 
 The worst shape a gap can take. `ChMod` returned Success and stored nothing, while `GetAttr` reported
