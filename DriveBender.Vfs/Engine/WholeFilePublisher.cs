@@ -152,9 +152,26 @@ public static class WholeFilePublisher {
   /// therefore taken BEFORE the copy there and held throughout, which is the old behaviour and the
   /// only safe one when the destination cannot stage.
   /// </param>
+  /// <param name="preserve">
+  /// The source file's own timestamps, carried onto the copy; null to let it take the time of the
+  /// write.
+  ///
+  /// This matters far more than it looks. A publish writes bytes and renames, and a file created
+  /// that way is stamped NOW — so every drain down a tier, every duplication heal, every media
+  /// replace silently reset the modification time of a file nobody had touched. Measured on a
+  /// tiered pool: a file stamped 2019 came back stamped today, two and a half thousand days out,
+  /// purely because the pool had moved it. Anything that asks "what changed since last time" — an
+  /// incremental backup, a sync tool, a build — reads that as the whole pool changing every time it
+  /// rebalances.
+  ///
+  /// It is also a correctness gain inside the engine, which resolves a file's authoritative metadata
+  /// and reconciles divergent copies by NEWEST mtime. A freshly healed copy used to win that
+  /// comparison against the original it was copied from, on the strength of a timestamp that only
+  /// meant "the pool touched this last".
+  /// </param>
   /// <returns>False when <paramref name="commit"/> declined to publish; true otherwise.</returns>
   public static bool PublishStream(IVolumeIO member, string normalizedPath, bool shadow, Func<Stream> openSource, long? expectedLength = null, bool blockingSource = false,
-    Action<long>? admit = null, Func<IDisposable?>? commit = null) {
+    Action<long>? admit = null, Func<IDisposable?>? commit = null, FileMeta? preserve = null) {
     long written;
     if ((member.Caps & BackendCaps.AtomicRename) != 0) {
       var temp = normalizedPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
@@ -164,6 +181,10 @@ public static class WholeFilePublisher {
         written = CopyCounted(source, stream, blockingSource: blockingSource, admit: admit);
         stream.Flush();
       }
+
+      // stamped on the STAGING file, so the rename publishes something already correct rather than
+      // leaving a window in which the file exists under its real name with the wrong time
+      _Preserve(member, temp, shadow, preserve);
 
       if (commit == null)
         member.AtomicReplace(temp, normalizedPath, shadow);
@@ -201,8 +222,27 @@ public static class WholeFilePublisher {
       stream.Flush();
     }
 
+    _Preserve(member, normalizedPath, shadow, preserve);
     _VerifySize(member, normalizedPath, shadow, expectedLength ?? written, written);
     return true;
+  }
+
+  /// <summary>
+  /// Stamps a published copy with the source's own times, where the member can hold them.
+  ///
+  /// Gated on <see cref="BackendCaps.Timestamps"/> and tolerant of a backend that declines anyway:
+  /// a store that cannot keep a modification time is a limitation of that store, and failing the
+  /// whole copy over it would trade a metadata gap for a data one.
+  /// </summary>
+  private static void _Preserve(IVolumeIO member, string path, bool shadow, FileMeta? preserve) {
+    if (preserve is not { } meta || (member.Caps & BackendCaps.Timestamps) == 0)
+      return;
+
+    try {
+      member.SetTimestamps(path, shadow, meta.CreationTimeUtc, meta.LastWriteTimeUtc);
+    } catch (PoolFsException e) {
+      DriveBender.Logger($"[Warning]Could not carry '{path}' timestamps onto '{member.DisplayName}': {e.Message}");
+    }
   }
 
   private static void _VerifySize(IVolumeIO member, string normalizedPath, bool shadow, long expected, long written) {
@@ -219,9 +259,9 @@ public static class WholeFilePublisher {
   /// </summary>
   public static bool CopyBetween(IVolumeIO source, string sourcePath, bool sourceShadow, IVolumeIO target, string targetPath, bool targetShadow,
     Action<long>? admit = null, Func<IDisposable?>? commit = null) {
-    var expected = source.Stat(sourcePath, sourceShadow)?.Length;
-    return PublishStream(target, targetPath, targetShadow, () => source.OpenRead(sourcePath, sourceShadow), expected,
-      blockingSource: source.BlocksCallingThread, admit: admit, commit: commit);
+    var from = source.Stat(sourcePath, sourceShadow);
+    return PublishStream(target, targetPath, targetShadow, () => source.OpenRead(sourcePath, sourceShadow), from?.Length,
+      blockingSource: source.BlocksCallingThread, admit: admit, commit: commit, preserve: from);
   }
 
   /// <summary>

@@ -137,4 +137,42 @@ public class TrashEndToEndTests {
       kept.Should().Equal(first, $"what was trashed at {where} must still be what was deleted");
   }
 
+  [Test]
+  [Category("HappyPath")]
+  [Description("A deleted file can be listed in the recycle bin and put back where it came from.")]
+  public void Recover_GivenAFileWasDeleted_ThenItCanBeListedAndRestored() {
+    // The engine has kept a recycle bin since deletes were first journalled, and until now nothing
+    // could open it: no verb, no endpoint, no screen. Keeping the bytes is only half a recoverable
+    // delete — the half that costs disk space. This is the other half.
+    using var pool = MountedPool.Create(members: 2, poolDefaults: _TRASH_ON);
+    var content = _Payload(64 * 1024, 611);
+    var path = pool.PathTo("accounts/2026-q1.xlsx");
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    File.WriteAllBytes(path, content);
+
+    File.Delete(path);
+    File.Exists(path).Should().BeFalse("the delete must take it out of the namespace");
+
+    // the bin is readable while the pool is mounted: listing touches nothing
+    var listed = DbMount.RunExpectingSuccess(TimeSpan.FromMinutes(2), "pool-trash-list", pool.PoolName, "--json");
+    listed.StandardOutput.Should().Contain("accounts/2026-q1.xlsx",
+      $"a deleted file has to be FINDABLE before it can be recovered.{Environment.NewLine}{listed.Output}");
+
+    // restoring writes to the members, so it runs with the pool unmounted — and says so if not
+    var refused = DbMount.Run(TimeSpan.FromMinutes(2), "pool-trash-restore", pool.PoolName, "accounts/2026-q1.xlsx");
+    refused.Succeeded.Should().BeFalse("restoring rewrites members, which a second engine must not do while mounted");
+
+    pool.WhileUnmounted(() => DbMount.RunExpectingSuccess(TimeSpan.FromMinutes(2),
+      "pool-trash-restore", pool.PoolName, "accounts/2026-q1.xlsx"));
+
+    File.Exists(path).Should().BeTrue(
+      $"the file must come back at its original path.{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+    File.ReadAllBytes(path).Should().Equal(content, "and with the bytes it was deleted with");
+
+    var after = DbMount.RunExpectingSuccess(TimeSpan.FromMinutes(2), "pool-trash-list", pool.PoolName, "--json");
+    after.StandardOutput.Should().NotContain("2026-q1.xlsx",
+      $"a restored file is no longer in the bin — leaving it there would keep a second copy of every "
+      + $"recovered file forever.{Environment.NewLine}{after.Output}");
+  }
+
 }

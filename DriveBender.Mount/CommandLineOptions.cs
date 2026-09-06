@@ -113,6 +113,30 @@ public sealed class PoolRestoreOptions {
   public bool Json { get; set; }
 }
 
+[Verb("pool-trash-list", HelpText = "List what the pool's recycle bin is holding: what was deleted, when, and how big.")]
+public sealed class PoolTrashListOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+
+  [Option("json", HelpText = "Print the listing as JSON.")]
+  public bool Json { get; set; }
+}
+
+[Verb("pool-trash-restore", HelpText = "Put a deleted file back where it came from.")]
+public sealed class PoolTrashRestoreOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+
+  [Value(1, Required = true, MetaName = "path", HelpText = "The file's original pool-relative path, as shown by pool-trash-list.")]
+  public string Path { get; set; } = "";
+}
+
+[Verb("pool-trash-purge", HelpText = "Apply the retention and size policy to the recycle bin now, oldest first.")]
+public sealed class PoolTrashPurgeOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+}
+
 [Verb("pool-remove-media", HelpText = "Scatter a member's data over the remaining members, then remove it from the pool.")]
 public sealed class PoolRemoveMediaOptions {
   [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
