@@ -775,6 +775,19 @@ it, or run the operation from the manager, which files it through the process th
 pool. A plain `pool-health` still runs against a mounted pool, because reading a member while the
 mount serves from it is what the mount is doing anyway.
 
+### A tiering benchmark whose bar was a round number, not the property
+
+`Tiering_GivenTheCapacityDiskIsGenuinelySlow` failed on Windows CI at 87.8 MiB/s against a required
+93.8 — a pool absorbing a burst at 1.87x the slow device's own rate, and missing an arbitrary 2x by
+six percent.
+
+The property is that the slow disk is BEHIND the write rather than in it: a pool writing through
+lands at roughly the device's own rate, so anything well clear of 1x separates the two. Twice was
+picked as "deliberately generous" and is not, because the ratio carries the noise of both
+measurements — the device is timed once and the pool once, on a runner shared with whatever else is
+running. Half again still cannot be reached by a write-through pool, and is not decided by the
+neighbours.
+
 ### A throttle applied by live reload was a bet on the pump, not a setting
 
 `Read_GivenTheFileIsMidDrain` failed on Windows CI reporting that the drain never started. It was
