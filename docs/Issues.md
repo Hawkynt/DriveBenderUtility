@@ -775,6 +775,31 @@ it, or run the operation from the manager, which files it through the process th
 pool. A plain `pool-health` still runs against a mounted pool, because reading a member while the
 mount serves from it is what the mount is doing anyway.
 
+### The coverage matrix could not converge, because a skip was decided by a benchmark
+
+The merge blocked on it, which is how it was noticed. The HeterogeneousDevice rows flipped between
+`skipped` and `pass` on Windows from one run to the next — and the matrix is GENERATED from the
+results, so every run rewrote it, every rewrite was a commit, and every commit started another run.
+
+The cause is that the SKIP DECISION was itself a measurement. Those scenarios need a second,
+genuinely slower device; without `DBE2E_DEVICES` the suite goes looking for one. On a hosted runner
+what it finds is transient — there or not depending on what the previous job left behind — and its
+speed on shared hardware swings across the threshold that decides whether it counts as slow. So the
+scenarios ran on some runs and skipped on others, for reasons that had nothing to do with the code
+under test.
+
+On CI it no longer guesses. A runner that genuinely has a second device says so with
+`DBE2E_DEVICES`, which is exactly what that override was documented for; without it the answer is
+"this machine has none", deterministically, every run. The cost is real and worth stating: eight
+scenarios that were occasionally running on CI now never do there. They were not dependable coverage
+— they ran when a stray volume happened to be present and fast enough — and they still run in full
+on a developer machine with an SD card or a spinning disk plugged in, which is what they were written
+for. A suite that cannot converge is a worse failure than coverage that was already accidental.
+
+This is the third time this class has bitten in this work: a test identity that embedded a measured
+rate, a premise guard whose skip depended on host speed, and now a device search. The pattern is the
+same each time — anything the matrix records must not be decided by a measurement.
+
 ### A tiering benchmark whose bar was a round number, not the property
 
 `Tiering_GivenTheCapacityDiskIsGenuinelySlow` failed on Windows CI at 87.8 MiB/s against a required
