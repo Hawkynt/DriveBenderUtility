@@ -246,6 +246,31 @@ internal static class MountCommand {
           json = System.Text.Json.JsonSerializer.Serialize(new { ok = true, copiesCreated = report.CopiesCreated });
           break;
         }
+        case "trash-list": {
+          // Read straight off the live engine. Listing the recycle bin of a MOUNTED pool from
+          // outside would mean a second process walking members the mount is serving from, which is
+          // the thing the engine lock exists to stop; here it is simply the pool answering about
+          // itself.
+          json = System.Text.Json.JsonSerializer.Serialize(new {
+            ok = true,
+            entries = fs.Trash.List()
+              .OrderByDescending(e => e.DeletedUtc)
+              .Select(e => new { path = e.OriginalPath, deletedUtc = e.DeletedUtc, length = e.Length }),
+          });
+          break;
+        }
+        case "trash-purge": {
+          json = System.Text.Json.JsonSerializer.Serialize(new { ok = true, purged = fs.PurgeTrash() });
+          break;
+        }
+        case not null when op.StartsWith("trash-restore:", StringComparison.Ordinal): {
+          // The ENGINE's restore, not the trash object's: it puts the file back and then
+          // re-establishes its duplication level, so a recovered file is redundant again rather
+          // than sitting as the single copy the CLI path has to warn about.
+          fs.RestoreFromTrash(op["trash-restore:".Length..]);
+          json = System.Text.Json.JsonSerializer.Serialize(new { ok = true });
+          break;
+        }
         default:
           json = System.Text.Json.JsonSerializer.Serialize(new { ok = false, error = $"unknown pool operation '{op}'" });
           break;

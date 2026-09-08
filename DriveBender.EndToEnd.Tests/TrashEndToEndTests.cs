@@ -175,4 +175,49 @@ public class TrashEndToEndTests {
       + $"recovered file forever.{Environment.NewLine}{after.Output}");
   }
 
+  [Test]
+  [Category("HappyPath")]
+  [Description("Through the manager, on a MOUNTED pool: a deleted file is listed and restored without unmounting anything.")]
+  public void Recover_GivenThePoolIsMounted_ThenTheManagerListsAndRestoresIt() {
+    // The journey a person actually takes. Everything else about the recycle bin is exercised with
+    // the pool down; this is the case that matters, because a backup target is mounted, and it is
+    // the only one that goes through the relay — the manager hands the work to the process that
+    // owns the pool rather than opening the members itself.
+    //
+    // It also gets the better restore: the engine's, which puts the file back AND re-establishes
+    // its duplication level, where the offline CLI path can only return it as a single copy.
+    using var daemon = ManagementDaemon.Start();
+    using var pool = MountedPool.Create(members: 2, poolDefaults: _TRASH_ON);
+
+    var content = _Payload(96 * 1024, 612);
+    var path = pool.PathTo("ledgers/2026-invoices.db");
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    File.WriteAllBytes(path, content);
+    MountedPool.WaitUntil(() => pool.PhysicalCopies("ledgers/2026-invoices.db").Count >= 2, TimeSpan.FromMinutes(2))
+      .Should().BeTrue($"the file must start duplicated.{Environment.NewLine}{pool.DescribeMembers()}");
+
+    File.Delete(path);
+
+    var listed = daemon.GetJson($"api/pool/trash?pool={pool.PoolName}");
+    listed.GetProperty("ok").GetBoolean().Should().BeTrue($"the bin of a mounted pool must be readable: {listed}");
+    var entries = listed.GetProperty("result").GetProperty("entries");
+    entries.EnumerateArray().Select(e => e.GetProperty("path").GetString())
+      .Should().Contain("ledgers/2026-invoices.db",
+        $"the manager has to find the deleted file before anyone can ask for it back: {listed}");
+
+    var restored = daemon.PostJson(
+      $"api/pool/trash/restore?pool={pool.PoolName}&path={Uri.EscapeDataString("ledgers/2026-invoices.db")}");
+    restored.GetProperty("ok").GetBoolean().Should().BeTrue($"the restore must succeed on a mounted pool: {restored}");
+
+    File.Exists(path).Should().BeTrue(
+      $"the file must be back at its original path, in a pool that never stopped serving."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+    File.ReadAllBytes(path).Should().Equal(content, "with the bytes it was deleted with");
+
+    MountedPool.WaitUntil(() => pool.PhysicalCopies("ledgers/2026-invoices.db").Count >= 2, TimeSpan.FromMinutes(2))
+      .Should().BeTrue(
+        $"and back at its duplication level: a recovered file that is one bad sector from being lost "
+        + $"again is only half recovered.{Environment.NewLine}{pool.DescribeMembers()}");
+  }
+
 }

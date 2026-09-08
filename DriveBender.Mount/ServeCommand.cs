@@ -255,6 +255,25 @@ internal sealed class ServeCommand(
             ["pool-replace-media", this._RequirePool(request), "--old", request.QueryString["old"] ?? "", "--new", request.QueryString["new"] ?? ""],
             subject: request.QueryString["old"] ?? "")));
           break;
+        case "/api/pool/trash" when request.HttpMethod == "GET":
+          this._WriteJson(context, this._PoolOp(this._RequirePool(request), "trash-list",
+            ["pool-trash-list", this._RequirePool(request), "--json"]));
+          break;
+        case "/api/pool/trash/restore" when request.HttpMethod == "POST": {
+          // Validated into the SAME envelope the rest of the API answers in. _PoolOp is already
+          // guarded, so a throw out here escaped it and the caller got an empty body — a dialog
+          // showing nothing at all rather than the reason.
+          var original = request.QueryString["path"];
+          this._WriteJson(context, string.IsNullOrEmpty(original)
+            ? _Guard(() => throw new ManifestException("restoring from the recycle bin needs ?path=<original path>"))
+            : this._PoolOp(this._RequirePool(request), $"trash-restore:{original}",
+              ["pool-trash-restore", this._RequirePool(request), original]));
+          break;
+        }
+        case "/api/pool/trash/purge" when request.HttpMethod == "POST":
+          this._WriteJson(context, this._PoolOp(this._RequirePool(request), "trash-purge",
+            ["pool-trash-purge", this._RequirePool(request)]));
+          break;
         case "/api/pool/delete" when request.HttpMethod == "POST":
           this._WriteJson(context, this._Delete(request, purge: false));
           break;

@@ -117,6 +117,19 @@ public static class StorageDevices {
       yield break;
     }
 
+    // On CI, guessing is worse than having nothing. A hosted runner's second volume is a transient
+    // thing: it is there or it is not depending on what the job before it left behind, and its speed
+    // on shared hardware swings by more than the threshold that decides whether it counts as slow.
+    // The scenarios built on it therefore ran on some runs and skipped on others — and because the
+    // coverage matrix is GENERATED from the results, every run rewrote it, every rewrite was a
+    // commit, and every commit started another run. The suite could not converge, which is a worse
+    // failure than the coverage those scenarios were contributing.
+    //
+    // A runner that genuinely has a second device says so with DBE2E_DEVICES, which is what the
+    // override is for. Without it, this machine has none — deterministically, every run.
+    if (Environment.GetEnvironmentVariable("CI") is { Length: > 0 })
+      yield break;
+
     if (OperatingSystem.IsWindows()) {
       foreach (var drive in _WindowsDrives())
         yield return drive;

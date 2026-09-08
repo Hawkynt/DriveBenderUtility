@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34039661270).
+Generated from run: [34283873604](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34283873604).
 
-180 scenarios — 159 passing on at least one target, 0 failing.
+178 scenarios — 157 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -64,7 +64,7 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | HeterogeneousDevice | `Duplication_GivenOneCopyOnEachDevice_ThenBothCopiesAreWhole` | A file mirrored across a fast and a slow disk is byte-identical on both, whichever of them took it first. | skipped | skipped |
 | HeterogeneousDevice | `Duplication_GivenOneCopyOnEachDevice_ThenReadsAreNotHeldToTheSlowDisksPace` | With one copy on a fast disk and one on a slow one, reading the file is not held to the slow disk's pace. | skipped | skipped |
 | HeterogeneousDevice | `Health_GivenAMemberOnARealDevice_ThenItsSmartStateReachesTheSnapshot` | A member on a real block device reports that device's SMART health into the live snapshot the dashboard reads. | skipped | skipped |
-| HeterogeneousDevice | `SlowMember_GivenItComesAndGoesRepeatedly_ThenNothingIsLostAndThePoolStaysResponsive` | A removable disk that comes and goes repeatedly leaves the pool with every file whole and still responsive. | pass | skipped |
+| HeterogeneousDevice | `SlowMember_GivenItComesAndGoesRepeatedly_ThenNothingIsLostAndThePoolStaysResponsive` | A removable disk that comes and goes repeatedly leaves the pool with every file whole and still responsive. | skipped | skipped |
 | HeterogeneousDevice | `SlowMember_WhenItIsPulledMidWrite_ThenTheWriteFinishesWithoutStalling` | Pulling the slow disk out from under a live write does not stall the pool: the write finishes at the fast disk's pace. | skipped | skipped |
 | HeterogeneousDevice | `SlowMember_WhenItRunsCompletelyOutOfSpace_ThenTheRefusalIsCleanAndStoredDataIsIntact` | Filling the only disk in a pool right up is refused cleanly, and everything already stored stays readable and whole. | skipped | skipped |
 | HeterogeneousDevice | `Tiering_GivenTheCapacityDiskIsGenuinelySlow_ThenAWriteBurstRunsAtTheFastTiersPace` | With a genuinely slow capacity disk behind a fast landing zone, a write burst still runs at the fast tier's pace rather than the slow disk's. | skipped | skipped |
@@ -85,6 +85,8 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | ManagementApi | `Pools_GivenTheDashboardFrame_ThenItIsWellFormedAndCarriesTheJobList` | Given The Dashboard Frame , then It Is Well Formed And Carries The Job List | pass | pass |
 | ManagementApi | `Prereqs_GivenThisMachine_ThenTheDriverStatusIsReportedHonestly` | Given This Machine , then The Driver Status Is Reported Honestly | pass | pass |
 | ManagementApi | `Stream_GivenAConnectedClient_ThenLiveFramesArrive` | Given AConnected Client , then Live Frames Arrive | pass | pass |
+| ManagementApi | `Trash_GivenNoPathIsGiven_ThenRestoreIsRefusedClearly` | Restoring without saying what to restore is refused with a message, rather than failing obscurely. | pass | pass |
+| ManagementApi | `Trash_GivenThePoolHasNothingDeleted_ThenTheApiAnswersWithAnEmptyBin` | The recycle bin is readable through the API on an unmounted pool, and answers with a well-formed listing. | pass | pass |
 | MemberFailureLatency | `Cripple_GivenAMemberFailsEveryOperationWithoutGoingOffline_ThenReadsStillCompletePromptly` | A member that is still present but fails every operation is routed around: reads keep completing promptly from the healthy copy. | skipped | pass |
 | MemberFailureLatency | `Eject_GivenEveryMemberGoesAndOneComesBack_ThenItsContentIsServedAgain` | Every member goes away and one comes back: its content is served again rather than the pool staying dark. | pass | pass |
 | MemberFailureLatency | `Eject_WhileALargeReadIsStreaming_ThenEveryRemainingChunkStillArrivesPromptly` | A member pulled while a large read is streaming: every remaining chunk still arrives promptly and the content is whole. | pass | pass |
@@ -150,32 +152,26 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Unmount_GivenBackgroundWorkIsStarved_ThenThePoolStillComesDownCleanly` | A pool whose background work is throttled to a crawl still unmounts cleanly, instead of having to be killed. | pass | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(RAM + RAM)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(RAM + RAM) | skipped | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(RAM + SD card)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(RAM + SD card) | skipped | pass |
-| StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(real: temp directory + D:\)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(real: temp directory + D:\) | skipped | not run |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(SSD + cloud)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(SSD + cloud) | skipped | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(SSD + HDD)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(SSD + HDD) | skipped | pass |
 | StorageFailureMatrix | `PowerCut_GivenAMemberIsAlsoMissingAfterwards_ThenTheSurvivorStillServes(RAM + RAM)` | Given AMember Is Also Missing Afterwards , then The Survivor Still Serves(RAM + RAM) | pass | pass |
 | StorageFailureMatrix | `PowerCut_GivenAMemberIsAlsoMissingAfterwards_ThenTheSurvivorStillServes(RAM + SD card)` | Given AMember Is Also Missing Afterwards , then The Survivor Still Serves(RAM + SD card) | pass | pass |
-| StorageFailureMatrix | `PowerCut_GivenAMemberIsAlsoMissingAfterwards_ThenTheSurvivorStillServes(real: temp directory + D:\)` | Given AMember Is Also Missing Afterwards , then The Survivor Still Serves(real: temp directory + D:\) | pass | not run |
 | StorageFailureMatrix | `PowerCut_GivenAMemberIsAlsoMissingAfterwards_ThenTheSurvivorStillServes(SSD + cloud)` | Given AMember Is Also Missing Afterwards , then The Survivor Still Serves(SSD + cloud) | pass | pass |
 | StorageFailureMatrix | `PowerCut_GivenAMemberIsAlsoMissingAfterwards_ThenTheSurvivorStillServes(SSD + HDD)` | Given AMember Is Also Missing Afterwards , then The Survivor Still Serves(SSD + HDD) | pass | pass |
 | StorageFailureMatrix | `PowerCut_GivenFilesWereWrittenAndClosed_ThenEveryByteSurvives(RAM + RAM)` | Given Files Were Written And Closed , then Every Byte Survives(RAM + RAM) | pass | pass |
 | StorageFailureMatrix | `PowerCut_GivenFilesWereWrittenAndClosed_ThenEveryByteSurvives(RAM + SD card)` | Given Files Were Written And Closed , then Every Byte Survives(RAM + SD card) | pass | pass |
-| StorageFailureMatrix | `PowerCut_GivenFilesWereWrittenAndClosed_ThenEveryByteSurvives(real: temp directory + D:\)` | Given Files Were Written And Closed , then Every Byte Survives(real: temp directory + D:\) | pass | not run |
 | StorageFailureMatrix | `PowerCut_GivenFilesWereWrittenAndClosed_ThenEveryByteSurvives(SSD + cloud)` | Given Files Were Written And Closed , then Every Byte Survives(SSD + cloud) | pass | pass |
 | StorageFailureMatrix | `PowerCut_GivenFilesWereWrittenAndClosed_ThenEveryByteSurvives(SSD + HDD)` | Given Files Were Written And Closed , then Every Byte Survives(SSD + HDD) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenAMemberIsPulledAndStaysGone_ThenEveryFileIsStillServedPromptly(RAM + RAM)` | Given AMember Is Pulled And Stays Gone , then Every File Is Still Served Promptly(RAM + RAM) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenAMemberIsPulledAndStaysGone_ThenEveryFileIsStillServedPromptly(RAM + SD card)` | Given AMember Is Pulled And Stays Gone , then Every File Is Still Served Promptly(RAM + SD card) | pass | pass |
-| StorageFailureMatrix | `Removed_GivenAMemberIsPulledAndStaysGone_ThenEveryFileIsStillServedPromptly(real: temp directory + D:\)` | Given AMember Is Pulled And Stays Gone , then Every File Is Still Served Promptly(real: temp directory + D:\) | pass | not run |
 | StorageFailureMatrix | `Removed_GivenAMemberIsPulledAndStaysGone_ThenEveryFileIsStillServedPromptly(SSD + cloud)` | Given AMember Is Pulled And Stays Gone , then Every File Is Still Served Promptly(SSD + cloud) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenAMemberIsPulledAndStaysGone_ThenEveryFileIsStillServedPromptly(SSD + HDD)` | Given AMember Is Pulled And Stays Gone , then Every File Is Still Served Promptly(SSD + HDD) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenAMemberVanishesMidWrite_ThenEveryAcknowledgedByteSurvives(RAM + RAM)` | Given AMember Vanishes Mid Write , then Every Acknowledged Byte Survives(RAM + RAM) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenAMemberVanishesMidWrite_ThenEveryAcknowledgedByteSurvives(RAM + SD card)` | Given AMember Vanishes Mid Write , then Every Acknowledged Byte Survives(RAM + SD card) | pass | pass |
-| StorageFailureMatrix | `Removed_GivenAMemberVanishesMidWrite_ThenEveryAcknowledgedByteSurvives(real: temp directory + D:\)` | Given AMember Vanishes Mid Write , then Every Acknowledged Byte Survives(real: temp directory + D:\) | pass | not run |
 | StorageFailureMatrix | `Removed_GivenAMemberVanishesMidWrite_ThenEveryAcknowledgedByteSurvives(SSD + cloud)` | Given AMember Vanishes Mid Write , then Every Acknowledged Byte Survives(SSD + cloud) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenAMemberVanishesMidWrite_ThenEveryAcknowledgedByteSurvives(SSD + HDD)` | Given AMember Vanishes Mid Write , then Every Acknowledged Byte Survives(SSD + HDD) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenTheMemberReturns_ThenThePoolConvergesWithEveryCopyAgreeing(RAM + RAM)` | Given The Member Returns , then The Pool Converges With Every Copy Agreeing(RAM + RAM) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenTheMemberReturns_ThenThePoolConvergesWithEveryCopyAgreeing(RAM + SD card)` | Given The Member Returns , then The Pool Converges With Every Copy Agreeing(RAM + SD card) | pass | pass |
-| StorageFailureMatrix | `Removed_GivenTheMemberReturns_ThenThePoolConvergesWithEveryCopyAgreeing(real: temp directory + D:\)` | Given The Member Returns , then The Pool Converges With Every Copy Agreeing(real: temp directory + D:\) | pass | not run |
 | StorageFailureMatrix | `Removed_GivenTheMemberReturns_ThenThePoolConvergesWithEveryCopyAgreeing(SSD + cloud)` | Given The Member Returns , then The Pool Converges With Every Copy Agreeing(SSD + cloud) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenTheMemberReturns_ThenThePoolConvergesWithEveryCopyAgreeing(SSD + HDD)` | Given The Member Returns , then The Pool Converges With Every Copy Agreeing(SSD + HDD) | pass | pass |
 | Tiering | `Tiering_GivenAFileHasDrained_ThenTheFastTierIsFreedAgain` | The fast tier is freed again after a file drains, so a landing zone does not fill up permanently. | pass | pass |
@@ -183,6 +179,7 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | Tiering | `Tiering_GivenALandingZone_ThenWritesAreAcceptedAndReadBackIntact` | A landing-zone pool accepts writes and serves them back correctly through the mount. | pass | pass |
 | Tiering | `Tiering_WhileTheMoverIsRelocatingFiles_ThenTheyStayReadableAndWritable` | Tiering is transparent: a file stays readable AND writable throughout, including while the mover is relocating it. | pass | pass |
 | Trash | `Recover_GivenAFileWasDeleted_ThenItCanBeListedAndRestored` | A deleted file can be listed in the recycle bin and put back where it came from. | pass | pass |
+| Trash | `Recover_GivenThePoolIsMounted_ThenTheManagerListsAndRestoresIt` | Through the manager, on a MOUNTED pool: a deleted file is listed and restored without unmounting anything. | pass | pass |
 | Trash | `Trash_GivenAFileWasTrashed_ThenItsNameCanBeUsedAgainAtOnce` | A trashed file's name is free again immediately: creating a new file at the same path is not confused by the deleted one. | pass | pass |
 | Trash | `Trash_GivenItIsEnabled_ThenADeletedFilesBytesAreKeptIntact` | With the trash on, a deleted file leaves the pool but its bytes are kept, whole, on a member. | pass | pass |
 | Trash | `Trash_GivenItIsOff_ThenADeleteIsPermanent` | With the trash off — the default — a delete really is permanent and leaves nothing behind. | pass | pass |
@@ -193,6 +190,7 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | WebUi | `Dashboard_WhenOpenedWithoutAToken_ThenItDoesNotLeakPoolData` | , when Opened Without AToken , then It Does Not Leak Pool Data | pass | pass |
 | WebUi | `Dashboard_WhenOpenedWithTheToken_ThenItRendersThePoolWithoutScriptErrors` | , when Opened With The Token , then It Renders The Pool Without Script Errors | pass | pass |
 | WebUi | `Dashboard_WhenTheLiveStreamConnects_ThenTheIndicatorReportsItAsLive` | , when The Live Stream Connects , then The Indicator Reports It As Live | pass | pass |
+| WebUi | `RecycleBin_WhenOpenedFromThePoolCard_ThenItRendersTheBinWithoutScriptErrors` | , when Opened From The Pool Card , then It Renders The Bin Without Script Errors | pass | pass |
 
 `skipped` marks a scenario the platform cannot express or one deliberately held back against a
 known defect — the reason travels with the test, in its `Assert.Ignore`/`[Ignore]` text.

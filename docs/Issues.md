@@ -775,6 +775,96 @@ it, or run the operation from the manager, which files it through the process th
 pool. A plain `pool-health` still runs against a mounted pool, because reading a member while the
 mount serves from it is what the mount is doing anyway.
 
+### The coverage matrix could not converge, because a skip was decided by a benchmark
+
+The merge blocked on it, which is how it was noticed. The HeterogeneousDevice rows flipped between
+`skipped` and `pass` on Windows from one run to the next — and the matrix is GENERATED from the
+results, so every run rewrote it, every rewrite was a commit, and every commit started another run.
+
+The cause is that the SKIP DECISION was itself a measurement. Those scenarios need a second,
+genuinely slower device; without `DBE2E_DEVICES` the suite goes looking for one. On a hosted runner
+what it finds is transient — there or not depending on what the previous job left behind — and its
+speed on shared hardware swings across the threshold that decides whether it counts as slow. So the
+scenarios ran on some runs and skipped on others, for reasons that had nothing to do with the code
+under test.
+
+On CI it no longer guesses. A runner that genuinely has a second device says so with
+`DBE2E_DEVICES`, which is exactly what that override was documented for; without it the answer is
+"this machine has none", deterministically, every run. The cost is real and worth stating: eight
+scenarios that were occasionally running on CI now never do there. They were not dependable coverage
+— they ran when a stray volume happened to be present and fast enough — and they still run in full
+on a developer machine with an SD card or a spinning disk plugged in, which is what they were written
+for. A suite that cannot converge is a worse failure than coverage that was already accidental.
+
+This is the third time this class has bitten in this work: a test identity that embedded a measured
+rate, a premise guard whose skip depended on host speed, and now a device search. The pattern is the
+same each time — anything the matrix records must not be decided by a measurement.
+
+### A tiering benchmark whose bar was a round number, not the property
+
+`Tiering_GivenTheCapacityDiskIsGenuinelySlow` failed on Windows CI at 87.8 MiB/s against a required
+93.8 — a pool absorbing a burst at 1.87x the slow device's own rate, and missing an arbitrary 2x by
+six percent.
+
+The property is that the slow disk is BEHIND the write rather than in it: a pool writing through
+lands at roughly the device's own rate, so anything well clear of 1x separates the two. Twice was
+picked as "deliberately generous" and is not, because the ratio carries the noise of both
+measurements — the device is timed once and the pool once, on a runner shared with whatever else is
+running. Half again still cannot be reached by a write-through pool, and is not decided by the
+neighbours.
+
+### A throttle applied by live reload was a bet on the pump, not a setting
+
+`Read_GivenTheFileIsMidDrain` failed on Windows CI reporting that the drain never started. It was
+right, and the reason was in the setup rather than the product.
+
+Those scenarios held a member's background rate down by editing the manifest, asking the running
+mount to reload it, and sleeping 2500ms. That sleep is a bet on the pump getting to the request, and
+on a loaded runner it loses: the limit was not in force when the file was written, the drain ran at
+full speed and was over before anything could observe it mid-copy. The scenario then failed saying
+the drain had not started — true, and not the fault it exists to find.
+
+They set the limit with the pool DOWN now. The mount reads the manifest as it comes up, so the limit
+is simply in force by the time the helper returns; there is no window to widen and no sleep to tune.
+Removing a race beats making it less likely, and a fixed sleep in a setup step is a race with the
+evidence hidden in a failure message about something else.
+
+### The recycle bin, finished: API and screen
+
+The CLI verbs made the bin reachable; they did not make it usable, because a backup target is
+mounted and the person who needs it is looking at the manager, not a terminal.
+
+Three endpoints — list, restore, purge — routed through `_PoolOp`, which already knew how to do the
+one thing that matters here: a MOUNTED pool executes the work in its own process over the op channel,
+an unmounted one gets a transient worker. The dialog is written once and works either way.
+
+The relayed restore is also the better one. It calls the ENGINE's `RestoreFromTrash`, which puts the
+file back and then re-establishes its duplication level, where the offline CLI path can only return
+it as a single copy and has to say so. Recovering a file into a state one bad sector from losing it
+again is half a recovery.
+
+Two things the screen had to get right, both of which are failure modes rather than features. An
+empty bin says so in words: a panel that renders nothing is indistinguishable from one that failed to
+load, and "the recycle bin is empty" is what the browser scenario asserts. And a missing `?path` is
+answered in the SAME envelope as everything else — the first cut threw outside `_PoolOp`'s guard, so
+the caller got an empty body and the dialog would have shown nothing at all rather than the reason.
+
+### Snapshots: not built, and not mocked up either
+
+Asked for alongside the recycle bin UI. There is no snapshot capability in this codebase — every
+occurrence of the word is the unrelated metrics snapshot, and there is no copy-on-write or versioning
+anywhere. A screen over that would be a screen backed by nothing.
+
+That is the same shape as the two worst defects found in this work: `chmod` answering Success and
+storing nothing, and `ChOwn` doing the same. Both were dangerous precisely because the surface said
+one thing and the storage did another, and a snapshot list that cannot restore a snapshot is that
+mistake made deliberately, on the feature where being wrong costs the most.
+
+What it needs before a UI is worth drawing: a version-addressed layer under the current
+path-addressed one, block sharing with per-snapshot reference counts, a reserve that placement
+understands and that the drainer and healer respect, and recovery semantics for each of those. That
+is a design, then an engine, then a screen — in that order.
+
 ### The recycle bin was built and unreachable
 
 `PoolTrash` has been there since deletes were first journalled: a delete moves the file aside instead
