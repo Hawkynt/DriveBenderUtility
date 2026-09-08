@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34039661270).
+Generated from run: [34270271283](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34270271283).
 
-180 scenarios — 159 passing on at least one target, 0 failing.
+184 scenarios — 163 passing on at least one target, 1 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -85,6 +85,8 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | ManagementApi | `Pools_GivenTheDashboardFrame_ThenItIsWellFormedAndCarriesTheJobList` | Given The Dashboard Frame , then It Is Well Formed And Carries The Job List | pass | pass |
 | ManagementApi | `Prereqs_GivenThisMachine_ThenTheDriverStatusIsReportedHonestly` | Given This Machine , then The Driver Status Is Reported Honestly | pass | pass |
 | ManagementApi | `Stream_GivenAConnectedClient_ThenLiveFramesArrive` | Given AConnected Client , then Live Frames Arrive | pass | pass |
+| ManagementApi | `Trash_GivenNoPathIsGiven_ThenRestoreIsRefusedClearly` | Restoring without saying what to restore is refused with a message, rather than failing obscurely. | pass | pass |
+| ManagementApi | `Trash_GivenThePoolHasNothingDeleted_ThenTheApiAnswersWithAnEmptyBin` | The recycle bin is readable through the API on an unmounted pool, and answers with a well-formed listing. | pass | pass |
 | MemberFailureLatency | `Cripple_GivenAMemberFailsEveryOperationWithoutGoingOffline_ThenReadsStillCompletePromptly` | A member that is still present but fails every operation is routed around: reads keep completing promptly from the healthy copy. | skipped | pass |
 | MemberFailureLatency | `Eject_GivenEveryMemberGoesAndOneComesBack_ThenItsContentIsServedAgain` | Every member goes away and one comes back: its content is served again rather than the pool staying dark. | pass | pass |
 | MemberFailureLatency | `Eject_WhileALargeReadIsStreaming_ThenEveryRemainingChunkStillArrivesPromptly` | A member pulled while a large read is streaming: every remaining chunk still arrives promptly and the content is whole. | pass | pass |
@@ -129,7 +131,7 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(SSD over HDD)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(SSD over HDD) | pass | pass |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(SSD over SD card)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(SSD over SD card) | pass | pass |
 | SimulatedDevice | `Limits_GivenBackgroundIsStarvedOnTheLandingZone_ThenTheApplicationIsNotHeldToIt` | Starving the pool's own background copying does not starve the application: writes stay fast while the drain crawls. | pass | pass |
-| SimulatedDevice | `Read_GivenTheFileIsMidDrain_ThenItIsServedAtOnceRatherThanAtTheDrainsPace` | A file stays readable at full speed while the pool is relocating it, even when that relocation is throttled to a crawl. | pass | pass |
+| SimulatedDevice | `Read_GivenTheFileIsMidDrain_ThenItIsServedAtOnceRatherThanAtTheDrainsPace` | A file stays readable at full speed while the pool is relocating it, even when that relocation is throttled to a crawl. | **FAIL** | pass |
 | SimulatedDevice | `Throttle_GivenAMemberLimitedToAByteRate_ThenTheMountIsHeldToIt` | A member the manifest limits to a byte rate really is held to it through a real mount, rather than the limit being decoration. | pass | pass |
 | SimulatedDevice | `Throttle_GivenNoLimit_ThenTheSamePoolIsFarFaster` | The same pool without the limit is far faster, so the limit is what the previous scenario measured and not the host. | pass | pass |
 | SimulatedDevice | `Tiering_GivenAFastLandingZoneOverSlowCapacity_ThenTheBurstLandsOnTheFastTier(HDD over cloud)` | Given AFast Landing Zone Over Slow Capacity , then The Burst Lands On The Fast Tier(HDD over cloud) | skipped | pass |
@@ -183,6 +185,7 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | Tiering | `Tiering_GivenALandingZone_ThenWritesAreAcceptedAndReadBackIntact` | A landing-zone pool accepts writes and serves them back correctly through the mount. | pass | pass |
 | Tiering | `Tiering_WhileTheMoverIsRelocatingFiles_ThenTheyStayReadableAndWritable` | Tiering is transparent: a file stays readable AND writable throughout, including while the mover is relocating it. | pass | pass |
 | Trash | `Recover_GivenAFileWasDeleted_ThenItCanBeListedAndRestored` | A deleted file can be listed in the recycle bin and put back where it came from. | pass | pass |
+| Trash | `Recover_GivenThePoolIsMounted_ThenTheManagerListsAndRestoresIt` | Through the manager, on a MOUNTED pool: a deleted file is listed and restored without unmounting anything. | pass | pass |
 | Trash | `Trash_GivenAFileWasTrashed_ThenItsNameCanBeUsedAgainAtOnce` | A trashed file's name is free again immediately: creating a new file at the same path is not confused by the deleted one. | pass | pass |
 | Trash | `Trash_GivenItIsEnabled_ThenADeletedFilesBytesAreKeptIntact` | With the trash on, a deleted file leaves the pool but its bytes are kept, whole, on a member. | pass | pass |
 | Trash | `Trash_GivenItIsOff_ThenADeleteIsPermanent` | With the trash off — the default — a delete really is permanent and leaves nothing behind. | pass | pass |
@@ -193,6 +196,7 @@ Generated from run: [34039661270](https://github.com/Hawkynt/DriveBenderUtility/
 | WebUi | `Dashboard_WhenOpenedWithoutAToken_ThenItDoesNotLeakPoolData` | , when Opened Without AToken , then It Does Not Leak Pool Data | pass | pass |
 | WebUi | `Dashboard_WhenOpenedWithTheToken_ThenItRendersThePoolWithoutScriptErrors` | , when Opened With The Token , then It Renders The Pool Without Script Errors | pass | pass |
 | WebUi | `Dashboard_WhenTheLiveStreamConnects_ThenTheIndicatorReportsItAsLive` | , when The Live Stream Connects , then The Indicator Reports It As Live | pass | pass |
+| WebUi | `RecycleBin_WhenOpenedFromThePoolCard_ThenItRendersTheBinWithoutScriptErrors` | , when Opened From The Pool Card , then It Renders The Bin Without Script Errors | pass | pass |
 
 `skipped` marks a scenario the platform cannot express or one deliberately held back against a
 known defect — the reason travels with the test, in its `Assert.Ignore`/`[Ignore]` text.
