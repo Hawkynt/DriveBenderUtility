@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34274699850](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34274699850).
+Generated from run: [34277910534](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34277910534).
 
-184 scenarios — 166 passing on at least one target, 1 failing.
+184 scenarios — 163 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -61,14 +61,14 @@ Generated from run: [34274699850](https://github.com/Hawkynt/DriveBenderUtility/
 | Durability | `Crash_GivenStagedWritesWereInterrupted_ThenNoInternalFileIsExposedToTheUser` | A power cut leaves half-written staging files on the members; none of them may show up in the pool as if they were the user's. | pass | pass |
 | Durability | `Divergence_GivenEachMemberTookAWriteWhileTheOtherWasAway_ThenOneWholeVersionIsServed` | Each member took a write while the other was away: the pool serves one whole version, never a mixture of the two. | pass | pass |
 | FolderRenameRace | `RenameFolder_WhileAChildIsBeingWritten_ThenNoAcknowledgedWriteIsLost` | A folder renamed under files that are being written: no write the pool acknowledged may go missing. | skipped | pass |
-| HeterogeneousDevice | `Duplication_GivenOneCopyOnEachDevice_ThenBothCopiesAreWhole` | A file mirrored across a fast and a slow disk is byte-identical on both, whichever of them took it first. | pass | skipped |
+| HeterogeneousDevice | `Duplication_GivenOneCopyOnEachDevice_ThenBothCopiesAreWhole` | A file mirrored across a fast and a slow disk is byte-identical on both, whichever of them took it first. | skipped | skipped |
 | HeterogeneousDevice | `Duplication_GivenOneCopyOnEachDevice_ThenReadsAreNotHeldToTheSlowDisksPace` | With one copy on a fast disk and one on a slow one, reading the file is not held to the slow disk's pace. | skipped | skipped |
 | HeterogeneousDevice | `Health_GivenAMemberOnARealDevice_ThenItsSmartStateReachesTheSnapshot` | A member on a real block device reports that device's SMART health into the live snapshot the dashboard reads. | skipped | skipped |
 | HeterogeneousDevice | `SlowMember_GivenItComesAndGoesRepeatedly_ThenNothingIsLostAndThePoolStaysResponsive` | A removable disk that comes and goes repeatedly leaves the pool with every file whole and still responsive. | pass | skipped |
-| HeterogeneousDevice | `SlowMember_WhenItIsPulledMidWrite_ThenTheWriteFinishesWithoutStalling` | Pulling the slow disk out from under a live write does not stall the pool: the write finishes at the fast disk's pace. | pass | skipped |
+| HeterogeneousDevice | `SlowMember_WhenItIsPulledMidWrite_ThenTheWriteFinishesWithoutStalling` | Pulling the slow disk out from under a live write does not stall the pool: the write finishes at the fast disk's pace. | skipped | skipped |
 | HeterogeneousDevice | `SlowMember_WhenItRunsCompletelyOutOfSpace_ThenTheRefusalIsCleanAndStoredDataIsIntact` | Filling the only disk in a pool right up is refused cleanly, and everything already stored stays readable and whole. | skipped | skipped |
-| HeterogeneousDevice | `Tiering_GivenTheCapacityDiskIsGenuinelySlow_ThenAWriteBurstRunsAtTheFastTiersPace` | With a genuinely slow capacity disk behind a fast landing zone, a write burst still runs at the fast tier's pace rather than the slow disk's. | **FAIL** | skipped |
-| HeterogeneousDevice | `Tiering_WhenTheBurstDrainsDownToTheSlowDisk_ThenEveryByteArrivesIntact` | Everything the fast tier absorbed arrives byte-for-byte on the slow capacity disk when the drainer moves it down. | pass | skipped |
+| HeterogeneousDevice | `Tiering_GivenTheCapacityDiskIsGenuinelySlow_ThenAWriteBurstRunsAtTheFastTiersPace` | With a genuinely slow capacity disk behind a fast landing zone, a write burst still runs at the fast tier's pace rather than the slow disk's. | skipped | skipped |
+| HeterogeneousDevice | `Tiering_WhenTheBurstDrainsDownToTheSlowDisk_ThenEveryByteArrivesIntact` | Everything the fast tier absorbed arrives byte-for-byte on the slow capacity disk when the drainer moves it down. | skipped | skipped |
 | LargeFile | `LargeFile_GivenItExceedsTwoGiB_ThenItsLengthIsReportedInFull` | A file larger than 2 GiB reports its true length rather than a 32-bit wrapped one. | pass | pass |
 | LargeFile | `LargeFile_GivenReadsAroundTheThirtyTwoBitBoundaries_ThenEveryByteIsCorrect` | Reads on both sides of the 2 GiB and 4 GiB-relevant boundaries return the right bytes. | pass | pass |
 | LargeFile | `LargeFile_WhenAppendedTo_ThenTheNewBytesLandPastTheOldEnd` | Appending to a file that is already past 2 GiB puts the bytes at the true end, not at a wrapped offset. | pass | pass |
