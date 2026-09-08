@@ -146,9 +146,7 @@ public class SimulatedDeviceEndToEndTests {
     const int size = 1024 * 1024;
 
     using var pool = MountedPool.CreateTieredAlwaysLanding();
-    DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: starved);
-    DbMount.RequestLiveReload(pool.PoolName);
-    Thread.Sleep(2500); // the pump consumes the reload on its next tick
+    pool.ThrottleBackground(0, starved);
 
     var written = new Dictionary<string, byte[]>();
     var stopwatch = Stopwatch.StartNew();
@@ -192,9 +190,7 @@ public class SimulatedDeviceEndToEndTests {
     const long starved = 64 * 1024;
 
     using var pool = MountedPool.CreateTieredAlwaysLanding();
-    DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: starved);
-    DbMount.RequestLiveReload(pool.PoolName);
-    Thread.Sleep(2500);
+    pool.ThrottleBackground(0, starved);
 
     var content = _Payload(8 * 1024 * 1024, 980);
     File.WriteAllBytes(pool.PathTo("relocating.bin"), content);
@@ -229,9 +225,7 @@ public class SimulatedDeviceEndToEndTests {
     const long starved = 64 * 1024;
 
     using var pool = MountedPool.CreateTieredAlwaysLanding();
-    DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: starved);
-    DbMount.RequestLiveReload(pool.PoolName);
-    Thread.Sleep(2500);
+    pool.ThrottleBackground(0, starved);
 
     var content = _Payload(8 * 1024 * 1024, 970);
     File.WriteAllBytes(pool.PathTo("pending.bin"), content);

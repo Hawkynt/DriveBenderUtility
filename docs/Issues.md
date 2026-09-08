@@ -775,6 +775,22 @@ it, or run the operation from the manager, which files it through the process th
 pool. A plain `pool-health` still runs against a mounted pool, because reading a member while the
 mount serves from it is what the mount is doing anyway.
 
+### A throttle applied by live reload was a bet on the pump, not a setting
+
+`Read_GivenTheFileIsMidDrain` failed on Windows CI reporting that the drain never started. It was
+right, and the reason was in the setup rather than the product.
+
+Those scenarios held a member's background rate down by editing the manifest, asking the running
+mount to reload it, and sleeping 2500ms. That sleep is a bet on the pump getting to the request, and
+on a loaded runner it loses: the limit was not in force when the file was written, the drain ran at
+full speed and was over before anything could observe it mid-copy. The scenario then failed saying
+the drain had not started — true, and not the fault it exists to find.
+
+They set the limit with the pool DOWN now. The mount reads the manifest as it comes up, so the limit
+is simply in force by the time the helper returns; there is no window to widen and no sleep to tune.
+Removing a race beats making it less likely, and a fixed sleep in a setup step is a race with the
+evidence hidden in a failure message about something else.
+
 ### The recycle bin, finished: API and screen
 
 The CLI verbs made the bin reachable; they did not make it usable, because a backup target is

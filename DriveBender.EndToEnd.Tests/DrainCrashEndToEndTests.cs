@@ -42,11 +42,7 @@ public class DrainCrashEndToEndTests {
   /// file completes in well under a second: applying the limit after the write is a race the test
   /// loses every time, and it loses it invisibly, by passing.
   /// </summary>
-  private static void _CrawlTheDrain(MountedPool pool) {
-    DbMount.SetMemberThroughput(pool.PoolName, pool.MemberPaths[0], background: _CRAWL);
-    DbMount.RequestLiveReload(pool.PoolName);
-    Thread.Sleep(2500); // the pump consumes the reload on its next tick
-  }
+  private static void _CrawlTheDrain(MountedPool pool) => pool.ThrottleBackground(0, _CRAWL);
 
   private static byte[] _Payload(int length, int seed) {
     var content = new byte[length];

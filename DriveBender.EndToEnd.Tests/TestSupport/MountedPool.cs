@@ -345,6 +345,21 @@ public sealed class MountedPool : IDisposable {
 
   /// <summary>The copies of a pool-relative file across every member, primary or shadow container.</summary>
   /// <summary>
+  /// Holds one member's BACKGROUND copying to a byte rate, with the pool DOWN while it is set.
+  ///
+  /// The obvious way is to edit the manifest and ask the running mount to reload it, then sleep a
+  /// moment. That sleep is a bet on the pump getting round to the request, and on a loaded Windows
+  /// runner it loses: the limit was not in force when the write landed, the drain ran at full speed
+  /// and finished before anything could observe it mid-copy, and the scenario failed reporting that
+  /// the drain never started. Which was true, and not the fault it exists to find.
+  ///
+  /// Setting it while unmounted removes the race rather than widening the window: the mount reads
+  /// the manifest as it comes up, so by the time this returns the limit is simply in force.
+  /// </summary>
+  public void ThrottleBackground(int memberIndex, long bytesPerSecond)
+    => this.WhileUnmounted(() => DbMount.SetMemberThroughput(this.PoolName, this.MemberPaths[memberIndex], background: bytesPerSecond));
+
+  /// <summary>
   /// Skips the test unless the file really did land on the LANDING ZONE (member 0 of a tiered pool).
   ///
   /// Placement is free to decline the fast tier — and does, once that member is past its low
