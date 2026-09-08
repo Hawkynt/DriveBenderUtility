@@ -308,4 +308,32 @@ public class ManagementApiEndToEndTests {
     }
   }
 
+  [Test]
+  [Category("HappyPath")]
+  [Description("The recycle bin is readable through the API on an unmounted pool, and answers with a well-formed listing.")]
+  public void Trash_GivenThePoolHasNothingDeleted_ThenTheApiAnswersWithAnEmptyBin() {
+    // The endpoint the UI's Recycle bin dialog opens with. On an unmounted pool the daemon runs the
+    // work in a transient worker; on a mounted one it relays into the process that owns the pool.
+    // Both paths answer the same shape, which is what lets the dialog be written once.
+    var listed = this._daemon.GetJson($"api/pool/trash?pool={this._poolName}");
+
+    listed.GetProperty("ok").GetBoolean().Should().BeTrue("the bin of a healthy pool is readable");
+    listed.GetProperty("result").GetProperty("entries").ValueKind.Should().Be(JsonValueKind.Array,
+      "the dialog iterates this, so an empty bin has to be an empty ARRAY rather than a null or a "
+      + "missing property — the difference between an empty panel and a broken one");
+    listed.GetProperty("result").GetProperty("entries").GetArrayLength().Should().Be(0,
+      "nothing has been deleted from this pool");
+  }
+
+  [Test]
+  [Category("Exception")]
+  [Description("Restoring without saying what to restore is refused with a message, rather than failing obscurely.")]
+  public void Trash_GivenNoPathIsGiven_ThenRestoreIsRefusedClearly() {
+    var refused = this._daemon.PostJson($"api/pool/trash/restore?pool={this._poolName}");
+
+    refused.GetProperty("ok").GetBoolean().Should().BeFalse("there is nothing to restore without a path");
+    refused.GetProperty("error").GetString().Should().Contain("path",
+      "the message has to name what was missing; the UI shows it verbatim");
+  }
+
 }

@@ -240,4 +240,37 @@ public class WebUiEndToEndTests {
     await page.CloseAsync();
   }
 
+  [Test]
+  [Category("HappyPath")]
+  public async Task RecycleBin_WhenOpenedFromThePoolCard_ThenItRendersTheBinWithoutScriptErrors() {
+    // The recycle bin exists in the engine, in the CLI and in the API; this is the last link, and
+    // the one an operator actually reaches for. Driven as a user drives it — find the pool, press
+    // the button, read what comes back — because the failure this catches is not an endpoint
+    // returning the wrong JSON but a dialog that renders nothing and says nothing.
+    var (page, errors) = await this._OpenDashboardAsync();
+
+    var card = page.Locator("#pools .card", new() { HasTextString = this._poolName });
+    await card.First.WaitForAsync(new() { Timeout = 30_000, State = WaitForSelectorState.Visible });
+
+    await card.First.GetByRole(AriaRole.Button, new() { Name = "Recycle bin" }).ClickAsync();
+
+    // an empty bin is the normal state of a healthy pool, and it must SAY so rather than sit blank:
+    // a panel that renders nothing is indistinguishable from one that failed to load
+    var modal = page.Locator(".modal");
+    await modal.First.WaitForAsync(new() { Timeout = 30_000, State = WaitForSelectorState.Visible });
+
+    // the dialog opens on "Loading…" and fills itself in when the pool answers; reading it before
+    // that resolves asserts against the placeholder
+    await modal.First.GetByText("Loading…").WaitForAsync(new() { Timeout = 30_000, State = WaitForSelectorState.Detached });
+    var text = await modal.First.InnerTextAsync();
+
+    text.Should().Contain(this._poolName, "the dialog must name the pool it is showing");
+    text.Should().Contain("recycle bin is empty",
+      $"nothing has been deleted from this pool, and the dialog has to say that in words. What it "
+      + $"showed instead was: {text}");
+
+    errors.Should().BeEmpty("opening the recycle bin must not raise script errors");
+    await page.CloseAsync();
+  }
+
 }

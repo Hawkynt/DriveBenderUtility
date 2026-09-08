@@ -597,6 +597,7 @@ function patchCard(c, pool) {
   else
     add("Mount", "primary", () => mountPool(pool));
   add("Browse", "", () => browseDialog(pool, ""));
+  add("Recycle bin", "", () => trashDialog(pool));
   add("Health", "", () => healthDialog(pool, false));
   add("Fix", "", () => healthDialog(pool, true));
   add("Restore", "", async () => {
@@ -696,6 +697,83 @@ async function healthDialog(pool, fix, deep) {
 
 // Pool browser (FR-UI-MAP): a tree-style listing with one column per member showing exactly
 // where every file/folder physically lives — ✅ primary copy, 🔁 shadow copy, ❌ not present.
+// The recycle bin. The engine has moved deleted files aside since deletes were first journalled;
+// until now nothing could open it, which made it a disk-space cost with no benefit. For a pool used
+// as a backup target this is the screen someone reaches for in a hurry, so it says plainly what is
+// there, how long ago it went, and what restoring will do.
+async function trashDialog(pool) {
+  const body = el("div");
+  body.innerHTML = `<p class="hint">Loading…</p>`;
+  infoModal(`Recycle bin — ${esc(pool.name)}`, body, true);
+  await trashInto(pool, body);
+}
+
+// The shared `ago` reads as an inline aside ("· 5m ago") and stops at hours. A recycle bin is
+// measured in days against a retention policy, and the age is a column here rather than an aside.
+function trashAge(stamp) {
+  if (!stamp) return "";
+  const seconds = Math.max(0, (Date.now() - Date.parse(stamp)) / 1000);
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m ago";
+  if (seconds < 86400) return Math.floor(seconds / 3600) + "h ago";
+  return Math.floor(seconds / 86400) + "d ago";
+}
+
+async function trashInto(pool, body) {
+  const j = await fetch(`/api/pool/trash?pool=${pool.id}&token=${encodeURIComponent(token)}`)
+    .then(r => r.json()).catch(e => ({ ok: false, error: String(e) }));
+  if (!j.ok) { body.innerHTML = `<p class="hint">Could not read the recycle bin: ${esc(j.error || "")}</p>`; return; }
+
+  const entries = (j.result && j.result.entries) || [];
+  if (!entries.length) {
+    body.innerHTML = `<p class="hint">The recycle bin is empty. Deleted files are kept here while
+      <code>trash.enabled</code> is on, and are cleared by the retention and size policy in Settings.</p>`;
+    return;
+  }
+
+  const total = entries.reduce((a, e) => a + (e.length || 0), 0);
+  body.innerHTML = `
+    <table class="browse"><thead><tr>
+      <th style="text-align:left">Deleted file</th><th>Size</th><th>Deleted</th><th></th>
+    </tr></thead><tbody>
+      ${entries.map((e, i) => `<tr>
+        <td>🗑 ${esc(e.path)}</td>
+        <td class="sz">${fmtBytes(e.length)}</td>
+        <td class="sz" title="${esc(e.deletedUtc)}">${esc(trashAge(e.deletedUtc))}</td>
+        <td class="sz"><button data-restore="${i}">Restore</button></td>
+      </tr>`).join("")}
+    </tbody></table>
+    <p class="hint">${entries.length} item(s), ${fmtBytes(total)}. Restoring puts a file back at its
+      original path and rebuilds its duplication level. <button class="danger" data-purge="1">Empty now</button>
+      applies the retention and size policy immediately.</p>`;
+
+  body.querySelectorAll("button[data-restore]").forEach(button => {
+    button.onclick = async () => {
+      const entry = entries[Number(button.dataset.restore)];
+      button.disabled = true;
+      button.textContent = "Restoring…";
+      const ok = await op(`/api/pool/trash/restore?pool=${pool.id}&path=${encodeURIComponent(entry.path)}`);
+      if (ok)
+        await trashInto(pool, body);
+      else {
+        button.disabled = false;
+        button.textContent = "Restore";
+      }
+    };
+  });
+
+  const purge = body.querySelector("button[data-purge]");
+  if (purge)
+    purge.onclick = async () => {
+      // destructive and not undoable — the one action in this dialog that needs asking about
+      if (!confirm("Apply the retention and size policy now?\n\nItems past either limit are deleted for good."))
+        return;
+
+      if (await op(`/api/pool/trash/purge?pool=${pool.id}`))
+        await trashInto(pool, body);
+    };
+}
+
 async function browseDialog(pool, path) {
   const body = el("div");
   body.innerHTML = `<p class="hint">Loading…</p>`;

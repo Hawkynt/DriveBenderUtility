@@ -775,6 +775,42 @@ it, or run the operation from the manager, which files it through the process th
 pool. A plain `pool-health` still runs against a mounted pool, because reading a member while the
 mount serves from it is what the mount is doing anyway.
 
+### The recycle bin, finished: API and screen
+
+The CLI verbs made the bin reachable; they did not make it usable, because a backup target is
+mounted and the person who needs it is looking at the manager, not a terminal.
+
+Three endpoints — list, restore, purge — routed through `_PoolOp`, which already knew how to do the
+one thing that matters here: a MOUNTED pool executes the work in its own process over the op channel,
+an unmounted one gets a transient worker. The dialog is written once and works either way.
+
+The relayed restore is also the better one. It calls the ENGINE's `RestoreFromTrash`, which puts the
+file back and then re-establishes its duplication level, where the offline CLI path can only return
+it as a single copy and has to say so. Recovering a file into a state one bad sector from losing it
+again is half a recovery.
+
+Two things the screen had to get right, both of which are failure modes rather than features. An
+empty bin says so in words: a panel that renders nothing is indistinguishable from one that failed to
+load, and "the recycle bin is empty" is what the browser scenario asserts. And a missing `?path` is
+answered in the SAME envelope as everything else — the first cut threw outside `_PoolOp`'s guard, so
+the caller got an empty body and the dialog would have shown nothing at all rather than the reason.
+
+### Snapshots: not built, and not mocked up either
+
+Asked for alongside the recycle bin UI. There is no snapshot capability in this codebase — every
+occurrence of the word is the unrelated metrics snapshot, and there is no copy-on-write or versioning
+anywhere. A screen over that would be a screen backed by nothing.
+
+That is the same shape as the two worst defects found in this work: `chmod` answering Success and
+storing nothing, and `ChOwn` doing the same. Both were dangerous precisely because the surface said
+one thing and the storage did another, and a snapshot list that cannot restore a snapshot is that
+mistake made deliberately, on the feature where being wrong costs the most.
+
+What it needs before a UI is worth drawing: a version-addressed layer under the current
+path-addressed one, block sharing with per-snapshot reference counts, a reserve that placement
+understands and that the drainer and healer respect, and recovery semantics for each of those. That
+is a design, then an engine, then a screen — in that order.
+
 ### The recycle bin was built and unreachable
 
 `PoolTrash` has been there since deletes were first journalled: a delete moves the file aside instead
