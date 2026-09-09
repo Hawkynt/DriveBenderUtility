@@ -829,6 +829,30 @@ is simply in force by the time the helper returns; there is no window to widen a
 Removing a race beats making it less likely, and a fixed sleep in a setup step is a race with the
 evidence hidden in a failure message about something else.
 
+### Removing a member destroyed its recycle bin
+
+Found while writing the snapshot design, by checking a claim rather than asserting it. The design
+says a snapshot store must relocate when its member leaves; the trash is that store's existing
+analogue, so the same question was asked of it.
+
+`ScatterAndRemove` walks the visible namespace, and that walk skips the pool's hidden tree. Skipping
+it is right for almost everything under there — the member's journal, its manifest mirror, its
+checksums are bookkeeping that belongs to the disk and must not be scattered. The recycle bin is the
+exception: it is user data, kept precisely so somebody can still ask for it. So `pool-remove-media`,
+whose entire promise is that a member's data is scattered over the others before it leaves, silently
+destroyed every recoverable file that happened to live on the member being removed. Reproduced: the
+bin listed the file, the member was removed, the bin came back `{"entries":[]}`.
+
+The bin now moves with everything else — copied before the original is dropped, like the rest of the
+scatter, so an interruption leaves a version on one member or both and never on neither. Where there
+is nowhere to put it, that is logged rather than swallowed, because the bin is the one thing in this
+operation with no second copy anywhere.
+
+Worth noting how it was found. The design document had to state which engine paths a snapshot store
+would touch; writing "the media operations relocate whole files, so a pinned version must relocate
+too" is the kind of sentence that is easy to write and easy not to check. Checking it took one grep
+and turned up a live data-loss bug in a feature shipped two changes earlier.
+
 ### The recycle bin, finished: API and screen
 
 The CLI verbs made the bin reachable; they did not make it usable, because a backup target is
