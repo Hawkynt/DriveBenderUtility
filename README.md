@@ -30,11 +30,27 @@ crash-safe journaling, bit-rot/SMART health checks with correction, and both a
 CLI (`dbmount`) and an animated live web/desktop dashboard. Jump to
 [**Quick Start**](#-quick-start) to create and mount your first pool.
 
-![Drive Bender Pool Manager — live dashboard](docs/screenshots/dashboard.png)
+## 📸 Screenshots
 
-> The animated live dashboard (`dbmount serve`, and the desktop app) — one card per
-> pool with capacity donuts, a RAM→fast→capacity tier topology, per-member usage
-> and health. See more in [**Screenshots**](#-screenshots).
+The GUI is a dependency-free web dashboard served by `dbmount serve` (and hosted
+verbatim in the desktop app) — theme-aware, so it follows your OS light/dark
+preference:
+
+| Live dashboard (dark) | Live dashboard (light) |
+|---|---|
+| ![Dashboard, dark theme](docs/screenshots/dashboard.png) | ![Dashboard, light theme](docs/screenshots/dashboard-light.png) |
+
+| Create a pool | Pool settings |
+|---|---|
+| ![Create pool dialog](docs/screenshots/create-pool.png) | ![Pool settings dialog](docs/screenshots/settings.png) |
+
+- **Dashboard** — one card per pool: a capacity donut, the RAM→fast→capacity
+  tier topology with animated flow lines, per-member usage bars and health, and
+  the full lifecycle actions (mount, browse, health/fix, duplication, settings…).
+- **Create a pool** — stack up members (local folder/drive, UNC, or any remote
+  URI) with a per-member role and a folder browser; no JSON required.
+- **Settings** — every pool knob as a labelled control (mount location, write
+  policy, cache, background maintenance…), with an advanced JSON escape hatch.
 
 ## 🧭 How it works
 
@@ -413,28 +429,6 @@ without a real pool.
 - ✅ Semantic data types (PoolName, DrivePath, FolderPath, ByteSize, DuplicationLevel)
 - ✅ Input validation and sanitization
 - ✅ Compile-time safety for critical operations
-
-## 📸 Screenshots
-
-The GUI is a dependency-free web dashboard served by `dbmount serve` (and hosted
-verbatim in the desktop app) — theme-aware, so it follows your OS light/dark
-preference:
-
-| Live dashboard (dark) | Live dashboard (light) |
-|---|---|
-| ![Dashboard, dark theme](docs/screenshots/dashboard.png) | ![Dashboard, light theme](docs/screenshots/dashboard-light.png) |
-
-| Create a pool | Pool settings |
-|---|---|
-| ![Create pool dialog](docs/screenshots/create-pool.png) | ![Pool settings dialog](docs/screenshots/settings.png) |
-
-- **Dashboard** — one card per pool: a capacity donut, the RAM→fast→capacity
-  tier topology with animated flow lines, per-member usage bars and health, and
-  the full lifecycle actions (mount, browse, health/fix, duplication, settings…).
-- **Create a pool** — stack up members (local folder/drive, UNC, or any remote
-  URI) with a per-member role and a folder browser; no JSON required.
-- **Settings** — every pool knob as a labelled control (mount location, write
-  policy, cache, background maintenance…), with an advanced JSON escape hatch.
 
 ## 📦 Getting Started
 
