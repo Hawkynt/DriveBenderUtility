@@ -65,19 +65,20 @@ on several. That is what makes a member readable on its own — pull a disk out,
 machine, and the files on it are just files.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","lineColor":"#90A4AE","textColor":"#37474F","clusterBkg":"#FAFAFA","clusterBorder":"#E0E0E0","edgeLabelBackground":"#FFFFFF"}}}%%
 flowchart TD
-    App["Application<br/>reads and writes a drive letter<br/>or a mountpoint"] --> Driver
+    App["Application<br/>reads and writes a drive letter or a mountpoint"] --> Driver
 
     subgraph Driver["Filesystem driver"]
-        WinFsp["WinFsp / Dokan<br/>(Windows)"]
-        Fuse["FUSE<br/>(Linux)"]
+        WinFsp["WinFsp / Dokan<br/>Windows"]
+        Fuse["FUSE<br/>Linux"]
     end
 
     Driver --> Engine
 
     subgraph Engine["Pool engine"]
         Placement["Placement<br/>which member takes this file"]
-        Journal["Journal<br/>intent → completion, replayed on mount"]
+        Journal["Journal<br/>intent to completion, replayed on mount"]
         Cache["Caches<br/>blocks, metadata, owed writes"]
     end
 
@@ -86,8 +87,20 @@ flowchart TD
     subgraph Members["Members — each holds whole files"]
         M0["Landing zone<br/>fast tier"]
         M1["Capacity disk"]
-        M2["Cloud / UNC<br/>capacity"]
+        M2["Cloud / UNC"]
     end
+
+    classDef primary fill:#E3F2FD,stroke:#42A5F5,stroke-width:1.5px,color:#0D47A1,rx:8,ry:8
+    classDef surface fill:#FFFFFF,stroke:#CFD8DC,stroke-width:1.5px,color:#37474F,rx:8,ry:8
+    classDef store fill:#E8F5E9,stroke:#66BB6A,stroke-width:1.5px,color:#1B5E20,rx:8,ry:8
+    classDef warn fill:#FFF8E1,stroke:#FFB300,stroke-width:1.5px,color:#E65100,rx:8,ry:8
+    classDef danger fill:#FFEBEE,stroke:#EF5350,stroke-width:1.5px,color:#B71C1C,rx:8,ry:8
+    classDef accent fill:#EDE7F6,stroke:#7E57C2,stroke-width:1.5px,color:#4527A0,rx:8,ry:8
+    classDef decision fill:#ECEFF1,stroke:#90A4AE,stroke-width:1.5px,color:#37474F
+    class App primary
+    class WinFsp,Fuse,Placement,Journal surface
+    class Cache accent
+    class M0,M1,M2 store
 ```
 
 ### Reading: cache, then the readiest copy
@@ -101,18 +114,32 @@ member that just failed is parked at the back of the order for a while — one d
 be tried first for every block of a large read.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","lineColor":"#90A4AE","textColor":"#37474F","clusterBkg":"#FAFAFA","clusterBorder":"#E0E0E0","edgeLabelBackground":"#FFFFFF"}}}%%
 flowchart TD
     Read["read(path, offset, length)"] --> Block{"block in<br/>page cache?"}
     Block -- yes --> Serve["serve from RAM"]
-    Block -- no --> Resolve["resolve copies<br/>(metadata cache)"]
-    Resolve --> Order["order by readiness:<br/>outstanding I/O → latency → rotation"]
-    Order --> Fetch["read block from the chosen copy"]
+    Block -- no --> Resolve["resolve copies<br/>from the metadata cache"]
+    Resolve --> Order["order by readiness<br/>outstanding I/O, then latency"]
+    Order --> Fetch["read the block<br/>from the chosen copy"]
     Fetch --> Ok{"complete?"}
     Ok -- yes --> Fill["fill cache, serve,<br/>maybe read ahead"]
-    Ok -- "no: error, or shorter<br/>than the file's length" --> Next{"another<br/>copy?"}
+    Ok -- "no — error, or shorter<br/>than the file's length" --> Next{"another<br/>copy?"}
     Next -- yes --> Fetch
-    Next -- "no" --> Requery["re-resolve once<br/>(copies may have moved)"]
+    Next -- no --> Requery["re-resolve once<br/>the copies may have moved"]
     Requery --> Fail["error — never<br/>silently short"]
+
+    classDef primary fill:#E3F2FD,stroke:#42A5F5,stroke-width:1.5px,color:#0D47A1,rx:8,ry:8
+    classDef surface fill:#FFFFFF,stroke:#CFD8DC,stroke-width:1.5px,color:#37474F,rx:8,ry:8
+    classDef store fill:#E8F5E9,stroke:#66BB6A,stroke-width:1.5px,color:#1B5E20,rx:8,ry:8
+    classDef warn fill:#FFF8E1,stroke:#FFB300,stroke-width:1.5px,color:#E65100,rx:8,ry:8
+    classDef danger fill:#FFEBEE,stroke:#EF5350,stroke-width:1.5px,color:#B71C1C,rx:8,ry:8
+    classDef accent fill:#EDE7F6,stroke:#7E57C2,stroke-width:1.5px,color:#4527A0,rx:8,ry:8
+    classDef decision fill:#ECEFF1,stroke:#90A4AE,stroke-width:1.5px,color:#37474F
+    class Read primary
+    class Serve,Fill store
+    class Resolve,Order,Fetch,Requery surface
+    class Block,Ok,Next decision
+    class Fail danger
 ```
 
 ### Writing: staged, acknowledged, then converged
@@ -122,9 +149,11 @@ so a crash mid-write leaves no half-written file. A write is acknowledged once i
 required number of copies; any copies still owed are recorded and completed in the background.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","actorBkg":"#E3F2FD","actorBorder":"#42A5F5","actorTextColor":"#0D47A1","actorLineColor":"#B0BEC5","signalColor":"#546E7A","signalTextColor":"#37474F","noteBkgColor":"#FFF8E1","noteBorderColor":"#FFB300","noteTextColor":"#E65100","sequenceNumberColor":"#FFFFFF"}}}%%
 sequenceDiagram
+    autonumber
     participant App
-    participant Engine
+    participant Engine as Pool engine
     participant A as Member A
     participant B as Member B
 
@@ -134,8 +163,8 @@ sequenceDiagram
     Note over Engine: acknowledged once the ack quorum is durable
     Engine-->>App: ok
     App->>Engine: close
-    Engine->>A: atomic rename temp → final
-    Engine->>B: atomic rename temp → final
+    Engine->>A: atomic rename temp to final
+    Engine->>B: atomic rename temp to final
     Note over Engine,B: copies still owed are held in the write buffer and completed in the background — the journal intent closes last
 ```
 
@@ -145,16 +174,27 @@ One configurable pool of RAM, split between reading and writing. The split can b
 or two separate budgets.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","lineColor":"#90A4AE","textColor":"#37474F","clusterBkg":"#FAFAFA","clusterBorder":"#E0E0E0","edgeLabelBackground":"#FFFFFF"}}}%%
 flowchart LR
-    subgraph RAM["cache.size — e.g. 4 GiB"]
+    subgraph RAM["cache.size — one budget, split between reading and writing"]
         direction TB
-        Pages["<b>Page cache</b><br/>file blocks, default 1 MiB<br/>serves repeat reads and read-ahead"]
-        Meta["<b>Metadata cache</b><br/>stat, directory listings,<br/>which members hold a file<br/>bounded by entries + TTL"]
-        Buf["<b>Write buffer</b><br/>bytes acknowledged but not yet<br/>on every copy; the ONLY record<br/>of what a lagging copy still owes"]
+        Pages["Page cache<br/>file blocks, 1 MiB by default<br/>serves repeat reads and read-ahead"]
+        Meta["Metadata cache<br/>stat, directory listings,<br/>which members hold a file"]
+        Buf["Write buffer<br/>bytes acknowledged but not yet on every copy<br/>the only record of what a copy still owes"]
     end
 
-    Pages -. "invalidated on write,<br/>heal, drain" .-> Meta
-    Buf -. "drained by the owed-sync job;<br/>restored if a flush fails" .-> Members["Members"]
+    Buf --> Members["Members"]
+
+    classDef primary fill:#E3F2FD,stroke:#42A5F5,stroke-width:1.5px,color:#0D47A1,rx:8,ry:8
+    classDef surface fill:#FFFFFF,stroke:#CFD8DC,stroke-width:1.5px,color:#37474F,rx:8,ry:8
+    classDef store fill:#E8F5E9,stroke:#66BB6A,stroke-width:1.5px,color:#1B5E20,rx:8,ry:8
+    classDef warn fill:#FFF8E1,stroke:#FFB300,stroke-width:1.5px,color:#E65100,rx:8,ry:8
+    classDef danger fill:#FFEBEE,stroke:#EF5350,stroke-width:1.5px,color:#B71C1C,rx:8,ry:8
+    classDef accent fill:#EDE7F6,stroke:#7E57C2,stroke-width:1.5px,color:#4527A0,rx:8,ry:8
+    classDef decision fill:#ECEFF1,stroke:#90A4AE,stroke-width:1.5px,color:#37474F
+    class Pages,Meta accent
+    class Buf warn
+    class Members store
 ```
 
 ### Tiering: land fast, drain later
@@ -167,12 +207,25 @@ The drain copies the file down, re-validates that nothing changed underneath it,
 the fast tier — so an interruption leaves the file on one tier or the other, never on neither.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","lineColor":"#90A4AE","textColor":"#37474F","clusterBkg":"#FAFAFA","clusterBorder":"#E0E0E0","edgeLabelBackground":"#FFFFFF"}}}%%
 flowchart LR
     W["new file"] --> P{"fast tier below<br/>its low watermark?"}
-    P -- yes --> L["Landing zone<br/>(SSD)"]
-    P -- "no — full" --> C["Capacity<br/>(HDD / cloud)"]
+    P -- yes --> L["Landing zone<br/>SSD"]
+    P -- "no — it is full" --> C["Capacity<br/>HDD or cloud"]
     L -- "settled: closed,<br/>clean, unchanged" --> D["Drainer<br/>copy down, re-validate,<br/>then free the fast tier"]
     D --> C
+
+    classDef primary fill:#E3F2FD,stroke:#42A5F5,stroke-width:1.5px,color:#0D47A1,rx:8,ry:8
+    classDef surface fill:#FFFFFF,stroke:#CFD8DC,stroke-width:1.5px,color:#37474F,rx:8,ry:8
+    classDef store fill:#E8F5E9,stroke:#66BB6A,stroke-width:1.5px,color:#1B5E20,rx:8,ry:8
+    classDef warn fill:#FFF8E1,stroke:#FFB300,stroke-width:1.5px,color:#E65100,rx:8,ry:8
+    classDef danger fill:#FFEBEE,stroke:#EF5350,stroke-width:1.5px,color:#B71C1C,rx:8,ry:8
+    classDef accent fill:#EDE7F6,stroke:#7E57C2,stroke-width:1.5px,color:#4527A0,rx:8,ry:8
+    classDef decision fill:#ECEFF1,stroke:#90A4AE,stroke-width:1.5px,color:#37474F
+    class W primary
+    class P decision
+    class L,C store
+    class D surface
 ```
 
 ### The recycle bin
@@ -188,14 +241,29 @@ file's duplication level on the way back — a recovered file that is one bad se
 only half recovered.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","lineColor":"#90A4AE","textColor":"#37474F","clusterBkg":"#FAFAFA","clusterBorder":"#E0E0E0","edgeLabelBackground":"#FFFFFF"}}}%%
 flowchart TD
     Del["delete file"] --> On{"trash<br/>enabled?"}
-    On -- no --> Gone["copies removed<br/>— permanent"]
-    On -- yes --> Move["rename ONE copy into<br/>.drivebenderutility/trash<br/>+ .trashinfo sidecar;<br/>drop the others"]
+    On -- no --> Gone["every copy removed<br/>permanently"]
+    On -- yes --> Move["rename ONE copy into the hidden<br/>trash tree with a .trashinfo sidecar<br/>and drop the others"]
     Move --> Bin["Recycle bin<br/>listed by CLI, API and the dashboard"]
-    Bin --> R["restore"] --> Back["file back at its original path,<br/>duplication re-established"]
-    Bin --> Pol["retention / max-size policy"] --> Purge["oldest purged for good"]
-    Bin -. "member removed from the pool" .-> Scatter["bin moves to the<br/>remaining members"]
+    Bin --> R["restore"] --> Back["back at its original path,<br/>duplication re-established"]
+    Bin --> Pol["retention and size policy"] --> Purge["oldest purged for good"]
+    Bin -. "member removed from the pool" .-> Scatter["the bin moves to<br/>the remaining members"]
+
+    classDef primary fill:#E3F2FD,stroke:#42A5F5,stroke-width:1.5px,color:#0D47A1,rx:8,ry:8
+    classDef surface fill:#FFFFFF,stroke:#CFD8DC,stroke-width:1.5px,color:#37474F,rx:8,ry:8
+    classDef store fill:#E8F5E9,stroke:#66BB6A,stroke-width:1.5px,color:#1B5E20,rx:8,ry:8
+    classDef warn fill:#FFF8E1,stroke:#FFB300,stroke-width:1.5px,color:#E65100,rx:8,ry:8
+    classDef danger fill:#FFEBEE,stroke:#EF5350,stroke-width:1.5px,color:#B71C1C,rx:8,ry:8
+    classDef accent fill:#EDE7F6,stroke:#7E57C2,stroke-width:1.5px,color:#4527A0,rx:8,ry:8
+    classDef decision fill:#ECEFF1,stroke:#90A4AE,stroke-width:1.5px,color:#37474F
+    class Del primary
+    class On decision
+    class Gone,Purge danger
+    class Move,Pol,R surface
+    class Bin accent
+    class Back,Scatter store
 ```
 
 ### Snapshots
@@ -220,20 +288,34 @@ design:
 | Never touched again | **Nothing at all** — the snapshot's copy *is* the live file. Most of a backup pool. |
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","lineColor":"#90A4AE","textColor":"#37474F","clusterBkg":"#FAFAFA","clusterBorder":"#E0E0E0","edgeLabelBackground":"#FFFFFF"}}}%%
 flowchart TD
-    T["take snapshot"] --> Idx["record the namespace<br/>(no data copied)"]
+    T["take snapshot"] --> Idx["record the namespace<br/>no data copied"]
     Idx --> Pin["every path pinned"]
 
     Pin --> Ev{"something would destroy<br/>a pinned version"}
-    Ev -- "whole file replaced<br/>or deleted" --> Ren["<b>rename</b> live file into the store<br/>— no bytes moved"]
-    Ev -- "modified in place,<br/>or renamed" --> Cop["<b>copy</b> into the store<br/>— untouched bytes must survive twice"]
-    Ev -- "never touched" --> None["nothing stored;<br/>the live file IS the version"]
+    Ev -- "whole file replaced,<br/>or deleted" --> Ren["RENAME the live file<br/>into the store — no bytes moved"]
+    Ev -- "modified in place,<br/>or renamed" --> Cop["COPY into the store<br/>untouched bytes must survive twice"]
+    Ev -- "never touched" --> None["nothing stored<br/>the live file IS the version"]
 
-    Ren --> Un["path unpinned —<br/>later writes cost nothing<br/>until the next snapshot"]
+    Ren --> Un["path unpinned — later writes cost<br/>nothing until the next snapshot"]
     Cop --> Un
 
-    Un --> Rd["read as of the snapshot:<br/>earliest version after it was taken,<br/>else the live file"]
-    Un --> Dl["delete snapshot:<br/>drop its pin; version goes<br/>when the last pin does"]
+    Un --> Rd["read as of the snapshot:<br/>earliest version after it was taken,<br/>otherwise the live file"]
+    Un --> Dl["delete snapshot: drop its pin;<br/>the version goes when the last pin does"]
+
+    classDef primary fill:#E3F2FD,stroke:#42A5F5,stroke-width:1.5px,color:#0D47A1,rx:8,ry:8
+    classDef surface fill:#FFFFFF,stroke:#CFD8DC,stroke-width:1.5px,color:#37474F,rx:8,ry:8
+    classDef store fill:#E8F5E9,stroke:#66BB6A,stroke-width:1.5px,color:#1B5E20,rx:8,ry:8
+    classDef warn fill:#FFF8E1,stroke:#FFB300,stroke-width:1.5px,color:#E65100,rx:8,ry:8
+    classDef danger fill:#FFEBEE,stroke:#EF5350,stroke-width:1.5px,color:#B71C1C,rx:8,ry:8
+    classDef accent fill:#EDE7F6,stroke:#7E57C2,stroke-width:1.5px,color:#4527A0,rx:8,ry:8
+    classDef decision fill:#ECEFF1,stroke:#90A4AE,stroke-width:1.5px,color:#37474F
+    class T primary
+    class Ev decision
+    class Ren,None store
+    class Cop warn
+    class Idx,Pin,Un,Rd,Dl surface
 ```
 
 > **A snapshot is not a backup.** It shares the pool's disks and its failure domains: it protects
