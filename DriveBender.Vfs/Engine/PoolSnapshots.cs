@@ -251,6 +251,13 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
     return versionPath;
   }
 
+  /// <summary>What the version store is currently occupying, across every online member.</summary>
+  public long StoreBytes() => this._Versions().Sum(v => v.member.Stat(v.versionPath, false)?.Length ?? 0);
+
+  /// <summary>What one snapshot is costing: the versions it pins, with a shared version counted once.</summary>
+  public long BytesHeldBy(Guid id)
+    => this._Versions().Where(v => v.info.Pins.Contains(id)).Sum(v => v.member.Stat(v.versionPath, false)?.Length ?? 0);
+
   /// <summary>The snapshots that still point at the live content of a path — the pins an aside must carry.</summary>
   public IReadOnlyList<Guid> SnapshotsNeeding(string normalizedPath) {
     var versions = this._Versions().Where(v => PoolPaths.PathComparer.Equals(v.info.OriginalPath, normalizedPath)).ToArray();

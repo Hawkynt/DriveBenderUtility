@@ -598,6 +598,8 @@ function patchCard(c, pool) {
     add("Mount", "primary", () => mountPool(pool));
   add("Browse", "", () => browseDialog(pool, ""));
   add("Recycle bin", "", () => trashDialog(pool));
+  if (pool.mounted)
+    add("Snapshots", "", () => snapshotDialog(pool));
   add("Health", "", () => healthDialog(pool, false));
   add("Fix", "", () => healthDialog(pool, true));
   add("Restore", "", async () => {
@@ -697,6 +699,113 @@ async function healthDialog(pool, fix, deep) {
 
 // Pool browser (FR-UI-MAP): a tree-style listing with one column per member showing exactly
 // where every file/folder physically lives — ✅ primary copy, 🔁 shadow copy, ❌ not present.
+// Snapshots. Deliberately blunt about two things the UI is the only place to say: a snapshot is not
+// a backup, and what one costs depends on how the files in it get written. See docs/Snapshots.md.
+async function snapshotDialog(pool) {
+  const body = el("div");
+  body.innerHTML = `<p class="hint">Loading…</p>`;
+  infoModal(`Snapshots — ${esc(pool.name)}`, body, true);
+  await snapshotsInto(pool, body);
+}
+
+async function snapshotsInto(pool, body) {
+  const j = await fetch(`/api/pool/snapshots?pool=${pool.id}&token=${encodeURIComponent(token)}`)
+    .then(r => r.json()).catch(e => ({ ok: false, error: String(e) }));
+  if (!j.ok) { body.innerHTML = `<p class="hint">Could not read the snapshots: ${esc(j.error || "")}</p>`; return; }
+
+  const shots = (j.result && j.result.snapshots) || [];
+  const store = (j.result && j.result.storeBytes) || 0;
+
+  body.innerHTML = `
+    <p class="hint"><b>A snapshot is not a backup.</b> It shares this pool's disks, so it protects
+      against deleting or overwriting a file — not against losing the storage underneath it.</p>
+    ${shots.length ? `<table class="browse"><thead><tr>
+      <th style="text-align:left">Snapshot</th><th>Taken</th><th>Paths</th><th>Holding</th><th></th>
+    </tr></thead><tbody>
+      ${shots.map((s, i) => `<tr>
+        <td>📷 ${esc(s.name)}</td>
+        <td class="sz" title="${esc(s.createdUtc)}">${esc(trashAge(s.createdUtc))}</td>
+        <td class="sz">${s.files}</td>
+        <td class="sz">${fmtBytes(s.bytesHeld)}</td>
+        <td class="sz"><button data-browse="${i}">Browse</button> <button class="danger" data-drop="${i}">Delete</button></td>
+      </tr>`).join("")}
+    </tbody></table>
+    <p class="hint">The store is holding ${fmtBytes(store)}. A snapshot costs nothing when taken and
+      nothing for files nobody touches; it starts costing when a file it names is replaced or deleted.</p>`
+    : `<p class="hint">No snapshots yet.</p>`}
+    <p><input id="snapname" placeholder="name this snapshot" style="min-width:16rem"> <button class="primary" id="snaptake">Take snapshot</button></p>`;
+
+  const take = body.querySelector("#snaptake");
+  take.onclick = async () => {
+    const name = (body.querySelector("#snapname").value || "").trim();
+    if (!name) { alert("Give the snapshot a name."); return; }
+    take.disabled = true;
+    if (await op(`/api/pool/snapshots/take?pool=${pool.id}&name=${encodeURIComponent(name)}`))
+      await snapshotsInto(pool, body);
+    else
+      take.disabled = false;
+  };
+
+  body.querySelectorAll("button[data-drop]").forEach(button => {
+    button.onclick = async () => {
+      const shot = shots[Number(button.dataset.drop)];
+      if (!confirm(`Forget the snapshot "${shot.name}"?\n\nVersions no other snapshot needs are deleted for good.`))
+        return;
+
+      button.disabled = true;
+      if (await op(`/api/pool/snapshots/delete?pool=${pool.id}&id=${encodeURIComponent(shot.id)}`))
+        await snapshotsInto(pool, body);
+      else
+        button.disabled = false;
+    };
+  });
+
+  body.querySelectorAll("button[data-browse]").forEach(button => {
+    button.onclick = () => snapshotBrowse(pool, shots[Number(button.dataset.browse)], body);
+  });
+}
+
+async function snapshotBrowse(pool, shot, body) {
+  body.innerHTML = `<p class="hint">Loading ${esc(shot.name)}…</p>`;
+  const j = await fetch(`/api/pool/snapshots/browse?pool=${pool.id}&id=${encodeURIComponent(shot.id)}&token=${encodeURIComponent(token)}`)
+    .then(r => r.json()).catch(e => ({ ok: false, error: String(e) }));
+  if (!j.ok) { body.innerHTML = `<p class="hint">Could not read it: ${esc(j.error || "")}</p>`; return; }
+
+  const entries = (j.result && j.result.entries) || [];
+  body.innerHTML = `
+    <p class="fp-path">📷 ${esc(shot.name)} — ${esc(shot.createdUtc)}</p>
+    ${entries.length ? `<table class="browse"><thead><tr>
+      <th style="text-align:left">File as it was</th><th>Size</th><th>Kept</th><th></th>
+    </tr></thead><tbody>
+      ${entries.map((e, i) => `<tr>
+        <td>📄 ${esc(e.path)}</td>
+        <td class="sz">${fmtBytes(e.length)}</td>
+        <td class="sz" title="${e.preserved ? "a version was set aside when the live file changed" : "nothing has touched it — the live file is this snapshot's content"}">${e.preserved ? "version" : "unchanged"}</td>
+        <td class="sz"><button data-restore="${i}">Restore</button></td>
+      </tr>`).join("")}
+    </tbody></table>` : `<p class="hint">This snapshot names no files that still exist.</p>`}
+    <p class="hint"><button id="snapback">← all snapshots</button> Restoring overwrites the live file —
+      which is itself preserved first, for any newer snapshot that still needs it.</p>`;
+
+  body.querySelector("#snapback").onclick = () => snapshotsInto(pool, body);
+  body.querySelectorAll("button[data-restore]").forEach(button => {
+    button.onclick = async () => {
+      const entry = entries[Number(button.dataset.restore)];
+      if (!confirm(`Put "${entry.path}" back as it was in "${shot.name}"?\n\nThe current version is replaced.`))
+        return;
+
+      button.disabled = true;
+      button.textContent = "Restoring…";
+      if (await op(`/api/pool/snapshots/restore?pool=${pool.id}&id=${encodeURIComponent(shot.id)}&path=${encodeURIComponent(entry.path)}`))
+        await snapshotBrowse(pool, shot, body);
+      else {
+        button.disabled = false;
+        button.textContent = "Restore";
+      }
+    };
+  });
+}
+
 // The recycle bin. The engine has moved deleted files aside since deletes were first journalled;
 // until now nothing could open it, which made it a disk-space cost with no benefit. For a pool used
 // as a backup target this is the screen someone reaches for in a hurry, so it says plainly what is

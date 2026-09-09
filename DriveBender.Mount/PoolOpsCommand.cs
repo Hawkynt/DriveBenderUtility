@@ -215,6 +215,80 @@ internal static class PoolOpsCommand {
   /// no screen. A recycle bin nobody can open is a disk-space cost with no benefit, and for a pool
   /// used as a backup target it is the single most likely thing an operator needs in a hurry.
   /// </summary>
+  /// <summary>
+  /// The snapshot verbs (docs/Snapshots.md).
+  ///
+  /// Every one of them REQUIRES the pool to be mounted, and that is not an accident of the plumbing.
+  /// The engine keeps the set of pinned paths in memory and consults it before every write; a second
+  /// process taking a snapshot of an unmounted pool would write an index that the running engine
+  /// never learns about, and the versions it names would be destroyed by the next write to them. So
+  /// these relay into the process that owns the pool, or say plainly that there is not one.
+  /// </summary>
+  private static int _SnapshotOp(IPoolProvider provider, MountRegistry registry, string poolRef, string op, Func<string, int> onAnswer) {
+    var pools = provider.Discover();
+    var pool = (Guid.TryParse(poolRef, out var id)
+                 ? pools.FirstOrDefault(p => p.PoolId == id)
+                 : pools.FirstOrDefault(p => p.Name.Equals(poolRef, StringComparison.OrdinalIgnoreCase)))
+               ?? throw new ManifestException($"No pool '{poolRef}'");
+
+    if (_RelayToMount(registry, pool, op, TimeSpan.FromHours(2)) is not { } json) {
+      Console.Error.WriteLine(
+        $"Pool '{pool.Name}' is not mounted. Snapshots are kept by the running engine — it tracks "
+        + $"which files a snapshot still needs before every write — so mount the pool first "
+        + $"(dbmount mount {pool.Name} <target>).");
+      return ExitError;
+    }
+
+    return onAnswer(json);
+  }
+
+  public static int SnapshotTake(IPoolProvider provider, MountRegistry registry, PoolSnapshotTakeOptions options)
+    => _SnapshotOp(provider, registry, options.Pool, $"snapshot-take:{options.Name}", json => {
+      using var document = System.Text.Json.JsonDocument.Parse(json);
+      var root = document.RootElement;
+      Console.WriteLine($"Snapshot '{options.Name}' taken over {root.GetProperty("files").GetInt32()} path(s): {root.GetProperty("id").GetGuid():D}");
+      Console.WriteLine("  No data was copied. It starts costing only when a file it names is changed or deleted.");
+      return 0;
+    });
+
+  public static int SnapshotList(IPoolProvider provider, MountRegistry registry, PoolSnapshotListOptions options)
+    => _SnapshotOp(provider, registry, options.Pool, "snapshot-list", json => {
+      if (options.Json) {
+        Console.WriteLine(json);
+        return 0;
+      }
+
+      using var document = System.Text.Json.JsonDocument.Parse(json);
+      var root = document.RootElement;
+      var snapshots = root.GetProperty("snapshots").EnumerateArray().ToArray();
+      if (snapshots.Length == 0) {
+        Console.WriteLine($"Pool '{options.Pool}': no snapshots.");
+        return 0;
+      }
+
+      Console.WriteLine($"Pool '{options.Pool}': {snapshots.Length} snapshot(s), store holding {root.GetProperty("storeBytes").GetInt64():N0} bytes.");
+      foreach (var snapshot in snapshots)
+        Console.WriteLine($"  {snapshot.GetProperty("createdUtc").GetDateTime():yyyy-MM-dd HH:mm:ss}  "
+                          + $"{snapshot.GetProperty("bytesHeld").GetInt64(),12:N0}  "
+                          + $"{snapshot.GetProperty("files").GetInt32(),8} paths  "
+                          + $"{snapshot.GetProperty("id").GetGuid():D}  {snapshot.GetProperty("name").GetString()}");
+
+      return 0;
+    });
+
+  public static int SnapshotDelete(IPoolProvider provider, MountRegistry registry, PoolSnapshotDeleteOptions options)
+    => _SnapshotOp(provider, registry, options.Pool, $"snapshot-delete:{options.Id}", json => {
+      using var document = System.Text.Json.JsonDocument.Parse(json);
+      Console.WriteLine($"Snapshot {options.Id} forgotten; {document.RootElement.GetProperty("released").GetInt32()} version(s) released.");
+      return 0;
+    });
+
+  public static int SnapshotRestore(IPoolProvider provider, MountRegistry registry, PoolSnapshotRestoreOptions options)
+    => _SnapshotOp(provider, registry, options.Pool, $"snapshot-restore:{options.Id}:{options.Path}", _ => {
+      Console.WriteLine($"Restored '{options.Path}' from snapshot {options.Id}.");
+      return 0;
+    });
+
   public static int TrashList(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, PoolTrashListOptions options) {
     var (pool, online, _, _, _) = _Open(host, provider, remoteResolver, options.Pool);
     var ios = online.Select(m => m.io).ToArray();

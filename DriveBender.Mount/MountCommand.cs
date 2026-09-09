@@ -246,6 +246,53 @@ internal static class MountCommand {
           json = System.Text.Json.JsonSerializer.Serialize(new { ok = true, copiesCreated = report.CopiesCreated });
           break;
         }
+        case not null when op.StartsWith("snapshot-take:", StringComparison.Ordinal): {
+          var taken = fs.TakeSnapshot(op["snapshot-take:".Length..]);
+          json = System.Text.Json.JsonSerializer.Serialize(new {
+            ok = true, id = taken.Id, name = taken.Name, createdUtc = taken.CreatedUtc, files = taken.Files,
+          });
+          break;
+        }
+        case "snapshot-list": {
+          json = System.Text.Json.JsonSerializer.Serialize(new {
+            ok = true,
+            snapshots = fs.ListSnapshots().Select(s => new {
+              id = s.Id, name = s.Name, createdUtc = s.CreatedUtc, files = s.Files,
+              // what this one is actually costing, which is the number an operator needs before
+              // deciding which to drop
+              bytesHeld = fs.Snapshots.BytesHeldBy(s.Id),
+            }),
+            storeBytes = fs.Snapshots.StoreBytes(),
+          });
+          break;
+        }
+        case not null when op.StartsWith("snapshot-delete:", StringComparison.Ordinal): {
+          var released = Guid.TryParse(op["snapshot-delete:".Length..], out var target)
+            ? fs.DeleteSnapshot(target)
+            : throw new ManifestException("snapshot-delete needs a snapshot id");
+          json = System.Text.Json.JsonSerializer.Serialize(new { ok = true, released });
+          break;
+        }
+        case not null when op.StartsWith("snapshot-restore:", StringComparison.Ordinal): {
+          var rest = op["snapshot-restore:".Length..];
+          var split = rest.IndexOf(':');
+          if (split <= 0 || !Guid.TryParse(rest[..split], out var restoring))
+            throw new ManifestException("snapshot-restore needs <id>:<path>");
+
+          fs.RestoreFromSnapshot(restoring, rest[(split + 1)..]);
+          json = System.Text.Json.JsonSerializer.Serialize(new { ok = true });
+          break;
+        }
+        case not null when op.StartsWith("snapshot-browse:", StringComparison.Ordinal): {
+          var browsing = Guid.TryParse(op["snapshot-browse:".Length..], out var parsed)
+            ? parsed
+            : throw new ManifestException("snapshot-browse needs a snapshot id");
+          json = System.Text.Json.JsonSerializer.Serialize(new {
+            ok = true,
+            entries = fs.BrowseSnapshot(browsing).Select(e => new { path = e.Path, preserved = e.Preserved, length = e.Length }),
+          });
+          break;
+        }
         case "trash-list": {
           // Read straight off the live engine. Listing the recycle bin of a MOUNTED pool from
           // outside would mean a second process walking members the mount is serving from, which is

@@ -255,6 +255,42 @@ internal sealed class ServeCommand(
             ["pool-replace-media", this._RequirePool(request), "--old", request.QueryString["old"] ?? "", "--new", request.QueryString["new"] ?? ""],
             subject: request.QueryString["old"] ?? "")));
           break;
+        case "/api/pool/snapshots" when request.HttpMethod == "GET":
+          this._WriteJson(context, this._PoolOp(this._RequirePool(request), "snapshot-list",
+            ["pool-snapshot-list", this._RequirePool(request), "--json"]));
+          break;
+        case "/api/pool/snapshots/take" when request.HttpMethod == "POST": {
+          var label = request.QueryString["name"];
+          this._WriteJson(context, string.IsNullOrWhiteSpace(label)
+            ? _Guard(() => throw new ManifestException("taking a snapshot needs ?name=<label>"))
+            : this._PoolOp(this._RequirePool(request), $"snapshot-take:{label}",
+              ["pool-snapshot-take", this._RequirePool(request), label]));
+          break;
+        }
+        case "/api/pool/snapshots/delete" when request.HttpMethod == "POST": {
+          var which = request.QueryString["id"];
+          this._WriteJson(context, string.IsNullOrWhiteSpace(which)
+            ? _Guard(() => throw new ManifestException("deleting a snapshot needs ?id=<snapshot id>"))
+            : this._PoolOp(this._RequirePool(request), $"snapshot-delete:{which}",
+              ["pool-snapshot-delete", this._RequirePool(request), which]));
+          break;
+        }
+        case "/api/pool/snapshots/browse" when request.HttpMethod == "GET": {
+          var which = request.QueryString["id"];
+          this._WriteJson(context, string.IsNullOrWhiteSpace(which)
+            ? _Guard(() => throw new ManifestException("browsing a snapshot needs ?id=<snapshot id>"))
+            : this._PoolOp(this._RequirePool(request), $"snapshot-browse:{which}", []));
+          break;
+        }
+        case "/api/pool/snapshots/restore" when request.HttpMethod == "POST": {
+          var which = request.QueryString["id"];
+          var file = request.QueryString["path"];
+          this._WriteJson(context, string.IsNullOrWhiteSpace(which) || string.IsNullOrWhiteSpace(file)
+            ? _Guard(() => throw new ManifestException("restoring needs ?id=<snapshot id>&path=<file>"))
+            : this._PoolOp(this._RequirePool(request), $"snapshot-restore:{which}:{file}",
+              ["pool-snapshot-restore", this._RequirePool(request), which, file]));
+          break;
+        }
         case "/api/pool/trash" when request.HttpMethod == "GET":
           this._WriteJson(context, this._PoolOp(this._RequirePool(request), "trash-list",
             ["pool-trash-list", this._RequirePool(request), "--json"]));
