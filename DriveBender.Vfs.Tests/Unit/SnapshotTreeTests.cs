@@ -222,6 +222,32 @@ public class SnapshotTreeTests {
 
   [Test]
   [Category("Exception")]
+  public void Tree_GivenTheWindowsTwoStepDelete_ThenValidationRefusesItRatherThanCleanupSwallowingIt() {
+    // The Windows drivers do not delete where they are told to. WinFsp asks CanDelete and Dokan asks
+    // DeleteFile — both validation only — and the removal happens later in Cleanup, where a callback
+    // may not let an exception escape and a failure can only be logged. So a path the engine refuses
+    // to delete came back to the application as a SUCCESSFUL delete with the file still there, which
+    // is the one outcome worse than failing. This is the seam that stops it, and the property worth
+    // pinning is that the two doors agree.
+    var fs = this._Mounted();
+    _Write(fs, "report.doc", [1, 1]);
+    fs.TakeSnapshot("monday");
+
+    var validate = () => fs.RequireUnlinkable(".snapshots/monday/report.doc");
+    validate.Should().Throw<PoolFsException>("validation has to refuse what the delete would refuse")
+      .Where(e => e.Error == PoolFsError.AccessDenied);
+
+    var deleteIt = () => fs.Unlink(".snapshots/monday/report.doc");
+    deleteIt.Should().Throw<PoolFsException>().Where(e => e.Error == PoolFsError.AccessDenied,
+      "and it refuses it for the same reason — a validation that answers differently from the "
+      + "operation is worse than none, because it is trusted");
+
+    var ordinary = () => fs.RequireUnlinkable("report.doc");
+    ordinary.Should().NotThrow("while an ordinary file is deletable and validation must say so");
+  }
+
+  [Test]
+  [Category("Exception")]
   public void Tree_GivenAWriteThroughAReadHandle_ThenItIsRefusedRatherThanSilentlyDropped() {
     var fs = this._Mounted();
     _Write(fs, "report.doc", [1, 1]);

@@ -1445,6 +1445,23 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   #endregion
 
+  /// <summary>
+  /// Throws exactly what a delete of this path would throw, without deleting anything.
+  ///
+  /// The Windows drivers do not remove a file where they are told to. WinFsp asks <c>CanDelete</c>
+  /// and Dokan asks <c>DeleteFile</c>, both of which are validation only; the removal happens later,
+  /// in <c>Cleanup</c>, where a driver callback must never let an exception escape and a failure can
+  /// therefore only be logged. So a path the engine refuses to delete is reported to the application
+  /// as a successful delete, and the file quietly stays — which is the one outcome worse than
+  /// failing, because nothing downstream can tell.
+  ///
+  /// Validation has to answer the same question the operation does, so it asks the same code.
+  /// </summary>
+  public void RequireUnlinkable(string path) {
+    this._RequireWritable();
+    _RefuseWriteToSnapshotTree(PoolPaths.Normalize(path));
+  }
+
   public void Unlink(string path) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);

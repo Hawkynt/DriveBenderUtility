@@ -70,6 +70,20 @@ public interface IPoolFileSystem : IDisposable {
   NodeHandle Open(string path, AccessMode mode, ShareMode share);
   void Rename(string from, string to, RenameFlags flags);
   void Unlink(string path);
+
+  /// <summary>
+  /// Throws exactly what <see cref="Unlink"/> would throw for this path, without deleting anything.
+  ///
+  /// For drivers whose delete is split in two. WinFsp asks <c>CanDelete</c> and Dokan asks
+  /// <c>DeleteFile</c> — both validation only — and the removal happens later in <c>Cleanup</c>,
+  /// where a callback may not let an exception escape and a failure can only be logged. Without a
+  /// way to refuse at validation time, a path the engine will not delete is reported to the
+  /// application as a successful delete and the file quietly stays.
+  ///
+  /// The default is the honest one for a backend that has nothing extra to say: nothing is refused
+  /// here, and the delete itself decides.
+  /// </summary>
+  void RequireUnlinkable(string path) { }
   void MakeDir(string path);
   void RemoveDir(string path);
 

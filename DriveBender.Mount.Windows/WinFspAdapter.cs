@@ -304,6 +304,9 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
   public override int CanDelete(object fileNode, object fileDesc, string fileName) {
     var descriptor = (FileDescriptor)fileDesc;
     try {
+      // Cleanup does the removal and cannot report a failure, so anything the engine would refuse
+      // has to be refused HERE or the application is told the delete succeeded and nothing happened
+      pool.RequireUnlinkable(descriptor.Path);
       if (descriptor.IsDirectory && pool.ReadDirectory(descriptor.Path).Count > 0)
         return STATUS_DIRECTORY_NOT_EMPTY;
 
