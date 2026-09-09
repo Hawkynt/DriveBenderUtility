@@ -28,10 +28,16 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
       switch (intent.Op) {
         case JournalOp.Delete when intent.Path != null:
           // roll forward: some copies may already be gone; remove the rest (FR-DELETE)
+          if (this._WouldDestroyNewerContent(intent, intent.Path))
+            break;
+
           rolledForward += this._DeleteAllCopies(intent.Path) ? 1 : 0;
           break;
 
         case JournalOp.Rename or JournalOp.TrashMove when intent is { Path: not null, TargetPath: not null }:
+          if (this._WouldDestroyNewerContent(intent, intent.Path))
+            break;
+
           rolledForward += this._RollForwardRename(intent.Path, intent.TargetPath) ? 1 : 0;
           break;
 
@@ -53,6 +59,47 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
     var tempsRemoved = this._RemoveOrphanedTemps();
     journal.Checkpoint();
     return new(rolledForward, reconciled, tempsRemoved);
+  }
+
+  /// <summary>
+  /// Whether rolling this intent forward would destroy content that CANNOT be what it was about.
+  ///
+  /// An intent is written before the operation and completed after it, so a crash can leave one
+  /// behind that genuinely needs finishing. A journal can also arrive from somewhere else entirely:
+  /// a member restored from a backup, a hidden folder copied across, an old <c>.drivebenderutility</c>
+  /// put back by hand. Then it describes work that finished long ago, against a path that has since
+  /// been recreated — and finishing it deletes a file nobody asked to delete, with the recovery
+  /// machinery itself as the cause. That is the worst possible source of data loss.
+  ///
+  /// The two are told apart by time. In a real crash the file was written BEFORE the delete was
+  /// logged, so its mtime is older than the intent. A file whose mtime is NEWER than the intent was
+  /// written after the operation was recorded and therefore cannot be the content the operation was
+  /// about; destroying it would finish an operation that already happened to something else.
+  ///
+  /// An intent with no timestamp — written by an older version, or forged — proves nothing about
+  /// when it was made, so it never gets to destroy anything. Declining costs an unacknowledged
+  /// operation that the caller was never told had succeeded; proceeding costs the file.
+  /// </summary>
+  private bool _WouldDestroyNewerContent(JournalRecord intent, string path) {
+    var newest = DateTime.MinValue;
+    foreach (var member in this._Online)
+      foreach (var shadow in new[] { false, true })
+        if (member.FileExists(path, shadow) && member.Stat(path, shadow) is { } meta && meta.LastWriteTimeUtc > newest)
+          newest = meta.LastWriteTimeUtc;
+
+    if (newest == DateTime.MinValue)
+      return false; // nothing there to destroy; rolling forward is a no-op either way
+
+    if (intent.LoggedUtc > DateTime.MinValue && newest <= intent.LoggedUtc)
+      return false; // older than the intent: this really is the file the intent was about
+
+    DriveBender.Logger(
+      $"[Warning]Journal intent #{intent.Sequence} ({intent.Op} '{path}') is not being rolled forward: "
+      + $"the file there was written {(intent.LoggedUtc > DateTime.MinValue ? $"at {newest:u}, after the intent was logged at {intent.LoggedUtc:u}" : $"at {newest:u} and the intent carries no timestamp")}. "
+      + "A journal describing work already done — a restored disk, a copied-back hidden folder — must "
+      + "not delete a file that is here now.");
+
+    return true;
   }
 
   private bool _DeleteAllCopies(string path) {

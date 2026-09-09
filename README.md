@@ -610,6 +610,11 @@ flowchart TD
 > A pool that already contains a real folder named `.snapshots` will find it shadowed by the view.
 > Rename it before mounting.
 
+A snapshot will **not** serve the live file in place of a version it has lost — to a pulled disk, a
+deleted sidecar, or somebody tidying a hidden folder. Reading it fails instead, loudly. Handing back
+today's content under Monday's name is undetectable downstream, and a restore driven off it would
+overwrite the good copy. See [docs/Tampering.md](docs/Tampering.md).
+
 ## 📁 Project structure
 
 The solution is organized into the following projects:

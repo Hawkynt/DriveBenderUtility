@@ -158,16 +158,25 @@ public class TrashEndToEndTests {
     listed.StandardOutput.Should().Contain("accounts/2026-q1.xlsx",
       $"a deleted file has to be FINDABLE before it can be recovered.{Environment.NewLine}{listed.Output}");
 
-    // restoring writes to the members, so it runs with the pool unmounted — and says so if not
-    var refused = DbMount.Run(TimeSpan.FromMinutes(2), "pool-trash-restore", pool.PoolName, "accounts/2026-q1.xlsx");
-    refused.Succeeded.Should().BeFalse("restoring rewrites members, which a second engine must not do while mounted");
-
-    pool.WhileUnmounted(() => DbMount.RunExpectingSuccess(TimeSpan.FromMinutes(2),
-      "pool-trash-restore", pool.PoolName, "accounts/2026-q1.xlsx"));
+    // Restoring rewrites members, which a second engine must never do under a live mount — so it is
+    // handed to the process that already owns the pool rather than refused. Refusing was correct and,
+    // on its own, a dead end: the pool people restore from is the one that is up and serving, and
+    // "unmount your backup target first" is not an answer.
+    var restored = DbMount.RunExpectingSuccess(TimeSpan.FromMinutes(2),
+      "pool-trash-restore", pool.PoolName, "accounts/2026-q1.xlsx");
+    restored.Output.Should().Contain("inside the process that owns it",
+      $"it must have been RELAYED, not run here — two engines over one member set corrupt each other."
+      + $"{Environment.NewLine}{restored.Output}");
 
     File.Exists(path).Should().BeTrue(
       $"the file must come back at its original path.{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
     File.ReadAllBytes(path).Should().Equal(content, "and with the bytes it was deleted with");
+
+    // the engine's restore, unlike the CLI's own, puts the duplication back too — a recovered file
+    // that is quietly down to one copy is not really recovered
+    pool.WaitForPhysicalCopies("accounts/2026-q1.xlsx", atLeast: 2).Should().HaveCountGreaterThanOrEqualTo(2,
+      $"a file restored through the running engine comes back redundant."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
 
     var after = DbMount.RunExpectingSuccess(TimeSpan.FromMinutes(2), "pool-trash-list", pool.PoolName, "--json");
     after.StandardOutput.Should().NotContain("2026-q1.xlsx",
