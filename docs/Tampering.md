@@ -71,6 +71,22 @@ An intent with **no** timestamp — written by an older version, or forged — p
 it was made and never gets to destroy anything. Declining costs an operation the caller was never
 told had succeeded. Proceeding costs the file.
 
+## Whole, or an error — never something in between
+
+A read that cannot be served must not return what it *could* reach. An application that asks for a
+file and gets back fewer bytes with no error has no way to know it was truncated: it writes the short
+version to its backup, and the loss is permanent and invisible.
+
+So a read has exactly two legitimate answers — the whole file, or a failure. Which of the two you get
+when a member is failing depends on caches and on how many copies exist, and both are fine. The third
+possibility is the one that must never happen, and it is what the read-fault tests assert.
+
+Deleting a sidecar is the obvious tamper; **renaming** it is the likelier one — a sync tool resolving
+a conflict appends " (1)", a user adds `.bak` before editing, a filesystem check moves what it cannot
+place into `lost+found`. The renamed file is still *there*, which is what makes it different: the
+danger is not losing it but reading it as something it is not. Covered for the journal and for both
+snapshot sidecars.
+
 ## A dying disk is not a missing one
 
 Three failure shapes, treated differently, and the tamper suite covers all three:

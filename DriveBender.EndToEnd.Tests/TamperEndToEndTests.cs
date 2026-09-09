@@ -444,6 +444,139 @@ public class TamperEndToEndTests {
 
   #endregion
 
+  #region bookkeeping moved rather than removed
+
+  [Test]
+  [Description("Sidecars are RENAMED rather than deleted — the shape a tidy-up or a sync conflict actually takes.")]
+  public void Sidecars_GivenTheyAreRenamedRatherThanDeleted_ThenNothingIsSilentlyMisread() {
+    // Deleting is the obvious tamper; renaming is the likelier one. A sync tool resolving a conflict
+    // appends " (1)", a user "backs up" a file by adding .bak before editing it, a filesystem check
+    // moves what it cannot place into lost+found. The renamed copy is still THERE, which is the part
+    // that makes this different: the danger is not losing it but reading it as something it is not.
+    using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
+    var monday = _Payload(24 * 1024, 230);
+    File.WriteAllBytes(pool.PathTo("ledger.db"), monday);
+    _TakeSnapshot(pool, "monday");
+    var friday = _Payload(4 * 1024, 231);
+    File.WriteAllBytes(pool.PathTo("ledger.db"), friday);
+
+    pool.WhileUnmounted(() => {
+      var touched = 0;
+      foreach (var sidecar in _HiddenFiles(pool, ".snapinfo").Concat(_HiddenFiles(pool, ".snapver"))) {
+        File.Move(sidecar, sidecar + ".bak");
+        ++touched;
+      }
+
+      touched.Should().BeGreaterThan(0, "there has to be something to rename");
+    });
+
+    var read = _TryRead(pool.PathTo(Path.Combine(".snapshots", "monday", "ledger.db")));
+    read.content.Should().NotEqual(friday,
+      $"a version the pool can no longer recognise is unavailable — it must not fall through to the "
+      + $"live file, and a '.bak' next to it changes nothing about that."
+      + $"{Environment.NewLine}{read.error}{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+
+    File.ReadAllBytes(pool.PathTo("ledger.db")).Should().Equal(friday,
+      $"and the live namespace is untouched by any of it."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+
+    File.WriteAllBytes(pool.PathTo("after.bin"), [1, 2, 3]);
+    File.ReadAllBytes(pool.PathTo("after.bin")).Should().Equal(new byte[] { 1, 2, 3 },
+      "and the pool keeps working with a store it cannot fully read");
+  }
+
+  [Test]
+  [Description("The journal is renamed out of the way on every member: the pool mounts and writes a fresh one.")]
+  public void Journal_GivenItIsRenamedAside_ThenThePoolTreatsItAsAbsentAndCarriesOn() {
+    using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
+    var content = _Payload(16 * 1024, 232);
+    File.WriteAllBytes(pool.PathTo("kept.bin"), content);
+
+    pool.WhileUnmounted(() => {
+      foreach (var journal in _MetadataFiles(pool, $"{_UTILITY}/journal.jsonl"))
+        File.Move(journal, journal + ".old");
+    });
+
+    File.ReadAllBytes(pool.PathTo("kept.bin")).Should().Equal(content,
+      $"a journal under another name is a journal the pool does not have, which is the same as not "
+      + $"having one — and never costs a file."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+
+    File.WriteAllBytes(pool.PathTo("after.bin"), [4]);
+    File.ReadAllBytes(pool.PathTo("after.bin")).Should().Equal(new byte[] { 4 });
+  }
+
+  #endregion
+
+  #region reads that fail
+
+  [Test]
+  [Description("The member holding the only copy fails every read: the answer is the whole file or an error, never something in between.")]
+  public void Read_GivenTheOnlyCopysMemberFailsEveryRead_ThenTheAnswerIsWholeOrAnError() {
+    using var pool = MountedPool.Create(members: 2, poolDefaults: """{ "duplication": 1 }""");
+    var content = _Payload(256 * 1024, 233);
+    File.WriteAllBytes(pool.PathTo("only.bin"), content);
+    var copies = pool.WaitForPhysicalCopies("only.bin");
+    copies.Should().HaveCount(1, $"duplication 1 means one copy.{Environment.NewLine}{pool.DescribeMembers()}");
+
+    var holder = pool.MemberPaths.Select((path, index) => (path, index))
+      .First(m => copies[0].where.StartsWith(m.path, StringComparison.Ordinal)).index;
+
+    pool.Remount(); // permissions bite at open, so nothing may be held open
+    if (!pool.Cripple(holder))
+      Assert.Ignore("this filesystem cannot be crippled without root");
+
+    try {
+      // Either answer is legitimate — the pool may still be able to serve the file from a cache, and
+      // a crippled member is not automatically an unreadable one. What is NOT legitimate is the
+      // third possibility, and it is the quietest way a filesystem can betray you: an application
+      // that asks for a file and gets back FEWER bytes with no error has no way to know it was
+      // truncated. It writes the short version to its backup and the loss is permanent and invisible.
+      var read = _TryRead(pool.PathTo("only.bin"));
+      if (read.ok)
+        read.content.Should().Equal(content,
+          $"a read that SUCCEEDS must return the whole file. Serving what could be reached and "
+          + $"calling it the file is undetectable to the caller and silently corrupts anything that "
+          + $"copies it.{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+      else
+        read.error.Should().NotBeEmpty("and a read that cannot be served says so");
+    } finally {
+      pool.Uncripple(holder);
+    }
+
+    pool.Remount();
+    File.ReadAllBytes(pool.PathTo("only.bin")).Should().Equal(content,
+      $"and once the member answers again the file is whole — a read fault damages nothing."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+  }
+
+  [Test]
+  [Description("One of two copies fails every read: the other serves it, whole.")]
+  public void Read_GivenOneOfTwoCopiesFails_ThenTheOtherServesTheFileWhole() {
+    // The reason duplication is worth paying for, stated as a test. A member that answers every
+    // request with an error stays in the rotation — the online probe cannot see anything wrong with
+    // it — so it has to be routed around one failure at a time rather than filtered out.
+    using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
+    var content = _Payload(192 * 1024, 234);
+    File.WriteAllBytes(pool.PathTo("duplicated.bin"), content);
+    pool.WaitForPhysicalCopies("duplicated.bin", atLeast: 2).Should().HaveCountGreaterThanOrEqualTo(2,
+      $"there must be two copies before losing one proves anything.{Environment.NewLine}{pool.DescribeMembers()}");
+
+    pool.Remount();
+    if (!pool.Cripple(0))
+      Assert.Ignore("this filesystem cannot be crippled without root");
+
+    try {
+      File.ReadAllBytes(pool.PathTo("duplicated.bin")).Should().Equal(content,
+        $"a second copy is only redundancy if a dead first one is routed around silently and whole."
+        + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+    } finally {
+      pool.Uncripple(0);
+    }
+  }
+
+  #endregion
+
   #region the members themselves
 
   [Test]
