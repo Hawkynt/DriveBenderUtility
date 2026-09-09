@@ -164,7 +164,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
   }
 
   /// <summary>
-  /// Moves the leaving member's RECYCLE BIN onto the members that stay.
+  /// Moves the leaving member's RECYCLE BIN and SNAPSHOT STORE onto the members that stay.
   ///
   /// The scatter above walks the visible namespace, and that walk skips the pool's own hidden tree —
   /// correctly, because most of what is in there is per-member bookkeeping (this member's journal,
@@ -179,7 +179,15 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
   /// </summary>
   private int _ScatterRecoverables(IVolumeIO leaving) {
     var moved = 0;
-    foreach (var path in this._WalkFolder(leaving, PoolTrash.TrashPrefix)) {
+    foreach (var root in new[] { PoolTrash.TrashPrefix, PoolSnapshots.SnapshotPrefix })
+      moved += this._ScatterHiddenTree(leaving, root);
+
+    return moved;
+  }
+
+  private int _ScatterHiddenTree(IVolumeIO leaving, string root) {
+    var moved = 0;
+    foreach (var path in this._WalkFolder(leaving, root)) {
       var size = leaving.Stat(path, false)?.Length ?? 0;
       var target = this._ChooseTarget([], size, leaving);
       if (target == null) {

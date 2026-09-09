@@ -113,6 +113,45 @@ public sealed class PoolRestoreOptions {
   public bool Json { get; set; }
 }
 
+[Verb("pool-snapshot-take", HelpText = "Record the pool as it is now. Copies no data — see docs/Snapshots.md for what it costs later.")]
+public sealed class PoolSnapshotTakeOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+
+  [Value(1, Required = true, MetaName = "name", HelpText = "A name for the snapshot.")]
+  public string Name { get; set; } = "";
+}
+
+[Verb("pool-snapshot-list", HelpText = "List the pool's snapshots: when each was taken, how many paths it names, and what it is holding.")]
+public sealed class PoolSnapshotListOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+
+  [Option("json", HelpText = "Print the listing as JSON.")]
+  public bool Json { get; set; }
+}
+
+[Verb("pool-snapshot-delete", HelpText = "Forget a snapshot and release the versions only it was holding.")]
+public sealed class PoolSnapshotDeleteOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+
+  [Value(1, Required = true, MetaName = "id", HelpText = "Snapshot id, as shown by pool-snapshot-list.")]
+  public string Id { get; set; } = "";
+}
+
+[Verb("pool-snapshot-restore", HelpText = "Put one file back as it was at a snapshot.")]
+public sealed class PoolSnapshotRestoreOptions {
+  [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]
+  public string Pool { get; set; } = "";
+
+  [Value(1, Required = true, MetaName = "id", HelpText = "Snapshot id.")]
+  public string Id { get; set; } = "";
+
+  [Value(2, Required = true, MetaName = "path", HelpText = "Pool-relative path of the file to put back.")]
+  public string Path { get; set; } = "";
+}
+
 [Verb("pool-trash-list", HelpText = "List what the pool's recycle bin is holding: what was deleted, when, and how big.")]
 public sealed class PoolTrashListOptions {
   [Value(0, Required = true, MetaName = "pool", HelpText = "Pool name or id.")]

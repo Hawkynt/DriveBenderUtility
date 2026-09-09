@@ -533,6 +533,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._mountOptions = options;
 
+    // Which paths the snapshots still point at the LIVE file for. Held in memory because it is
+    // consulted before every write, and therefore rebuilt from the members here — without this a
+    // remount comes up with an empty set and the snapshots quietly stop protecting anything, which
+    // is the worst way for this feature to fail: nothing errors, nothing warns, and the versions
+    // simply are not kept.
+    this._RebuildPinned();
+
     // any under-duplication (writes taken while a member was away, deferred shadow placement)
     // converges in the background without waiting for an explicit repair (FR-HEAL)
     this.RequestHeal();
@@ -1066,6 +1073,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// </summary>
   public SnapshotEntry TakeSnapshot(string name) {
     this._RequireWritable();
+
+    var configured = this._config.Snapshots;
+    if ((configured?.OnReserveFull ?? SnapshotReservePolicy.DropOldest) == SnapshotReservePolicy.Refuse) {
+      var reserve = SizeSpec.Parse(configured?.Reserve ?? "10%").ResolveBytes(this.StatFs().BytesTotal);
+      if (reserve > 0 && this._snapshots.StoreBytes() > reserve)
+        throw new PoolFsException(PoolFsError.NoSpace,
+          $"The snapshot store is over its {reserve:N0}-byte reserve and the policy is 'refuse' — "
+          + "delete a snapshot, or raise snapshots.reserve.");
+    }
+
     var paths = this._AllLogicalFiles().ToArray();
     var taken = this._snapshots.Take(name, paths);
     foreach (var path in paths)
@@ -1082,6 +1099,114 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var released = this._snapshots.Delete(id);
     this._RebuildPinned();
     return released;
+  }
+
+  /// <summary>
+  /// Keeps the version store inside the reserve, dropping the oldest snapshots until it fits.
+  ///
+  /// Enforced BEFORE the aside that would grow the store rather than after, because "after" means a
+  /// pool can always be pushed one file past its ceiling — and the file that does it is arbitrarily
+  /// large. Checked only when there is at least one snapshot, so a pool that does not use the
+  /// feature never pays for it.
+  ///
+  /// Dropping the oldest is the default because the alternative — refusing to take new snapshots —
+  /// turns the feature off without saying so. Both are the operator's to choose.
+  /// </summary>
+  private void _EnforceSnapshotReserve() {
+    var configured = this._config.Snapshots;
+    var reserve = SizeSpec.Parse(configured?.Reserve ?? "10%").ResolveBytes(this.StatFs().BytesTotal);
+    if (reserve <= 0)
+      return;
+
+    var policy = configured?.OnReserveFull ?? SnapshotReservePolicy.DropOldest;
+    if (policy == SnapshotReservePolicy.Refuse)
+      return; // nothing is dropped; Take refuses instead, where the caller can be told
+
+    // oldest first, because the promise this keeps is that RECENT history is available
+    foreach (var snapshot in this._snapshots.List()) {
+      if (this._snapshots.StoreBytes() <= reserve)
+        return;
+
+      if (this._snapshots.List().Count <= 1)
+        return; // never drop the only snapshot to satisfy a ceiling — that is not a policy, it is a no-op feature
+
+      DriveBender.Logger(
+        $"[Warning]Snapshot store is over its {reserve:N0}-byte reserve — dropping '{snapshot.Name}' "
+        + $"({snapshot.CreatedUtc:u}), the oldest");
+      this._snapshots.Delete(snapshot.Id);
+    }
+  }
+
+  /// <summary>
+  /// Everything a snapshot recorded, with where each path's content actually lives now.
+  ///
+  /// <c>Preserved</c> distinguishes the two: a path whose content had to be set aside, and one that
+  /// nothing has touched since — for which the live file IS the snapshot's content and no copy of it
+  /// exists or is needed. Presenting those identically would make a snapshot of an idle pool look
+  /// empty.
+  /// </summary>
+  public IReadOnlyList<(string Path, bool Preserved, long Length)> BrowseSnapshot(Guid id) {
+    this._RequireMounted();
+    var listed = new List<(string, bool, long)>();
+    foreach (var path in this._snapshots.PathsIn(id).OrderBy(p => p, PoolPaths.PathComparer)) {
+      if (this._snapshots.Resolve(id, path) is { } version)
+        listed.Add((path, true, version.member.Stat(version.versionPath, false)?.Length ?? 0));
+      else if (this._placement.ResolveCopies(this._DataName(path)).Count > 0)
+        listed.Add((path, false, this._StatUncached(path)?.Length ?? 0));
+
+      // a path in neither place was deleted AND its version has since been released — the snapshot
+      // that held it is gone, so there is nothing honest to show for it
+    }
+
+    return listed;
+  }
+
+  /// <summary>
+  /// Opens a file as it was at a snapshot, read-only.
+  ///
+  /// Two sources, one contract: a preserved version, or the live file when nothing has touched it.
+  /// The caller cannot tell which, and should not have to.
+  /// </summary>
+  public Stream OpenSnapshotFile(Guid id, string path) {
+    this._RequireMounted();
+    var normalized = PoolPaths.Normalize(path);
+    if (this._snapshots.Resolve(id, normalized) is { } version)
+      return version.member.OpenRead(version.versionPath, false);
+
+    if (!this._snapshots.PathsIn(id).Contains(normalized, PoolPaths.PathComparer))
+      throw new PoolFsException(PoolFsError.NotFound, $"Snapshot {id:D} does not contain '{path}'");
+
+    var copies = this._placement.ResolveCopies(this._DataName(normalized));
+    if (copies.Count == 0)
+      throw new PoolFsException(PoolFsError.NotFound,
+        $"'{path}' was in snapshot {id:D} but neither the live file nor a preserved version remains");
+
+    return copies[0].Volume.OpenRead(this._DataName(normalized), copies[0].Shadow);
+  }
+
+  /// <summary>
+  /// Puts a file back as it was at a snapshot, over whatever is live now.
+  ///
+  /// The live file is not simply overwritten: it is first preserved for any OTHER snapshot that
+  /// still points at it, by the same path every other write takes. Restoring an old version must not
+  /// destroy a newer one that something else promised.
+  /// </summary>
+  public void RestoreFromSnapshot(Guid id, string path) {
+    this._RequireWritable();
+    var normalized = PoolPaths.Normalize(path);
+    using var source = this.OpenSnapshotFile(id, normalized);
+
+    var handle = this.Create(normalized, NodeKind.File, CreateFlags.Truncate);
+    try {
+      var buffer = new byte[WholeFilePublisher.CopyBufferSize];
+      long offset = 0;
+      for (int read; (read = source.Read(buffer, 0, buffer.Length)) > 0; offset += read)
+        this.Write(handle, buffer.AsSpan(0, read), offset, WriteMode.Normal);
+    } finally {
+      this.Close(handle);
+    }
+
+    DriveBender.Logger($" - Restored '{normalized}' from snapshot {id:D}");
   }
 
   private void _RebuildPinned() {
@@ -1130,6 +1255,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._pinned.TryRemove(normalized, out _);
     this._Invalidate(normalized);
+    this._EnforceSnapshotReserve();
   }
 
   #endregion

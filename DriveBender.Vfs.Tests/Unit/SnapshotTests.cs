@@ -197,4 +197,136 @@ public class SnapshotTests {
       "the file that was overwritten by the rename is content the snapshot promised");
   }
 
+  private static byte[] _ReadSnapshotFile(PoolFileSystem fs, Guid id, string path) {
+    using var stream = fs.OpenSnapshotFile(id, path);
+    using var buffer = new MemoryStream();
+    stream.CopyTo(buffer);
+    return buffer.ToArray();
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Browse_GivenAMixOfTouchedAndUntouchedFiles_ThenBothAreListed() {
+    // The listing has to show a file nobody has touched since the snapshot. Its content is the LIVE
+    // file — there is no preserved copy and none is needed — and showing only what was set aside
+    // would make a snapshot of an idle pool look empty.
+    var fs = this._Mounted();
+    _Write(fs, "changed.bin", [1]);
+    _Write(fs, "untouched.bin", [2, 2]);
+    var taken = fs.TakeSnapshot("mixed");
+
+    _Write(fs, "changed.bin", [9]);
+
+    var listed = fs.BrowseSnapshot(taken.Id);
+    listed.Should().HaveCount(2, "both files were in the pool when the snapshot was taken");
+    listed.Single(e => e.Path == "changed.bin").Preserved.Should().BeTrue("it was rewritten, so a version was kept");
+    listed.Single(e => e.Path == "untouched.bin").Preserved.Should().BeFalse("nothing touched it — the live file IS its content");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Open_GivenAnUntouchedFile_ThenItReadsTheLiveContent() {
+    var fs = this._Mounted();
+    _Write(fs, "quiet.bin", [5, 5, 5]);
+    var taken = fs.TakeSnapshot("quiet");
+
+    _ReadSnapshotFile(fs, taken.Id, "quiet.bin").Should().Equal(new byte[] { 5, 5, 5 },
+      "a caller must not have to know whether a version was set aside — one contract, two sources");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Restore_GivenTheFileWasOverwritten_ThenTheSnapshotVersionComesBack() {
+    var fs = this._Mounted();
+    _Write(fs, "report.doc", [1, 1, 1]);
+    var taken = fs.TakeSnapshot("good-version");
+    _Write(fs, "report.doc", [9, 9, 9, 9]);
+
+    fs.RestoreFromSnapshot(taken.Id, "report.doc");
+
+    var handle = fs.Open("report.doc", AccessMode.Read, ShareMode.Read);
+    var live = new byte[3];
+    var read = fs.Read(handle, live, 0);
+    fs.Close(handle);
+    read.Should().Be(3, "the restored file is the old, shorter one");
+    live.Should().Equal(new byte[] { 1, 1, 1 }, "restoring puts the snapshot's content back");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Restore_GivenAnotherSnapshotNamesTheLiveVersion_ThenThatVersionIsPreservedToo() {
+    // Restoring is a write like any other, and it destroys whatever was live. A newer snapshot that
+    // promised THAT content must not lose it just because an older version was put back.
+    var fs = this._Mounted();
+    _Write(fs, "ledger.db", [1]);
+    var first = fs.TakeSnapshot("first");
+    _Write(fs, "ledger.db", [2, 2]);
+    var second = fs.TakeSnapshot("second");
+
+    fs.RestoreFromSnapshot(first.Id, "ledger.db");
+
+    _ReadSnapshotFile(fs, second.Id, "ledger.db").Should().Equal(new byte[] { 2, 2 },
+      "the second snapshot promised the content that the restore has just overwritten");
+    _ReadSnapshotFile(fs, first.Id, "ledger.db").Should().Equal(new byte[] { 1 },
+      "and the first still promises what was restored");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Reserve_GivenTheStoreOutgrowsIt_ThenTheOldestSnapshotIsDropped() {
+    // Without a ceiling a pool taking snapshots grows until the disks are full, and it does it
+    // quietly — nothing the user is doing looks like it consumes space.
+    var fs = this._Mounted(
+      """{ "duplication": 1, "trash": { "enabled": false }, "snapshots": { "reserve": "4096", "onReserveFull": "drop-oldest" } }""");
+
+    _Write(fs, "big.bin", new byte[3000]);
+    var oldest = fs.TakeSnapshot("oldest");
+    _Write(fs, "big.bin", new byte[3000]);   // preserves 3000 bytes — still inside 4096
+    var newer = fs.TakeSnapshot("newer");
+    _Write(fs, "big.bin", new byte[3000]);   // would take the store to 6000 — over the reserve
+
+    var left = fs.ListSnapshots();
+    left.Should().NotContain(s => s.Id == oldest.Id,
+      "the oldest is dropped so the store fits its reserve — the promise kept is that RECENT history "
+      + "is available");
+    left.Should().Contain(s => s.Id == newer.Id, "and the newer one survives");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Reserve_GivenTheRefusePolicy_ThenANewSnapshotIsRefusedRatherThanDroppingOne() {
+    var fs = this._Mounted(
+      """{ "duplication": 1, "trash": { "enabled": false }, "snapshots": { "reserve": "1024", "onReserveFull": "refuse" } }""");
+
+    _Write(fs, "big.bin", new byte[3000]);
+    var kept = fs.TakeSnapshot("kept");
+    _Write(fs, "big.bin", new byte[10]);   // preserves 3000 bytes, well over the reserve
+
+    var take = () => fs.TakeSnapshot("another");
+    take.Should().Throw<PoolFsException>("the policy is to refuse rather than drop somebody's history")
+      .WithMessage("*reserve*");
+
+    fs.ListSnapshots().Should().Contain(s => s.Id == kept.Id, "and nothing already taken is dropped");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Remount_GivenASnapshotWasTakenBefore_ThenItStillProtectsAfterwards() {
+    // The pinned set is held in memory because it is consulted before every write. If it is not
+    // rebuilt from the members when the pool comes back up, a remount produces an empty set and the
+    // snapshots quietly stop protecting anything — nothing errors, nothing warns, and the versions
+    // simply are not kept. Which is exactly what happened until this test existed.
+    var fs = this._Mounted();
+    _Write(fs, "payroll.db", [1, 2, 3]);
+    var taken = fs.TakeSnapshot("before-the-restart");
+    fs.Unmount();
+
+    var reopened = this._Mounted();
+    _Write(reopened, "payroll.db", [9]);
+
+    _ReadSnapshotFile(reopened, taken.Id, "payroll.db").Should().Equal(new byte[] { 1, 2, 3 },
+      "a snapshot taken before a restart must still be honoured after it — the promise does not "
+      + "expire because the process did");
+  }
+
 }

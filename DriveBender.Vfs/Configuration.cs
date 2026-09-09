@@ -289,6 +289,37 @@ public sealed record TrashConfig {
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
 }
 
+/// <summary>
+/// What a pool may spend on snapshots, and what happens when it has spent it (docs/Snapshots.md).
+///
+/// A ceiling is not optional for this feature. Snapshots preserve versions the pool would otherwise
+/// have destroyed, so a pool taking them and never dropping them grows until the disks are full —
+/// and it does that quietly, because nothing the user is doing looks like it consumes space.
+/// </summary>
+public sealed record SnapshotsConfig {
+  /// <summary>How much of the pool the version store may occupy — a size or a percentage.</summary>
+  [JsonPropertyName("reserve")] public string? Reserve { get; init; }
+
+  /// <summary>
+  /// What to do when the reserve is full: drop the oldest snapshot, or refuse to take new ones.
+  ///
+  /// Neither is obviously right and the difference matters, so it is a decision the operator makes
+  /// rather than one buried here. Dropping the oldest keeps the promise that recent history is
+  /// available and quietly lets older history go; refusing keeps every snapshot ever taken and stops
+  /// making new ones. The default drops, because a snapshot nobody can take is a feature that has
+  /// turned itself off without saying so.
+  /// </summary>
+  [JsonPropertyName("onReserveFull")] public SnapshotReservePolicy? OnReserveFull { get; init; }
+
+  [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter<SnapshotReservePolicy>))]
+public enum SnapshotReservePolicy {
+  [JsonStringEnumMemberName("drop-oldest")] DropOldest,
+  [JsonStringEnumMemberName("refuse")] Refuse,
+}
+
 public sealed record ObservabilityConfig {
   [JsonPropertyName("logLevel")] public string? LogLevel { get; init; }
   [JsonPropertyName("metrics")] public JsonElement? Metrics { get; init; }
@@ -316,6 +347,7 @@ public sealed record PoolConfig {
   [JsonPropertyName("resilience")] public ResilienceConfig? Resilience { get; init; }
   [JsonPropertyName("integrity")] public IntegrityConfig? Integrity { get; init; }
   [JsonPropertyName("trash")] public TrashConfig? Trash { get; init; }
+  [JsonPropertyName("snapshots")] public SnapshotsConfig? Snapshots { get; init; }
   [JsonPropertyName("locale")] public string? Locale { get; init; }
 
   /// <summary>Per-folder overrides keyed by glob (e.g. "Documents/**"); duplication level D lives here too.</summary>
@@ -382,6 +414,7 @@ public static class ConfigResolver {
       "deepScrubSchedule": null
     },
     "trash": { "enabled": false, "retention": "7d", "maxSize": "5%", "dropDuplicatesInTrash": true },
+    "snapshots": { "reserve": "10%", "onReserveFull": "drop-oldest" },
     "locale": "auto",
     "duplication": 1,
     "observability": { "logLevel": "info", "metrics": { "enabled": true, "endpoint": "127.0.0.1:9723" } }

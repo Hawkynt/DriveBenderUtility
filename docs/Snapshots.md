@@ -175,14 +175,30 @@ Honestly enumerated, because this is the part that decides the schedule:
      it would resolve to a live file that is no longer there, and a rename ONTO a file is a delete
      wearing a different verb. Both are preserved now, by copy, because the live file has to stay
      put for the rename itself to have something to move.
-2. **Read a snapshot.** Resolution, then a CLI verb to list and restore a single file from one — the
-   recycle bin's shape, which is already built and understood.
-3. **Reserve and policy.** Accounting against `StatFs` and placement, the ceiling, the drop-oldest or
-   refuse decision, per-snapshot cost reporting.
-4. **The interactions.** Drain, heal, scatter, replace, recovery. Scenarios for each. This slice
-   contains the data-loss risks and is the one that must not be rushed to reach the screen.
-5. **The UI.** Only now. A snapshot list, what each costs, take/delete, browse-and-restore, and the
-   two warnings in plain words: this is not a backup, and it is expensive for large rewritten files.
+2. **Read a snapshot.** ✅ **Done.** Browse what a snapshot recorded, open a file as it was, and
+   restore one over the live file. Browsing distinguishes a path whose content had to be set aside
+   from one nothing has touched since — for the second the live file IS the snapshot's content, and
+   showing them identically would make a snapshot of an idle pool look empty. Restoring is a write
+   like any other, so the version it overwrites is itself preserved for any newer snapshot that
+   still needs it.
+3. **Reserve and policy.** ✅ **Done.** `snapshots.reserve` (default 10%) with
+   `onReserveFull: drop-oldest | refuse`. The ceiling is enforced BEFORE the aside that would breach
+   it, not after — "after" means the pool can always be pushed one arbitrarily large file past its
+   limit. Dropping is oldest-first, because the promise worth keeping is that RECENT history is
+   available; it never drops the only snapshot, since that is not a policy but a feature switching
+   itself off. Per-snapshot cost is reported by the listing, which is the number an operator needs
+   before deciding what to drop.
+4. **The interactions.** ⚠️ **Partly done.** `ScatterAndRemove` now moves the snapshot store off a
+   member that is leaving, which was the risk this slice was named for and is the same bug the
+   recycle bin had — covered end to end. Still outstanding: what a *replace* does with the store,
+   and a crash-mid-aside scenario. The drainer and the healer relocate live files rather than
+   versions, and a version is only ever created from a file that is settled, so those two are
+   believed safe rather than demonstrated — which is a distinction worth keeping in writing.
+5. **The UI.** ✅ **Done.** A Snapshots panel on the pool card — only when the pool is mounted,
+   because the engine is what keeps a snapshot honest. It lists each snapshot with what it is
+   holding, takes and deletes, and browses one to restore a single file. It opens with the sentence
+   that matters most and that nowhere else will say: a snapshot is not a backup, because it shares
+   these disks.
 
 The order is deliberate: every earlier slice is useful without the later ones, and the screen comes
 last because a screen over a half-built engine is the mistake this project has already made twice —
@@ -197,8 +213,9 @@ because the surface said one thing and the storage did another.
   modified in place and cost close to their full size per snapshot. If the pools hold the second
   kind, the answer is to not build this rather than to build it and document a sharp edge.
 - **Reserve exhausted: refuse, or drop the oldest?** It decides whether a snapshot is a promise or a
-  convenience, and every later slice depends on which. Slice 1 ships with neither, because slice 1
-  has no reserve — a pool with snapshots and no ceiling will fill up, and that is the first thing
-  slice 3 must fix.
+  convenience, and every later slice depends on which. **Answered by default rather than by
+  decision:** the ceiling is 10% and the policy is drop-oldest, both configurable. If snapshots are
+  meant to be a promise rather than a convenience on these pools, `onReserveFull: refuse` is the
+  other half of that question and it is one setting away.
 - **Scheduled snapshots, or manual only?** Scheduling is small once the engine exists, and it changes
   the reserve maths from "an operator's choice" to "a rate".
