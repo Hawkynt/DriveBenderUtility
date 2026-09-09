@@ -273,6 +273,12 @@ internal static class PoolOpsCommand {
                           + $"{snapshot.GetProperty("files").GetInt32(),8} paths  "
                           + $"{snapshot.GetProperty("id").GetGuid():D}  {snapshot.GetProperty("name").GetString()}");
 
+      // Worth one line every time it is listed, because it is the recovery route that does not need
+      // this tool at all — and nothing else will say so, since the folder does not show up in a listing.
+      Console.WriteLine();
+      Console.WriteLine($"  Each is also browsable inside the pool at '{PoolFileSystem.SnapshotTreeName}/<name>/…' — "
+                        + "read-only, and hidden from a directory walk so backup tools skip it.");
+
       return 0;
     });
 

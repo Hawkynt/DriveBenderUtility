@@ -708,6 +708,16 @@ async function snapshotDialog(pool) {
   await snapshotsInto(pool, body);
 }
 
+/// The snapshot view's path, spelled the way this host spells paths, so it can be pasted.
+function snapshotViewPath(pool) {
+  const at = pool.mounted || "";
+  if (!at) return null;
+
+  const windows = /^[A-Za-z]:/.test(at) || at.includes("\\");
+  const sep = windows ? "\\" : "/";
+  return at.replace(/[\\/]+$/, "") + sep + ".snapshots";
+}
+
 async function snapshotsInto(pool, body) {
   const j = await fetch(`/api/pool/snapshots?pool=${pool.id}&token=${encodeURIComponent(token)}`)
     .then(r => r.json()).catch(e => ({ ok: false, error: String(e) }));
@@ -715,10 +725,15 @@ async function snapshotsInto(pool, body) {
 
   const shots = (j.result && j.result.snapshots) || [];
   const store = (j.result && j.result.storeBytes) || 0;
+  const view = snapshotViewPath(pool);
 
   body.innerHTML = `
     <p class="hint"><b>A snapshot is not a backup.</b> It shares this pool's disks, so it protects
       against deleting or overwriting a file — not against losing the storage underneath it.</p>
+    ${view ? `<p class="hint">Every snapshot is also a folder inside the pool, at
+      <code>${esc(view)}</code>. Open it in your file manager and copy a file back — no admin needed.
+      It is read-only, and deliberately does not show up when something walks the pool, so backup
+      tools never copy the history alongside the live files.</p>` : ""}
     ${shots.length ? `<table class="browse"><thead><tr>
       <th style="text-align:left">Snapshot</th><th>Taken</th><th>Paths</th><th>Holding</th><th></th>
     </tr></thead><tbody>

@@ -574,9 +574,187 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   #region metadata
 
+  #region the snapshot tree inside the namespace
+
+  /// <summary>
+  /// The folder a snapshot can be browsed through, from any file manager: <c>.snapshots/&lt;name&gt;/…</c>.
+  ///
+  /// Deliberately NOT returned by a directory listing, which is the same choice ZFS makes for
+  /// <c>.zfs</c> and for the same reason: a backup or sync tool walking the pool would recurse into
+  /// it and copy every version of every file it has ever held. It is navigable if you ask for it by
+  /// name, and invisible if you do not — which is exactly the behaviour that makes it safe to leave
+  /// switched on.
+  /// </summary>
+  public const string SnapshotTreeName = ".snapshots";
+
+  private static bool _IsSnapshotTree(string normalized)
+    => normalized.Equals(SnapshotTreeName, PoolPaths.PathComparison)
+       || normalized.StartsWith(SnapshotTreeName + "/", PoolPaths.PathComparison);
+
+  /// <summary>Splits <c>.snapshots/&lt;name&gt;/rest/of/path</c> into its parts.</summary>
+  private (string? name, string rest) _SplitSnapshotPath(string normalized) {
+    var tail = normalized.Length == SnapshotTreeName.Length ? "" : normalized[(SnapshotTreeName.Length + 1)..];
+    if (tail.Length == 0)
+      return (null, "");
+
+    var slash = tail.IndexOf('/');
+    return slash < 0 ? (tail, "") : (tail[..slash], tail[(slash + 1)..]);
+  }
+
+  private SnapshotEntry? _SnapshotNamed(string name)
+    => this._snapshots.List().FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+  /// <summary>Everything under one snapshot, as a path set — so the tree can be walked a level at a time.</summary>
+  private IReadOnlyList<DirEntry> _ListSnapshotFolder(SnapshotEntry snapshot, string folder) {
+    var prefix = folder.Length == 0 ? "" : folder + "/";
+    var entries = new Dictionary<string, DirEntry>(PoolPaths.PathComparer);
+
+    foreach (var (path, _, length) in this.BrowseSnapshot(snapshot.Id)) {
+      if (prefix.Length > 0 && !path.StartsWith(prefix, PoolPaths.PathComparison))
+        continue;
+
+      var tail = path[prefix.Length..];
+      var slash = tail.IndexOf('/');
+      if (slash < 0)
+        entries[tail] = new(tail, NodeKind.File, length, snapshot.CreatedUtc, snapshot.CreatedUtc);
+      else
+        // a folder is implied by the paths under it; snapshots record files, not directories
+        entries.TryAdd(tail[..slash], new(tail[..slash], NodeKind.Directory, 0, snapshot.CreatedUtc, snapshot.CreatedUtc));
+    }
+
+    return [.. entries.Values.OrderBy(e => e.Name, PoolPaths.PathComparer)];
+  }
+
+  private IReadOnlyList<DirEntry> _ReadSnapshotTree(string normalized) {
+    var (name, rest) = this._SplitSnapshotPath(normalized);
+    if (name == null)
+      return [.. this._snapshots.List().Select(s => new DirEntry(s.Name, NodeKind.Directory, 0, s.CreatedUtc, s.CreatedUtc))];
+
+    var snapshot = this._SnapshotNamed(name)
+                   ?? throw new PoolFsException(PoolFsError.NotFound, $"No snapshot named '{name}'");
+
+    return this._ListSnapshotFolder(snapshot, rest);
+  }
+
+  private FileMeta _StatSnapshotTree(string normalized) {
+    var (name, rest) = this._SplitSnapshotPath(normalized);
+    if (name == null)
+      // a real timestamp, not DateTime.MinValue: that converts to a negative time_t, which several
+      // file managers render as 1601 and at least one refuses to enter at all
+      return new(0, this._clock(), this._clock(), FileAttributes.Directory | FileAttributes.Hidden | FileAttributes.ReadOnly);
+
+    var snapshot = this._SnapshotNamed(name)
+                   ?? throw new PoolFsException(PoolFsError.NotFound, $"No snapshot named '{name}'");
+
+    if (rest.Length == 0)
+      return new(0, snapshot.CreatedUtc, snapshot.CreatedUtc, FileAttributes.Directory | FileAttributes.ReadOnly);
+
+    foreach (var (path, _, length) in this.BrowseSnapshot(snapshot.Id)) {
+      if (PoolPaths.PathComparer.Equals(path, rest))
+        return new(length, snapshot.CreatedUtc, snapshot.CreatedUtc, FileAttributes.ReadOnly);
+
+      if (path.StartsWith(rest + "/", PoolPaths.PathComparison))
+        return new(0, snapshot.CreatedUtc, snapshot.CreatedUtc, FileAttributes.Directory | FileAttributes.ReadOnly);
+    }
+
+    throw new PoolFsException(PoolFsError.NotFound, $"Snapshot '{name}' does not contain '{rest}'");
+  }
+
+  /// <summary>
+  /// A snapshot is history: everything under the tree is read-only, and saying so with EACCES is
+  /// the only honest answer. Silently accepting a write into a snapshot would be the worst of both
+  /// — the caller believes it edited the past, and nothing did.
+  /// </summary>
+  private static void _RefuseWriteToSnapshotHandle(NodeHandle handle) {
+    if (handle.Value < 0)
+      throw new PoolFsException(PoolFsError.AccessDenied,
+        "This handle is onto a snapshot's copy of a file, which is a record of what the pool held and cannot be changed.");
+  }
+
+  private static void _RefuseWriteToSnapshotTree(string normalized) {
+    if (_IsSnapshotTree(normalized))
+      throw new PoolFsException(PoolFsError.AccessDenied,
+        $"'{normalized}' is inside the snapshot view, which is a record of what the pool held and cannot be changed. "
+        + "Restore the file to its original path instead.");
+  }
+
+  /// <summary>
+  /// A handle onto a file as a snapshot saw it.
+  ///
+  /// Kept OUTSIDE the ordinary handle table on purpose. That table is keyed on live pool paths and
+  /// carries leases, write buffers, read-ahead state and staging — every one of which is about a
+  /// file the pool can still change. A snapshot handle points at a version that nothing may touch,
+  /// so it needs none of that, and letting it into the table would mean every one of those
+  /// mechanisms has to know about a path that does not really exist.
+  ///
+  /// Negative handle values, so a snapshot handle can never be confused with a real one.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<long, (IVolumeIO Member, string Path, bool Shadow)> _snapshotHandles = new();
+
+  private long _nextSnapshotHandle;
+
+  private NodeHandle _OpenSnapshotTreeFile(string normalized) {
+    var (name, rest) = this._SplitSnapshotPath(normalized);
+    if (name == null || rest.Length == 0)
+      throw new PoolFsException(PoolFsError.IsADirectory, $"'{normalized}' is a folder in the snapshot view");
+
+    var snapshot = this._SnapshotNamed(name)
+                   ?? throw new PoolFsException(PoolFsError.NotFound, $"No snapshot named '{name}'");
+
+    // either a preserved version, or the live file when nothing has touched it since
+    (IVolumeIO member, string path, bool shadow) source;
+    if (this._snapshots.Resolve(snapshot.Id, rest) is { } version)
+      source = (version.member, version.versionPath, false);
+    else {
+      var copies = this._placement.ResolveCopies(this._DataName(rest));
+      if (copies.Count == 0) {
+        // A folder resolves to no version and no live file for the same reason a lost file does —
+        // snapshots record paths, and a folder is only ever implied by the paths beneath it. Saying
+        // "nothing remains" about a directory would report data loss where there is none, so ask
+        // whether anything in the snapshot lives under this name before reaching for that message.
+        if (this.BrowseSnapshot(snapshot.Id).Any(e => e.Path.StartsWith(rest + "/", PoolPaths.PathComparison)))
+          throw new PoolFsException(PoolFsError.IsADirectory, $"'{normalized}' is a folder in the snapshot view");
+
+        throw new PoolFsException(PoolFsError.NotFound, $"Snapshot '{name}' recorded '{rest}', but neither a version nor the live file remains");
+      }
+
+      source = (copies[0].Volume, this._DataName(rest), copies[0].Shadow);
+    }
+
+    var handle = new NodeHandle(-Interlocked.Increment(ref this._nextSnapshotHandle));
+    this._snapshotHandles[handle.Value] = source;
+    return handle;
+  }
+
+  private int _ReadSnapshotHandle(NodeHandle handle, Span<byte> buffer, long offset) {
+    if (!this._snapshotHandles.TryGetValue(handle.Value, out var source))
+      throw new PoolFsException(PoolFsError.StaleHandle, "This snapshot handle has been closed");
+
+    using var stream = source.Member.OpenRead(source.Path, source.Shadow);
+    if (offset > 0)
+      stream.Seek(offset, SeekOrigin.Begin);
+
+    var rented = new byte[buffer.Length];
+    var read = 0;
+    while (read < rented.Length) {
+      var got = stream.Read(rented, read, rented.Length - read);
+      if (got <= 0)
+        break;
+
+      read += got;
+    }
+
+    rented.AsSpan(0, read).CopyTo(buffer);
+    return read;
+  }
+
+  #endregion
+
   public FileMeta GetAttributes(string path) {
     this._RequireMounted();
     var normalized = PoolPaths.Normalize(path);
+    if (_IsSnapshotTree(normalized))
+      return this._StatSnapshotTree(normalized);
 
     // A file's logical length comes from TWO reads — the durable stat of a physical copy plus
     // the write buffer's overlay of the bytes still owed to the others — and they must be
@@ -638,6 +816,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void SetAttributes(string path, FileMetaPatch patch) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
+    _RefuseWriteToSnapshotTree(normalized);
     using var lease = this._handles.AcquireWrite(normalized); // copies must not move under the stamp
     var dataName = this._DataName(normalized);
     var copies = this._placement.ResolveCopies(dataName);
@@ -659,6 +838,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public IReadOnlyList<DirEntry> ReadDirectory(string path) {
     this._RequireMounted();
     var normalized = PoolPaths.Normalize(path);
+    if (_IsSnapshotTree(normalized))
+      return this._ReadSnapshotTree(normalized); // never cached: a snapshot list changes under the caller
+
     var key = new MetadataKey(this._poolId, normalized, MetadataKind.DirectoryListing);
     if (this._cache.Metadata.TryGet<IReadOnlyList<DirEntry>>(key, out var cached))
       return cached;
@@ -779,6 +961,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public NodeHandle Create(string path, NodeKind kind, CreateFlags flags) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
+    _RefuseWriteToSnapshotTree(normalized);
     if (kind == NodeKind.Directory) {
       this.MakeDir(normalized);
       return NodeHandle.Invalid;
@@ -924,6 +1107,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._RequireWritable();
     var fromNormalized = PoolPaths.Normalize(from);
     var toNormalized = PoolPaths.Normalize(to);
+    _RefuseWriteToSnapshotTree(fromNormalized);
+    _RefuseWriteToSnapshotTree(toNormalized);
 
     // renaming a path to itself (identical, or only a case change on a case-insensitive backend)
     // must NEVER go through the overwrite path — "the target" resolves to the source's own copies,
@@ -1263,6 +1448,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void Unlink(string path) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
+    _RefuseWriteToSnapshotTree(normalized);
 
     // exclusive for the whole delete: a background flush/heal must not be mid-way through
     // rewriting copies we are about to remove, and a reader must not observe a half-deleted set
@@ -1369,6 +1555,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void MakeDir(string path) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
+    _RefuseWriteToSnapshotTree(normalized);
     if (normalized.Length == 0)
       throw new PoolFsException(PoolFsError.Exists, "The pool root always exists");
 
@@ -1394,6 +1581,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void RemoveDir(string path) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
+    _RefuseWriteToSnapshotTree(normalized);
     if (normalized.Length == 0)
       throw new PoolFsException(PoolFsError.AccessDenied, "The pool root cannot be removed");
 
@@ -1440,6 +1628,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._RequireWritable();
 
     var normalized = PoolPaths.Normalize(path);
+    if (_IsSnapshotTree(normalized)) {
+      if ((mode & AccessMode.Write) != 0)
+        _RefuseWriteToSnapshotTree(normalized);
+
+      return this._OpenSnapshotTreeFile(normalized);
+    }
+
     if (this._placement.ResolveCopies(this._DataName(normalized)).Count == 0)
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
 
@@ -1455,6 +1650,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public int Read(NodeHandle handle, Span<byte> buffer, long offset) {
     this._RequireMounted();
+    if (handle.Value < 0)
+      return this._ReadSnapshotHandle(handle, buffer, offset);
+
     var open = this._handles.Get(handle);
     if (offset < 0)
       throw new PoolFsException(PoolFsError.InvalidArgument, "Negative offset");
@@ -1990,6 +2188,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   public int Write(NodeHandle handle, ReadOnlySpan<byte> data, long offset, WriteMode mode) {
+    _RefuseWriteToSnapshotHandle(handle);
     this._RequireWritable();
     var open = this._handles.Get(handle);
     if ((open.Access & AccessMode.Write) == 0)
@@ -2275,6 +2474,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public void SetLength(NodeHandle handle, long length) {
     this._RequireWritable();
+    _RefuseWriteToSnapshotHandle(handle);
     var open = this._handles.Get(handle);
     if ((open.Access & AccessMode.Write) == 0)
       throw new PoolFsException(PoolFsError.AccessDenied, "Handle is not open for writing");
@@ -2307,6 +2507,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public void Flush(NodeHandle handle) {
     this._RequireMounted();
+    if (handle.Value < 0)
+      return; // nothing was ever owed on a read-only view of the past
     var open = this._handles.Get(handle);
 
     // one lease covers both steps: a publish that raced the flush could otherwise rename the
@@ -2843,6 +3045,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   public void Close(NodeHandle handle) {
+    if (handle.Value < 0) {
+      this._snapshotHandles.TryRemove(handle.Value, out _);
+      return;
+    }
+
     var open = this._handles.Get(handle);
     var path = open.File.Path;
     var wrote = (open.Access & AccessMode.Write) != 0;
