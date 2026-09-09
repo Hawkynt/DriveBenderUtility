@@ -36,6 +36,193 @@ CLI (`dbmount`) and an animated live web/desktop dashboard. Jump to
 > pool with capacity donuts, a RAM→fast→capacity tier topology, per-member usage
 > and health. See more in [**Screenshots**](#-screenshots).
 
+## 🧭 How it works
+
+Seven diagrams for the parts that are hard to guess from the file list. They describe the engine as
+it is, not as it is planned — where something is not built yet, it says so.
+
+### The pool: one namespace over many storages
+
+A pool is a set of **members** (a drive, a folder, a UNC share, a cloud endpoint) presented as one
+filesystem. A file is never split: it lives whole on one member, and a *duplicated* file lives whole
+on several. That is what makes a member readable on its own — pull a disk out, plug it into any
+machine, and the files on it are just files.
+
+```mermaid
+flowchart TD
+    App["Application<br/>reads and writes a drive letter<br/>or a mountpoint"] --> Driver
+
+    subgraph Driver["Filesystem driver"]
+        WinFsp["WinFsp / Dokan<br/>(Windows)"]
+        Fuse["FUSE<br/>(Linux)"]
+    end
+
+    Driver --> Engine
+
+    subgraph Engine["Pool engine"]
+        Placement["Placement<br/>which member takes this file"]
+        Journal["Journal<br/>intent → completion, replayed on mount"]
+        Cache["Caches<br/>blocks, metadata, owed writes"]
+    end
+
+    Engine --> M0 & M1 & M2
+
+    subgraph Members["Members — each holds whole files"]
+        M0["Landing zone<br/>fast tier"]
+        M1["Capacity disk"]
+        M2["Cloud / UNC<br/>capacity"]
+    end
+```
+
+### Reading: cache, then the readiest copy
+
+A read is answered from the block cache where it can be. Where it cannot, the engine resolves which
+members hold the file and asks the one that is **readiest** — fewest requests outstanding, then
+lowest measured latency. A duplicated file can serve different offsets from different disks at once.
+
+If a copy fails or answers short, the next copy is tried before the read is allowed to fail, and a
+member that just failed is parked at the back of the order for a while — one dying disk should not
+be tried first for every block of a large read.
+
+```mermaid
+flowchart TD
+    Read["read(path, offset, length)"] --> Block{"block in<br/>page cache?"}
+    Block -- yes --> Serve["serve from RAM"]
+    Block -- no --> Resolve["resolve copies<br/>(metadata cache)"]
+    Resolve --> Order["order by readiness:<br/>outstanding I/O → latency → rotation"]
+    Order --> Fetch["read block from the chosen copy"]
+    Fetch --> Ok{"complete?"}
+    Ok -- yes --> Fill["fill cache, serve,<br/>maybe read ahead"]
+    Ok -- "no: error, or shorter<br/>than the file's length" --> Next{"another<br/>copy?"}
+    Next -- yes --> Fetch
+    Next -- "no" --> Requery["re-resolve once<br/>(copies may have moved)"]
+    Requery --> Fail["error — never<br/>silently short"]
+```
+
+### Writing: staged, acknowledged, then converged
+
+A new file is written under a hidden temp name and becomes visible only at the final atomic rename,
+so a crash mid-write leaves no half-written file. A write is acknowledged once it is durable on the
+required number of copies; any copies still owed are recorded and completed in the background.
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Engine
+    participant A as Member A
+    participant B as Member B
+
+    App->>Engine: create + write
+    Engine->>A: write to hidden temp
+    Engine->>B: write to hidden temp
+    Note over Engine: acknowledged once the ack quorum is durable
+    Engine-->>App: ok
+    App->>Engine: close
+    Engine->>A: atomic rename temp → final
+    Engine->>B: atomic rename temp → final
+    Note over Engine,B: copies still owed are held in the write buffer and completed in the background — the journal intent closes last
+```
+
+### Memory: three caches with different jobs
+
+One configurable pool of RAM, split between reading and writing. The split can be automatic, fixed,
+or two separate budgets.
+
+```mermaid
+flowchart LR
+    subgraph RAM["cache.size — e.g. 4 GiB"]
+        direction TB
+        Pages["<b>Page cache</b><br/>file blocks, default 1 MiB<br/>serves repeat reads and read-ahead"]
+        Meta["<b>Metadata cache</b><br/>stat, directory listings,<br/>which members hold a file<br/>bounded by entries + TTL"]
+        Buf["<b>Write buffer</b><br/>bytes acknowledged but not yet<br/>on every copy; the ONLY record<br/>of what a lagging copy still owes"]
+    end
+
+    Pages -. "invalidated on write,<br/>heal, drain" .-> Meta
+    Buf -. "drained by the owed-sync job;<br/>restored if a flush fails" .-> Members["Members"]
+```
+
+### Tiering: land fast, drain later
+
+With a **landing zone** member, new files go to the fast tier and a background drainer moves settled
+files down to capacity. Placement declines the fast tier once it is past its low watermark, so a full
+SSD stops absorbing rather than wedging the pool.
+
+The drain copies the file down, re-validates that nothing changed underneath it, and only then frees
+the fast tier — so an interruption leaves the file on one tier or the other, never on neither.
+
+```mermaid
+flowchart LR
+    W["new file"] --> P{"fast tier below<br/>its low watermark?"}
+    P -- yes --> L["Landing zone<br/>(SSD)"]
+    P -- "no — full" --> C["Capacity<br/>(HDD / cloud)"]
+    L -- "settled: closed,<br/>clean, unchanged" --> D["Drainer<br/>copy down, re-validate,<br/>then free the fast tier"]
+    D --> C
+```
+
+### The recycle bin
+
+Off by default — `trash.enabled` turns it on. With it, a delete does not destroy the file: one copy
+is **renamed** into a hidden per-member trash tree with a sidecar recording where it came from, and
+the other copies are dropped (`dropDuplicatesInTrash`, on by default — the bin keeps the file
+recoverable, not redundant). Nothing is copied, so deleting stays as cheap as it was. A
+retention/size policy purges oldest-first in the background.
+
+Restoring from a pool that is mounted goes through the process that owns it, and re-establishes the
+file's duplication level on the way back — a recovered file that is one bad sector from being lost again is
+only half recovered.
+
+```mermaid
+flowchart TD
+    Del["delete file"] --> On{"trash<br/>enabled?"}
+    On -- no --> Gone["copies removed<br/>— permanent"]
+    On -- yes --> Move["rename ONE copy into<br/>.drivebenderutility/trash<br/>+ .trashinfo sidecar;<br/>drop the others"]
+    Move --> Bin["Recycle bin<br/>listed by CLI, API and the dashboard"]
+    Bin --> R["restore"] --> Back["file back at its original path,<br/>duplication re-established"]
+    Bin --> Pol["retention / max-size policy"] --> Purge["oldest purged for good"]
+    Bin -. "member removed from the pool" .-> Scatter["bin moves to the<br/>remaining members"]
+```
+
+### Snapshots
+
+> **Engine only today.** Taking, listing, deleting and preserving work and are tested; there is no
+> CLI verb, no API and no screen yet, and **no reserve** — see [docs/Snapshots.md](docs/Snapshots.md)
+> for the design and the delivery slices.
+
+Taking a snapshot **copies nothing**: it records the pool's namespace at that instant. From then on
+the pool may not destroy content those paths still point at, so the first thing that would destroy
+one preserves it first.
+
+What that costs depends entirely on *how* the file is written, and the difference is the whole
+design:
+
+| What happens to a pinned file | What it costs |
+| --- | --- |
+| Replaced outright (truncate + write — `File.WriteAllBytes`, editors, backup tools) | **Nothing.** The old file is *renamed* into the store; the new content is staged and renamed into place. Two renames. |
+| Modified in place (write at an offset, keep the rest) | **A copy.** The untouched bytes must survive in the live file *and* in the version. |
+| Renamed, or renamed over | A copy — the live file has to stay put for the rename to have something to move. |
+| Deleted | Nothing. The file is renamed into the store. |
+| Never touched again | **Nothing at all** — the snapshot's copy *is* the live file. Most of a backup pool. |
+
+```mermaid
+flowchart TD
+    T["take snapshot"] --> Idx["record the namespace<br/>(no data copied)"]
+    Idx --> Pin["every path pinned"]
+
+    Pin --> Ev{"something would destroy<br/>a pinned version"}
+    Ev -- "whole file replaced<br/>or deleted" --> Ren["<b>rename</b> live file into the store<br/>— no bytes moved"]
+    Ev -- "modified in place,<br/>or renamed" --> Cop["<b>copy</b> into the store<br/>— untouched bytes must survive twice"]
+    Ev -- "never touched" --> None["nothing stored;<br/>the live file IS the version"]
+
+    Ren --> Un["path unpinned —<br/>later writes cost nothing<br/>until the next snapshot"]
+    Cop --> Un
+
+    Un --> Rd["read as of the snapshot:<br/>earliest version after it was taken,<br/>else the live file"]
+    Un --> Dl["delete snapshot:<br/>drop its pin; version goes<br/>when the last pin does"]
+```
+
+> **A snapshot is not a backup.** It shares the pool's disks and its failure domains: it protects
+> against deleting or overwriting a file, not against losing the storage underneath it.
+
 ## 🏗️ Project Structure
 
 The solution is organized into the following projects:
