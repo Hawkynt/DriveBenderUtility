@@ -1,11 +1,17 @@
 # Snapshots — a design, before any code
 
-Written because snapshots have been asked for three times and declined twice. Declining a UI over a
-feature that does not exist was right; leaving it there was not. This is the design that has to come
-first, and its most important section is the one about what this approach cannot do.
+Written before any code, because a screen over a feature that does not exist is worse than no
+feature. The most important section here is the one about what this approach cannot do.
 
 Nothing here is implemented. Every occurrence of "snapshot" in the codebase today is the unrelated
 metrics snapshot.
+
+The mechanism below is not the one this document first proposed. The first draft copied a file's old
+content aside before the first write to it, which is both expensive and unnecessary: the engine
+already publishes a new file by renaming a staged temp into place, and hanging the design on that
+point turns the common case from a full-file copy into two renames. The cost section is rewritten
+around that — the first draft stated the expensive case as if it were universal, which would have
+argued the feature out of existence for workloads it suits perfectly well.
 
 ## What the storage model allows
 
@@ -40,25 +46,56 @@ files, not their size. On a pool of a million files this is a metadata write, no
 A **version** is a file's content as it was. The live file is the current version. Older versions
 live in a per-member snapshot store, alongside the trash and using the same mechanics.
 
-The rule that makes it work: **the first modification of a file that at least one snapshot pins moves
-the current content aside before the modification proceeds.** Second and subsequent modifications
-cost nothing extra until the next snapshot. "Modification" is write, truncate, delete and rename —
-every path that would otherwise destroy content a snapshot promised.
+The rule that makes it work: **a file that at least one snapshot pins is written through the staging
+lifecycle, and the old version is moved aside when the staged file is published.** Not on the first
+write — at the publish, which is a point the engine already has.
 
-Reading a snapshot resolves a path to a version token: either an aside copy, or the live file when
-nothing has touched it since. Most files in a backup pool are never rewritten, so most of a snapshot
-is the live file and costs nothing at all.
+This is worth being precise about, because the obvious design is worse. "Copy the old content aside
+before the first modification" costs a full-file copy and puts a check on the write path. The engine
+already has the better mechanism and uses it for every newly created file: `_staging` holds the paths
+being written through a temp name, `_DataName` transparently routes every read and write of such a
+path to that temp, and `Close` renames the temp into place once the last handle goes. Staging is
+keyed on the path being in that set — not on the file being new — so an existing file can be routed
+the same way by putting it there.
+
+Publishing a pinned file then becomes two renames on one filesystem: the live file into the snapshot
+store, the temp into the live name. **No bytes are copied at all.** The store is
+`.drivebenderutility/snapshots/…` on the same member as the file, so both renames are metadata
+operations, and the version that lands in the store is the original file itself rather than a
+duplicate of it.
+
+"Modification" is also delete and rename. Delete already moves the file aside instead of unlinking it
+when the trash is on, which is the same operation against a different destination. Rename is the
+awkward one and is discussed below.
+
+Reading a snapshot resolves a path to a version token: either a version in the store, or the live
+file when nothing has touched it since. Most files in a backup pool are never rewritten, so most of a
+snapshot is the live file and costs nothing at all.
 
 ## What this cannot do, and who it hurts
 
-**Changing one byte of a large file copies the whole file.** This is the cost of file granularity and
-there is no way to soften it within this storage model. A 40 GB image edited daily, with seven daily
-snapshots, is 280 GB of snapshot store.
+The cost divides into two cases, and only one of them is expensive. An earlier draft of this document
+stated the expensive one as if it were universal, which was wrong and would have argued the feature
+out of existence for workloads it suits perfectly well.
 
-Whether that is acceptable depends entirely on the workload, and for the stated one — a backup target
-— it mostly is: backup tools write whole files once and rarely rewrite them in place. It is
-emphatically not acceptable for a pool holding virtual machine disks, database files, or anything
-else large and randomly rewritten. That must be said in the UI, not just here.
+**A whole-file rewrite costs nothing.** Truncate-then-write is what `File.WriteAllBytes` does, what
+every save-to-a-temp-and-rename editor does, and what backup tools do. The writer supplies all the
+bytes, so the staged temp is complete on its own and publishing is the two renames above. The old
+version reaching the store is free, and the snapshot store grows by the size of the old file without
+that file ever being read.
+
+**A partial in-place modification costs the bytes the writer did NOT touch.** Writing one byte at
+offset 0 of a 40 GB file leaves the staged temp holding one byte and 40 GB of nothing, so the
+remainder has to come from the old version before the temp can be published. That is a real copy and
+file granularity offers no way around it. The write buffer already records which ranges were written
+(`PendingOp` carries offset and length), so it is the untouched remainder rather than the whole file
+— which for a small edit to a large file is very nearly the whole file, and the distinction is
+honest rather than comforting.
+
+So: a pool holding documents, photos, archives and backup sets pays almost nothing. A pool holding
+virtual machine disks or database files, which are large and rewritten in place, pays close to full
+size per snapshot per file. That must be said in the UI, not just here, and it is an argument for the
+size ceiling and path exclusions below rather than against the feature.
 
 Two mitigations are worth having and neither is a fix:
 
@@ -96,11 +133,15 @@ or drop the oldest. Both are defensible; silently doing either is not.
 
 Honestly enumerated, because this is the part that decides the schedule:
 
-- **The write path.** One check before the first modification of a file — "is this pinned" — and the
-  aside-move when it is. The check must be cheap and cached, or every write pays for a feature most
-  pools do not use.
-- **Delete and rename.** Both destroy a version. Delete already has the trash to reuse; rename is the
-  awkward one, because the snapshot names a path and the live file no longer has it.
+- **The write path.** Nothing on the hot path. The question "is this pinned" is asked once, when a
+  file is opened for writing, and its answer decides whether the path joins `_staging`. Every write
+  after that is the staged path the engine already runs for new files. This is the whole reason to
+  hang the design on staging rather than on a copy-before-write hook: a pool with no snapshots pays
+  one set lookup per open and nothing else.
+- **Delete and rename.** Both destroy a version. Delete already has the trash to reuse — the same
+  aside-rename against a different destination. Rename is the awkward one, because a snapshot names a
+  path and the live file no longer has it: either the version is moved into the store at rename time,
+  or the index has to follow the file, and the first is simpler and matches what delete does.
 - **The drainer, the healer, the media operations.** All relocate whole files. A pinned version in a
   member's store must relocate with it, or be pinned in place. This is the most dangerous interaction
   in the list and it is not hypothetical: writing this document turned up the same bug in the trash,
@@ -136,9 +177,11 @@ because the surface said one thing and the storage did another.
 
 ## What I would want decided before slice 1
 
-- **Is the file-granularity cost acceptable for the intended pools?** If they hold VM disks or
-  databases, this design is wrong and the answer is to not build it rather than to build it and
-  document the sharp edge.
+- **Do the intended pools hold anything large that is rewritten IN PLACE?** Not "large files" —
+  large files that are modified rather than replaced. Documents, photos, archives and backup sets
+  are replaced wholesale and cost nothing here. Virtual machine disks and database files are
+  modified in place and cost close to their full size per snapshot. If the pools hold the second
+  kind, the answer is to not build this rather than to build it and document a sharp edge.
 - **Reserve exhausted: refuse, or drop the oldest?** It decides whether a snapshot is a promise or a
   convenience, and every later slice depends on which.
 - **Scheduled snapshots, or manual only?** Scheduling is small once the engine exists, and it changes
