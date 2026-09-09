@@ -7,7 +7,7 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34392012689](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34392012689).
+Generated from run: [34398752695](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34398752695).
 
 190 scenarios — 169 passing on at least one target, 1 failing.
 
@@ -150,7 +150,7 @@ Generated from run: [34392012689](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(SSD over HDD)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(SSD over HDD) | pass | pass |
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(SSD over SD card)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(SSD over SD card) | pass | pass |
 | SimulatedDevice | `Unmount_GivenBackgroundWorkIsStarved_ThenThePoolStillComesDownCleanly` | A pool whose background work is throttled to a crawl still unmounts cleanly, instead of having to be killed. | pass | pass |
-| Snapshot | `RemoveMedia_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable` | Removing a member from the pool takes its snapshot store with it, rather than discarding preserved versions. | pass | pass |
+| Snapshot | `RemoveMedia_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable` | Removing a member from the pool takes its snapshot store with it, rather than discarding preserved versions. | pass | **FAIL** |
 | Snapshot | `Snapshot_GivenAFileIsDeleted_ThenItCanBeRestoredFromTheSnapshot` | A file deleted after a snapshot is still recoverable from it. | pass | pass |
 | Snapshot | `Snapshot_GivenAFileIsOverwritten_ThenItCanBeRestoredFromTheSnapshot` | A file overwritten after a snapshot is still recoverable from it, through the shipped CLI. | pass | pass |
 | Snapshot | `Snapshot_GivenThePoolIsNotMounted_ThenTheVerbRefusesAndExplains` | Snapshot verbs refuse clearly when the pool is not mounted, rather than writing state the running engine would not know about. | pass | pass |
@@ -158,7 +158,7 @@ Generated from run: [34392012689](https://github.com/Hawkynt/DriveBenderUtility/
 | SnapshotBrowsing | `Browse_GivenAFileWasOverwritten_ThenTheOldOneOpensFromTheSnapshotFolder` | An overwritten file's old content reads back through .snapshots with File.ReadAllBytes, no tooling involved. | pass | pass |
 | SnapshotBrowsing | `Browse_GivenALargeFile_ThenItStreamsBackWholeThroughTheView` | A large file reads back through the view whole, in the many-chunk reads the kernel actually issues. | pass | pass |
 | SnapshotBrowsing | `Browse_GivenAMissingSnapshot_ThenTheViewSaysNotFoundRatherThanFailing` | A snapshot that no longer exists has no folder in the view, and one that never existed reads as not found. | pass | pass |
-| SnapshotBrowsing | `Browse_GivenAnAttemptToChangeTheView_ThenItIsRefusedAsAPermissionProblem` | Nothing under the snapshot view can be written, deleted or renamed — and the refusal is a permission error, not an I/O error. | **FAIL** | pass |
+| SnapshotBrowsing | `Browse_GivenAnAttemptToChangeTheView_ThenItIsRefusedAsAPermissionProblem` | Nothing under the snapshot view can be written, deleted or renamed — and the refusal is a permission error, not an I/O error. | pass | pass |
 | SnapshotBrowsing | `Browse_GivenARecursiveWalk_ThenTheSnapshotViewIsNotPartOfIt` | A walk of the whole pool never descends into the snapshot view. | pass | pass |
 | SnapshotBrowsing | `Browse_GivenNestedContent_ThenEachLevelOfTheViewListsWhatIsUnderIt` | The snapshot view can be walked by hand: snapshots, then folders, then files. | pass | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(RAM + RAM)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(RAM + RAM) | skipped | pass |
