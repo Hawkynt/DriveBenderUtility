@@ -38,6 +38,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly Journal _journal;
   private readonly WriteBufferManager _writeBuffer;
   private readonly PoolTrash _trash;
+  private readonly PoolSnapshots _snapshots;
+
+  /// <summary>
+  /// Paths at least one snapshot still points at the LIVE file for.
+  ///
+  /// The whole point of holding this in memory: a pool with no snapshots answers "is this pinned"
+  /// with one lookup on an empty set, and a pool with snapshots answers it once per file and then
+  /// never again, because a path leaves the set the moment its content has been preserved.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _pinned = new(PoolPaths.PathComparer);
   private readonly IntegrityService _integrity;
   private readonly ActivityFeed _activity;
   // FR-RA, double-buffered: how many read-ahead chains one path may have running at once. With
@@ -252,6 +262,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._clock = clock ?? (static () => DateTime.UtcNow);
     this._writeBuffer = new(cache, this._clock);
     this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock, this.AdmitBulk);
+    this._snapshots = new([.. members.Select(m => m.Io)], this._journal, this._clock, this.AdmitBulk);
     this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest, this.AdmitBulk);
     this._activity = new(clock: this._clock);
     this._placement = new(
@@ -286,6 +297,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public Journal Journal => this._journal;
   public WriteBufferManager WriteBuffer => this._writeBuffer;
   public PoolTrash Trash => this._trash;
+  public PoolSnapshots Snapshots => this._snapshots;
   public IntegrityService Integrity => this._integrity;
   public ActivityFeed Activity => this._activity;
   public Caching.CacheInstance Cache => this._cache;
@@ -778,6 +790,23 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if ((flags & CreateFlags.Exclusive) != 0)
         throw new PoolFsException(PoolFsError.Exists, $"File already exists: {path}");
 
+      // The cheap path, and the one that matters. Creating over an existing file with Truncate is
+      // what File.WriteAllBytes does, what every save-to-a-temp-and-rename editor does, and what a
+      // backup tool does: the caller is replacing the whole file, so the old one is RENAMED into
+      // the snapshot store and nothing is read or written.
+      //
+      // Which leaves no file at this path — so the create must then take the NEW-file branch below
+      // rather than open something that is no longer there. That is the right shape anyway: the
+      // replacement is staged to a temp and published by a rename, exactly as any new file is, and
+      // the pair of renames is the whole design. Opening for writing WITHOUT that promise cannot do
+      // this, and falls to the conservative copy in Open.
+      if ((flags & CreateFlags.Truncate) != 0) {
+        this._PreserveIfPinned(normalized, wholeFileReplaced: true);
+        existing = this._placement.ResolveCopies(normalized);
+      }
+    }
+
+    if (existing.Count > 0) {
       var handleForExisting = this._handles.Open(normalized, AccessMode.ReadWrite).Handle;
       lease.Dispose(); // SetLength re-takes this very lock through the handle (NoRecursion)
       if ((flags & CreateFlags.Truncate) != 0)
@@ -929,6 +958,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (!this._ParentExists(toNormalized))
       throw new PoolFsException(PoolFsError.NotFound, $"Target parent folder not found: {to}");
 
+    // A rename destroys a snapshot's view of BOTH endpoints and neither is obvious. The source path
+    // stops naming this content, so a snapshot that recorded it would resolve to a live file that is
+    // no longer there — the file is not lost, but the snapshot's account of it silently is. The
+    // target, when it already exists, is overwritten outright, which is a delete wearing a different
+    // verb.
+    //
+    // Preserved by COPY rather than by rename, unlike the other paths: the live file has to stay
+    // where it is for the rename itself to have something to move. A rename of a pinned file
+    // therefore costs what an in-place modification costs, and is rare enough for that to be the
+    // right trade against making the rename itself a multi-step operation that can fail half way.
+    this._PreserveIfPinned(fromNormalized, wholeFileReplaced: false);
+    if (!sameFile)
+      this._PreserveIfPinned(toNormalized, wholeFileReplaced: false);
+
     // a case-only rename has no distinct target to conflict with or overwrite — its "target
     // copies" ARE the source; only a genuinely different path is a real target
     var targetCopies = sameFile ? [] : this._placement.ResolveCopies(toNormalized);
@@ -1015,6 +1058,82 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     DriveBender.Logger($"Renamed folder '{fromNormalized}' to '{toNormalized}' across {this._Online.Count(m => m.FolderExists(toNormalized, false))} member(s)");
   }
 
+  #region snapshots
+
+  /// <summary>
+  /// Takes a snapshot of the pool as it is now (docs/Snapshots.md). No data is copied: the
+  /// namespace is recorded, and from here on nothing may destroy a version those paths point at.
+  /// </summary>
+  public SnapshotEntry TakeSnapshot(string name) {
+    this._RequireWritable();
+    var paths = this._AllLogicalFiles().ToArray();
+    var taken = this._snapshots.Take(name, paths);
+    foreach (var path in paths)
+      this._pinned[path] = 0;
+
+    return taken;
+  }
+
+  public IReadOnlyList<SnapshotEntry> ListSnapshots() => this._snapshots.List();
+
+  /// <summary>Forgets a snapshot and releases whatever only it was holding.</summary>
+  public int DeleteSnapshot(Guid id) {
+    this._RequireWritable();
+    var released = this._snapshots.Delete(id);
+    this._RebuildPinned();
+    return released;
+  }
+
+  private void _RebuildPinned() {
+    this._pinned.Clear();
+    foreach (var path in this._snapshots.PinnedPaths())
+      this._pinned[path] = 0;
+  }
+
+  /// <summary>
+  /// Preserves a file's current content for the snapshots that still point at it, before whatever
+  /// is about to happen to it destroys it.
+  ///
+  /// <paramref name="wholeFileReplaced"/> is what decides the cost, and it is the difference the
+  /// design turns on. When the caller is replacing the file outright — a truncate to nothing, a
+  /// delete — the live file is RENAMED into the store and nothing is read or written. When it is
+  /// modifying in place, the untouched bytes have to survive too, so the content is copied and the
+  /// live file left where it is. The first case is what File.WriteAllBytes, every save-to-temp
+  /// editor and every backup tool does; the second is what costs.
+  /// </summary>
+  private void _PreserveIfPinned(string normalized, bool wholeFileReplaced) {
+    if (this._pinned.IsEmpty || !this._pinned.ContainsKey(normalized))
+      return;
+
+    var pins = this._snapshots.SnapshotsNeeding(normalized);
+    if (pins.Count == 0) {
+      this._pinned.TryRemove(normalized, out _);
+      return;
+    }
+
+    var copies = this._placement.ResolveCopies(this._DataName(normalized));
+    if (copies.Count == 0) {
+      this._pinned.TryRemove(normalized, out _);
+      return;
+    }
+
+    // One copy is preserved, not all of them: the store holds the CONTENT, and a second aside of
+    // the same bytes on another member buys the snapshot nothing the first one has not already
+    // bought it. Which copy is arbitrary; the first readable one keeps this cheap.
+    var source = copies[0];
+    if (wholeFileReplaced)
+      this._snapshots.Aside(source.Volume, this._DataName(normalized), source.Shadow, pins);
+    else {
+      var versionPath = this._snapshots.AsideByCopy(source.Volume, this._DataName(normalized), source.Shadow, pins);
+      DriveBender.Logger($" - Preserved '{normalized}' for {pins.Count} snapshot(s) by copy ({versionPath}) — an in-place modification cannot be preserved by rename");
+    }
+
+    this._pinned.TryRemove(normalized, out _);
+    this._Invalidate(normalized);
+  }
+
+  #endregion
+
   public void Unlink(string path) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
@@ -1049,6 +1168,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var copies = this._placement.ResolveCopies(normalized);
     if (copies.Count == 0)
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
+
+    // a snapshot that named this path keeps the content: the live file is renamed into the store
+    // before the delete takes the rest (docs/Snapshots.md)
+    this._PreserveIfPinned(normalized, wholeFileReplaced: true);
+    copies = this._placement.ResolveCopies(normalized);
+    if (copies.Count == 0) {
+      // the only copy was the one just preserved — the delete has nothing left to do
+      this._shadow.Remove(normalized);
+      return;
+    }
 
     // pending buffered mutations are moot once the file dies; their intents complete with the delete
     var discarded = this._writeBuffer.Drain(normalized);
@@ -1187,6 +1316,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var normalized = PoolPaths.Normalize(path);
     if (this._placement.ResolveCopies(this._DataName(normalized)).Count == 0)
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
+
+    // Opened for writing with no promise about how much of it will be rewritten, so the content is
+    // preserved by copy. A caller that goes on to truncate has already been given the cheap path by
+    // SetLength; this is the conservative case, and being conservative here is the difference
+    // between a snapshot and a suggestion.
+    if ((mode & AccessMode.Write) != 0)
+      this._PreserveIfPinned(normalized, wholeFileReplaced: false);
 
     return this._handles.Open(normalized, mode).Handle;
   }

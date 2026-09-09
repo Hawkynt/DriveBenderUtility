@@ -158,9 +158,23 @@ Honestly enumerated, because this is the part that decides the schedule:
 
 ## Delivery, in slices that are each worth having
 
-1. **Store and index, no UI.** Take, list and delete a snapshot; aside-move on first write; refcounts;
-   journalled throughout. Engine tests only. At the end of this slice the feature is real but only
-   reachable from tests.
+1. **Store and index, no UI.** ✅ **Done.** Take, list and delete a snapshot; preservation on
+   overwrite, delete and rename; refcounts; journalled throughout; nine engine tests. The feature is
+   real and reachable only from the engine — there is no verb and no screen, on purpose.
+
+   What the implementation confirmed, and what it changed:
+
+   - The cheap path works as designed. Creating over an existing file WITH truncate preserves by
+     renaming the old file into the store and then takes the ordinary new-file branch, so the
+     replacement is staged and published by a rename exactly as any new file is. Two renames, no
+     bytes.
+   - Opening for writing WITHOUT that promise preserves by copy. It has to: the caller may modify in
+     place, and the untouched bytes must survive in the live file as well as in the version.
+   - Rename was the one this design nearly missed. It destroys a snapshot's view of BOTH endpoints
+     and neither is obvious — the source path stops naming the content, so a snapshot that recorded
+     it would resolve to a live file that is no longer there, and a rename ONTO a file is a delete
+     wearing a different verb. Both are preserved now, by copy, because the live file has to stay
+     put for the rename itself to have something to move.
 2. **Read a snapshot.** Resolution, then a CLI verb to list and restore a single file from one — the
    recycle bin's shape, which is already built and understood.
 3. **Reserve and policy.** Accounting against `StatFs` and placement, the ceiling, the drop-oldest or
@@ -183,6 +197,8 @@ because the surface said one thing and the storage did another.
   modified in place and cost close to their full size per snapshot. If the pools hold the second
   kind, the answer is to not build this rather than to build it and document a sharp edge.
 - **Reserve exhausted: refuse, or drop the oldest?** It decides whether a snapshot is a promise or a
-  convenience, and every later slice depends on which.
+  convenience, and every later slice depends on which. Slice 1 ships with neither, because slice 1
+  has no reserve — a pool with snapshots and no ceiling will fill up, and that is the first thing
+  slice 3 must fix.
 - **Scheduled snapshots, or manual only?** Scheduling is small once the engine exists, and it changes
   the reserve maths from "an operator's choice" to "a rate".
