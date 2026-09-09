@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34283873604](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34283873604).
+Generated from run: [34315657334](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34315657334).
 
-178 scenarios — 157 passing on at least one target, 0 failing.
+179 scenarios — 158 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -180,6 +180,7 @@ Generated from run: [34283873604](https://github.com/Hawkynt/DriveBenderUtility/
 | Tiering | `Tiering_WhileTheMoverIsRelocatingFiles_ThenTheyStayReadableAndWritable` | Tiering is transparent: a file stays readable AND writable throughout, including while the mover is relocating it. | pass | pass |
 | Trash | `Recover_GivenAFileWasDeleted_ThenItCanBeListedAndRestored` | A deleted file can be listed in the recycle bin and put back where it came from. | pass | pass |
 | Trash | `Recover_GivenThePoolIsMounted_ThenTheManagerListsAndRestoresIt` | Through the manager, on a MOUNTED pool: a deleted file is listed and restored without unmounting anything. | pass | pass |
+| Trash | `RemoveMedia_GivenTheMemberHoldsTrashedFiles_ThenTheyAreStillRecoverableAfterwards` | Removing a member from the pool takes its recycle bin with it, rather than discarding what was still recoverable. | pass | pass |
 | Trash | `Trash_GivenAFileWasTrashed_ThenItsNameCanBeUsedAgainAtOnce` | A trashed file's name is free again immediately: creating a new file at the same path is not confused by the deleted one. | pass | pass |
 | Trash | `Trash_GivenItIsEnabled_ThenADeletedFilesBytesAreKeptIntact` | With the trash on, a deleted file leaves the pool but its bytes are kept, whole, on a member. | pass | pass |
 | Trash | `Trash_GivenItIsOff_ThenADeleteIsPermanent` | With the trash off — the default — a delete really is permanent and leaves nothing behind. | pass | pass |

@@ -220,4 +220,41 @@ public class TrashEndToEndTests {
         + $"again is only half recovered.{Environment.NewLine}{pool.DescribeMembers()}");
   }
 
+  /// <summary>Trash on, single copies — so a deleted file sits in exactly one member's bin.</summary>
+  private const string _TRASH_ON_SINGLE =
+    """{ "duplication": 1, "trash": { "enabled": true, "retention": "7d", "maxSize": "50%" } }""";
+
+  [Test]
+  [Category("Exception")]
+  [Description("Removing a member from the pool takes its recycle bin with it, rather than discarding what was still recoverable.")]
+  public void RemoveMedia_GivenTheMemberHoldsTrashedFiles_ThenTheyAreStillRecoverableAfterwards() {
+    // remove-media promises to scatter a member's data over the others before dropping it. A file in
+    // the recycle bin is data the user can still ask for — that is the entire point of keeping it —
+    // and the walk that decides what to scatter skips the pool's own hidden tree, which is where the
+    // bin lives. So the copies move and the recoverable versions are left on a disk about to leave.
+    using var pool = MountedPool.Create(members: 3, poolDefaults: _TRASH_ON_SINGLE);
+
+    var content = _Payload(48 * 1024, 613);
+    var path = pool.PathTo("quarterly.xlsx");
+    File.WriteAllBytes(path, content);
+    var holder = Enumerable.Range(0, pool.MemberPaths.Count)
+      .First(i => File.Exists(Path.Combine(pool.MemberPaths[i], "quarterly.xlsx")));
+
+    File.Delete(path);
+
+    var binned = _InTheTrash(pool);
+    binned.Should().NotBeEmpty($"the delete must put it in the bin.{Environment.NewLine}{pool.DescribeMembers()}");
+
+    // the member holding the recoverable copy is taken out of the pool
+    pool.WhileUnmounted(() => DbMount.RunExpectingSuccess(TimeSpan.FromMinutes(3),
+      "pool-remove-media", pool.PoolName, "--member", pool.MemberPaths[holder]));
+
+    var listed = DbMount.RunExpectingSuccess(TimeSpan.FromMinutes(2), "pool-trash-list", pool.PoolName, "--json");
+    listed.StandardOutput.Should().Contain("quarterly.xlsx",
+      $"removing a disk must not quietly destroy what was still recoverable. The verb's promise is "
+      + $"that a member's data is scattered over the others before it leaves, and a file in the "
+      + $"recycle bin is data somebody may still ask for."
+      + $"{Environment.NewLine}{listed.Output}{Environment.NewLine}{pool.DescribeMembers()}");
+  }
+
 }

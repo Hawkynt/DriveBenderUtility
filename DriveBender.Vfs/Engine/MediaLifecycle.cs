@@ -157,8 +157,74 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
       }
     }
 
+    moved += this._ScatterRecoverables(leaving);
+
     DriveBender.Logger($"Removed media '{leaving.DisplayName}': {moved} file(s) relocated, {removed} copy(ies) cleared");
     return new(moved, moved, removed);
+  }
+
+  /// <summary>
+  /// Moves the leaving member's RECYCLE BIN onto the members that stay.
+  ///
+  /// The scatter above walks the visible namespace, and that walk skips the pool's own hidden tree —
+  /// correctly, because most of what is in there is per-member bookkeeping (this member's journal,
+  /// its manifest mirror, its checksums) which belongs to the disk and must not be scattered. The
+  /// recycle bin is the exception: it is USER DATA, kept precisely so somebody can still ask for it,
+  /// and it was going out of the door with the disk. The verb promises to scatter a member's data
+  /// before removing it, and answered that promise by silently destroying every recoverable file
+  /// that happened to live on the member being removed.
+  ///
+  /// Copied before the original is dropped, like everything else here, so an interruption leaves the
+  /// version on one member or both and never on neither.
+  /// </summary>
+  private int _ScatterRecoverables(IVolumeIO leaving) {
+    var moved = 0;
+    foreach (var path in this._WalkFolder(leaving, PoolTrash.TrashPrefix)) {
+      var size = leaving.Stat(path, false)?.Length ?? 0;
+      var target = this._ChooseTarget([], size, leaving);
+      if (target == null) {
+        // Said out loud rather than swallowed: the bin is the one thing here that has no second
+        // copy anywhere, so failing to place it is the difference between "moved" and "gone".
+        DriveBender.Logger($"[Warning]Nowhere to move recoverable '{path}' off '{leaving.DisplayName}' — it stays on the removed member");
+        continue;
+      }
+
+      var parent = PoolPaths.GetParent(path);
+      if (parent.Length > 0)
+        target.EnsureFolder(parent, false);
+
+      var sequence = journal.LogIntent(JournalOp.Rebalance, path, memberId: target.MemberId);
+      WholeFilePublisher.CopyBetween(leaving, path, false, target, path, false,
+        admit: WholeFilePublisher.Pace(admit, leaving, target));
+      journal.Complete(sequence, JournalOp.Rebalance);
+      leaving.Delete(path, false);
+      ++moved;
+    }
+
+    return moved;
+  }
+
+  /// <summary>Every file under one folder of a member, hidden names included — the walk above deliberately excludes them.</summary>
+  private IEnumerable<string> _WalkFolder(IVolumeIO member, string root) {
+    var stack = new Stack<string>();
+    stack.Push(root);
+    while (stack.Count > 0) {
+      var folder = stack.Pop();
+      VolumeEntry[] entries;
+      try {
+        entries = [.. member.List(folder, false)];
+      } catch (PoolFsException) {
+        continue; // the bin may simply not exist on this member
+      }
+
+      foreach (var entry in entries) {
+        var child = $"{folder}/{entry.Name}";
+        if (entry.IsDirectory)
+          stack.Push(child);
+        else
+          yield return child;
+      }
+    }
   }
 
   /// <summary>
