@@ -17,6 +17,15 @@ public enum JournalOp {
   Drain,
   Rebalance,
   TrashMove,
+
+  /// <summary>A snapshot's index was written across the members.</summary>
+  SnapshotTake,
+
+  /// <summary>A snapshot was forgotten and the versions only it pinned were released.</summary>
+  SnapshotDelete,
+
+  /// <summary>A pinned file was renamed into the snapshot store so the content survives what happens to its name.</summary>
+  SnapshotAside,
 }
 
 /// <summary>One journal line: an intent (Completed=false) or its completion marker.</summary>
