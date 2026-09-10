@@ -1,4 +1,4 @@
-using DivisonM.Backends;
+﻿using DivisonM.Backends;
 using DivisonM.Vfs;
 using DivisonM.Vfs.Engine;
 
@@ -152,7 +152,7 @@ internal static class PoolOpsCommand {
         // reported the rot in detail and repaired none of it.
         if (_RelayToMount(registry, target, "fix", TimeSpan.FromHours(12)) is { } relayed) {
           Console.WriteLine(relayed);
-          return 0;
+          return _RelayedVerdict(relayed);
         }
 
         if ((exclusive = _TakeEngineLock(registry, target)) == null)
@@ -181,6 +181,30 @@ internal static class PoolOpsCommand {
         (member.Smart.ReallocatedSectors is { } r and > 0 ? $", {r} reallocated sectors" : ""));
 
     return report.Healthy ? 0 : 1;
+  }
+
+  /// <summary>
+  /// The exit code for a health run that was relayed into the mount that owns the pool.
+  ///
+  /// The relayed answer is the same report the local path produces, and the local path ends with
+  /// `report.Healthy ? 0 : 1`. Returning a flat 0 here meant that `pool-health --fix` on a MOUNTED
+  /// pool — the ordinary case, since a pool in use is mounted — always reported success, while
+  /// printing "healthy": false and an unrecoverable-bit-rot issue in the very same breath. Anything
+  /// script-driven (a cron check, a monitor, a pre-backup gate) read that as a clean bill of health
+  /// and said nothing, which is worse than the damage it was failing to mention.
+  ///
+  /// A report that cannot be parsed is NOT treated as healthy. Something answered in a shape this
+  /// build does not understand, and calling that "fine" is the same mistake in a smaller hat.
+  /// </summary>
+  private static int _RelayedVerdict(string relayed) {
+    try {
+      using var document = System.Text.Json.JsonDocument.Parse(relayed);
+      return document.RootElement.TryGetProperty("healthy", out var healthy) && healthy.ValueKind == System.Text.Json.JsonValueKind.True
+        ? 0
+        : 1;
+    } catch (System.Text.Json.JsonException) {
+      return 1;
+    }
   }
 
   public static int Restore(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, PoolRestoreOptions options) {
