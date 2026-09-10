@@ -252,7 +252,9 @@ public class PerformanceMatrixEndToEndTests {
                ("cached write", cachedWrite), ("cached read", warm),
                ("storage write", storageWrite), ("storage read", cold), ("landing write", landingWrite),
              })
-      rate.Should().BeGreaterThan(10L * 1024 * 1024,
+      // a hosted runner writes at ~77 MiB/s where this machine does 1,000, so the floor has to
+      // clear the slow end of that range rather than the fast one
+      rate.Should().BeGreaterThan(2L * 1024 * 1024,
         $"{what} collapsed to {rate / (1024 * 1024)} MiB/s — a per-block round trip looks exactly like this");
 
     warm.Should().BeGreaterThanOrEqualTo(cold / 2,
@@ -349,8 +351,8 @@ public class PerformanceMatrixEndToEndTests {
     var coldMany = _Parallel(_THREADS, _RANDOM_OPS / 5, () => new Reader(_uncached.PathTo("large.bin")), Read);
     _Record("Storage", $"random {_RANDOM_BLOCK / 1024} KiB read", $"{_THREADS}", _Ops(coldMany));
 
-    warmSingle.Should().BeGreaterThan(50, $"single-threaded cached random reads collapsed to {warmSingle:N0} IOPS");
-    coldSingle.Should().BeGreaterThan(20, $"single-threaded storage random reads collapsed to {coldSingle:N0} IOPS");
+    warmSingle.Should().BeGreaterThan(20, $"single-threaded cached random reads collapsed to {warmSingle:N0} IOPS");
+    coldSingle.Should().BeGreaterThan(10, $"single-threaded storage random reads collapsed to {coldSingle:N0} IOPS");
 
     // MEASURED, NOT ASPIRATIONAL: cached random reads do not currently scale with threads — they
     // regress by roughly a third. The floor below is set where it is so the suite reports the real
@@ -390,12 +392,19 @@ public class PerformanceMatrixEndToEndTests {
     var readMany = _Parallel(_THREADS, _SMALL_FILES, (i, _) => File.ReadAllBytes(_uncached.PathTo($"sn-{i}.bin")));
     _Record("RAM cache", $"open+read+close, {_SMALL} B", $"{_THREADS}", _Ops(readMany));
 
-    createSingle.Should().BeGreaterThan(20, $"creating small files collapsed to {createSingle:N0}/s");
-    readSingle.Should().BeGreaterThan(50, $"reading small files collapsed to {readSingle:N0}/s");
+    // CALIBRATED FOR THE SLOWEST PLAUSIBLE HOST, not for a workstation. A hosted CI runner writes
+    // small files at about 8/s where a local NVMe manages 113 - a fourteen-fold spread - and the
+    // first real scheduled run of this job failed on a floor of 20 that had been called "loose".
+    // A floor tuned to the machine it was written on is not a collapse detector, it is a report
+    // that the hardware differs. These sit where only a per-operation round trip could reach.
+    createSingle.Should().BeGreaterThan(2, $"creating small files collapsed to {createSingle:N0}/s");
+    readSingle.Should().BeGreaterThan(20, $"reading small files collapsed to {readSingle:N0}/s");
     _Record("RAM cache", $"open+read+close scaling, {_SMALL} B", $"1 -> {_THREADS}",
       string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{readMany / readSingle:N1}x"));
 
-    readMany.Should().BeGreaterThan(readSingle * 0.9,
+    // relative, so it travels across hardware — but generous, because a two-core runner cannot
+    // show the concurrency a twenty-core workstation can
+    readMany.Should().BeGreaterThan(readSingle * 0.5,
       $"{_THREADS} threads read {readMany:N0}/s against {readSingle:N0}/s on one — small-file reads are serialising");
   }
 
@@ -433,7 +442,7 @@ public class PerformanceMatrixEndToEndTests {
     _Record("Scatter", $"sequential read, {_SCATTER / (1024 * 1024)} MiB, 2 copies", "1", _Rate(mirrored));
 
     foreach (var (what, rate) in new[] { ("queue depth 1", serial), ("overlapped", overlapped), ("two copies", mirrored) })
-      rate.Should().BeGreaterThan(10L * 1024 * 1024, $"the {what} read collapsed to {rate / (1024 * 1024)} MiB/s");
+      rate.Should().BeGreaterThan(2L * 1024 * 1024, $"the {what} read collapsed to {rate / (1024 * 1024)} MiB/s");
 
     // Deliberately NOT asserting that overlapped beats serial. On a host whose members share one
     // device — every CI runner, and most developer machines — the two numbers can land either way,
