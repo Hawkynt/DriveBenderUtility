@@ -1,4 +1,4 @@
-# When somebody messes with the storage
+﻿# When somebody messes with the storage
 
 Every other part of this design assumes the members hold what the pool put there. This one assumes
 the opposite, because that is what happens on real machines.
@@ -112,9 +112,74 @@ until two copies are down cannot honour that with one disk frozen, and the hones
 the write. Acking anyway would tell the application its data is redundant when it is not — which on a
 backup target is the whole proposition quietly evaporating.
 
+## The pool's own shape, and the files that decide it
+
+Every member carries `pool.json`, a mirror of the manifest, and `member.json`, which says which
+member of which pool the disk is. These are different in kind from the rest: the others describe the
+data, these describe the **pool**, and reconciliation takes the highest version. So a mirror is not a
+cache — raise its version and it becomes the configuration. Editing one is the most leveraged thing
+on the disk, and it is plain JSON in an ordinary folder.
+
+All of it holds. A forged higher version that drops a member does not make data unreachable; one
+that lowers duplication to 1 does not revoke the redundancy the pool promised; one that adds a folder
+nobody configured does not get that folder's contents published as pool data.
+
+One case is worth knowing about because the answer looks like a fault and is not. Resolution is **by
+marker**, which is what lets a drive letter change without losing the pool — so a disk carrying a
+*copy* of its neighbour's `member.json` stops resolving as itself, and the pool opens degraded on one
+member. On a pool told to keep two copies the next write is then refused with a device-not-ready.
+That is the acknowledgement policy being honoured, not a bug: accepting would mean acking with less
+redundancy than promised. The realistic way to arrive here is cloning a failing member and attaching
+both disks.
+
+## The checksum database
+
+Not a description of the data but a licence to *act on* it, which makes it the most dangerous sidecar
+to get wrong: the others make the pool forget something, this one can make it "repair" a file nobody
+damaged. Deleting it, truncating it, filling it with prose, pointing it at files that never existed,
+replacing it with a directory, inflating it to a hundred thousand records — none of it costs a byte
+of user data. Nor does the pointed case: a database that claims a *wrong hash* for a healthy file
+makes the pool report `BitRotUnrecoverable` and **leave the data where it is**, because every copy
+contradicting its record means the record is the odd one out.
+
+Fixing that scenario's test found a real defect in the reporting rather than the repairing:
+`pool-health --fix` on a *mounted* pool always exited 0, whatever it found. A pool in use is mounted,
+so the ordinary case announced success while printing `"healthy": false` in the same breath, and
+anything script-driven believed it.
+
+## Links, which are the one escape containment cannot see
+
+Path containment rejects a hostile path *string*. A hard link carries no string: it makes the stored
+copy **be** a file somewhere else — the same MFT record — under a name that looks entirely ordinary.
+Every check the pool has then says the file is where it belongs, so reads serve the outsider's bytes
+and writes overwrite them. Hard links need no privileges on NTFS.
+
+This is recorded as a hardening gap rather than fixed. Refusing it means comparing hard-link counts
+or file identifiers on the read path — a stat per open, against a threat that already requires write
+access inside a member folder. That is a judgement about cost, and it belongs to whoever owns the
+risk. The scenario is held back in
+`TamperPhysicalEndToEndTests.Stored_GivenACopyIsRelinkedOutsideThePool_...` with the measurement, so
+it is not forgotten.
+
+## Running out of room
+
+A write that fails for want of space is the classic way a filesystem destroys the file it was asked
+to *update*: truncate first, fail second, and neither version exists. Tested by reserving the members
+rather than filling a real disk — a volume the pool has been told to leave alone is the supported way
+to say "this is not yours", and filling somebody's workstation is not a reasonable test. A failed
+update leaves the old version behind, and a file never claims a length it did not store.
+
 ## Where the tests are
+
+
 
 - `DriveBender.EndToEnd.Tests/TamperEndToEndTests.cs` — the real thing: a mounted pool, the members
   edited behind its back, driven through the shipped binary.
 - `DriveBender.Vfs.Tests/Unit/TamperResilienceTests.cs` — the same rules where they are cheap to check
   and impossible to misattribute.
+
+- `DriveBender.EndToEnd.Tests/TamperChecksumEndToEndTests.cs` — the checksum database, damaged and lying.
+- `DriveBender.EndToEnd.Tests/TamperWeaponisedEndToEndTests.cs` — sidecars edited to say something
+  false but well-formed, and made enormous.
+- `DriveBender.EndToEnd.Tests/TamperIdentityEndToEndTests.cs` — the manifest mirror and the member marker.
+- `DriveBender.EndToEnd.Tests/TamperPhysicalEndToEndTests.cs` — links, and running out of room.
