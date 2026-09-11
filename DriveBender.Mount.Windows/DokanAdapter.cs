@@ -276,6 +276,9 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
 
   public NtStatus DeleteFile(string fileName, IDokanFileInfo info) {
     try {
+      // Cleanup does the removal and cannot report a failure, so anything the engine would refuse
+      // has to be refused HERE or the application is told the delete succeeded and nothing happened
+      pool.RequireUnlinkable(_ToPoolPath(fileName));
       var meta = pool.GetAttributes(_ToPoolPath(fileName));
       return meta.IsDirectory ? DokanResult.AccessDenied : DokanResult.Success; // validation only; Cleanup deletes
     } catch (PoolFsException e) {
@@ -289,6 +292,7 @@ public sealed class DokanAdapter(IPoolFileSystem pool, string volumeLabel) : IDo
 
   public NtStatus DeleteDirectory(string fileName, IDokanFileInfo info) {
     try {
+      pool.RequireUnlinkable(_ToPoolPath(fileName)); // see DeleteFile — Cleanup cannot refuse
       return pool.ReadDirectory(_ToPoolPath(fileName)).Count > 0
         ? DokanResult.DirectoryNotEmpty
         : DokanResult.Success; // validation only; Cleanup deletes

@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34368121260](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34368121260).
+Generated from run: [34633965376](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34633965376).
 
-183 scenarios — 162 passing on at least one target, 0 failing.
+190 scenarios — 169 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -154,6 +154,13 @@ Generated from run: [34368121260](https://github.com/Hawkynt/DriveBenderUtility/
 | Snapshot | `Snapshot_GivenAFileIsDeleted_ThenItCanBeRestoredFromTheSnapshot` | A file deleted after a snapshot is still recoverable from it. | pass | pass |
 | Snapshot | `Snapshot_GivenAFileIsOverwritten_ThenItCanBeRestoredFromTheSnapshot` | A file overwritten after a snapshot is still recoverable from it, through the shipped CLI. | pass | pass |
 | Snapshot | `Snapshot_GivenThePoolIsNotMounted_ThenTheVerbRefusesAndExplains` | Snapshot verbs refuse clearly when the pool is not mounted, rather than writing state the running engine would not know about. | pass | pass |
+| SnapshotBrowsing | `Browse_GivenADeletedFile_ThenRecoveryIsACopyOutOfTheView` | A file deleted after the snapshot is still openable through the view, and copying it back is the whole recovery. | pass | pass |
+| SnapshotBrowsing | `Browse_GivenAFileWasOverwritten_ThenTheOldOneOpensFromTheSnapshotFolder` | An overwritten file's old content reads back through .snapshots with File.ReadAllBytes, no tooling involved. | pass | pass |
+| SnapshotBrowsing | `Browse_GivenALargeFile_ThenItStreamsBackWholeThroughTheView` | A large file reads back through the view whole, in the many-chunk reads the kernel actually issues. | pass | pass |
+| SnapshotBrowsing | `Browse_GivenAMissingSnapshot_ThenTheViewSaysNotFoundRatherThanFailing` | A snapshot that no longer exists has no folder in the view, and one that never existed reads as not found. | pass | pass |
+| SnapshotBrowsing | `Browse_GivenAnAttemptToChangeTheView_ThenItIsRefusedAsAPermissionProblem` | Nothing under the snapshot view can be written, deleted or renamed — and the refusal is a permission error, not an I/O error. | pass | pass |
+| SnapshotBrowsing | `Browse_GivenARecursiveWalk_ThenTheSnapshotViewIsNotPartOfIt` | A walk of the whole pool never descends into the snapshot view. | pass | pass |
+| SnapshotBrowsing | `Browse_GivenNestedContent_ThenEachLevelOfTheViewListsWhatIsUnderIt` | The snapshot view can be walked by hand: snapshots, then folders, then files. | pass | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(RAM + RAM)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(RAM + RAM) | skipped | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(RAM + SD card)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(RAM + SD card) | skipped | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(SSD + cloud)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(SSD + cloud) | skipped | pass |

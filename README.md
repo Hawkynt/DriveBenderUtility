@@ -510,10 +510,6 @@ flowchart TD
 
 ### Snapshots
 
-> **Engine only today.** Taking, listing, deleting and preserving work and are tested; there is no
-> CLI verb, no API and no screen yet, and **no reserve** — see [docs/Snapshots.md](docs/Snapshots.md)
-> for the design and the delivery slices.
-
 Taking a snapshot **copies nothing**: it records the pool's namespace at that instant. From then on
 the pool may not destroy content those paths still point at, so the first thing that would destroy
 one preserves it first.
@@ -562,6 +558,57 @@ flowchart TD
 
 > **A snapshot is not a backup.** It shares the pool's disks and its failure domains: it protects
 > against deleting or overwriting a file, not against losing the storage underneath it.
+
+#### Browsing snapshots from the pool itself
+
+Recovering a file should not require the utility. Every snapshot is a folder inside the mounted pool:
+
+```
+X:\.snapshots\before-the-edit\books\ledger.db
+```
+
+Open it, copy the file back, done — File Explorer, Finder, `cp`, or whatever the user already has.
+The whole tree is read-only; anything that would change it is refused with a permission error rather
+than quietly accepted, because a record of the past that can be edited is not a record.
+
+The one deliberate oddity is that **`.snapshots` never appears in a directory listing.** It resolves
+when you ask for it by name and is invisible to a walk. That is the same choice ZFS makes for
+`.zfs`, for the same reason: a backup or sync tool pointed at the pool walks it, and a visible
+snapshot view would have it faithfully copy every version of every file the pool has ever held, on
+every run — forever, and growing.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","lineColor":"#90A4AE","textColor":"#37474F","clusterBkg":"#FAFAFA","clusterBorder":"#E0E0E0","edgeLabelBackground":"#FFFFFF"}}}%%
+flowchart TD
+    U["user opens the pool"] --> W{"listed, or asked<br/>for by name?"}
+
+    W -- "a walk: backup tool,<br/>sync, indexer" --> L["the live namespace only<br/>.snapshots is not in the listing"]
+    W -- "by name:<br/>X:\.snapshots\…" --> V["the snapshot view opens"]
+
+    V --> S["one folder per snapshot"]
+    S --> F["the paths that snapshot held,<br/>as folders and files"]
+    F --> R{"read, or write?"}
+    R -- read --> Src["the preserved version,<br/>or the live file when<br/>nothing has touched it since"]
+    R -- "write, delete,<br/>rename, chmod" --> Deny["refused — EACCES"]
+
+    Src --> Cp["copy it back<br/>with any file manager"]
+
+    classDef primary fill:#E3F2FD,stroke:#42A5F5,stroke-width:1.5px,color:#0D47A1,rx:8,ry:8
+    classDef surface fill:#FFFFFF,stroke:#CFD8DC,stroke-width:1.5px,color:#37474F,rx:8,ry:8
+    classDef store fill:#E8F5E9,stroke:#66BB6A,stroke-width:1.5px,color:#1B5E20,rx:8,ry:8
+    classDef danger fill:#FFEBEE,stroke:#EF5350,stroke-width:1.5px,color:#B71C1C,rx:8,ry:8
+    classDef accent fill:#EDE7F6,stroke:#7E57C2,stroke-width:1.5px,color:#4527A0,rx:8,ry:8
+    classDef decision fill:#ECEFF1,stroke:#90A4AE,stroke-width:1.5px,color:#37474F
+    class U primary
+    class W,R decision
+    class V,S,F accent
+    class L,Src surface
+    class Cp store
+    class Deny danger
+```
+
+> A pool that already contains a real folder named `.snapshots` will find it shadowed by the view.
+> Rename it before mounting.
 
 ## 📁 Project structure
 

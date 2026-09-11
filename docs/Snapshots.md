@@ -200,6 +200,37 @@ Honestly enumerated, because this is the part that decides the schedule:
    that matters most and that nowhere else will say: a snapshot is not a backup, because it shares
    these disks.
 
+6. **A place inside the pool.** ✅ **Done.** Every snapshot is a folder in the mounted namespace:
+   `.snapshots/<name>/<path>`. Recovering a file is a copy in a file manager — no verb, no screen,
+   no administrator — which is the difference between a feature an operator uses and one a user
+   does.
+
+   Three properties make it safe, and each of them is load-bearing:
+
+   - **Not listed.** The tree resolves when asked for by name and does not appear in a directory
+     listing. That is what ZFS does with `.zfs` and for the same reason: a backup or sync tool walks
+     the pool, and a visible view would have it copy every version of every file the pool has ever
+     held, on every run. A hidden-but-navigable tree is the only shape that can be left switched on.
+   - **Read-only, loudly.** Every mutation door — create, open-for-write, unlink, rename either
+     way, mkdir, rmdir, setattr, and write or truncate through a handle already open — refuses with
+     `AccessDenied`, which reaches the application as `EACCES`. Silently accepting a write into the
+     past would be the worst available answer: the caller believes it edited history and nothing did.
+   - **Its own handle space.** Snapshot handles are negative and live outside the ordinary handle
+     table. That table is keyed on live pool paths and carries leases, write buffers, read-ahead and
+     staging — every one of them about a file the pool can still change. Letting a path that does
+     not really exist into it would mean each of those mechanisms has to learn about the view.
+
+   Two things the implementation had to get right that the design did not say. A file *nothing has
+   touched since the snapshot* has no preserved version, so the view falls through to the live file
+   — without that, a snapshot of an idle pool would appear to contain only the files that happened
+   to change afterwards. And a *folder* in the view resolves to no version and no live file for
+   exactly the same reason a lost file does; answering `NotFound` with "neither a version nor the
+   live file remains" would report data loss where there is none, so the view asks whether anything
+   lives beneath the name before reaching for that message.
+
+   A pool that already contains a real folder named `.snapshots` finds it shadowed by the view. That
+   is a known and accepted collision, in exchange for a path users can guess.
+
 The order is deliberate: every earlier slice is useful without the later ones, and the screen comes
 last because a screen over a half-built engine is the mistake this project has already made twice —
 `ChMod` answering success and storing nothing, `ChOwn` doing the same. Both were dangerous precisely
