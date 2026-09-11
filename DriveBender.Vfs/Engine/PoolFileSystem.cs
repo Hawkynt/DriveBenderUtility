@@ -118,6 +118,22 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private int _healScanRequested;
   private IEnumerator<string>? _healScan; // advanced only by HealStep (single pump thread)
 
+  /// <summary>
+  /// When to look again because a file was left under-duplicated, or default when nothing is owed.
+  ///
+  /// Healing is event-driven: a member returning asks for a scan, and the scan walks every file
+  /// once. A file that could not be placed AT THAT MOMENT was simply dropped — the comment said a
+  /// later heal would converge, but nothing schedules a later heal, so "later" meant the next
+  /// member event, which may never come. A member returning is exactly when placement briefly
+  /// fails, too: reachability is cached for about a second, so the first files the scan reaches see
+  /// the returning member as still offline and find nowhere to put a copy. They stayed
+  /// single-copy for the life of the mount while the files behind them in the queue healed
+  /// normally, which is why this looked like slowness rather than permanent lost redundancy.
+  /// </summary>
+  private DateTime _healRetryAtUtc = DateTime.MaxValue;
+
+  private static readonly TimeSpan _HEAL_RETRY_DELAY = TimeSpan.FromSeconds(15);
+
   // degraded-write warnings deduplicate per path; cleared when membership changes
   private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _degradedAckWarned = new(PoolPaths.PathComparer);
 
@@ -2835,6 +2851,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._mountOptions == null || this.IsReadOnly)
       return false; // a read-only mount must not mutate members — an explicit repair op can
 
+    // something was left owed by an earlier pass: look again, but on a timer rather than at once,
+    // because placement can be impossible for a long while (one disk and SAFE-PHYS) and a tight
+    // retry would spend the pump on a file that cannot move
+    if (this._healScan == null && this._healQueue.IsEmpty && this._clock() >= this._healRetryAtUtc) {
+      this._healRetryAtUtc = DateTime.MaxValue;
+      Interlocked.Exchange(ref this._healScanRequested, 1);
+    }
+
     if (this._healQueue.TryDequeue(out var path))
       // Whether the QUEUE ADVANCED, which is not the same as whether a copy was made. Deciding a
       // file needs nothing is progress — it leaves the queue one shorter — and reporting that as
@@ -2979,8 +3003,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     while (holders.Count < duplication) {
       var target = this._placement.ChooseShadowTarget(size, holders);
-      if (target == null)
-        break; // not placeable right now (SAFE-PHYS) — a later heal converges
+      if (target == null) {
+        // Nowhere to put it THIS INSTANT — a member still reading as offline, a watermark, or one
+        // disk and SAFE-PHYS. Ask for another look later instead of dropping the file: the queue
+        // is not re-walked on its own, so a break alone left this copy owed for the life of the
+        // mount. Scheduling rather than re-queueing keeps a genuinely unplaceable file from
+        // spinning the pump.
+        this._healRetryAtUtc = this._clock() + _HEAL_RETRY_DELAY;
+        break;
+      }
 
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: target.MemberId);
       target.EnsureFolder(PoolPaths.GetParent(normalized), true);
