@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34639872518](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34639872518).
+Generated from run: [34644884258](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34644884258).
 
-210 scenarios — 189 passing on at least one target, 0 failing.
+232 scenarios — 210 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -205,6 +205,28 @@ Generated from run: [34639872518](https://github.com/Hawkynt/DriveBenderUtility/
 | Tamper | `Trash_GivenASidecarIsDeleted_ThenTheBinStillListsAndRestoresWhatItCan` | A .trashinfo sidecar is deleted: listing the bin still works and the remaining entries are still restorable. | pass | pass |
 | Tamper | `Trash_GivenASidecarIsGarbage_ThenTheBinStillListsAndRestoresWhatItCan` | A .trashinfo sidecar is rewritten as garbage: the bin still lists and still restores the healthy entries. | pass | pass |
 | Tamper | `Utility_GivenTheHiddenTreeIsDeletedFromOneMember_ThenTheOtherMemberCarriesThePool` | Somebody deletes the whole hidden folder off one member: the pool mounts, and every duplicated file is still there. | pass | pass |
+| TamperChecksum | `Checksums_GivenAnEnormousSidecar_ThenMountingAndReadingStayQuick` | Somebody inflates the checksum sidecar to a hundred thousand records: mounting and reading stay quick. | pass | pass |
+| TamperChecksum | `Checksums_GivenTheSidecarIsDeletedEverywhere_ThenThePoolMountsAndKeepsItsFiles` | The checksum sidecar is deleted from every member: the pool mounts, keeps its files, and rebuilds a baseline. | pass | pass |
+| TamperChecksum | `Checksums_GivenTheSidecarIsGarbage_ThenThePoolMountsAndKeepsItsFiles` | The checksum sidecar is replaced with text that is not JSON: the pool mounts and keeps its files. | pass | pass |
+| TamperChecksum | `Checksums_GivenTheSidecarIsReplacedByADirectory_ThenThePoolStillMountsAndKeepsItsFiles` | The sidecar is replaced by a DIRECTORY of that name: the pool still mounts and keeps its files. | pass | pass |
+| TamperChecksum | `Checksums_GivenTheSidecarIsTruncatedMidObject_ThenThePoolMountsAndKeepsItsFiles` | The checksum sidecar is truncated mid-object: the pool mounts and keeps its files. | pass | pass |
+| TamperChecksum | `Checksums_GivenTheSidecarLiesAboutAHealthyFile_ThenAFixDoesNotDestroyIt` | The sidecar claims a WRONG hash for a healthy file: --fix must not overwrite content that two members agree on. | pass | pass |
+| TamperChecksum | `Checksums_GivenTheSidecarLiesAndAMemberIsAway_ThenTheSurvivorStillServesTheFile` | The sidecar is tampered with AND a member is away: the surviving member still serves the file unchanged. | pass | pass |
+| TamperChecksum | `Checksums_GivenTheSidecarNamesFilesThatAreNotThere_ThenNothingChokes` | The sidecar names files that do not exist: the pool mounts, works, and a health check does not choke. | pass | pass |
+| TamperIdentity | `Marker_GivenItNamesADifferentPool_ThenTheMemberIsNotSilentlyUsed` | A member's marker is rewritten to name a different pool: the disk must not be treated as a member of this one. | pass | pass |
+| TamperIdentity | `Marker_GivenTwoMembersClaimTheSameIdentity_ThenThePoolDoesNotLoseData` | One member's identity marker is overwritten with the other's: two disks claiming to be the same member must not corrupt the pool. | pass | pass |
+| TamperIdentity | `Mirror_GivenAForgedHigherVersionAddsAStrangeMember_ThenItIsNotAdopted` | A mirror is given a huge version naming a member folder that was never part of the pool: the pool must not adopt it. | pass | pass |
+| TamperIdentity | `Mirror_GivenAForgedHigherVersionDropsAMember_ThenNoDataBecomesUnreachable` | A member's manifest mirror is given a huge version with one member REMOVED: the pool must not silently drop a disk holding data. | pass | pass |
+| TamperIdentity | `Mirror_GivenAForgedHigherVersionLowersDuplication_ThenRedundancyIsNotSilentlyDropped` | A mirror is given a huge version with duplication lowered to 1: redundancy must not be reduced by editing a file. | pass | pass |
+| TamperIdentity | `Mirror_GivenEveryCopyIsGarbage_ThenThePoolStillMountsFromTheRegistry` | Both mirrors are replaced with garbage: the pool still mounts from the registry and keeps its files. | pass | pass |
+| TamperPhysical | `Space_GivenEveryMemberIsReservedToTheBrim_ThenAWriteIsRefusedAndTheOldFileSurvives` | Every member is reserved to the brim: a write is refused cleanly and the file it would have replaced is intact. | pass | pass |
+| TamperPhysical | `Space_GivenItRunsOutMidStream_ThenTheFileDoesNotClaimBytesItNeverStored` | The pool runs out of room mid-write: the partially written file is not left claiming a length it does not have. | pass | pass |
+| TamperPhysical | `Stored_GivenACopyIsRelinkedOutsideThePool_ThenNeitherReadsNorWritesFollowIt` | A stored copy is replaced by a hard link to a file outside the pool: the pool reads and writes through it. _(held back: Measured, and recorded as a hardening gap rather than a broken promise. A hard link inside a member folder makes the stored copy BE the outside file - same MFT record - so every check the pool has says the file is where it belongs, and reads serve the outsider's bytes while writes overwrite them. Refusing it means comparing hard-link counts or file IDs on the read path, which costs a stat per open for a threat that already requires write access to a member folder. That is a design call, not a fix. See docs/Tampering.md.)_ | skipped | skipped |
+| TamperWeaponised | `Snapshot_GivenASidecarPointsOutsideThePool_ThenNothingEscapes` | A snapshot sidecar claims its stored version belongs outside the pool: nothing is written there. | pass | pass |
+| TamperWeaponised | `Tombstones_GivenAForgedRecordNamesALiveFile_ThenReplayDoesNotDeleteIt` | A forged tombstone claims a LIVE file was deleted: replay must not delete a file that is demonstrably there. | pass | pass |
+| TamperWeaponised | `Tombstones_GivenAnEnormousLog_ThenAMemberReturnStillCompletes` | The tombstone log is inflated to a hundred thousand records: a member's return still completes quickly. | pass | pass |
+| TamperWeaponised | `Trash_GivenASidecarPointsOutsideThePool_ThenRestoringDoesNotEscape` | A recycle-bin sidecar claims its file came from outside the pool: restoring must not write there. | pass | pass |
+| TamperWeaponised | `Trash_GivenThousandsOfEntries_ThenListingStaysResponsive` | The recycle bin holds thousands of entries: listing it stays responsive and the pool keeps working. | pass | pass |
 | Tiering | `Tiering_GivenAFileHasDrained_ThenTheFastTierIsFreedAgain` | The fast tier is freed again after a file drains, so a landing zone does not fill up permanently. | pass | pass |
 | Tiering | `Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` | New data lands on the fast tier first, then the drainer moves it down to capacity storage on its own. | pass | pass |
 | Tiering | `Tiering_GivenALandingZone_ThenWritesAreAcceptedAndReadBackIntact` | A landing-zone pool accepts writes and serves them back correctly through the mount. | pass | pass |
