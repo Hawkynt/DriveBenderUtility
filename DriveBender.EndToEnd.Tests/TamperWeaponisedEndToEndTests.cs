@@ -52,10 +52,38 @@ public class TamperWeaponisedEndToEndTests {
         .Where(f => f.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))];
 
   /// <summary>Everything outside the pool's own tree that a restore or replay might have created.</summary>
-  private static string[] _EscapedEntries(MountedPool pool) {
-    var root = Path.GetFullPath(pool.Root);
-    var parent = Path.GetDirectoryName(root)!;
-    return [.. Directory.EnumerateFileSystemEntries(parent, "escaped*", SearchOption.TopDirectoryOnly)];
+  /// <summary>
+  /// Anything sitting in the pool's PARENT directory under the bait name this scenario planted —
+  /// which is where a "../.." in a sidecar lands, and therefore what an escape looks like.
+  ///
+  /// Scoped to the exact stem, and that matters more than it looks. The parent of a pool root is the
+  /// machine's shared temp directory, so an earlier version of this that globbed <c>escaped*</c>
+  /// was asking a question about the whole of /tmp: one unrelated file left there by anything, ever,
+  /// failed both scenarios permanently, while a clean CI runner passed them. A check whose verdict
+  /// is decided by ambient state it does not control is not a check. The trailing wildcard stays so
+  /// a half-written <c>.TEMP.$DRIVEBENDER</c> of the bait still counts as an escape.
+  /// </summary>
+  private static string[] _EscapedEntries(MountedPool pool, string baitStem)
+    => [.. Directory.EnumerateFileSystemEntries(
+        Path.GetDirectoryName(Path.GetFullPath(pool.Root))!, baitStem + "*", SearchOption.TopDirectoryOnly)];
+
+  /// <summary>
+  /// Clears this scenario's bait before it plants it, so the verdict is about THIS run.
+  ///
+  /// A leftover from a previous run would otherwise be indistinguishable from an escape that just
+  /// happened — and since a genuine escape leaves the file behind, the very next run would fail for
+  /// the previous run's reason and keep doing so until somebody cleaned the directory by hand.
+  /// </summary>
+  private static void _ClearEscapeBait(MountedPool pool, string baitStem) {
+    foreach (var stale in _EscapedEntries(pool, baitStem))
+      try {
+        if (Directory.Exists(stale))
+          Directory.Delete(stale, recursive: true);
+        else
+          File.Delete(stale);
+      } catch (IOException) {
+        // not ours to insist on; the assertion below will report it either way
+      }
   }
 
   [Test]
@@ -118,8 +146,10 @@ public class TamperWeaponisedEndToEndTests {
     // The same shape as a hostile directory listing, which path containment already refuses: a
     // string from the disk that becomes a write location. Here it arrives in a .trashinfo rather
     // than in a remote listing, and a restore is exactly the operation that acts on it.
+    const string bait = "escaped-from-trash.bin";
     var content = _Payload(16 * 1024, 23);
     using var pool = MountedPool.Create(members: 2, poolDefaults: _TRASH_ON);
+    _ClearEscapeBait(pool, bait);
 
     File.WriteAllBytes(pool.PathTo("bin-me.bin"), content);
     MountedPool.WaitUntil(() => pool.PhysicalCopies("bin-me.bin").Count >= 1, TimeSpan.FromMinutes(1));
@@ -148,7 +178,7 @@ public class TamperWeaponisedEndToEndTests {
     var restored = DbMount.Run(_CLI, "pool-trash-restore", pool.PoolName, "../../escaped-from-trash.bin");
     TestContext.Out.WriteLine($"restore exit {restored.ExitCode}:{Environment.NewLine}{restored.Output}");
 
-    _EscapedEntries(pool).Should().BeEmpty(
+    _EscapedEntries(pool, bait).Should().BeEmpty(
       $"restoring wrote outside the pool because a sidecar named a path there. Whether the restore "
       + $"succeeds or is refused is a judgement call; writing to '../..' is not."
       + $"{Environment.NewLine}{restored.Output}");
@@ -157,8 +187,10 @@ public class TamperWeaponisedEndToEndTests {
   [Test]
   [Description("A snapshot sidecar claims its stored version belongs outside the pool: nothing is written there.")]
   public void Snapshot_GivenASidecarPointsOutsideThePool_ThenNothingEscapes() {
+    const string bait = "escaped-from-snapshot.bin";
     var content = _Payload(16 * 1024, 24);
     using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
+    _ClearEscapeBait(pool, bait);
 
     File.WriteAllBytes(pool.PathTo("snapped.bin"), content);
     pool.WaitForPhysicalCopies("snapped.bin", atLeast: 2, TimeSpan.FromMinutes(2));
@@ -193,7 +225,7 @@ public class TamperWeaponisedEndToEndTests {
 
     DbMount.Run(_CLI, "pool-snapshot-restore", pool.PoolName, "tampered", "snapped.bin");
     DbMount.Run(_CLI, "pool-snapshot-restore", pool.PoolName, "tampered", "../../escaped-from-snapshot.bin");
-    _EscapedEntries(pool).Should().BeEmpty("a snapshot sidecar must not be able to name a write location outside the pool");
+    _EscapedEntries(pool, bait).Should().BeEmpty("a snapshot sidecar must not be able to name a write location outside the pool");
   }
 
   [Test]
