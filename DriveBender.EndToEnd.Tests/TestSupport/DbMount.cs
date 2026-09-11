@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -315,6 +315,32 @@ public static class DbMount {
     } catch (Exception) {
       return null; // a half-written snapshot is read again on the next poll
     }
+  }
+
+  /// <summary>
+  /// Sets every member's reserveBytes, which is how a pool is made to believe it has no room.
+  ///
+  /// The alternative is filling the actual disk, which is not a reasonable thing to do to the
+  /// machine running the tests — and a volume at 100% free-space exhaustion behaves differently from
+  /// one the pool has simply been told to leave alone. The reserve is the supported way to say "this
+  /// much is not yours", and placement honours it, so exhaustion becomes configurable.
+  /// </summary>
+  public static void SetMemberReserves(string poolName, long reserveBytes) {
+    foreach (var path in Directory.EnumerateFiles(PoolRegistryDirectory, "*.json")) {
+      var text = File.ReadAllText(path);
+      if (!text.Contains($"\"{poolName}\"", StringComparison.Ordinal))
+        continue;
+
+      var manifest = System.Text.Json.Nodes.JsonNode.Parse(text)!.AsObject();
+      foreach (var member in manifest["members"]!.AsArray())
+        member!["reserveBytes"] = reserveBytes;
+
+      manifest["version"] = (manifest["version"]?.GetValue<int>() ?? 1) + 1; // highest version wins on mount
+      File.WriteAllText(path, manifest.ToJsonString(new() { WriteIndented = true }));
+      return;
+    }
+
+    throw new FileNotFoundException($"No registry manifest for pool '{poolName}' under '{PoolRegistryDirectory}'");
   }
 
   /// <summary>Removes a test pool's registry entry by name; never throws, cleanup must not fail a run.</summary>
