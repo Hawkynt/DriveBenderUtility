@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34633965376](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34633965376).
+Generated from run: [34639872518](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34639872518).
 
-190 scenarios — 169 passing on at least one target, 0 failing.
+210 scenarios — 189 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -37,7 +37,7 @@ Generated from run: [34633965376](https://github.com/Hawkynt/DriveBenderUtility/
 | Brownout | `Brownout_GivenTheVolatileAckOptIn_ThenTheWriteIsNotPacedByTheSickCopy` | The RAM-ack opt-in is the sanctioned way out: the write is taken at memory speed and both copies converge behind it. | pass | pass |
 | Brownout | `Brownout_WhenAMembersLimitIsLoweredLive_ThenItTakesEffectWithoutARemount` | A rate limit lowered on a mounted pool takes effect without a remount, rather than being ignored until the next mount. | pass | pass |
 | Brownout | `Brownout_WhenTheMemberRecovers_ThenThroughputComesBack` | When the collapsed member recovers, the pool's throughput comes back rather than staying degraded. | pass | pass |
-| ConcurrentEngineGuard | `Mounted_GivenAVerbTheMountCannotRun_ThenItRefusesAndExplains` | A verb the mount process cannot run refuses against a mounted pool, and says where to run it. | pass | pass |
+| ConcurrentEngineGuard | `Mounted_GivenAVerbTheMountCannotRun_ThenItRefusesAndExplains` | A verb that changes the member set refuses against a mounted pool, and says where to run it. | pass | pass |
 | ConcurrentEngineGuard | `Mounted_GivenRestoreIsRunFromTheCli_ThenItIsExecutedByTheOwningProcess` | An administrative verb run against a mounted pool is executed by the process that owns it, not by a second engine. | pass | pass |
 | ConcurrentEngineGuard | `Unmounted_GivenRestoreIsRunFromTheCli_ThenItProceeds` | The same verb runs normally once the pool is unmounted. | pass | pass |
 | DrainCrash | `Crash_GivenADrainWasInFlight_ThenNoStagingFileIsExposed` | A crash mid-drain leaves no half-written staging file visible to the user after the pool comes back. | pass | pass |
@@ -185,6 +185,26 @@ Generated from run: [34633965376](https://github.com/Hawkynt/DriveBenderUtility/
 | StorageFailureMatrix | `Removed_GivenTheMemberReturns_ThenThePoolConvergesWithEveryCopyAgreeing(RAM + SD card)` | Given The Member Returns , then The Pool Converges With Every Copy Agreeing(RAM + SD card) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenTheMemberReturns_ThenThePoolConvergesWithEveryCopyAgreeing(SSD + cloud)` | Given The Member Returns , then The Pool Converges With Every Copy Agreeing(SSD + cloud) | pass | pass |
 | StorageFailureMatrix | `Removed_GivenTheMemberReturns_ThenThePoolConvergesWithEveryCopyAgreeing(SSD + HDD)` | Given The Member Returns , then The Pool Converges With Every Copy Agreeing(SSD + HDD) | pass | pass |
+| Tamper | `Journal_GivenAStaleIntentNamesALiveFile_ThenRecoveryDoesNotDestroyIt` | A restored backup puts an OLD journal back, holding a completed delete: recovery must not replay it against the file that exists now. | pass | pass |
+| Tamper | `Journal_GivenEveryMirrorIsGarbage_ThenThePoolStillMountsAndKeepsItsFiles` | The journal is replaced with text that is not JSON at all: the pool mounts and keeps its files. | pass | pass |
+| Tamper | `Journal_GivenEveryMirrorIsTruncatedMidRecord_ThenThePoolStillMountsAndKeepsItsFiles` | The journal is truncated mid-line on every member: the pool mounts and every file is intact. | pass | pass |
+| Tamper | `Journal_GivenItIsDeletedEverywhere_ThenThePoolStillMountsAndKeepsItsFiles` | Somebody deletes the journal off every member: the pool mounts and keeps its files. | pass | pass |
+| Tamper | `Journal_GivenItIsRenamedAside_ThenThePoolTreatsItAsAbsentAndCarriesOn` | The journal is renamed out of the way on every member: the pool mounts and writes a fresh one. | pass | pass |
+| Tamper | `Member_GivenAStoredFileIsRenamedBehindThePoolsBack_ThenTheNamespaceAgreesWithTheDisk` | Somebody renames a stored file on a member behind the pool's back: the namespace shows the rename's effect and nothing is silently wrong. | pass | pass |
+| Tamper | `Member_GivenOneGoesReadOnlyAndOneCopySuffices_ThenWritesRouteToTheHealthyMember` | A member goes read-only under a live pool that acks on one copy: writes are routed to the healthy member and the owed duplicate is deferred. | skipped | pass |
+| Tamper | `Member_GivenOneGoesReadOnlyAndTwoCopiesAreRequired_ThenTheWriteIsRefusedRatherThanQuietlyLessSafe` | A member goes read-only under a live pool while the ack policy demands two copies: the write is REFUSED rather than acknowledged with less redundancy than promised. | skipped | pass |
+| Tamper | `Read_GivenOneOfTwoCopiesFails_ThenTheOtherServesTheFileWhole` | One of two copies fails every read: the other serves it, whole. | skipped | pass |
+| Tamper | `Read_GivenTheOnlyCopysMemberFailsEveryRead_ThenTheAnswerIsWholeOrAnError` | The member holding the only copy fails every read: the answer is the whole file or an error, never something in between. | skipped | pass |
+| Tamper | `Sidecars_GivenTheyAreRenamedRatherThanDeleted_ThenNothingIsSilentlyMisread` | Sidecars are RENAMED rather than deleted — the shape a tidy-up or a sync conflict actually takes. | pass | pass |
+| Tamper | `Snapshot_GivenAStoredVersionIsDeleted_ThenReadingItFailsRatherThanReturningTheLiveFile` | A snapshot's stored version is deleted from the disk: reading it through the view FAILS rather than quietly returning today's file. | pass | pass |
+| Tamper | `Snapshot_GivenTheIndexIsCorrupted_ThenThePoolMountsAndTheLiveFilesAreUntouched` | A snapshot's index file is corrupted: the pool mounts, the live files are untouched, and the snapshot is not half-listed. | pass | pass |
+| Tamper | `Snapshot_GivenTheMemberHoldingAVersionIsGone_ThenTheViewFailsLegiblyAndThePoolCarriesOn` | A member holding a snapshot's stored version is ejected: reading it through the view fails legibly, and the live pool carries on. | pass | pass |
+| Tamper | `Snapshot_GivenTheVersionSidecarIsDeleted_ThenTheViewDoesNotSilentlySubstituteTheLiveFile` | A snapshot's .snapinfo sidecar is deleted, leaving the stored bytes: the view must not silently fall back to the live file. | pass | pass |
+| Tamper | `Tombstones_GivenTheLogIsCorrupted_ThenThePoolStillMountsAndStaysConsistent` | The tombstone log is corrupted while a member is away: the pool mounts, and the member's return does not resurrect anything readable as live. | pass | pass |
+| Tamper | `Tombstones_GivenTheLogIsDeleted_ThenThePoolStillMountsAndKeepsWhatItHas` | Somebody deletes the tombstone log: the pool mounts, works, and never loses a file that was not deleted. | pass | pass |
+| Tamper | `Trash_GivenASidecarIsDeleted_ThenTheBinStillListsAndRestoresWhatItCan` | A .trashinfo sidecar is deleted: listing the bin still works and the remaining entries are still restorable. | pass | pass |
+| Tamper | `Trash_GivenASidecarIsGarbage_ThenTheBinStillListsAndRestoresWhatItCan` | A .trashinfo sidecar is rewritten as garbage: the bin still lists and still restores the healthy entries. | pass | pass |
+| Tamper | `Utility_GivenTheHiddenTreeIsDeletedFromOneMember_ThenTheOtherMemberCarriesThePool` | Somebody deletes the whole hidden folder off one member: the pool mounts, and every duplicated file is still there. | pass | pass |
 | Tiering | `Tiering_GivenAFileHasDrained_ThenTheFastTierIsFreedAgain` | The fast tier is freed again after a file drains, so a landing zone does not fill up permanently. | pass | pass |
 | Tiering | `Tiering_GivenAFileIsWritten_ThenItLandsOnTheFastTierAndDrainsToCapacity` | New data lands on the fast tier first, then the drainer moves it down to capacity storage on its own. | pass | pass |
 | Tiering | `Tiering_GivenALandingZone_ThenWritesAreAcceptedAndReadBackIntact` | A landing-zone pool accepts writes and serves them back correctly through the mount. | pass | pass |
