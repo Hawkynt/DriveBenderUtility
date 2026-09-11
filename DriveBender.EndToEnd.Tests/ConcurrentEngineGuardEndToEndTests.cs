@@ -49,14 +49,17 @@ public class ConcurrentEngineGuardEndToEndTests {
 
   [Test]
   [Category("Exception")]
-  [Description("A verb the mount process cannot run refuses against a mounted pool, and says where to run it.")]
+  [Description("A verb that changes the member set refuses against a mounted pool, and says where to run it.")]
   public void Mounted_GivenAVerbTheMountCannotRun_ThenItRefusesAndExplains() {
     using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
     File.WriteAllBytes(pool.PathTo("live.bin"), new byte[4096]);
 
-    // restoring from the recycle bin has no handler inside the mount process, so there is nowhere
-    // safe to relay it to — which must read as a clear refusal rather than a silent second engine
-    var result = DbMount.Run(_CLI, "pool-trash-restore", pool.PoolName, "live.bin");
+    // Changing the MEMBER SET is different in kind from the verbs that relay. Repairing bit rot or
+    // restoring a file from the bin is work the running engine can do, and does, on request; taking
+    // a disk out from under a live mount is not something to hand to the mount at all, so there is
+    // no handler for it and there should not be. That has to read as a clear refusal rather than a
+    // silent second engine writing the same members.
+    var result = DbMount.Run(_CLI, "pool-remove-media", pool.PoolName, "--member", pool.MemberPaths[1]);
 
     result.Succeeded.Should().BeFalse(
       $"there is no safe way to run this against a mounted pool, so it must not run."
@@ -65,6 +68,13 @@ public class ConcurrentEngineGuardEndToEndTests {
     result.Output.Should().Contain("mounted",
       $"refusing is only half of it: the operator has to be told why and what to do instead."
       + $"{Environment.NewLine}{result.Output}");
+
+    // and the verbs that CAN be relayed are not caught by the same net — the guard exists to stop a
+    // second engine, not to make a live pool unmanageable
+    var relayed = DbMount.Run(_CLI, "pool-trash-list", pool.PoolName);
+    relayed.Succeeded.Should().BeTrue(
+      $"reading the recycle bin of a mounted pool has to work; it is the pool people actually use."
+      + $"{Environment.NewLine}{relayed.Output}");
   }
 
   [Test]

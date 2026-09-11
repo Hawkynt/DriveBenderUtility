@@ -40,6 +40,13 @@ public sealed record JournalRecord {
   [JsonPropertyName("offset")] public long Offset { get; init; }
   [JsonPropertyName("length")] public long Length { get; init; }
   [JsonPropertyName("member")] public Guid MemberId { get; init; }
+
+  // When the intent was logged. Recovery uses it to tell an interrupted operation from one that
+  // finished long ago and came back on a restored disk: content NEWER than the intent cannot be the
+  // content the intent was about. Absent (DateTime.MinValue) on records written before this field
+  // existed and on anything forged, which reads as "cannot prove this is recent" — and recovery
+  // then declines to destroy anything, which is the safe direction to be wrong in.
+  [JsonPropertyName("utc")] public DateTime LoggedUtc { get; init; }
   [JsonPropertyName("done")] public bool Completed { get; init; }
 
   // a compaction checkpoint: carries the high-water sequence forward so a compacted (empty of
@@ -371,6 +378,7 @@ public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
         Offset = offset,
         Length = length,
         MemberId = memberId,
+        LoggedUtc = this._clock(),
       };
       line = JsonSerializer.Serialize(record, _OPTIONS);
       this._open.Add(record.Sequence);

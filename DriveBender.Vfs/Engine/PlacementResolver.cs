@@ -12,7 +12,7 @@ public sealed record PhysicalCopy(IVolumeIO Volume, bool Shadow);
 /// (SAFE-PHYS).
 /// </summary>
 public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> members, MetadataCache metadata, PoolConfig config, IReadOnlyDictionary<Guid, MemberRole>? memberRoles = null, IReadOnlyDictionary<Guid, long>? memberReserves = null,
-  Func<IVolumeIO, double>? loadOf = null) {
+  Func<IVolumeIO, double>? loadOf = null, Func<IVolumeIO, bool>? isFaulted = null) {
 
   private int _roundRobinCounter;
   private IReadOnlyDictionary<Guid, MemberRole>? _roles = memberRoles;
@@ -125,8 +125,8 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
     var holders = existingCopyHolders.ToArray();
     var occupiedDomains = new HashSet<string>(holders.Select(m => m.PhysicalVolumeId), StringComparer.OrdinalIgnoreCase);
 
-    var independent = this._Online
-      .Where(m => this._IsEligible(m, size, null) && !occupiedDomains.Contains(m.PhysicalVolumeId))
+    var independent = this._PreferHealthy([.. this._Online
+        .Where(m => this._IsEligible(m, size, null) && !occupiedDomains.Contains(m.PhysicalVolumeId))])
       .OrderByDescending(this._UsableFree)
       .FirstOrDefault();
     if (independent != null)
@@ -136,8 +136,8 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
     // and never on a member that already holds a copy of this file (that would be the same data)
     if (config.Placement?.ShadowNeverSamePhysical == false) {
       var holderIds = new HashSet<Guid>(holders.Select(m => m.MemberId));
-      return this._Online
-        .Where(m => this._IsEligible(m, size, null) && !holderIds.Contains(m.MemberId))
+      return this._PreferHealthy([.. this._Online
+          .Where(m => this._IsEligible(m, size, null) && !holderIds.Contains(m.MemberId))])
         .OrderByDescending(this._UsableFree)
         .FirstOrDefault();
     }
@@ -176,6 +176,8 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
     if (candidates.Length == 0)
       return null;
 
+    candidates = _PreferHealthy(candidates);
+
     return (config.Placement?.Strategy ?? PlacementStrategy.MostFreeSpace) switch {
       // spreads consecutive new files across members — parallel spindles, lower per-file latency, higher aggregate throughput
       PlacementStrategy.RoundRobin => candidates[Interlocked.Increment(ref this._roundRobinCounter) % candidates.Length],
@@ -187,6 +189,31 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
         .First(),
       _ => this._BusiestLast(candidates),
     };
+  }
+
+  /// <summary>
+  /// Drops members that just failed an operation — unless that would leave nothing to choose from.
+  ///
+  /// A member's configured role says whether the OPERATOR made it read-only. It says nothing about a
+  /// filesystem that remounted itself read-only after an I/O error, or a disk whose controller has
+  /// started refusing writes; those members are online, have plenty of free space and look like the
+  /// obvious place to put a new file, so placement kept choosing them. The create path already
+  /// retries across members and records the failure, on the stated understanding that the retry
+  /// would land somewhere else — but the record lived in the engine and placement could not see it,
+  /// so every retry picked the same member again and the write failed with a healthy disk sitting
+  /// beside it.
+  ///
+  /// Preference, never exclusion: if every member is inside its cooldown the choice is made from all
+  /// of them, because a pool that refuses to try is worse than one that tries and fails.
+  /// </summary>
+  private IVolumeIO[] _PreferHealthy(IVolumeIO[] candidates) {
+    // A single candidate is not a choice — the result is the same either way, so skip the filtering
+    // rather than allocate for it on what is the common path.
+    if (isFaulted == null || candidates.Length < 2)
+      return candidates;
+
+    var healthy = candidates.Where(m => !isFaulted(m)).ToArray();
+    return healthy.Length > 0 ? healthy : candidates;
   }
 
   /// <summary>

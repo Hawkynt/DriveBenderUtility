@@ -322,6 +322,17 @@ internal static class PoolOpsCommand {
 
   public static int TrashRestore(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, PoolTrashRestoreOptions options) {
     var (pool, online, _, _, _) = _Open(host, provider, remoteResolver, options.Pool);
+
+    // A mounted pool is the one people actually restore from — somebody deleted the wrong file on a
+    // share that is up and serving, and "unmount your backup target first" is not an answer. The
+    // mount process already runs this operation for the manager, and its version is the BETTER one:
+    // it puts the file back and re-establishes its duplication, where doing the work here leaves a
+    // single copy the operator has to be warned about.
+    if (_RelayToMount(registry, pool, $"trash-restore:{PoolPaths.Normalize(options.Path)}", TimeSpan.FromHours(1)) is not null) {
+      Console.WriteLine($"Restored '{options.Path}' to pool '{pool.Name}', with its duplication re-established.");
+      return 0;
+    }
+
     using var exclusive = _TakeEngineLock(registry, pool);
     if (exclusive == null)
       return ExitError;
@@ -344,6 +355,12 @@ internal static class PoolOpsCommand {
 
   public static int TrashPurge(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, MountRegistry registry, PoolTrashPurgeOptions options) {
     var (pool, online, _, _, _) = _Open(host, provider, remoteResolver, options.Pool);
+    if (_RelayToMount(registry, pool, "trash-purge", TimeSpan.FromHours(2)) is { } relayed) {
+      using var answer = System.Text.Json.JsonDocument.Parse(relayed);
+      Console.WriteLine($"Pool '{pool.Name}': {answer.RootElement.GetProperty("purged").GetInt32()} recycle-bin entr(ies) purged.");
+      return 0;
+    }
+
     using var exclusive = _TakeEngineLock(registry, pool);
     if (exclusive == null)
       return ExitError;

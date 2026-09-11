@@ -272,7 +272,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       effectiveConfig,
       members.ToDictionary(m => m.Io.MemberId, m => m.Role),
       members.ToDictionary(m => m.Io.MemberId, m => m.ReserveBytes),
-      this._LoadScore); // new files go where the least work is already queued
+      this._LoadScore, // new files go where the least work is already queued
+      member => this._IsCoolingDown(member.MemberId)); // and never at one that just refused a write
 
     this._queues = new(effectiveConfig, members.ToDictionary(m => m.Io.MemberId, m => m.Role));
     this._queues.SetThrottles(members.Select(m => (m.Io.MemberId, m.EffectiveLimits)));
@@ -701,25 +702,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var snapshot = this._SnapshotNamed(name)
                    ?? throw new PoolFsException(PoolFsError.NotFound, $"No snapshot named '{name}'");
 
-    // either a preserved version, or the live file when nothing has touched it since
-    (IVolumeIO member, string path, bool shadow) source;
-    if (this._snapshots.Resolve(snapshot.Id, rest) is { } version)
-      source = (version.member, version.versionPath, false);
-    else {
-      var copies = this._placement.ResolveCopies(this._DataName(rest));
-      if (copies.Count == 0) {
-        // A folder resolves to no version and no live file for the same reason a lost file does —
-        // snapshots record paths, and a folder is only ever implied by the paths beneath it. Saying
-        // "nothing remains" about a directory would report data loss where there is none, so ask
-        // whether anything in the snapshot lives under this name before reaching for that message.
-        if (this.BrowseSnapshot(snapshot.Id).Any(e => e.Path.StartsWith(rest + "/", PoolPaths.PathComparison)))
-          throw new PoolFsException(PoolFsError.IsADirectory, $"'{normalized}' is a folder in the snapshot view");
+    // A folder resolves to no version and no live file for the same reason a lost file does —
+    // snapshots record paths, and a folder is only ever implied by the paths beneath it. Saying
+    // "nothing remains" about a directory would report data loss where there is none, so ask
+    // whether anything in the snapshot lives under this name before letting the resolver speak.
+    if (this._snapshots.PathsIn(snapshot.Id).Any(p => p.StartsWith(rest + "/", PoolPaths.PathComparison)))
+      throw new PoolFsException(PoolFsError.IsADirectory, $"'{normalized}' is a folder in the snapshot view");
 
-        throw new PoolFsException(PoolFsError.NotFound, $"Snapshot '{name}' recorded '{rest}', but neither a version nor the live file remains");
-      }
-
-      source = (copies[0].Volume, this._DataName(rest), copies[0].Shadow);
-    }
+    var source = this._ResolveSnapshotSource(snapshot, rest);
 
     var handle = new NodeHandle(-Interlocked.Increment(ref this._nextSnapshotHandle));
     this._snapshotHandles[handle.Value] = source;
@@ -1085,17 +1075,40 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var sourceShadow = knownCopies.Count > 0 ? knownCopies[0].Shadow : !sourceVol.FileExists(normalized, false);
     var size = sourceVol.Stat(normalized, sourceShadow)?.Length ?? 0;
 
+    // Members that have just REFUSED this copy, kept apart from the ones that hold it. Both are
+    // excluded from the next choice, for different reasons: a holder already has the data, and a
+    // refuser has proved it cannot take it. Without the second list a two-member pool with one
+    // frozen disk picks the frozen one on every pass, for ever.
+    var refused = new List<IVolumeIO>();
+
     while (holders.Count < duplication) {
-      var target = this._placement.ChooseShadowTarget(size, holders);
+      var target = this._placement.ChooseShadowTarget(size, [.. holders, .. refused]);
       if (target == null) {
         DriveBender.Logger($"[Warning]Duplication level {duplication} for '{normalized}' not placeable — no independent failure domain left; owed copies deferred (SAFE-PHYS)");
         return;
       }
 
       var parent = PoolPaths.GetParent(normalized);
-      target.EnsureFolder(parent, true);
-      WholeFilePublisher.CopyBetween(sourceVol, normalized, sourceShadow, target, normalized, true,
-        admit: this._AdmitBulkBetween(sourceVol, target));
+      try {
+        target.EnsureFolder(parent, true);
+        WholeFilePublisher.CopyBetween(sourceVol, normalized, sourceShadow, target, normalized, true,
+          admit: this._AdmitBulkBetween(sourceVol, target));
+      } catch (PoolFsException e) {
+        // A member with no ROOM for the second copy already defers it and lets the write succeed —
+        // and a member that cannot take it because its filesystem went read-only under us, or its
+        // controller started refusing, is the same situation reached by a different road. Failing
+        // the whole write there loses a file the pool could perfectly well have stored on a healthy
+        // member, for the sake of a redundancy the healer exists to restore. This is the commonest
+        // real disk failure there is: ext4 remounts itself read-only on the first I/O error.
+        DriveBender.Logger(
+          $"[Warning]'{target.DisplayName}' refused the duplicate copy of '{normalized}' ({e.Error}: {e.Message}) — "
+          + "the file is stored, and the owed copy is deferred to the healer");
+        this._NoteMemberFault(target.MemberId); // and nothing else gets placed there until it recovers
+        this._placement.InvalidateAll();
+        refused.Add(target);
+        continue;
+      }
+
       this._activity.Publish(ActivityKind.Duplicate, normalized, size,
         fromMember: sourceVol.DisplayName, toMember: target.DisplayName,
         reason: $"duplication level {duplication}");
@@ -1332,18 +1345,77 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// </summary>
   public IReadOnlyList<(string Path, bool Preserved, long Length)> BrowseSnapshot(Guid id) {
     this._RequireMounted();
+    var snapshot = this._snapshots.List().FirstOrDefault(s => s.Id == id)
+                   ?? throw new PoolFsException(PoolFsError.NotFound, $"No snapshot {id:D}");
+
     var listed = new List<(string, bool, long)>();
     foreach (var path in this._snapshots.PathsIn(id).OrderBy(p => p, PoolPaths.PathComparer)) {
-      if (this._snapshots.Resolve(id, path) is { } version)
+      if (this._snapshots.Resolve(id, path) is { } version) {
         listed.Add((path, true, version.member.Stat(version.versionPath, false)?.Length ?? 0));
-      else if (this._placement.ResolveCopies(this._DataName(path)).Count > 0)
-        listed.Add((path, false, this._StatUncached(path)?.Length ?? 0));
+        continue;
+      }
 
-      // a path in neither place was deleted AND its version has since been released — the snapshot
-      // that held it is gone, so there is nothing honest to show for it
+      if (this._placement.ResolveCopies(this._DataName(path)).Count == 0)
+        continue; // deleted, and its version already released with the snapshot that held it
+
+      // Listed either way, because the snapshot really did hold this path and hiding that would be
+      // its own kind of lie — but a live file that has CHANGED since is not the snapshot's content,
+      // so its size is not reported as though it were. Opening it says why, at length.
+      listed.Add(this._LiveFileIsStillAsOf(path, snapshot.CreatedUtc)
+        ? (path, false, this._StatUncached(path)?.Length ?? 0)
+        : (path, false, 0L));
     }
 
     return listed;
+  }
+
+  /// <summary>
+  /// Whether the LIVE file at a path is still, provably, what a snapshot saw.
+  ///
+  /// A snapshot copies nothing when it is taken, so most of what it holds is the live file itself —
+  /// and reading through to that file is what makes a snapshot of an idle pool free. The danger is
+  /// the same fallback reached for the wrong reason: if a version WAS set aside and has since been
+  /// lost — a disk pulled, a sidecar deleted, somebody tidying the hidden folder — then falling
+  /// through hands back TODAY's content under the snapshot's name. No error, no way for the caller
+  /// to tell, and a restore driven off it overwrites the good copy with the newer one. That is worse
+  /// than failing, because failing is detectable.
+  ///
+  /// The proof is the file's own modification time, which is durable, needs no extra bookkeeping and
+  /// cannot be invalidated by damage to the snapshot store: a file not written since the snapshot
+  /// was taken cannot have changed since the snapshot was taken. Anything newer has changed, so the
+  /// live file is definitively NOT the snapshot's content and the missing version has to be
+  /// reported rather than papered over.
+  /// </summary>
+  private bool _LiveFileIsStillAsOf(string normalized, DateTime takenUtc) {
+    var meta = this._StatUncached(normalized);
+    return meta is { } found && found.LastWriteTimeUtc <= takenUtc;
+  }
+
+  /// <summary>
+  /// Where a path's content as of a snapshot actually lives, or an exception saying why it does not.
+  /// The single door every snapshot read goes through, so the honesty rule cannot be forgotten at one
+  /// of them.
+  /// </summary>
+  private (IVolumeIO member, string path, bool shadow) _ResolveSnapshotSource(SnapshotEntry snapshot, string normalized) {
+    if (this._snapshots.Resolve(snapshot.Id, normalized) is { } version)
+      return (version.member, version.versionPath, false);
+
+    if (!this._snapshots.PathsIn(snapshot.Id).Contains(normalized, PoolPaths.PathComparer))
+      throw new PoolFsException(PoolFsError.NotFound, $"Snapshot '{snapshot.Name}' does not contain '{normalized}'");
+
+    var copies = this._placement.ResolveCopies(this._DataName(normalized));
+    if (copies.Count == 0)
+      throw new PoolFsException(PoolFsError.NotFound,
+        $"'{normalized}' was in snapshot '{snapshot.Name}', but neither a preserved version nor the live file remains");
+
+    if (!this._LiveFileIsStillAsOf(normalized, snapshot.CreatedUtc))
+      throw new PoolFsException(PoolFsError.IoError,
+        $"Snapshot '{snapshot.Name}' preserved '{normalized}', and that copy is not available — the "
+        + "member holding it may be offline, or the store may have been altered. The live file has "
+        + "changed since the snapshot was taken, so it is NOT what the snapshot holds and will not be "
+        + "served in its place.");
+
+    return (copies[0].Volume, this._DataName(normalized), copies[0].Shadow);
   }
 
   /// <summary>
@@ -1355,18 +1427,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public Stream OpenSnapshotFile(Guid id, string path) {
     this._RequireMounted();
     var normalized = PoolPaths.Normalize(path);
-    if (this._snapshots.Resolve(id, normalized) is { } version)
-      return version.member.OpenRead(version.versionPath, false);
+    var snapshot = this._snapshots.List().FirstOrDefault(s => s.Id == id)
+                   ?? throw new PoolFsException(PoolFsError.NotFound, $"No snapshot {id:D}");
 
-    if (!this._snapshots.PathsIn(id).Contains(normalized, PoolPaths.PathComparer))
-      throw new PoolFsException(PoolFsError.NotFound, $"Snapshot {id:D} does not contain '{path}'");
-
-    var copies = this._placement.ResolveCopies(this._DataName(normalized));
-    if (copies.Count == 0)
-      throw new PoolFsException(PoolFsError.NotFound,
-        $"'{path}' was in snapshot {id:D} but neither the live file nor a preserved version remains");
-
-    return copies[0].Volume.OpenRead(this._DataName(normalized), copies[0].Shadow);
+    var source = this._ResolveSnapshotSource(snapshot, normalized);
+    return source.member.OpenRead(source.path, source.shadow);
   }
 
   /// <summary>
