@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34398752695](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34398752695).
+Generated from run: [34633965376](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34633965376).
 
-190 scenarios — 169 passing on at least one target, 1 failing.
+190 scenarios — 169 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -150,7 +150,7 @@ Generated from run: [34398752695](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(SSD over HDD)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(SSD over HDD) | pass | pass |
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(SSD over SD card)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(SSD over SD card) | pass | pass |
 | SimulatedDevice | `Unmount_GivenBackgroundWorkIsStarved_ThenThePoolStillComesDownCleanly` | A pool whose background work is throttled to a crawl still unmounts cleanly, instead of having to be killed. | pass | pass |
-| Snapshot | `RemoveMedia_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable` | Removing a member from the pool takes its snapshot store with it, rather than discarding preserved versions. | pass | **FAIL** |
+| Snapshot | `RemoveMedia_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable` | Removing a member from the pool takes its snapshot store with it, rather than discarding preserved versions. | pass | pass |
 | Snapshot | `Snapshot_GivenAFileIsDeleted_ThenItCanBeRestoredFromTheSnapshot` | A file deleted after a snapshot is still recoverable from it. | pass | pass |
 | Snapshot | `Snapshot_GivenAFileIsOverwritten_ThenItCanBeRestoredFromTheSnapshot` | A file overwritten after a snapshot is still recoverable from it, through the shipped CLI. | pass | pass |
 | Snapshot | `Snapshot_GivenThePoolIsNotMounted_ThenTheVerbRefusesAndExplains` | Snapshot verbs refuse clearly when the pool is not mounted, rather than writing state the running engine would not know about. | pass | pass |
