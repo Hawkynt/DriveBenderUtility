@@ -30,7 +30,249 @@ crash-safe journaling, bit-rot/SMART health checks with correction, and both a
 CLI (`dbmount`) and an animated live web/desktop dashboard. Jump to
 [**Quick Start**](#-quick-start) to create and mount your first pool.
 
-## 📸 Screenshots
+![The dashboard: one card per pool, with tier topology and per-member health](docs/screenshots/dashboard.png)
+
+## 🧭 Vision
+
+Drive Bender pooled several disks into one drive letter and then stopped being maintained, leaving
+working pools on disks nobody could manage any more. This started as a way to read those pools and
+became a pool manager in its own right: local disks, UNC shares and remote storage stacked into one
+mount, with duplication, tiering and health checking over the top.
+
+The rule it holds to is that the data stays readable without it. Members keep ordinary files in
+ordinary folders, so a pool is recoverable with a file manager if this program is ever the thing that
+goes away.
+
+## ✨ Features
+
+### 🔧 Pool Management
+- ✅ Create new storage pools with multiple drives
+- ✅ Delete existing pools with data preservation options
+- ✅ Forget a pool (remove from this machine's list, keep data + on-disk markers)
+- ✅ Recover an orphaned pool from a member folder's manifest mirror
+- ✅ Take a foreign-claimed folder over for a new pool (explicit consent)
+- ✅ Add drives to existing pools with automatic balancing
+- ✅ Remove drives with intelligent data migration
+- ✅ Replace drives with seamless data transfer
+- ✅ Space checking with user warnings
+
+### 🚀 Write & read pipeline
+- ✅ Staged writes: in-progress files live under a hidden temp name and only the atomic
+  temp→final rename — the last action before the journal releases — makes them appear;
+  a crash mid-write leaves no half-written file (fsync publishes early)
+- ✅ Striped acks: with a relaxed ack quorum, consecutive blocks rotate across storages
+  while the journal-backed owed-sync converges every copy in the background
+- ✅ Parallel mirrored writes, parallel mirror-split reads (different offsets from
+  different storages at once), per-block read failover, pooled positional I/O handles,
+  background read-ahead
+
+### 💾 Advanced Duplication
+- ✅ Enable/disable duplication on folders
+- ✅ Support for multiple shadow copies (beyond standard 2-copy limit)
+- ✅ Configurable duplication levels (0-10 copies)
+- ✅ Automatic shadow copy creation across volumes
+- ✅ Smart duplication based on file importance
+
+### 🔍 File Integrity & Repair
+- ✅ Comprehensive integrity checking with 8 issue types:
+  - Missing primary files
+  - Missing shadow copies
+  - Corrupted files
+  - Orphaned shadow copies
+  - Size mismatches
+  - Timestamp inconsistencies
+  - Permission issues
+  - Duplicate primaries
+- ✅ Automated repair with backup creation
+- ✅ Dry-run mode for safe testing
+- ✅ Deep scan capabilities
+- ✅ Batch repair operations
+
+### 🛡️ Safety Features
+- ✅ Dry-run mode (enabled by default)
+- ✅ Automatic backups before repairs
+- ✅ Space validation before operations
+- ✅ User prompts for destructive actions
+- ✅ Comprehensive logging and error handling
+
+### 🔒 Type Safety
+- ✅ Semantic data types (PoolName, DrivePath, FolderPath, ByteSize, DuplicationLevel)
+- ✅ Input validation and sanitization
+- ✅ Compile-time safety for critical operations
+
+## 📦 Installation
+
+### Prerequisites
+
+- **Build:** [.NET SDK 10](https://dotnet.microsoft.com/download). The engine,
+  backends, `dbmount` and the app are `net10.0`; `DriveBender.Core` also targets
+  `net47`/`netstandard2.0`. (Nothing needs Drive Bender installed — native pools
+  are auto-discovered if present.)
+- **To mount on Windows:** [**WinFsp**](https://winfsp.dev) *or*
+  [**Dokan**](https://dokan-dev.github.io) — `dbmount` uses whichever is present
+  (WinFsp preferred, Dokan is the no-extra-install fallback). *Installing* the
+  driver needs admin (the app/UI can do it for you); *mounting* does not — mount
+  as your normal user so the drive is visible in your own Explorer session.
+- **To mount on Linux:** `fuse3` (`/dev/fuse`) — e.g. `sudo apt install fuse3`.
+- **Remote/cloud members** need nothing extra; the SDKs are bundled.
+
+### 🔨 Build
+
+```bash
+dotnet build DriveBender.sln -c Release
+```
+
+That produces `dbmount` (the CLI/daemon, `DriveBender.Mount/bin/Release/...`) and
+`DriveBender.App` (the desktop shell). To run `dbmount` directly during
+development, use `dotnet <path>/dbmount.dll <args>`; a published build gives a
+plain `dbmount` executable. The examples below write `dbmount`.
+
+### 🧪 Tests
+
+```bash
+dotnet test DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj   # the VFS engine (headless)
+dotnet test DriveBender.Tests/DriveBender.Tests.csproj           # legacy Core suite
+dotnet test DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj --filter "TestCategory=Unit"
+```
+
+## 🚀 Quick start
+
+A **pool** is defined by a portable JSON *manifest* — a set of member folders
+(local drives/subfolders, UNC shares, or remote endpoints) plus tuning. You
+create it once, then mount it as a live drive.
+
+### 1. Create a pool
+
+```bash
+# two local members, duplicated data mounted at X:\ (Windows) …
+dbmount pool create --name MyPool --member "D:\" --member "E:\" --mount "X:\"
+
+# … or on Linux, mounted at a directory
+dbmount pool create --name MyPool --member /mnt/disk1 --member /mnt/disk2 --mount /mnt/mypool
+
+# an SSD landing zone (fast tier) plus capacity drives
+dbmount pool create --name Media --landing "F:\ssd" --member "G:\" --member "H:\" --mount "M:\"
+
+dbmount pool list          # what's discovered (manifest pools + native scan)
+dbmount pool export MyPool # print the manifest JSON
+```
+
+Creating a pool never destroys existing folder contents without `--force`, and a
+folder already owned by another pool is always refused.
+
+### 2. Mount it
+
+```bash
+# Windows (WinFsp or Dokan must be installed; run as your normal user — NOT elevated, or the
+# drive lands in a different session than Explorer and won't be visible)
+dbmount mount --manifest MyPool            # mounts at the manifest's target, or pass --target Y:\
+dbmount status                             # what's mounted right now
+dbmount unmount X:\                        # clean unmount (flushes dirty data); or Ctrl+C the mount
+
+# Linux
+dbmount mount --manifest MyPool --target /mnt/mypool
+fusermount3 -u /mnt/mypool                 # or: dbmount unmount /mnt/mypool
+```
+
+Now use `X:\` (or `/mnt/mypool`) from Explorer / any app — reads, writes,
+rename, delete all work, with duplication, tiering and balancing handled
+underneath.
+
+**Mount automatically at boot / login:**
+
+```bash
+# Windows service (mounts before login)
+dbmount install-service --manifest MyPool --target X:\
+# Windows Explorer: register a right-click "mount" for *.dbpool.json manifests
+dbmount register-shell
+
+# Linux: install the systemd unit + mount.drivebender fstab helper (run with sudo)
+dbmount install-systemd --manifest MyPool
+systemctl enable --now drivebender-pool@MyPool.service
+#   …or add to /etc/fstab:
+#   /etc/drivebenderutility/pools/MyPool.json  /mnt/mypool  fuse.drivebender  defaults,_netdev  0 0
+```
+
+### 3. Remote & cloud members
+
+Store the secret once (it goes to the OS credential store, never the manifest),
+then reference it by handle:
+
+```bash
+# password / key based (FTP, SFTP, WebDAV, S3, Azure…)
+dbmount credential-set MyPool-nas --user backup      # prompts for the secret (hidden)
+dbmount pool add-member MyPool --member "sftp://backup@nas.local/pool" --credential MyPool-nas
+
+# OAuth providers (Google, OneDrive, Dropbox, Box, Yandex, HiDrive) — browser login
+# with your own registered client id (loopback + PKCE, auto-refresh)
+dbmount credential-login MyPool-gdrive --provider google --client-id <your-id> --client-secret <your-secret>
+dbmount pool add-member MyPool --member "gdrive://backups" --credential MyPool-gdrive
+```
+
+Supported schemes: `file`/`unc`, `ftp`/`ftps`, `sftp`, `webdav`/`webdavs`, `s3`,
+`azblob`, `azfile`, `dropbox`, `onedrive`, `gdrive`, `gcs`, `box`, `yandex`,
+`hidrive` (see the backend table above for the secret format each expects).
+
+### 4. The GUI — web dashboard & desktop app
+
+```bash
+dbmount serve --open      # animated live dashboard at http://127.0.0.1:9723 (token-gated)
+```
+
+The page shows every pool with live capacity donuts, cache-hit/dirty and
+cache-occupancy meters, a hit-rate history, and a **live flow map** — pool I/O →
+RAM cache → fast tier → capacity storage — where **data blocks fly along curves**
+as reads, writes, drains and duplications actually happen, with each storage's
+measured latency shown in its node; updated once a second while pools are
+mounted. With `placement.autoLandingZone` enabled, the **landing zone follows
+the measured-fastest drive automatically** (hysteresis + cooldown prevent
+flapping; a slow or busy drive gets demoted live). From the same page you can run the
+**entire lifecycle**: create a pool (pick local folders with a built-in **folder
+browser**, or add remote members whose **credentials are collected by a
+scheme-aware dialog** — user/password for FTP·WebDAV, password *or* private key
+for SFTP, access/secret keys for S3, account key for Azure, token for
+Dropbox·OneDrive, service-account JSON for Google — stored under a reference the
+manifest never inlines), mount / unmount, add or remove members, set
+**duplication** (copies to keep — pool-wide or per folder/file glob; copies land
+on independent physical disks by default, SAFE-PHYS, with an opt-in to also keep
+copies on the same disk for bit-rot protection when no independent disk is free),
+edit **all pool settings** via a validated JSON editor, remove- and replace-media,
+**browse the pool** with one column per storage showing exactly where every
+file/folder lives (✅ primary · 🔁 shadow · ❌ absent), run a **problem scan**
+with a full report (under-duplicated files, integrity issues, per-device SMART)
+plus one-click fix, restore, **forget** a pool (drop it from this machine's list
+while leaving its data and on-disk markers intact, so it can be re-imported or
+recovered later), and delete (keep data) or purge (wipe data, guarded by a
+name-confirmation). If a chosen member folder is still claimed by another —
+possibly forgotten or otherwise invisible — pool, the UI offers to **restore**
+that pool from the manifest copy left in the folder, or **take the folder over**
+for the new one, instead of failing outright. The **desktop app**
+(`DriveBender.App`) is the same page in a native window — it launches the daemon
+for you, so web and desktop are identical.
+
+### 5. Health & media maintenance
+
+```bash
+dbmount pool health MyPool               # metadata scan: SMART, missing copies, inconsistent files — never changes anything
+dbmount pool health MyPool --deep        # + re-checksum every file to find silent bit-rot (reads all data, can take long)
+dbmount pool health MyPool --fix         # repair bit-rot, re-sync stale copies, resolve conflicts, restore duplication
+dbmount pool restore MyPool              # bring every file back to its duplication level
+
+dbmount pool remove-media MyPool --member "E:\"                 # scatter its data, then drop it
+dbmount pool replace-media MyPool --old "D:\" --new "K:\newdisk"  # migrate to a replacement disk
+```
+
+A mounted pool also **heals itself**: losing a member degrades redundancy, not
+availability — reads fail over to surviving copies and writes keep flowing (ack
+on what is reachable; opt out with `resilience.acceptDegradedWrites: false`).
+Deletes and renames a missing member sleeps through are tombstoned and replayed
+on its return, stale content re-syncs to the newest write, and missing copies
+are recreated in the background until the pool is back at full duplication — no
+manual repair needed.
+
+Run `dbmount --help` (or `dbmount <verb> --help`) for the full option list.
+
+## 🖼️ Screenshots
 
 The GUI is a dependency-free web dashboard served by `dbmount serve` (and hosted
 verbatim in the desktop app) — theme-aware, so it follows your OS light/dark
@@ -52,7 +294,7 @@ preference:
 - **Settings** — every pool knob as a labelled control (mount location, write
   policy, cache, background maintenance…), with an advanced JSON escape hatch.
 
-## 🧭 How it works
+## ⚙️ How it works
 
 Seven diagrams for the parts that are hard to guess from the file list. They describe the engine as
 it is, not as it is planned — where something is not built yet, it says so.
@@ -321,7 +563,7 @@ flowchart TD
 > **A snapshot is not a backup.** It shares the pool's disks and its failure domains: it protects
 > against deleting or overwriting a file, not against losing the storage underneath it.
 
-## 🏗️ Project Structure
+## 📁 Project structure
 
 The solution is organized into the following projects:
 
@@ -455,235 +697,6 @@ Headless engine suite: the whole VFS engine runs against in-memory fakes
 no-space, torn writes, offline members — so every safety invariant is testable
 without a real pool.
 
-## ✨ Features
-
-### 🔧 Pool Management
-- ✅ Create new storage pools with multiple drives
-- ✅ Delete existing pools with data preservation options
-- ✅ Forget a pool (remove from this machine's list, keep data + on-disk markers)
-- ✅ Recover an orphaned pool from a member folder's manifest mirror
-- ✅ Take a foreign-claimed folder over for a new pool (explicit consent)
-- ✅ Add drives to existing pools with automatic balancing
-- ✅ Remove drives with intelligent data migration
-- ✅ Replace drives with seamless data transfer
-- ✅ Space checking with user warnings
-
-### 🚀 Write & read pipeline
-- ✅ Staged writes: in-progress files live under a hidden temp name and only the atomic
-  temp→final rename — the last action before the journal releases — makes them appear;
-  a crash mid-write leaves no half-written file (fsync publishes early)
-- ✅ Striped acks: with a relaxed ack quorum, consecutive blocks rotate across storages
-  while the journal-backed owed-sync converges every copy in the background
-- ✅ Parallel mirrored writes, parallel mirror-split reads (different offsets from
-  different storages at once), per-block read failover, pooled positional I/O handles,
-  background read-ahead
-
-### 💾 Advanced Duplication
-- ✅ Enable/disable duplication on folders
-- ✅ Support for multiple shadow copies (beyond standard 2-copy limit)
-- ✅ Configurable duplication levels (0-10 copies)
-- ✅ Automatic shadow copy creation across volumes
-- ✅ Smart duplication based on file importance
-
-### 🔍 File Integrity & Repair
-- ✅ Comprehensive integrity checking with 8 issue types:
-  - Missing primary files
-  - Missing shadow copies
-  - Corrupted files
-  - Orphaned shadow copies
-  - Size mismatches
-  - Timestamp inconsistencies
-  - Permission issues
-  - Duplicate primaries
-- ✅ Automated repair with backup creation
-- ✅ Dry-run mode for safe testing
-- ✅ Deep scan capabilities
-- ✅ Batch repair operations
-
-### 🛡️ Safety Features
-- ✅ Dry-run mode (enabled by default)
-- ✅ Automatic backups before repairs
-- ✅ Space validation before operations
-- ✅ User prompts for destructive actions
-- ✅ Comprehensive logging and error handling
-
-### 🔒 Type Safety
-- ✅ Semantic data types (PoolName, DrivePath, FolderPath, ByteSize, DuplicationLevel)
-- ✅ Input validation and sanitization
-- ✅ Compile-time safety for critical operations
-
-## 📦 Getting Started
-
-### Prerequisites
-
-- **Build:** [.NET SDK 10](https://dotnet.microsoft.com/download). The engine,
-  backends, `dbmount` and the app are `net10.0`; `DriveBender.Core` also targets
-  `net47`/`netstandard2.0`. (Nothing needs Drive Bender installed — native pools
-  are auto-discovered if present.)
-- **To mount on Windows:** [**WinFsp**](https://winfsp.dev) *or*
-  [**Dokan**](https://dokan-dev.github.io) — `dbmount` uses whichever is present
-  (WinFsp preferred, Dokan is the no-extra-install fallback). *Installing* the
-  driver needs admin (the app/UI can do it for you); *mounting* does not — mount
-  as your normal user so the drive is visible in your own Explorer session.
-- **To mount on Linux:** `fuse3` (`/dev/fuse`) — e.g. `sudo apt install fuse3`.
-- **Remote/cloud members** need nothing extra; the SDKs are bundled.
-
-### 🔨 Build
-
-```bash
-dotnet build DriveBender.sln -c Release
-```
-
-That produces `dbmount` (the CLI/daemon, `DriveBender.Mount/bin/Release/...`) and
-`DriveBender.App` (the desktop shell). To run `dbmount` directly during
-development, use `dotnet <path>/dbmount.dll <args>`; a published build gives a
-plain `dbmount` executable. The examples below write `dbmount`.
-
-### 🧪 Tests
-
-```bash
-dotnet test DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj   # the VFS engine (headless)
-dotnet test DriveBender.Tests/DriveBender.Tests.csproj           # legacy Core suite
-dotnet test DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj --filter "TestCategory=Unit"
-```
-
-## 🚀 Quick Start
-
-A **pool** is defined by a portable JSON *manifest* — a set of member folders
-(local drives/subfolders, UNC shares, or remote endpoints) plus tuning. You
-create it once, then mount it as a live drive.
-
-### 1. Create a pool
-
-```bash
-# two local members, duplicated data mounted at X:\ (Windows) …
-dbmount pool create --name MyPool --member "D:\" --member "E:\" --mount "X:\"
-
-# … or on Linux, mounted at a directory
-dbmount pool create --name MyPool --member /mnt/disk1 --member /mnt/disk2 --mount /mnt/mypool
-
-# an SSD landing zone (fast tier) plus capacity drives
-dbmount pool create --name Media --landing "F:\ssd" --member "G:\" --member "H:\" --mount "M:\"
-
-dbmount pool list          # what's discovered (manifest pools + native scan)
-dbmount pool export MyPool # print the manifest JSON
-```
-
-Creating a pool never destroys existing folder contents without `--force`, and a
-folder already owned by another pool is always refused.
-
-### 2. Mount it
-
-```bash
-# Windows (WinFsp or Dokan must be installed; run as your normal user — NOT elevated, or the
-# drive lands in a different session than Explorer and won't be visible)
-dbmount mount --manifest MyPool            # mounts at the manifest's target, or pass --target Y:\
-dbmount status                             # what's mounted right now
-dbmount unmount X:\                        # clean unmount (flushes dirty data); or Ctrl+C the mount
-
-# Linux
-dbmount mount --manifest MyPool --target /mnt/mypool
-fusermount3 -u /mnt/mypool                 # or: dbmount unmount /mnt/mypool
-```
-
-Now use `X:\` (or `/mnt/mypool`) from Explorer / any app — reads, writes,
-rename, delete all work, with duplication, tiering and balancing handled
-underneath.
-
-**Mount automatically at boot / login:**
-
-```bash
-# Windows service (mounts before login)
-dbmount install-service --manifest MyPool --target X:\
-# Windows Explorer: register a right-click "mount" for *.dbpool.json manifests
-dbmount register-shell
-
-# Linux: install the systemd unit + mount.drivebender fstab helper (run with sudo)
-dbmount install-systemd --manifest MyPool
-systemctl enable --now drivebender-pool@MyPool.service
-#   …or add to /etc/fstab:
-#   /etc/drivebenderutility/pools/MyPool.json  /mnt/mypool  fuse.drivebender  defaults,_netdev  0 0
-```
-
-### 3. Remote & cloud members
-
-Store the secret once (it goes to the OS credential store, never the manifest),
-then reference it by handle:
-
-```bash
-# password / key based (FTP, SFTP, WebDAV, S3, Azure…)
-dbmount credential-set MyPool-nas --user backup      # prompts for the secret (hidden)
-dbmount pool add-member MyPool --member "sftp://backup@nas.local/pool" --credential MyPool-nas
-
-# OAuth providers (Google, OneDrive, Dropbox, Box, Yandex, HiDrive) — browser login
-# with your own registered client id (loopback + PKCE, auto-refresh)
-dbmount credential-login MyPool-gdrive --provider google --client-id <your-id> --client-secret <your-secret>
-dbmount pool add-member MyPool --member "gdrive://backups" --credential MyPool-gdrive
-```
-
-Supported schemes: `file`/`unc`, `ftp`/`ftps`, `sftp`, `webdav`/`webdavs`, `s3`,
-`azblob`, `azfile`, `dropbox`, `onedrive`, `gdrive`, `gcs`, `box`, `yandex`,
-`hidrive` (see the backend table above for the secret format each expects).
-
-### 4. The GUI — web dashboard & desktop app
-
-```bash
-dbmount serve --open      # animated live dashboard at http://127.0.0.1:9723 (token-gated)
-```
-
-The page shows every pool with live capacity donuts, cache-hit/dirty and
-cache-occupancy meters, a hit-rate history, and a **live flow map** — pool I/O →
-RAM cache → fast tier → capacity storage — where **data blocks fly along curves**
-as reads, writes, drains and duplications actually happen, with each storage's
-measured latency shown in its node; updated once a second while pools are
-mounted. With `placement.autoLandingZone` enabled, the **landing zone follows
-the measured-fastest drive automatically** (hysteresis + cooldown prevent
-flapping; a slow or busy drive gets demoted live). From the same page you can run the
-**entire lifecycle**: create a pool (pick local folders with a built-in **folder
-browser**, or add remote members whose **credentials are collected by a
-scheme-aware dialog** — user/password for FTP·WebDAV, password *or* private key
-for SFTP, access/secret keys for S3, account key for Azure, token for
-Dropbox·OneDrive, service-account JSON for Google — stored under a reference the
-manifest never inlines), mount / unmount, add or remove members, set
-**duplication** (copies to keep — pool-wide or per folder/file glob; copies land
-on independent physical disks by default, SAFE-PHYS, with an opt-in to also keep
-copies on the same disk for bit-rot protection when no independent disk is free),
-edit **all pool settings** via a validated JSON editor, remove- and replace-media,
-**browse the pool** with one column per storage showing exactly where every
-file/folder lives (✅ primary · 🔁 shadow · ❌ absent), run a **problem scan**
-with a full report (under-duplicated files, integrity issues, per-device SMART)
-plus one-click fix, restore, **forget** a pool (drop it from this machine's list
-while leaving its data and on-disk markers intact, so it can be re-imported or
-recovered later), and delete (keep data) or purge (wipe data, guarded by a
-name-confirmation). If a chosen member folder is still claimed by another —
-possibly forgotten or otherwise invisible — pool, the UI offers to **restore**
-that pool from the manifest copy left in the folder, or **take the folder over**
-for the new one, instead of failing outright. The **desktop app**
-(`DriveBender.App`) is the same page in a native window — it launches the daemon
-for you, so web and desktop are identical.
-
-### 5. Health & media maintenance
-
-```bash
-dbmount pool health MyPool               # metadata scan: SMART, missing copies, inconsistent files — never changes anything
-dbmount pool health MyPool --deep        # + re-checksum every file to find silent bit-rot (reads all data, can take long)
-dbmount pool health MyPool --fix         # repair bit-rot, re-sync stale copies, resolve conflicts, restore duplication
-dbmount pool restore MyPool              # bring every file back to its duplication level
-
-dbmount pool remove-media MyPool --member "E:\"                 # scatter its data, then drop it
-dbmount pool replace-media MyPool --old "D:\" --new "K:\newdisk"  # migrate to a replacement disk
-```
-
-A mounted pool also **heals itself**: losing a member degrades redundancy, not
-availability — reads fail over to surviving copies and writes keep flowing (ack
-on what is reachable; opt out with `resilience.acceptDegradedWrites: false`).
-Deletes and renames a missing member sleeps through are tombstoned and replayed
-on its return, stale content re-syncs to the newest write, and missing copies
-are recreated in the background until the pool is back at full duplication — no
-manual repair needed.
-
-Run `dbmount --help` (or `dbmount <verb> --help`) for the full option list.
-
 ## 🔧 Configuration
 
 Tuning lives in the manifest's `defaults` block (per pool) or a machine-wide
@@ -722,7 +735,38 @@ Config is validated on load and can be reloaded live without unmounting. See
 > pools via `dbmount`, which can also *adopt* a discovered native pool
 > (`dbmount pool adopt <name>`) into an editable manifest without moving data.
 
-## 📊 Architecture & Design
+## 📈 Performance
+
+### Scalability Metrics
+- **Small Pools** (< 1TB): Operations complete in seconds
+- **Medium Pools** (1-10TB): Operations complete in minutes
+- **Large Pools** (10TB+): Operations may take hours but provide progress feedback
+
+### Memory Usage
+- **Core Library**: < 50MB baseline memory usage
+- **GUI Application**: < 200MB including UI framework
+- **Batch Operations**: Memory usage scales linearly with file count
+
+### Optimization Features
+- **Lazy Loading**: Files and metadata loaded on-demand
+- **Parallel Processing**: Multi-threaded integrity checking
+- **Caching**: Intelligent caching of file metadata
+- **Progress Reporting**: Real-time progress updates for long operations
+
+## 🛡️ Security
+
+### Permissions
+- **Administrator Rights**: Required for drive operations
+- **File System Access**: Full control over pool directories
+- **Registry Access**: Reading Drive Bender configuration
+
+### Data Protection
+- **Backup Creation**: Automatic backups before destructive operations
+- **Dry-Run Mode**: Preview changes before execution
+- **Validation**: Input validation prevents path traversal attacks
+- **Logging**: Comprehensive audit trail of all operations
+
+## 🏗️ Architecture
 
 ### Core Components
 
@@ -747,6 +791,15 @@ DriveBender.Core/
 - **Comprehensive Logging**: All operations logged with context
 - **User Feedback**: Clear error messages with suggested actions
 - **Recovery Options**: Multiple repair strategies for different issue types
+
+## 🛠️ Building
+
+```bash
+dotnet build -c Release
+dotnet test
+```
+
+Mounting needs WinFsp or Dokan on Windows and FUSE on Linux; the test suite does not.
 
 ## 🤝 Contributing
 
@@ -788,37 +841,6 @@ dotnet test DriveBender.Tests/DriveBender.Tests.csproj
 - **Integration Tests**: Required for cross-component features  
 - **Performance Tests**: Required for operations handling large datasets
 - **Regression Tests**: Add tests for bug fixes
-
-## 📈 Performance Considerations
-
-### Scalability Metrics
-- **Small Pools** (< 1TB): Operations complete in seconds
-- **Medium Pools** (1-10TB): Operations complete in minutes
-- **Large Pools** (10TB+): Operations may take hours but provide progress feedback
-
-### Memory Usage
-- **Core Library**: < 50MB baseline memory usage
-- **GUI Application**: < 200MB including UI framework
-- **Batch Operations**: Memory usage scales linearly with file count
-
-### Optimization Features
-- **Lazy Loading**: Files and metadata loaded on-demand
-- **Parallel Processing**: Multi-threaded integrity checking
-- **Caching**: Intelligent caching of file metadata
-- **Progress Reporting**: Real-time progress updates for long operations
-
-## 🛡️ Security Considerations
-
-### Permissions
-- **Administrator Rights**: Required for drive operations
-- **File System Access**: Full control over pool directories
-- **Registry Access**: Reading Drive Bender configuration
-
-### Data Protection
-- **Backup Creation**: Automatic backups before destructive operations
-- **Dry-Run Mode**: Preview changes before execution
-- **Validation**: Input validation prevents path traversal attacks
-- **Logging**: Comprehensive audit trail of all operations
 
 ## 🆘 Getting Help
 - **Documentation**: This README and inline code documentation
