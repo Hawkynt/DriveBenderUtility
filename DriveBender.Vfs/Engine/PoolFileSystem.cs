@@ -530,7 +530,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._journal.ReconcileMirrors();
 
     // recovery before serving: roll forward, reconcile, clean temps (FR-RECOVER)
-    var report = new PoolRecovery([.. this._Online], this._journal, this.AdmitBulk).Run();
+    var report = new PoolRecovery([.. this._Online], this._journal, this.AdmitBulk, this._snapshots).Run();
     if (report.AnythingDone) {
       DriveBender.Logger($"Recovery: {report.RolledForward} rolled forward, {report.Reconciled} reconciled, {report.TempsRemoved} staging files removed");
       this._activity.Publish(ActivityKind.Recovery, "", report.RolledForward + report.Reconciled, reason: "journal replay on mount");

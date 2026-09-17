@@ -188,12 +188,30 @@ Honestly enumerated, because this is the part that decides the schedule:
    available; it never drops the only snapshot, since that is not a policy but a feature switching
    itself off. Per-snapshot cost is reported by the listing, which is the number an operator needs
    before deciding what to drop.
-4. **The interactions.** ⚠️ **Partly done.** `ScatterAndRemove` now moves the snapshot store off a
-   member that is leaving, which was the risk this slice was named for and is the same bug the
-   recycle bin had — covered end to end. Still outstanding: what a *replace* does with the store,
-   and a crash-mid-aside scenario. The drainer and the healer relocate live files rather than
-   versions, and a version is only ever created from a file that is settled, so those two are
-   believed safe rather than demonstrated — which is a distinction worth keeping in writing.
+4. **The interactions.** ✅ **Done.** Both operations that can destroy a version now carry it, and
+   both cost a bug to find.
+
+   `ScatterAndRemove` moves the store off a member that is leaving — the risk this slice was named
+   for, and the same bug the recycle bin had. *Replace* had it too, on its own code: it walks the
+   departing member with a walker that skips hidden names, which is right for the rest of the
+   utility folder (the journal, the manifest copy, the checksum database are all mirrors the pool
+   rebuilds) and wrong for these two, which hold the only copy of what is in them. Replace ends by
+   dropping the old disk from the manifest, so what it left behind was gone at that moment — no
+   error, nothing to notice, and a recycle bin that was offering the file a minute ago now empty.
+   That is the worse of the two operations to get wrong, because remove at least leaves the data
+   where it was.
+
+   **A crash mid-aside could lose the file outright**, and recovery had no case for it at all: the
+   intent fell through the switch and was marked complete. An aside renames the live file into the
+   store and *then* writes the sidecar naming it; in between, on a pool keeping one copy, the file is
+   at neither place the pool looks. Which way to finish depends on whether the write that prompted
+   the aside landed, because the aside runs first — the original path empty means that write never
+   happened, so the aside had no reason to stand and rolls back; the original path occupied means the
+   pool acknowledged the new content, so the version is adopted instead and both survive.
+
+   The drainer and the healer relocate live files rather than versions, and a version is only ever
+   created from a file that is settled, so those two remain believed safe rather than demonstrated —
+   a distinction still worth keeping in writing.
 5. **The UI.** ✅ **Done.** A Snapshots panel on the pool card — only when the pool is mounted,
    because the engine is what keeps a snapshot honest. It lists each snapshot with what it is
    holding, takes and deletes, and browses one to restore a single file. It opens with the sentence

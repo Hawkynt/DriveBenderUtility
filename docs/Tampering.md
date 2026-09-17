@@ -87,6 +87,45 @@ place into `lost+found`. The renamed file is still *there*, which is what makes 
 danger is not losing it but reading it as something it is not. Covered for the journal and for both
 snapshot sidecars.
 
+## A disk swapped out takes nothing with it
+
+The member disks also get *replaced* — the operation an operator reaches for when SMART starts
+complaining and the disk is still readable. It is the sibling of remove-media and it is not the same
+code: remove rebuilds the departing member's contents from surviving copies elsewhere, while replace
+copies that member's files onto the new disk and then swaps it into the manifest.
+
+That difference is what makes it the worse one to get wrong. Remove at least leaves the data where it
+was; replace *ends* by dropping the old disk from the pool, so anything it did not carry across is
+gone at that moment, with no error and nothing to notice.
+
+It was not carrying the recycle bin or the snapshot store. Both live in the member's hidden tree,
+which is exactly what a namespace walk is written to skip — and rightly, for the rest of it: the
+journal, the manifest mirror and the checksum database are all per-member copies the pool rebuilds on
+the new disk. These two are not copies of anything. They hold the only instance of what is in them.
+
+The remove path learned this twice, once for the bin and once for the snapshot versions. Replace was
+never checked until now.
+
+## A power cut between an aside's two halves
+
+Preserving a snapshot's view of a file renames the live file into the store and *then* writes the
+sidecar naming it. Between those two, on a pool keeping one copy, the file is at neither place the
+pool looks: not at its path any more, and not yet anything the store can see — the store only yields
+a version whose sidecar parses. Recovery had no case for this at all; the intent fell through the
+switch and was marked complete, so the file was simply gone. That is the one outcome rule 1 says
+cannot happen.
+
+Which way to finish depends on whether the write that *prompted* the aside landed, because the aside
+runs first:
+
+- **The original path is empty.** That write never happened, so the aside had no reason to stand.
+  Rolling it back restores exactly the state before the crash — the same instinct the rename
+  roll-forward already had: an intent that never took effect leaves the source authoritative.
+- **The original path is occupied.** The replacing write did land and the pool acknowledged it.
+  Renaming the version back over that would destroy content the pool *promised* in order to rescue
+  content it only promised a snapshot. The version is adopted instead — given the sidecar it never
+  got — and both survive.
+
 ## A dying disk is not a missing one
 
 Three failure shapes, treated differently, and the tamper suite covers all three:

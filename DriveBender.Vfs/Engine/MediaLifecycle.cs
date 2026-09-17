@@ -264,8 +264,44 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
       ++moved;
     }
 
+    moved += this._MigrateRecoverables(old, replacement);
+
     DriveBender.Logger($"Replaced media '{old.DisplayName}' with '{replacement.DisplayName}': {moved} file(s) migrated");
     return new(moved, moved, moved);
+  }
+
+  /// <summary>
+  /// Carries the member's RECOVERABLE hidden trees — the recycle bin and the snapshot store — onto
+  /// the replacement.
+  ///
+  /// <see cref="_WalkMember"/> skips hidden names, and it is right to: the rest of the utility folder
+  /// is a per-member mirror — the journal, the manifest copy, the checksum database — that the pool
+  /// rebuilds on the new disk anyway. These two are not mirrors. They hold the ONLY copy of what is
+  /// in them, and replace ends by dropping the old member from the manifest, so whatever is left
+  /// behind here is gone at that moment: no error, nothing to notice, and a recycle bin that was
+  /// offering the file a minute ago now empty.
+  ///
+  /// The remove path learned this twice — first for the bin, then for the snapshot versions. This is
+  /// the same lesson on the sibling operation, which was never checked and is the worse one to get
+  /// wrong, because remove at least leaves the data where it was.
+  /// </summary>
+  private int _MigrateRecoverables(IVolumeIO old, IVolumeIO replacement) {
+    var moved = 0;
+    foreach (var root in new[] { PoolTrash.TrashPrefix, PoolSnapshots.SnapshotPrefix })
+      foreach (var path in this._WalkFolder(old, root).ToArray()) {
+        var parent = PoolPaths.GetParent(path);
+        if (parent.Length > 0)
+          replacement.EnsureFolder(parent, false);
+
+        var sequence = journal.LogIntent(JournalOp.Rebalance, path, memberId: replacement.MemberId);
+        WholeFilePublisher.CopyBetween(old, path, false, replacement, path, false,
+          admit: WholeFilePublisher.Pace(admit, old, replacement));
+        journal.Complete(sequence, JournalOp.Rebalance);
+        old.Delete(path, false);
+        ++moved;
+      }
+
+    return moved;
   }
 
   /// <summary>

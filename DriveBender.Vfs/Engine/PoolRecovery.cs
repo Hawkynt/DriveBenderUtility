@@ -16,7 +16,12 @@ public sealed record RecoveryReport(int RolledForward, int Reconciled, int Temps
 /// Recovery resync moves whole files like any heal does, and an operator who capped a member did
 /// not mean "except on mount".
 /// </param>
-public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journal, Action<IVolumeIO, long>? admit = null) {
+/// <param name="snapshots">
+/// The snapshot store, so an aside the power cut in half can be finished rather than abandoned.
+/// Null for a pool without one, in which case a stranded version is reported and left alone.
+/// </param>
+public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journal, Action<IVolumeIO, long>? admit = null,
+  PoolSnapshots? snapshots = null) {
 
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
@@ -44,6 +49,10 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
         case JournalOp.Write or JournalOp.Truncate or JournalOp.Create or JournalOp.ShadowCreate or JournalOp.Drain when intent.Path != null:
           // copies may diverge mid-operation; resync every copy from the authoritative primary
           reconciled += this._ResyncCopies(intent.Path) ? 1 : 0;
+          break;
+
+        case JournalOp.SnapshotAside when intent is { Path: not null, TargetPath: not null }:
+          rolledForward += this._ResolveInterruptedAside(intent.Path, intent.TargetPath) ? 1 : 0;
           break;
 
         case JournalOp.RemoveDir when intent.Path != null:
@@ -99,6 +108,57 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
       + "A journal describing work already done — a restored disk, a copied-back hidden folder — must "
       + "not delete a file that is here now.");
 
+    return true;
+  }
+
+  /// <summary>
+  /// Finishes an aside a crash caught between its two halves.
+  ///
+  /// Preserving a snapshot's view of a file RENAMES the live file into the store and then writes the
+  /// sidecar naming it. In between, on a pool keeping one copy, the file is at neither place the
+  /// pool looks: not at its path, and not yet anything the store can see. Recovery used to have no
+  /// case for this at all — the intent fell through the switch and was marked complete — so the file
+  /// was simply gone, which is the one outcome this pool promises cannot happen.
+  ///
+  /// Which way to finish depends on whether the write that PROMPTED the aside landed, because the
+  /// aside runs first:
+  ///
+  ///  - the original path is empty, so that write never happened. The aside had no reason to stand,
+  ///    and rolling it BACK restores exactly the state before the crash. This is the same instinct
+  ///    the rename roll-forward already has: an intent that never took effect leaves the source
+  ///    authoritative.
+  ///  - the original path is occupied, so the replacing write did land and the pool acknowledged it.
+  ///    Renaming the version back over that would destroy content the pool promised in order to
+  ///    rescue content it only promised a snapshot. The version is adopted instead, and both survive.
+  /// </summary>
+  private bool _ResolveInterruptedAside(string originalPath, string versionPath) {
+    var holder = this._Online.FirstOrDefault(m => m.FileExists(versionPath, false));
+    if (holder == null)
+      return false; // the rename never happened, or the aside finished and this is already tidy
+
+    if (holder.FileExists(PoolSnapshots.InfoPathFor(versionPath), false))
+      return false; // both halves are on disk; nothing was interrupted
+
+    if (this._Online.Any(m => m.FileExists(originalPath, false) || m.FileExists(originalPath, true))) {
+      if (snapshots == null) {
+        DriveBender.Logger(
+          $"[Warning]A snapshot version of '{originalPath}' was stranded by an interrupted aside and "
+          + $"cannot be adopted without the snapshot store; it stays on '{holder.DisplayName}' as "
+          + $"'{versionPath}' and no snapshot can see it.");
+        return false;
+      }
+
+      snapshots.AdoptStrandedVersion(holder, originalPath, versionPath);
+      DriveBender.Logger($" - Adopted the snapshot version of '{originalPath}' that an interrupted aside left unnamed");
+      return true;
+    }
+
+    var parent = PoolPaths.GetParent(originalPath);
+    if (parent.Length > 0)
+      holder.EnsureFolder(parent, false);
+
+    holder.AtomicReplace(versionPath, originalPath, false);
+    DriveBender.Logger($" - Rolled back an interrupted aside: '{originalPath}' is back where it was");
     return true;
   }
 
