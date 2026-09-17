@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [34644884258](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/34644884258).
+Generated from run: [35285444235](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/35285444235).
 
-232 scenarios — 210 passing on at least one target, 0 failing.
+236 scenarios — 214 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -87,6 +87,10 @@ Generated from run: [34644884258](https://github.com/Hawkynt/DriveBenderUtility/
 | ManagementApi | `Stream_GivenAConnectedClient_ThenLiveFramesArrive` | Given AConnected Client , then Live Frames Arrive | pass | pass |
 | ManagementApi | `Trash_GivenNoPathIsGiven_ThenRestoreIsRefusedClearly` | Restoring without saying what to restore is refused with a message, rather than failing obscurely. | pass | pass |
 | ManagementApi | `Trash_GivenThePoolHasNothingDeleted_ThenTheApiAnswersWithAnEmptyBin` | The recycle bin is readable through the API on an unmounted pool, and answers with a well-formed listing. | pass | pass |
+| MediaReplace | `Replace_GivenAMemberHoldsFiles_ThenTheyAreServedFromTheReplacement` | Replacing a disk carries the ordinary files across and the pool serves them from the new one. | pass | pass |
+| MediaReplace | `Replace_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable` | Replacing the disk that holds a snapshot's preserved versions: the snapshot is still restorable afterwards. | pass | pass |
+| MediaReplace | `Replace_GivenTheMemberHoldsTheRecycleBin_ThenDeletedFilesAreStillRecoverable` | Replacing the disk that holds the recycle bin: deleted files are still listed and still restorable. | pass | pass |
+| MediaReplace | `Replace_GivenTheOldMemberIsOffline_ThenItIsRefusedRatherThanAbandoningItsData` | Replacing a member that is not there is refused: its data would be abandoned rather than migrated. | pass | pass |
 | MemberFailureLatency | `Cripple_GivenAMemberFailsEveryOperationWithoutGoingOffline_ThenReadsStillCompletePromptly` | A member that is still present but fails every operation is routed around: reads keep completing promptly from the healthy copy. | skipped | pass |
 | MemberFailureLatency | `Eject_GivenEveryMemberGoesAndOneComesBack_ThenItsContentIsServedAgain` | Every member goes away and one comes back: its content is served again rather than the pool staying dark. | pass | pass |
 | MemberFailureLatency | `Eject_WhileALargeReadIsStreaming_ThenEveryRemainingChunkStillArrivesPromptly` | A member pulled while a large read is streaming: every remaining chunk still arrives promptly and the content is whole. | pass | pass |
