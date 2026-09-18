@@ -182,6 +182,25 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   public int Purge(TimeSpan retention, long maxSizeBytes) {
     var now = clock();
     var entries = this.List();
+
+    // A deletion date in the FUTURE is nonsense, and the arithmetic below cannot survive it:
+    // `now - deletedUtc` stays negative, so the entry never expires, and because entries are
+    // oldest-first a future-dated one sorts last — behind the `break` — so the size cap only ever
+    // reaches it if everything older already qualified. It becomes permanent ballast on the
+    // member's disk. The cause is usually innocent rather than hostile: a machine whose clock was
+    // wrong when the delete happened (dead RTC, a VM resumed from a stale snapshot, an NTP step
+    // that had not landed).
+    //
+    // Correct it durably to now rather than purging it on the spot, so it ages from the moment it
+    // was noticed. That keeps the file for a full retention period, which is the safe direction —
+    // a wrong clock must not cost somebody the chance to restore.
+    if (entries.Any(e => e.DeletedUtc > now)) {
+      foreach (var entry in entries.Where(e => e.DeletedUtc > now))
+        this._RedateToNow(entry.OriginalPath, now);
+
+      entries = this.List();
+    }
+
     var totalBytes = entries.Sum(e => e.Length);
     var purged = 0;
 
@@ -197,6 +216,29 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
     }
 
     return purged;
+  }
+
+  /// <summary>
+  /// Rewrites every version of a path whose sidecar claims a deletion date in the future, so the
+  /// entry starts ageing from now instead of never.
+  /// </summary>
+  private void _RedateToNow(string originalPath, DateTime now) {
+    foreach (var (member, trashPath, info) in this._VersionsOf(PoolPaths.Normalize(originalPath))) {
+      if (info.DeletedUtc <= now)
+        continue;
+
+      try {
+        var corrected = JsonSerializer.Serialize(new TrashInfo { OriginalPath = info.OriginalPath, DeletedUtc = now });
+        var bytes = Encoding.UTF8.GetBytes(corrected);
+        using var stream = member.OpenWrite(_InfoPathFor(trashPath), false, true);
+        stream.SetLength(0);
+        stream.Write(bytes, 0, bytes.Length);
+        stream.Flush();
+      } catch (PoolFsException e) {
+        // a read-only or offline member keeps its bad date; the others still get corrected
+        DriveBender.Logger($"[Warning]Could not correct a future deletion date on '{member.DisplayName}': {e.Message}");
+      }
+    }
   }
 
   private void _PurgeEntry(string originalPath) {

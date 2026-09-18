@@ -278,6 +278,71 @@ public class TamperEndToEndTests {
     File.ReadAllBytes(pool.PathTo("intact.bin")).Should().Equal(intact);
   }
 
+  /// <summary>Rewrites the deletion date a sidecar claims, leaving the rest of it alone.</summary>
+  private static int _RedateSidecars(MountedPool pool, string forFile, DateTime deletedUtc) {
+    var touched = 0;
+    foreach (var sidecar in _HiddenFiles(pool, ".trashinfo").Where(s => s.Contains(forFile, StringComparison.OrdinalIgnoreCase))) {
+      var document = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(sidecar))!;
+      document["deletedUtc"] = deletedUtc.ToString("O");
+      File.WriteAllText(sidecar, document.ToJsonString());
+      ++touched;
+    }
+
+    return touched;
+  }
+
+  [Test]
+  [Description("A sidecar dated in the future: the entry is still listed, and a purge can still reach it rather than keeping it forever.")]
+  public void Trash_GivenASidecarIsDatedInTheFuture_ThenItIsStillListedAndStillPurgeable() {
+    // Age accounting is `now - deletedUtc >= retention`. A deletion date in the FUTURE makes that
+    // difference negative, so the entry can never expire — it occupies the bin, and the member's
+    // disk, until somebody notices. The innocent cause is ordinary and common: a machine whose
+    // clock was wrong when the delete happened (a dead RTC, a VM resumed from a stale snapshot, an
+    // NTP step that had not landed yet). Every file deleted in that window becomes permanent
+    // ballast, which is a slow disk-exhaustion bug rather than a dramatic one.
+    using var pool = MountedPool.Create(members: 2, poolDefaults: _TRASH_ON);
+    File.WriteAllBytes(pool.PathTo("futuredated.bin"), _Payload(4096, 212));
+    var content = File.ReadAllBytes(pool.PathTo("futuredated.bin"));
+
+    File.Delete(pool.PathTo("futuredated.bin"));
+
+    pool.WhileUnmounted(() =>
+      _RedateSidecars(pool, "futuredated", DateTime.UtcNow.AddDays(400))
+        .Should().BeGreaterThan(0, "there has to be a sidecar to re-date"));
+
+    var listed = DbMount.RunExpectingSuccess(_CLI, "pool-trash-list", pool.PoolName, "--json");
+    listed.StandardOutput.Should().Contain("futuredated.bin",
+      $"an entry with an absurd date must still be visible — an invisible entry is one the user "
+      + $"cannot restore OR clear.{Environment.NewLine}{listed.Output}{Environment.NewLine}{pool.MountLog}");
+
+    DbMount.RunExpectingSuccess(_CLI, "pool-trash-purge", pool.PoolName);
+
+    // Retention here is the default 7d, so the entry is NOT expected to vanish — asserting that
+    // would mean waiting a week. What must change is that it has become reachable by ordinary
+    // ageing at all: the impossible date is corrected, so the entry now expires seven days from
+    // when the purge noticed it instead of never.
+    pool.WhileUnmounted(() => {
+      foreach (var sidecar in _HiddenFiles(pool, ".trashinfo").Where(s => s.Contains("futuredated", StringComparison.OrdinalIgnoreCase))) {
+        var claimed = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(sidecar))!["deletedUtc"]!.GetValue<DateTime>();
+        claimed.ToUniversalTime().Should().BeOnOrBefore(DateTime.UtcNow,
+          $"while a sidecar claims a deletion date in the future, 'now - deletedUtc' stays negative "
+          + $"and the entry can never expire. Because entries purge oldest-first and a future date "
+          + $"sorts last, the size cap does not rescue it either — it is permanent ballast on the "
+          + $"member's disk. A purge must correct the impossible date.{Environment.NewLine}{sidecar}");
+      }
+    });
+
+    // and correcting a date must never be an excuse to destroy the file
+    var still = DbMount.RunExpectingSuccess(_CLI, "pool-trash-list", pool.PoolName, "--json");
+    still.StandardOutput.Should().Contain("futuredated.bin",
+      $"correcting a nonsense date must not purge the entry on the spot — the file still has its "
+      + $"full retention period to be restored in.{Environment.NewLine}{still.Output}");
+
+    DbMount.RunExpectingSuccess(_CLI, "pool-trash-restore", pool.PoolName, "futuredated.bin");
+    File.ReadAllBytes(pool.PathTo("futuredated.bin")).Should().Equal(content,
+      $"and it restores byte for byte.{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+  }
+
   #endregion
 
   #region the snapshot store
