@@ -53,7 +53,7 @@ internal static class Program {
         PoolImportOptions o => _PoolImport(lifecycle, o),
         PoolExportOptions o => _PoolExport(provider, lifecycle, o),
         PoolListOptions o => _PoolList(provider, o.Json),
-        PoolAddMemberOptions o => _PoolAddMember(provider, lifecycle, o),
+        PoolAddMemberOptions o => _PoolAddMember(provider, lifecycle, credentialStore, o),
         PoolRemoveMemberOptions o => _PoolRemoveMember(provider, lifecycle, o),
         PoolAdoptOptions o => _PoolAdopt(provider, lifecycle, o),
         PoolRepairManifestOptions o => _PoolRepairManifest(provider, store, o),
@@ -264,7 +264,7 @@ internal static class Program {
     return ExitOk;
   }
 
-  private static int _PoolAddMember(IPoolProvider provider, PoolLifecycle lifecycle, PoolAddMemberOptions options) {
+  private static int _PoolAddMember(IPoolProvider provider, PoolLifecycle lifecycle, CredentialStore credentials, PoolAddMemberOptions options) {
     var pool = _FindPool(provider, options.Pool);
     if (pool == null) {
       Console.Error.WriteLine($"No pool named '{options.Pool}'.");
@@ -279,9 +279,26 @@ internal static class Program {
     };
 
     var reserve = options.Reserve == null ? 0 : SizeSpec.ParseBytes(options.Reserve);
-    var credentialReference = options.Credential == null
-      ? null
-      : "cred-ref:" + CredentialStore.NormalizeReference(options.Credential);
+    // '--credential' takes a reference NAME, but the flag reads like it wants the credential, and a
+    // secret pasted here used to be minted into the reference itself and written to the manifest —
+    // which pool-export then hands out. A secret cannot be un-shared, so refuse anything that does
+    // not already name an entry in the store. This also catches the ordinary typo at add time
+    // rather than at mount time.
+    string? credentialReference = null;
+    if (options.Credential != null) {
+      var name = CredentialStore.NormalizeReference(options.Credential);
+      if (credentials.Resolve(name) == null) {
+        // deliberately quotes nothing back: if the operator did paste a secret here, repeating it
+        // would put it in terminal scrollback and CI logs, which is the disclosure being prevented
+        Console.Error.WriteLine("That credential name is not in the credential store. Store the secret first "
+                                + "with 'dbmount credential-set <name>', then reference it here by NAME — "
+                                + "a secret passed here would be written to the pool manifest.");
+        return ExitError;
+      }
+
+      credentialReference = "cred-ref:" + name;
+    }
+
     var manifest = lifecycle.AddMember(pool.Manifest, new(options.Member, role, ReserveBytes: reserve, Credential: credentialReference), options.Force);
     Console.WriteLine($"Added '{options.Member}' to pool '{manifest.Name}' ({manifest.Members.Count} members).");
     return ExitOk;

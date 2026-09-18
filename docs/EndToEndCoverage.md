@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [35285444235](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/35285444235).
+Generated from run: [35322798125](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/35322798125).
 
-236 scenarios — 214 passing on at least one target, 0 failing.
+239 scenarios — 217 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -40,6 +40,9 @@ Generated from run: [35285444235](https://github.com/Hawkynt/DriveBenderUtility/
 | ConcurrentEngineGuard | `Mounted_GivenAVerbTheMountCannotRun_ThenItRefusesAndExplains` | A verb that changes the member set refuses against a mounted pool, and says where to run it. | pass | pass |
 | ConcurrentEngineGuard | `Mounted_GivenRestoreIsRunFromTheCli_ThenItIsExecutedByTheOwningProcess` | An administrative verb run against a mounted pool is executed by the process that owns it, not by a second engine. | pass | pass |
 | ConcurrentEngineGuard | `Unmounted_GivenRestoreIsRunFromTheCli_ThenItProceeds` | The same verb runs normally once the pool is unmounted. | pass | pass |
+| CredentialLeak | `Secret_GivenItIsAtRest_ThenItIsInTheCredentialStoreAloneAndThatStoreIsNotWorldReadable` | The credential store's own files are the only place the secret may rest, and the fallback file is owner-only. | pass | pass |
+| CredentialLeak | `Secret_GivenItIsPassedWhereTheReferenceNameBelongs_ThenItIsNotCommittedToTheManifest` | A raw secret passed where a reference NAME belongs must not be written verbatim into the manifest. | pass | pass |
+| CredentialLeak | `Secret_GivenItIsStoredAndReferencedByAMember_ThenOnlyTheReferenceIsEverPersisted` | A stored secret appears in no manifest, no export, no on-disk mirror and no console output — only its reference does. | pass | pass |
 | DrainCrash | `Crash_GivenADrainWasInFlight_ThenNoStagingFileIsExposed` | A crash mid-drain leaves no half-written staging file visible to the user after the pool comes back. | pass | pass |
 | DrainCrash | `Crash_GivenADrainWasInFlight_ThenTheFileSurvivesWholeOnOneTier` | The power goes off while the drainer is copying a file down to capacity: the file comes back whole, on one tier or the other. | pass | pass |
 | DrainCrash | `Recovery_GivenOnePathOnTwoMembers_ThenThePoolServesItOnceAndWhole` | The same file left on two members, as a crash between a relocation's copy and its delete leaves it: the pool serves one entry, not two. | pass | pass |
