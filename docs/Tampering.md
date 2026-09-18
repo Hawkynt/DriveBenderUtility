@@ -208,6 +208,22 @@ rather than filling a real disk — a volume the pool has been told to leave alo
 to say "this is not yours", and filling somebody's workstation is not a reasonable test. A failed
 update leaves the old version behind, and a file never claims a length it did not store.
 
+## A clock that was wrong, and the recycle bin that believed it
+
+The bin ages entries by `now - deletedUtc`, where `deletedUtc` is whatever the `.trashinfo` sidecar
+on the member says. A date in the **future** makes that difference negative, so the entry can never
+expire — and because the bin purges oldest-first and stops at the first entry that does not qualify,
+a future-dated entry sorts behind the stop and the size cap never rescues it either. It is permanent
+ballast on the member's disk.
+
+Nothing hostile is needed to get there. A machine whose clock was wrong when the delete happened —
+a dead RTC, a VM resumed from a stale snapshot, an NTP step that had not landed — dates every file
+deleted in that window into the future, and the bin holds them for good.
+
+A purge now corrects an impossible date to the moment it noticed it, rather than purging on the
+spot. The entry then ages normally and expires a full retention period later: a wrong clock must
+cost some disk space for a while, never somebody's chance to restore.
+
 ## Where the tests are
 
 
