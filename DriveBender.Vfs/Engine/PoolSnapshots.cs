@@ -62,7 +62,11 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
   private static string _IndexPathFor(Guid id) => $"{_INDEX_FOLDER}/{id:D}.json";
-  private static string _InfoPathFor(string versionPath) => versionPath + _INFO_SUFFIX;
+
+  /// <summary>The sidecar that names a stored version. Public so crash recovery can ask whether one exists.</summary>
+  public static string InfoPathFor(string versionPath) => versionPath + _INFO_SUFFIX;
+
+  private static string _InfoPathFor(string versionPath) => InfoPathFor(versionPath);
 
   /// <summary>
   /// A version destination that sorts by WHEN it was set aside.
@@ -224,6 +228,30 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
 
     journal.Complete(sequence, JournalOp.SnapshotAside);
     return versionPath;
+  }
+
+  /// <summary>
+  /// Gives a version that a crash stranded the sidecar it never got, so the snapshots that still
+  /// need it can see it again.
+  ///
+  /// An aside renames the live file into the store and only then writes the sidecar naming it. A
+  /// crash in between leaves bytes on the disk that nothing can reach: the store only yields a
+  /// version whose sidecar parses, so an unnamed one is invisible — present, paid for, and useless.
+  ///
+  /// The pins are recomputed rather than remembered, and that is exactly right: they are "the
+  /// snapshots that still point at the live content of this path", which is what the interrupted
+  /// aside was about to satisfy. A version nobody still needs adopts no pins and is reclaimed by the
+  /// next pass, which is also correct.
+  /// </summary>
+  public void AdoptStrandedVersion(IVolumeIO member, string normalizedPath, string versionPath) {
+    if (!member.FileExists(versionPath, false) || member.FileExists(InfoPathFor(versionPath), false))
+      return;
+
+    _WriteJson(member, InfoPathFor(versionPath), new SnapshotVersionInfo {
+      OriginalPath = normalizedPath,
+      AsidedUtc = clock(),
+      Pins = [.. this.SnapshotsNeeding(normalizedPath)],
+    });
   }
 
   /// <summary>

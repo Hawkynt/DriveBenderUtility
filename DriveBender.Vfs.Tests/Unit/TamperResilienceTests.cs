@@ -118,6 +118,82 @@ public class TamperResilienceTests {
 
   #endregion
 
+  #region an aside the power cut in half
+
+  /// <summary>
+  /// The exact state a crash leaves between the two halves of an aside, forged rather than raced
+  /// for: the intent is logged, the live file has been RENAMED into the store, and the sidecar that
+  /// would name it was never written.
+  ///
+  /// Forging is the honest way to reach this. The window is a rename and a small JSON write apart —
+  /// microseconds — so racing a real crash into it is a bet on the host being slow, and it is a bet
+  /// the test loses invisibly, by passing.
+  /// </summary>
+  private string _ForgeInterruptedAside(FakeVolumeIO member, Journal journal, string path) {
+    var versionPath = $"{PoolSnapshots.SnapshotPrefix}/versions/{path}.0001.snapver";
+    journal.LogIntent(JournalOp.SnapshotAside, path, versionPath); // never completed
+    member.EnsureFolder(PoolPaths.GetParent(versionPath), false);
+    member.AtomicReplace(path, versionPath, false); // the live file is now IN the store
+    return versionPath;                             // ...and no .snapinfo names it
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Recovery_GivenAnAsideWasInterruptedAfterTheRename_ThenTheFileIsNotLostFromBothPlaces() {
+    // The one window in the snapshot design where a crash can cost a file outright. An aside moves
+    // the live file INTO the store and then writes the sidecar that names it. Between those two, on
+    // a pool keeping one copy, the file is not at its path any more and not yet anything the store
+    // can see — and the aside runs BEFORE the write that prompted it, so the content that vanished
+    // is the content the user still has every reason to expect.
+    var fs = this._Mounted();
+    _Write(fs, "precious.bin", [1, 2, 3, 4]);
+    fs.TakeSnapshot("monday");
+
+    var journal = new Journal(new MemberJournalStore([this._a, this._b]));
+    var holder = this._a.FileExists("precious.bin", false) ? this._a : this._b;
+    this._ForgeInterruptedAside(holder, journal, "precious.bin");
+
+    holder.FileExists("precious.bin", false).Should().BeFalse("the forge must really have moved it");
+
+    new PoolRecovery([this._a, this._b], journal).Run();
+
+    holder.FileExists("precious.bin", false).Should().BeTrue(
+      "the write that would have replaced this file never landed, so the aside never had a reason "
+      + "to stand — and leaving it half-done costs the user a file they never asked to lose");
+    holder.GetContent("precious.bin", false).Should().Equal(new byte[] { 1, 2, 3, 4 },
+      "with the bytes it had before the interruption");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Recovery_GivenTheReplacingWriteDidLand_ThenTheAsideIsCompletedRatherThanRolledBack() {
+    // The other side of the same window, and the reason rolling back cannot be unconditional: if the
+    // replacing write DID complete before the crash, the live path holds the new file. Renaming the
+    // version back over it would destroy content the pool acknowledged in order to rescue content it
+    // only promised a snapshot. Completing the aside instead keeps both.
+    var fs = this._Mounted();
+    _Write(fs, "ledger.db", [1, 1, 1, 1]);
+    fs.TakeSnapshot("monday");
+
+    var journal = new Journal(new MemberJournalStore([this._a, this._b]));
+    var holder = this._a.FileExists("ledger.db", false) ? this._a : this._b;
+    this._ForgeInterruptedAside(holder, journal, "ledger.db");
+    holder.Seed("ledger.db", false, [9, 9]); // the replacing write landed after the rename
+
+    // the store is handed in, because adopting a stranded version is what it is FOR — recovery
+    // without it can only report the stranding, which is the degraded path the warning covers
+    new PoolRecovery([this._a, this._b], journal, null, fs.Snapshots).Run();
+
+    holder.GetContent("ledger.db", false).Should().Equal(new byte[] { 9, 9 },
+      "the acknowledged new content must survive recovery untouched");
+
+    _ReadThroughTree(fs, ".snapshots/monday/ledger.db").Should().Equal(new byte[] { 1, 1, 1, 1 },
+      "and the version the crash stranded is adopted by the snapshot that needed it, rather than "
+      + "left on the disk as bytes nothing can reach");
+  }
+
+  #endregion
+
   #region a snapshot whose stored version is gone
 
   [Test]
