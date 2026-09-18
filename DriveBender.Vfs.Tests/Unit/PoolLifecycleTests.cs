@@ -217,6 +217,22 @@ public class PoolLifecycleTests {
     act.Should().Throw<ManifestException>().WithMessage("*already a member*");
   }
 
+  /// <summary>
+  /// A path THIS platform recognises as rooted, for the scenarios below that turn on real path
+  /// semantics rather than on string equality.
+  ///
+  /// The rest of this fixture can use <c>C:\pools\…</c> literals happily, because it only ever
+  /// compares them against a fake host that stores whatever string it is given. The containment
+  /// check cannot: it resolves with <see cref="Path.GetFullPath(string)"/> and compares on a
+  /// separator boundary. On Linux a backslash is an ordinary filename character, so
+  /// <c>C:\pools\outer</c> is not an absolute path at all — it resolves to a RELATIVE name under the
+  /// working directory, and <c>outer\inner</c> is then one filename rather than a child of another.
+  /// The nesting scenarios therefore asserted nothing on Linux while passing on Windows, and the
+  /// engine suite runs on Windows only in CI, so nothing anywhere could see it.
+  /// </summary>
+  private static string _Rooted(params string[] segments)
+    => Path.Combine([OperatingSystem.IsWindows() ? @"C:\pools" : "/pools", .. segments]);
+
   // Nesting: the shape that looks like it worked. Exact duplicates were always refused, but a
   // member INSIDE another was accepted, and that is the more dangerous one — duplication across an
   // outer and an inner member puts a file's two "copies" in one directory tree on one disk, so the
@@ -226,9 +242,9 @@ public class PoolLifecycleTests {
   [Test]
   [Category("Exception")]
   public void AddMember_GivenItLiesInsideAnExistingMember_WhenAdded_ThenRefused() {
-    var manifest = this._lifecycle.Create("MyPool", [new(@"C:\pools\outer")]);
+    var manifest = this._lifecycle.Create("MyPool", [new(_Rooted("outer"))]);
 
-    var act = () => this._lifecycle.AddMember(manifest, new(@"C:\pools\outer\inner"));
+    var act = () => this._lifecycle.AddMember(manifest, new(_Rooted("outer", "inner")));
 
     act.Should().Throw<ManifestException>("two copies inside one tree on one disk is not redundancy")
       .WithMessage("*lies inside member*");
@@ -237,9 +253,9 @@ public class PoolLifecycleTests {
   [Test]
   [Category("Exception")]
   public void AddMember_GivenItContainsAnExistingMember_WhenAdded_ThenRefused() {
-    var manifest = this._lifecycle.Create("MyPool", [new(@"C:\pools\outer\inner")]);
+    var manifest = this._lifecycle.Create("MyPool", [new(_Rooted("outer", "inner"))]);
 
-    var act = () => this._lifecycle.AddMember(manifest, new(@"C:\pools\outer"));
+    var act = () => this._lifecycle.AddMember(manifest, new(_Rooted("outer")));
 
     act.Should().Throw<ManifestException>("the outer member would enumerate the inner one's own storage as pool content")
       .WithMessage("*contains member*");
@@ -248,7 +264,7 @@ public class PoolLifecycleTests {
   [Test]
   [Category("Exception")]
   public void Create_GivenTwoMembersWhereOneContainsTheOther_WhenCreated_ThenRefused() {
-    var act = () => this._lifecycle.Create("MyPool", [new(@"C:\pools\outer"), new(@"C:\pools\outer\inner")]);
+    var act = () => this._lifecycle.Create("MyPool", [new(_Rooted("outer")), new(_Rooted("outer", "inner"))]);
 
     act.Should().Throw<ManifestException>("the same trap is reachable at creation, not only when adding later")
       .WithMessage("*lies inside member*");
@@ -260,9 +276,9 @@ public class PoolLifecycleTests {
     // The boundary the containment check has to get right: "C:\pools\data2" starts with
     // "C:\pools\data" as a STRING but is a sibling, not a child. Refusing it would break ordinary
     // pools for no reason, which is how over-eager path checks usually go wrong.
-    var manifest = this._lifecycle.Create("MyPool", [new(@"C:\pools\data")]);
+    var manifest = this._lifecycle.Create("MyPool", [new(_Rooted("data"))]);
 
-    var updated = this._lifecycle.AddMember(manifest, new(@"C:\pools\data2"));
+    var updated = this._lifecycle.AddMember(manifest, new(_Rooted("data2")));
 
     updated.Members.Should().HaveCount(2);
   }
