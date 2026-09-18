@@ -1786,3 +1786,21 @@ These now fail the build rather than needing to be re-found:
   exists because the engine suite drives an in-memory fake and therefore stayed green through
   `5b67a05`, in which mounting any local pool was impossible. `DBE2E_REQUIRE_DRIVER=1` makes a
   missing driver a failure, so the suite cannot report green by skipping everything.
+
+### Open: `RemoveMedia…ThenTheyAreStillRecoverable` fails intermittently under battery load
+
+`RemoveMedia_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable`
+(`SwapMediaEndToEndTests`), added with the disk-swap fix in `d8bfa25`, failed twice while three
+unrelated pull requests were being validated: once on the Linux runner (run `35323450800`, on a
+branch whose only change was inert for that path) and once in a local Windows battery. It passed in
+isolation on both platforms, passed on `main`'s own run for the commit that introduced it, and
+passed on every later run of the same branches.
+
+So the evidence says intermittent-under-load rather than broken, but nobody has actually looked at
+why, and "it passed when I ran it again" is how a real fault gets written off. The assertion that
+fails is the restored snapshot version's content, which is the one thing in that scenario worth
+being sure about — a retired disk must not take a snapshot's only copy with it.
+
+Worth a deliberate reproduction under load before it is dismissed: run the full battery in a loop
+and capture the member dumps the failure already prints, rather than waiting to notice it again in
+somebody's unrelated pull request.
