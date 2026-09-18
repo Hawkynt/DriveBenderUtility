@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [35322798125](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/35322798125).
+Generated from run: [35331174204](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/35331174204).
 
-239 scenarios — 217 passing on at least one target, 0 failing.
+240 scenarios — 218 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -209,6 +209,7 @@ Generated from run: [35322798125](https://github.com/Hawkynt/DriveBenderUtility/
 | Tamper | `Snapshot_GivenTheVersionSidecarIsDeleted_ThenTheViewDoesNotSilentlySubstituteTheLiveFile` | A snapshot's .snapinfo sidecar is deleted, leaving the stored bytes: the view must not silently fall back to the live file. | pass | pass |
 | Tamper | `Tombstones_GivenTheLogIsCorrupted_ThenThePoolStillMountsAndStaysConsistent` | The tombstone log is corrupted while a member is away: the pool mounts, and the member's return does not resurrect anything readable as live. | pass | pass |
 | Tamper | `Tombstones_GivenTheLogIsDeleted_ThenThePoolStillMountsAndKeepsWhatItHas` | Somebody deletes the tombstone log: the pool mounts, works, and never loses a file that was not deleted. | pass | pass |
+| Tamper | `Trash_GivenASidecarIsDatedInTheFuture_ThenItIsStillListedAndStillPurgeable` | A sidecar dated in the future: the entry is still listed, and a purge can still reach it rather than keeping it forever. | pass | pass |
 | Tamper | `Trash_GivenASidecarIsDeleted_ThenTheBinStillListsAndRestoresWhatItCan` | A .trashinfo sidecar is deleted: listing the bin still works and the remaining entries are still restorable. | pass | pass |
 | Tamper | `Trash_GivenASidecarIsGarbage_ThenTheBinStillListsAndRestoresWhatItCan` | A .trashinfo sidecar is rewritten as garbage: the bin still lists and still restores the healthy entries. | pass | pass |
 | Tamper | `Utility_GivenTheHiddenTreeIsDeletedFromOneMember_ThenTheOtherMemberCarriesThePool` | Somebody deletes the whole hidden folder off one member: the pool mounts, and every duplicated file is still there. | pass | pass |
