@@ -278,6 +278,21 @@ public class TamperEndToEndTests {
     File.ReadAllBytes(pool.PathTo("intact.bin")).Should().Equal(intact);
   }
 
+  /// <summary>Polls the bin until it lists a given file, and returns the last listing seen.</summary>
+  private static string _WaitForTrashEntry(MountedPool pool, string fileName) {
+    var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(1);
+    var listing = "";
+    do {
+      listing = DbMount.RunExpectingSuccess(_CLI, "pool-trash-list", pool.PoolName, "--json").StandardOutput;
+      if (listing.Contains(fileName, StringComparison.OrdinalIgnoreCase))
+        break;
+
+      Thread.Sleep(250);
+    } while (DateTime.UtcNow < deadline);
+
+    return listing;
+  }
+
   /// <summary>Rewrites the deletion date a sidecar claims, leaving the rest of it alone.</summary>
   private static int _RedateSidecars(MountedPool pool, string forFile, DateTime deletedUtc) {
     var touched = 0;
@@ -306,14 +321,18 @@ public class TamperEndToEndTests {
 
     File.Delete(pool.PathTo("futuredated.bin"));
 
+    // The move into the bin is not synchronous with the unlink, so wait for the entry to actually
+    // be there before unmounting to tamper with it. The sibling sidecar tests get away without this
+    // because they assert on ANY sidecar; this one names a particular file, and on the Linux runner
+    // it raced and found none.
+    var listed = _WaitForTrashEntry(pool, "futuredated.bin");
+    listed.Should().Contain("futuredated.bin",
+      $"an entry with an absurd date must still be visible — an invisible entry is one the user "
+      + $"cannot restore OR clear.{Environment.NewLine}{listed}{Environment.NewLine}{pool.MountLog}");
+
     pool.WhileUnmounted(() =>
       _RedateSidecars(pool, "futuredated", DateTime.UtcNow.AddDays(400))
         .Should().BeGreaterThan(0, "there has to be a sidecar to re-date"));
-
-    var listed = DbMount.RunExpectingSuccess(_CLI, "pool-trash-list", pool.PoolName, "--json");
-    listed.StandardOutput.Should().Contain("futuredated.bin",
-      $"an entry with an absurd date must still be visible — an invisible entry is one the user "
-      + $"cannot restore OR clear.{Environment.NewLine}{listed.Output}{Environment.NewLine}{pool.MountLog}");
 
     DbMount.RunExpectingSuccess(_CLI, "pool-trash-purge", pool.PoolName);
 
