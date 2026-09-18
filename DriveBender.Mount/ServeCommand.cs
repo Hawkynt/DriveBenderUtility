@@ -943,7 +943,7 @@ internal sealed class ServeCommand(
     var specs = body.Members.Select(m => new PoolLifecycle.MemberSpec(
       m.Location,
       _ParseRole(m.Role),
-      Credential: string.IsNullOrWhiteSpace(m.Credential) ? null : "cred-ref:" + CredentialStore.NormalizeReference(m.Credential!),
+      Credential: this._CredentialReference(m.Credential),
       Network: MemberSchemes.IsRemote(MemberSchemes.SchemeOf(null, m.Location))));
 
     var manifest = lifecycle.Create(body.Name, specs, string.IsNullOrWhiteSpace(body.MountTarget) ? null : body.MountTarget, takeOver: body.TakeOver);
@@ -956,10 +956,32 @@ internal sealed class ServeCommand(
     if (body == null)
       throw new ManifestException("add-member needs a member body");
 
-    var credential = string.IsNullOrWhiteSpace(body.Credential) ? null : "cred-ref:" + CredentialStore.NormalizeReference(body.Credential!);
+    var credential = this._CredentialReference(body.Credential);
     lifecycle.AddMember(pool.Manifest, new(body.Location, _ParseRole(body.Role), Credential: credential), takeOver: request.QueryString["takeover"] == "true");
     return "ok";
   });
+
+  /// <summary>
+  /// Turns a posted credential field into a manifest reference, refusing anything that does not
+  /// already name a stored secret (SEC-CRED).
+  ///
+  /// The field is called "credential", so a password typed into it is the obvious mistake — and the
+  /// value goes straight into the manifest, which pool-export hands out. Requiring the name to
+  /// resolve first means a secret can never become its own reference. The refusal deliberately
+  /// echoes no part of the value back.
+  /// </summary>
+  private string? _CredentialReference(string? posted) {
+    if (string.IsNullOrWhiteSpace(posted))
+      return null;
+
+    var name = CredentialStore.NormalizeReference(posted);
+    if (credentials.Resolve(name) == null)
+      throw new ManifestException("That credential name is not in the credential store. Store the secret "
+                                  + "first, then reference it by name — a secret sent here would be written "
+                                  + "to the pool manifest.");
+
+    return "cred-ref:" + name;
+  }
 
   /// <summary>Rebuilds an orphaned pool from a member folder's manifest mirror and re-registers it.</summary>
   private object _Recover(HttpListenerRequest request) => _Guard(() => {

@@ -61,7 +61,7 @@ public sealed class PoolAddMemberOptions {
   [Option("reserve", HelpText = "Bytes the pool must not consume on the member's volume (e.g. 20GiB).")]
   public string? Reserve { get; set; }
 
-  [Option("credential", HelpText = "Credential reference for remote members (cred-ref:<name> or just <name>).")]
+  [Option("credential", HelpText = "NAME of a stored credential for remote members (cred-ref:<name> or just <name>); store it first with 'credential-set'. Never pass the secret itself.")]
   public string? Credential { get; set; }
 
   [Option("force", HelpText = "Consent to absorbing pre-existing content of a non-empty folder.")]

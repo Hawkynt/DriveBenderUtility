@@ -501,7 +501,16 @@ public interface IVolumeIOBackend {
 - **Credentials (`SEC-CRED`, Must):** all backends take credentials via an
   `ICredentialResolver` that reads the OS credential store (Windows Credential
   Manager / Linux Secret Service / libsecret) by reference — never plaintext in
-  the manifest.
+  the manifest. A credential field therefore accepts only the NAME of an
+  already-stored secret: `pool-add-member --credential` and the management API's
+  create/add-member bodies resolve the name first and **refuse** what does not
+  exist, rather than minting `cred-ref:<value>` out of whatever was passed.
+  Without that check a password typed into the field became the reference itself
+  and was written to the manifest, which `pool-export` hands out; a secret cannot
+  be un-shared afterwards. Refusals quote nothing back, since repeating the value
+  would put it in terminal scrollback and CI logs. Covered by
+  `CredentialLeakEndToEndTests`, which stores a marked secret and then sweeps the
+  registry, the export, the member-disk mirrors and the console for it.
 - **Read path (`FR-REMOTE-READ`, Should):** reads from a remote member use ranged
   GET where `RandomRead` is supported; otherwise the file is **staged whole** to a
   local scratch/fast tier on first access and served from there, with the staged
