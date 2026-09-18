@@ -217,6 +217,56 @@ public class PoolLifecycleTests {
     act.Should().Throw<ManifestException>().WithMessage("*already a member*");
   }
 
+  // Nesting: the shape that looks like it worked. Exact duplicates were always refused, but a
+  // member INSIDE another was accepted, and that is the more dangerous one — duplication across an
+  // outer and an inner member puts a file's two "copies" in one directory tree on one disk, so the
+  // pool reports redundancy it does not have. A probe against the shipped CLI accepted both
+  // directions, including adding the parent of every existing member.
+
+  [Test]
+  [Category("Exception")]
+  public void AddMember_GivenItLiesInsideAnExistingMember_WhenAdded_ThenRefused() {
+    var manifest = this._lifecycle.Create("MyPool", [new(@"C:\pools\outer")]);
+
+    var act = () => this._lifecycle.AddMember(manifest, new(@"C:\pools\outer\inner"));
+
+    act.Should().Throw<ManifestException>("two copies inside one tree on one disk is not redundancy")
+      .WithMessage("*lies inside member*");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void AddMember_GivenItContainsAnExistingMember_WhenAdded_ThenRefused() {
+    var manifest = this._lifecycle.Create("MyPool", [new(@"C:\pools\outer\inner")]);
+
+    var act = () => this._lifecycle.AddMember(manifest, new(@"C:\pools\outer"));
+
+    act.Should().Throw<ManifestException>("the outer member would enumerate the inner one's own storage as pool content")
+      .WithMessage("*contains member*");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Create_GivenTwoMembersWhereOneContainsTheOther_WhenCreated_ThenRefused() {
+    var act = () => this._lifecycle.Create("MyPool", [new(@"C:\pools\outer"), new(@"C:\pools\outer\inner")]);
+
+    act.Should().Throw<ManifestException>("the same trap is reachable at creation, not only when adding later")
+      .WithMessage("*lies inside member*");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void AddMember_GivenASiblingSharingAPathPrefix_WhenAdded_ThenAccepted() {
+    // The boundary the containment check has to get right: "C:\pools\data2" starts with
+    // "C:\pools\data" as a STRING but is a sibling, not a child. Refusing it would break ordinary
+    // pools for no reason, which is how over-eager path checks usually go wrong.
+    var manifest = this._lifecycle.Create("MyPool", [new(@"C:\pools\data")]);
+
+    var updated = this._lifecycle.AddMember(manifest, new(@"C:\pools\data2"));
+
+    updated.Members.Should().HaveCount(2);
+  }
+
   [Test]
   [Category("HappyPath")]
   public void RemoveMember_GivenTwoMembers_WhenRemoved_ThenDataStaysAndSidecarsGone() {
