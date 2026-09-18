@@ -48,8 +48,10 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
       var remote = MemberSchemes.IsRemote(scheme);
       // expand a local ~/… or %VAR% path before it is checked, created and stored
       var path = remote ? spec.Path : MemberSchemes.ExpandLocal(spec.Path);
-      if (!remote)
+      if (!remote) {
+        _EnsureDoesNotOverlap(definitions, path, name);
         this._EnsureMemberFolderUsable(path, poolId, force, takeOver: takeOver);
+      }
 
       definitions.Add(new() {
         MemberId = Guid.NewGuid(),
@@ -101,6 +103,57 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
     return store.Save(pool.Manifest);
   }
 
+  /// <summary>
+  /// Rejects a local member that lies inside another member, or that contains one.
+  ///
+  /// Exact duplicates were already refused, but nesting was not, and it is the more dangerous
+  /// shape because it looks like it worked. A member inside another is enumerated twice — once as
+  /// itself and once as a subfolder of its parent, sidecars and all — and, far worse, duplication
+  /// can then put a file's two "copies" on the outer and inner member, which are the same bytes in
+  /// one directory tree on one disk. The pool reports the redundancy it was asked for while having
+  /// none of it, and that is the failure the whole product exists to prevent.
+  ///
+  /// Remote members are skipped: their paths are not host paths and do not compare this way.
+  /// </summary>
+  private static void _EnsureDoesNotOverlap(IEnumerable<PoolMemberDefinition> existing, string path, string poolName) {
+    foreach (var member in existing) {
+      if (member.Scheme != null || member.Network)
+        continue;
+
+      if (_Encloses(member.Path, path))
+        throw new ManifestException(
+          $"'{path}' lies inside member '{member.Path}' of pool '{poolName}'. Nested members share "
+          + "one disk and one directory tree, so duplication across them would report redundancy "
+          + "the pool does not have. Pick a folder outside the existing members.");
+
+      if (_Encloses(path, member.Path))
+        throw new ManifestException(
+          $"'{path}' contains member '{member.Path}' of pool '{poolName}'. It would enumerate that "
+          + "member's own storage as pool content. Pick a folder that does not contain an existing "
+          + "member.");
+    }
+  }
+
+  /// <summary>Whether <paramref name="outer"/> is a strict ancestor directory of <paramref name="inner"/>.</summary>
+  private static bool _Encloses(string outer, string inner) {
+    string Full(string p) {
+      try {
+        return Path.TrimEndingDirectorySeparator(Path.GetFullPath(p));
+      } catch (Exception) {
+        return Path.TrimEndingDirectorySeparator(p); // unparseable stays comparable as written
+      }
+    }
+
+    var parent = Full(outer);
+    var child = Full(inner);
+    var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    // a strict ancestor, and only on a separator boundary — "C:\pool" must not swallow "C:\pool2"
+    return child.Length > parent.Length
+           && child.StartsWith(parent, comparison)
+           && (child[parent.Length] == Path.DirectorySeparatorChar || child[parent.Length] == Path.AltDirectorySeparatorChar);
+  }
+
   public PoolManifest AddMember(PoolManifest manifest, MemberSpec spec, bool force = false, bool takeOver = false) {
     if (manifest.IsVirtual)
       throw new ManifestException("Adopt the native pool first (pool adopt) before editing its membership");
@@ -113,6 +166,7 @@ public sealed class PoolLifecycle(IHostEnvironment host, ManifestStore store) {
       throw new ManifestException($"'{path}' is already a member of pool '{manifest.Name}'");
 
     if (!remote) {
+      _EnsureDoesNotOverlap(manifest.Members, path, manifest.Name);
       this._EnsureMemberFolderUsable(path, manifest.PoolId, force, takeOver: takeOver);
       if (!host.DirectoryExists(path))
         host.CreateDirectory(path);
