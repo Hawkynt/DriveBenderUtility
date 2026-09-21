@@ -94,8 +94,13 @@ public class SnapshotEndToEndTests {
     var id = _TakeSnapshot(pool, "before-the-swap");
     File.WriteAllBytes(path, _Payload(16 * 1024, 85));   // preserves the original somewhere
 
-    var holder = Enumerable.Range(0, pool.MemberPaths.Count).First(i =>
-      Directory.Exists(Path.Combine(pool.MemberPaths[i], ".drivebenderutility", "snapshots", "versions")));
+    // Preserving the original into the snapshot store is not synchronous with the overwrite
+    // returning, so looking for the holder straight away races it. That race does not fail the
+    // scenario, which is worse: picking a member whose versions folder merely exists yet, or that
+    // does not hold this version at all, retires an innocent disk and the restore then succeeds
+    // from the real holder — the test passes having exercised nothing. Wait for a COMPLETE
+    // preserved copy, so the disk that gets retired is always the one that matters.
+    var holder = _WaitForPreservedVersion(pool, original.Length);
 
     pool.WhileUnmounted(() => DbMount.RunExpectingSuccess(_CLI,
       "pool-remove-media", pool.PoolName, "--member", pool.MemberPaths[holder]));
@@ -105,6 +110,38 @@ public class SnapshotEndToEndTests {
     File.ReadAllBytes(path).Should().Equal(original,
       $"the version was on the member that left, and retiring a disk must not destroy what a "
       + $"snapshot promised.{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+  }
+
+  /// <summary>
+  /// Waits until a member holds a preserved version of the expected size and returns its index.
+  ///
+  /// Size is the check rather than mere existence: a copy still being written is present on disk
+  /// and short, and retiring the disk under a half-written version tests the wrong thing.
+  /// </summary>
+  private static int _WaitForPreservedVersion(MountedPool pool, int expectedLength) {
+    var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
+    do {
+      for (var member = 0; member < pool.MemberPaths.Count; ++member) {
+        var versions = Path.Combine(pool.MemberPaths[member], ".drivebenderutility", "snapshots", "versions");
+        if (!Directory.Exists(versions))
+          continue;
+
+        try {
+          if (Directory.EnumerateFiles(versions, "*", SearchOption.AllDirectories)
+              .Any(file => new FileInfo(file).Length == expectedLength))
+            return member;
+        } catch (IOException) {
+          // the store is being written into; look again next round
+        }
+      }
+
+      Thread.Sleep(200);
+    } while (DateTime.UtcNow < deadline);
+
+    throw new InvalidOperationException(
+      $"no member preserved a complete {expectedLength}-byte version of the overwritten file, so "
+      + $"there is no disk to retire and the scenario would prove nothing."
+      + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
   }
 
   [Test]
