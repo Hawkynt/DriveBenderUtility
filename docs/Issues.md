@@ -578,7 +578,7 @@ dropped from about 46 minutes to under 20. Two lessons, both cheap:
   could only fail — several hundred file reads and as many exceptions per `status`, and per each of
   the hundred polls one `unmount` makes. It now only considers files named for a pool id.
 
-### Open: the trash can take a file but nothing shipped can give it back
+### Resolved: the trash can take a file and now give it back
 
 `trash.enabled` moves a deleted file's bytes into a hidden per-member trash tree instead of destroying
 them (FR-TRASH, §6.14), and that half works — newly covered end to end: the file leaves the namespace,
@@ -595,6 +595,21 @@ because they wanted an undelete.
 Reported rather than built, because it is a user-facing surface rather than a fix: the engine work is
 already done and tested, so what is missing is a list-and-restore endpoint and somewhere in the
 dashboard to show it.
+
+**That has since shipped, on all three surfaces**, and this entry was left claiming otherwise —
+re-verified against the working tree rather than taken on trust:
+
+- CLI: `pool-trash-list`, `pool-trash-restore`, `pool-trash-purge` (`CommandLineOptions.cs:155`+,
+  dispatched in `Program.cs`).
+- Daemon: `GET /api/pool/trash`, `POST /api/pool/trash/restore`, `POST /api/pool/trash/purge`
+  (`ServeCommand.cs:294`+).
+- Dashboard: a **Recycle bin** button on every pool card opening `trashDialog`
+  (`WebAssets/app.js:600`, `:828`) — a table of deleted files with their size and age, a Restore
+  button each, and an "Empty now" that applies the retention and size policy.
+
+Covered end to end at both levels: `ManagementApiEndToEndTests` drives the list and restore
+endpoints, and `WebUiEndToEndTests` clicks the Recycle bin button in a real browser. The recorded
+symptom — an operator who turns the feature on and cannot recover anything — no longer holds.
 
 ### Per-kind I/O limits, so a disk can be left usable for everything else
 
@@ -1575,10 +1590,35 @@ being deleted, because what they cost is the point.
      handle rented before the replace is closed when its borrower returns it rather than re-pooled
      — a later reader cannot be served the pre-replace file out of the pool.
 
-   What is left is whatever a READER holds across the replace, since the staleness ends the moment
-   the readers stop. `FileState.ReadAhead` is per-handle and survives a rename — `RenamePath`
-   repoints the state rather than retiring it — which makes the read-ahead buffers the most
-   promising remaining candidate.
+   **Read-ahead was the standing lead and it is wrong.** `FileState.ReadAhead` survives a rename,
+   which made it look promising, but `ReadAheadState` holds **no data**: it is a sequential-access
+   detector whose whole state is `_expectedNextOffset` and a window size, and `OnRead` returns a
+   prefetch *length*. There are no buffers in it to go stale. Reading the type settles this without
+   an experiment.
+
+   **The engine is clean — measured, not argued.** The same shape was driven straight against
+   `PoolFileSystem` with no driver in the way: three writers staging and renaming over a target,
+   four readers opening the target **fresh every time** and recording the version they saw. Result:
+   564 replacements, 13,513 reads, **0 torn reads, 179 distinct versions observed**, settling on the
+   newest. So a fresh open through the engine resolves to new content, and the defect is added
+   **above** the engine, in the driver layer.
+
+   That is the useful narrowing: with the engine, the handle pool, `_Invalidate`, `IndexNumber` and
+   read-ahead all eliminated, what is left is WinFsp and the Windows cache manager — the FSD can
+   answer a read out of a file's cached section without the filesystem being called at all, and the
+   section is associated with the name's FCB, which stays alive exactly as long as readers keep
+   re-opening it. That matches the one behaviour nothing else explained: the staleness lasts
+   precisely as long as the readers do.
+
+   **The next attempt belongs in `WinFspAdapter`, not the engine**, and it should start by
+   establishing whether the Linux/FUSE target shows the same thing — if it does not, that confirms
+   the layer outright. Worth doing before writing any code, since the last three attempts each cost
+   an implementation.
+
+   To re-run the engine probe: a console project referencing `DriveBender.Vfs`, two
+   `LocalVolumeIO` members and a `CacheInstance`, duplication 2, then the writer/reader threads
+   described above using `fs.Create`/`fs.Write`/`fs.Rename(..., RenameFlags.ReplaceExisting)` and
+   `fs.Open`/`fs.Read`/`fs.Close` per read. It needs no driver and runs in ten seconds.
 
    It also passes when run ALONE and fails in the full suite, so it is timing-sensitive; a single
    green run of this scenario means nothing without the whole suite behind it.
