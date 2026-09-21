@@ -101,12 +101,16 @@ public class SharedAccessEndToEndTests {
 
   [Test]
   [Category("EdgeCase")]
-  [Ignore("A file replaced by rename keeps serving its OLD content to readers that hold the name "
-          + "open. Measured again this pass: 16 replacements landed, all 3,200 reads returned version 1, "
-          + "and the read taken after the workers stopped returned version 60 - so the data is correct on "
-          + "disk and the staleness is tied to concurrent handles, not a permanent failure to invalidate. "
-          + "Setting FspFileInfo.IndexNumber to a real per-file identity was tried and does NOT fix it. "
-          + "See docs/Issues.md.")]
+  [Ignore("A file replaced by rename keeps serving its OLD content to readers re-opening the name. "
+          + "Measured: 16 replacements landed, all 3,200 reads returned version 1, and the read taken "
+          + "after the workers stopped returned version 60 - so the data is correct on disk. "
+          + "LOCALISED since: the same shape driven straight against the engine, with no driver in the "
+          + "way, is CLEAN - 564 replacements, 13,513 fresh-open reads, 0 torn, 179 distinct versions "
+          + "seen. So the engine resolves a fresh open to new content and the staleness is added above "
+          + "it, in the driver layer. That rules out the three things already tried (IndexNumber, the "
+          + "pooled physical handles, per-handle read-ahead - which holds no data at all, only a "
+          + "prefetch length). The next attempt belongs in WinFspAdapter, not the engine. "
+          + "See docs/Issues.md for how to re-run the probe.")]
   public void SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeVersion() {
     // The atomic-replace pattern every careful application uses: write a temp, then rename over
     // the target. THAT is the one a filesystem must make tear-free — a plain truncate-and-rewrite
