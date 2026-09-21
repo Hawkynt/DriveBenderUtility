@@ -7,7 +7,7 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [35331174204](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/35331174204).
+Generated from run: [35560977943](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/35560977943).
 
 240 scenarios — 218 passing on at least one target, 0 failing.
 
@@ -131,7 +131,7 @@ Generated from run: [35331174204](https://github.com/Hawkynt/DriveBenderUtility/
 | SharedAccess | `SharedFile_GivenAReaderHoldsItOpenWhileItIsRenamed_ThenNeitherSideIsCorrupted` | Given AReader Holds It Open While It Is Renamed , then Neither Side Is Corrupted | pass | pass |
 | SharedAccess | `SharedFile_GivenConcurrentReadersOnOneOpenFile_ThenEachSeesTheWholeContent` | Given Concurrent Readers On One Open File , then Each Sees The Whole Content | pass | pass |
 | SharedAccess | `SharedFile_GivenWritersOwningDisjointRegionsOfOneFile_ThenNoRegionIsCorruptedByAnother` | Given Writers Owning Disjoint Regions Of One File , then No Region Is Corrupted By Another | pass | pass |
-| SharedAccess | `SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeVersion` | Given Writers Replacing It By Rename , then Every Read Is AWhole Version _(held back: A file replaced by rename keeps serving its OLD content to readers that hold the name open. Measured again this pass: 16 replacements landed, all 3,200 reads returned version 1, and the read taken after the workers stopped returned version 60 - so the data is correct on disk and the staleness is tied to concurrent handles, not a permanent failure to invalidate. Setting FspFileInfo.IndexNumber to a real per-file identity was tried and does NOT fix it. See docs/Issues.md.)_ | skipped | skipped |
+| SharedAccess | `SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeVersion` | Given Writers Replacing It By Rename , then Every Read Is AWhole Version _(held back: A file replaced by rename keeps serving its OLD content to readers re-opening the name. Measured: 16 replacements landed, all 3,200 reads returned version 1, and the read taken after the workers stopped returned version 60 - so the data is correct on disk. LOCALISED since: the same shape driven straight against the engine, with no driver in the way, is CLEAN - 564 replacements, 13,513 fresh-open reads, 0 torn, 179 distinct versions seen. So the engine resolves a fresh open to new content and the staleness is added above it, in the driver layer. That rules out the three things already tried (IndexNumber, the pooled physical handles, per-handle read-ahead - which holds no data at all, only a prefetch length). The next attempt belongs in WinFspAdapter, not the engine. See docs/Issues.md for how to re-run the probe.)_ | skipped | skipped |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(HDD over cloud)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(HDD over cloud) | pass | pass |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(RAM over cloud)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(RAM over cloud) | pass | pass |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(RAM over SD card)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(RAM over SD card) | pass | pass |
