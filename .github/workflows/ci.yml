@@ -121,6 +121,57 @@ jobs:
           path: '**/TestResults/*.trx'
 
   # ---------------------------------------------------------------------------
+  # The same engine suite, on Linux.
+  #
+  # The `test` job above calls this tier "platform-agnostic" and requires it to
+  # "stay green everywhere" -- but only ever ran it on windows-latest, so nothing
+  # anywhere checked that claim. A Linux-only engine defect was structurally
+  # invisible: #50 went green on every required check and left main red for anyone
+  # building on Linux, because its scenarios used C:\… literals that are not
+  # absolute paths on Linux and so asserted nothing there (#52).
+  #
+  # The end-to-end jobs do cover both targets, but they sit above the engine and
+  # take ~25 minutes each. This is the cheap tier -- no driver, no browser, fakes
+  # only -- so it belongs on both platforms and costs a few minutes.
+  # ---------------------------------------------------------------------------
+  engine-linux:
+    name: VFS engine (Linux, headless)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.x
+
+      - name: Stamp versions
+        run: perl .github/workflows/scripts/version.pl --stamp
+
+      # net47 is Windows-only, so only the portable engine tier is built here
+      - name: Build
+        run: dotnet build DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj --configuration Release
+
+      - name: Test (VFS engine, headless)
+        run: >
+          dotnet test DriveBender.Vfs.Tests/DriveBender.Vfs.Tests.csproj
+          --configuration Release --no-build
+          --logger "trx;LogFileName=vfs-tests-linux.trx"
+
+      - name: Publish failures as annotations
+        if: always()
+        shell: pwsh
+        run: ./.github/workflows/scripts/trx-annotations.ps1 -Path .
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: engine-linux-results
+          path: '**/TestResults/*.trx'
+
+  # ---------------------------------------------------------------------------
   # End-to-end: the SHIPPED binary, on both targets, the way a user meets it.
   #
   # The engine suite drives an in-memory fake, so it stays green even when the real
