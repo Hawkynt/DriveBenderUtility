@@ -77,6 +77,9 @@ public sealed class ProbeVolumeIO(IVolumeIO inner, TimeSpan readDelay = default)
   public void SetTimestamps(string relativePath, bool shadow, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc)
     => inner.SetTimestamps(relativePath, shadow, creationTimeUtc, lastWriteTimeUtc);
 
+  public void SetFolderTimestamps(string relativeFolder, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc)
+    => inner.SetFolderTimestamps(relativeFolder, creationTimeUtc, lastWriteTimeUtc);
+
   /// <summary>Holds the member's "a read is open" count until the engine actually lets the stream go.</summary>
   private sealed class CountingStream(Stream inner, ProbeVolumeIO owner) : Stream {
     private int _closed;

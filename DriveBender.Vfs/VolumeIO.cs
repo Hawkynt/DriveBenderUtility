@@ -109,6 +109,17 @@ public interface IVolumeIO {
   /// another.
   /// </summary>
   void SetPermissions(string relativePath, bool shadow, UnixFileMode mode) { }
+
+  /// <summary>
+  /// Stamps a FOLDER's times, where the member's storage keeps them.
+  ///
+  /// Separate from <see cref="SetTimestamps"/> because a folder resolves to a different physical
+  /// path and needs a different call on every OS, and because copy engines stamp every folder they
+  /// create: Explorer, robocopy, <c>cp -a</c> and <c>rsync -a</c> all do it, and refusing it fails
+  /// the whole copy. The default does nothing, which is right for object stores — they have no
+  /// folders to stamp — and wrong for any decorator, which must forward it explicitly.
+  /// </summary>
+  void SetFolderTimestamps(string relativeFolder, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) { }
 }
 
 /// <summary>Descriptor a backend needs to open a member (path/URI, tuning, credential reference).</summary>

@@ -826,8 +826,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var lease = this._handles.AcquireWrite(normalized); // copies must not move under the stamp
     var dataName = this._DataName(normalized);
     var copies = this._placement.ResolveCopies(dataName);
-    if (copies.Count == 0)
+    if (copies.Count == 0) {
+      // Not a file, so perhaps a folder. Looking only among file copies answered NotFound for every
+      // folder, and copy engines stamp each folder they create with the source's times — Explorer,
+      // robocopy, cp -a and rsync -a all do — so a tree copy failed on its first folder with
+      // "directory does not exist", about a folder it had just made. Retrying got a little further
+      // each time, one folder at a time.
+      if (this._StampFolder(normalized, patch))
+        return;
+
       throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {path}");
+    }
 
     foreach (var copy in copies) {
       copy.Volume.SetTimestamps(dataName, copy.Shadow, patch.CreationTimeUtc, patch.LastWriteTimeUtc);
@@ -839,6 +848,34 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     this._cache.Metadata.InvalidatePath(this._poolId, normalized);
+  }
+
+  /// <summary>
+  /// Stamps a folder on every member that holds it, and says whether any did.
+  ///
+  /// Every member, not the first: a folder exists wherever something beneath it was placed, and a
+  /// listing reports whichever member it enumerates first, so stamping one copy leaves the folder's
+  /// times depending on which disk answered.
+  /// </summary>
+  private bool _StampFolder(string normalized, FileMetaPatch patch) {
+    if (normalized.Length == 0)
+      return true; // the pool root always exists; its own times belong to the member roots
+
+    var any = false;
+    foreach (var member in this._Online) {
+      if (!member.FolderExists(normalized, false))
+        continue;
+
+      any = true;
+      member.SetFolderTimestamps(normalized, patch.CreationTimeUtc, patch.LastWriteTimeUtc);
+      if (patch.Permissions is { } mode && (member.Caps & BackendCaps.Permissions) != 0)
+        member.SetPermissions(normalized, false, mode);
+    }
+
+    if (any)
+      this._cache.Metadata.InvalidatePath(this._poolId, normalized);
+
+    return any;
   }
 
   public IReadOnlyList<DirEntry> ReadDirectory(string path) {

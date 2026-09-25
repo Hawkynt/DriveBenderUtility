@@ -577,6 +577,16 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
       File.SetLastWriteTimeUtc(path, modified);
   });
 
+  // Directory.*, not File.*: on Windows File.Set*Time opens the path without backup semantics and
+  // cannot open a directory at all, so it throws for exactly the case this exists for
+  public void SetFolderTimestamps(string relativeFolder, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) => this._Guard(() => {
+    var path = this._ResolveFolder(relativeFolder, false);
+    if (creationTimeUtc is { } created)
+      Directory.SetCreationTimeUtc(path, created);
+    if (lastWriteTimeUtc is { } modified)
+      Directory.SetLastWriteTimeUtc(path, modified);
+  });
+
 }
 
 /// <summary>Backend registration for local/UNC members (scheme "file"/"unc").</summary>

@@ -85,6 +85,9 @@ public sealed class MeasuredVolumeIO(IVolumeIO inner) : IVolumeIO {
   // exactly what happened, and it looked like the chmod never arriving.
   public void SetPermissions(string relativePath, bool shadow, UnixFileMode mode) => inner.SetPermissions(relativePath, shadow, mode);
 
+  // same trap as SetPermissions: inheriting the no-op default would drop every folder stamp
+  public void SetFolderTimestamps(string relativeFolder, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) => inner.SetFolderTimestamps(relativeFolder, creationTimeUtc, lastWriteTimeUtc);
+
   /// <summary>Times the actual data movement — where a busy disk really shows.</summary>
   private sealed class MeasuredStream(Stream inner, MeasuredVolumeIO owner) : Stream {
     public override bool CanRead => inner.CanRead;

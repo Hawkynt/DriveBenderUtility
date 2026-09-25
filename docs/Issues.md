@@ -1844,3 +1844,21 @@ being sure about — a retired disk must not take a snapshot's only copy with it
 Worth a deliberate reproduction under load before it is dismissed: run the full battery in a loop
 and capture the member dumps the failure already prints, rather than waiting to notice it again in
 somebody's unrelated pull request.
+
+### Resolved: copying a folder tree failed with "directory does not exist"
+
+Reported from real use: copying many files into the pool with Explorer failed over and over with
+write errors and "directory does not exist", and retrying got a few seconds further each time.
+
+Copy engines stamp every folder they create with the source folder's attributes and times —
+Explorer, robocopy, `cp -a` and `rsync -a` all do. That arrives as `SetBasicInfo` on Windows and
+`utimens`/`chmod` on Linux, and all of them land in `PoolFileSystem.SetAttributes`, which looked the
+path up among **file** copies only. A folder has none, so every folder stamp was answered NotFound —
+about a folder that had just been created. Explorer reports that as the folder not existing; each
+retry got one folder further.
+
+Nothing covered it because no scenario copied a *tree*. `BulkCopyEndToEndTests` now does, with the
+reporter's own pool settings, both file by file and with robocopy on eight threads — robocopy
+failed on its very first folder before the fix and copies 157 folders and 1,800 files cleanly
+after it. `SetAttributes` now falls back to stamping the folder on every member that holds it, and
+still answers NotFound when the path is neither a file nor a folder (`FolderAttributesTests`).
