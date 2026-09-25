@@ -49,6 +49,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// </summary>
   private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _pinned = new(PoolPaths.PathComparer);
   private readonly IntegrityService _integrity;
+  private readonly ReadVerifier _readVerifier;
   private readonly ActivityFeed _activity;
   // FR-RA, double-buffered: how many read-ahead chains one path may have running at once. With
   // ONE, the reader stalls at every window boundary — the chain that would fetch window N+1 is
@@ -283,6 +284,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock, this.AdmitBulk);
     this._snapshots = new([.. members.Select(m => m.Io)], this._journal, this._clock, this.AdmitBulk);
     this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest, this.AdmitBulk);
+    this._readVerifier = new(this._integrity, this._Invalidate, this._RepairAfterReadCheck);
     this._activity = new(clock: this._clock);
     this._placement = new(
       poolId,
@@ -311,6 +313,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._readAheadAdaptive = readAhead?.Adaptive ?? true;
     this._mirrorSplitThreshold = SizeSpec.ParseBytes(config.Io?.MirrorReadSplitThreshold ?? "8MiB");
     this._memberLossPolicy = config.Resilience?.OnMemberLoss ?? MemberLossPolicy.RetainMetadata;
+
+    // with the checksum database off there is nothing to check a read against
+    this._readVerifier.Mode = config.Integrity?.ChecksumDb == false
+      ? ReadVerification.Never
+      : config.Integrity?.VerifyReads ?? ReadVerification.Never;
   }
 
   public PlacementResolver Placement => this._placement;
@@ -1627,7 +1634,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         foreach (var staleSequence in discardedStaged.Value.journalSequences)
           this._journal.Complete(staleSequence, JournalOp.Write);
 
-      this._integrity.InvalidateFile(stagedName);
+      this._InvalidateChecksums(stagedName);
       this._Invalidate(stagedName);
       this._Invalidate(normalized);
       this._shadow.Remove(normalized);
@@ -1658,7 +1665,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (effective.Trash?.Enabled == true) {
       // recoverable delete: all copies move to the hidden pool trash instead of dying (FR-TRASH)
       this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true);
-      this._integrity.InvalidateFile(normalized);
+      this._InvalidateChecksums(normalized);
       if (discarded != null)
         foreach (var staleSequence in discarded.Value.journalSequences)
           this._journal.Complete(staleSequence, JournalOp.Write);
@@ -1700,7 +1707,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     this._journal.Complete(sequence, JournalOp.Delete);
-    this._integrity.InvalidateFile(normalized);
+    this._InvalidateChecksums(normalized);
     if (discarded != null)
       foreach (var staleSequence in discarded.Value.journalSequences)
         this._journal.Complete(staleSequence, JournalOp.Write);
@@ -1762,6 +1769,49 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private void _Invalidate(string normalized) {
     this._placement.Invalidate(normalized);
     this._cache.InvalidatePath(this._poolId, normalized);
+    this._readVerifier.Forget(normalized);
+  }
+
+  /// <summary>A write changed a file: its checksums are stale, and so is anything a read check concluded.</summary>
+  private void _InvalidateChecksums(string normalized) {
+    this._integrity.InvalidateFile(normalized);
+    this._readVerifier.Forget(normalized);
+  }
+
+  /// <summary>
+  /// Repairs a file a read check found damaged, exactly as a scrub would — under the file's write
+  /// lease, so it cannot rewrite a copy under a writer's feet. A file the write buffer owns right now
+  /// is left alone: its recorded checksums are stale anyway, and the scrub will see it later.
+  /// </summary>
+  private void _RepairAfterReadCheck(string normalized) {
+    using var lease = this._handles.AcquireWrite(normalized);
+    if (this._writeBuffer.IsDirty(normalized))
+      return;
+
+    foreach (var issue in this._integrity.ScrubFile(normalized, this._Invalidate))
+      this._activity.Publish(ActivityKind.Scrub, issue.Path, reason: $"{issue.Kind}: {issue.Message}");
+  }
+
+  /// <summary>How many copies read checks have hashed so far — their whole added cost.</summary>
+  public long ReadVerificationHashes => this._readVerifier.Hashes;
+
+  /// <summary>Waits for queued read checks and the repairs they triggered; false on timeout.</summary>
+  public bool WaitForReadVerifications(TimeSpan timeout) => this._readVerifier.WaitIdle(timeout);
+
+  /// <summary>
+  /// <see cref="ReadVerification.Before"/>: the copies this handle may read from, checked once per
+  /// handle. Re-checked if none of them still holds the file (a heal or rebalance moved it).
+  /// </summary>
+  private IReadOnlyList<PhysicalCopy> _CheckedCopies(FileState file, NodeHandle handle, string path, IReadOnlyList<PhysicalCopy> copies) {
+    if (file.ReadChecks.TryGetValue(handle.Value, out var allowed) && allowed != null) {
+      var serving = copies.Where(c => allowed.Contains((c.Volume.MemberId, c.Shadow))).ToArray();
+      if (serving.Length > 0)
+        return serving;
+    }
+
+    var selected = this._readVerifier.SelectForRead(path, copies);
+    file.ReadChecks[handle.Value] = [.. selected.Select(c => (c.Volume.MemberId, c.Shadow))];
+    return selected;
   }
 
   /// <summary>
@@ -1840,8 +1890,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // exactly right and the overlay supplies the tail. IsDirty is stable here: a flush takes
       // this path's write lease and we hold its read lock.
       var durableExpected = !this._writeBuffer.IsDirty(path);
+
+      // Only a settled file can be checked: one the write buffer holds, or one still being staged,
+      // has checksums that are stale by definition, and its content is legitimately in motion.
+      var checkable = durableExpected && dataPath == path;
+      var verification = this._readVerifier.Mode;
+      if (checkable && verification == ReadVerification.Before)
+        copies = this._CheckedCopies(lease.File, handle, path, copies);
+
       this._ReadRange(path, dataPath, copies, buffer[..count], offset, count >= this._mirrorSplitThreshold,
         durableExpected ? length : 0);
+
+      // after the bytes are out: one background check per handle, never one per read
+      if (checkable && verification == ReadVerification.After && lease.File.ReadChecks.TryAdd(handle.Value, null))
+        this._readVerifier.CheckAfterRead(path, copies);
       this._activity.Publish(ActivityKind.Read, path, count, fromMember: copies[0].Volume.DisplayName, reason: "user I/O");
 
       if (this._readAheadEnabled) {
@@ -2485,7 +2547,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._activity.Publish(ActivityKind.Duplicate, path, bytes.Length, fromMember: copies[0].Volume.DisplayName, toMember: copies[1].Volume.DisplayName, reason: "mirrored write");
 
       // coherency: a read after this write must return the new bytes (SAFE-COHERE)
-      this._integrity.InvalidateFile(dataPath);
+      this._InvalidateChecksums(dataPath);
       this._cache.Pages.InvalidatePath(this._poolId, dataPath);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
       return bytes.Length;
@@ -2665,7 +2727,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         copy.Volume.Truncate(dataPath, copy.Shadow, length); // grows zero-filled or shrinks on all copies (FR-TRUNC)
 
       this._journal.Complete(sequence, JournalOp.Truncate);
-      this._integrity.InvalidateFile(dataPath);
+      this._InvalidateChecksums(dataPath);
       this._cache.Pages.InvalidatePath(this._poolId, dataPath);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
     } finally {
@@ -2763,7 +2825,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     foreach (var sequence in journalSequences)
       this._journal.Complete(sequence, JournalOp.Write);
 
-    this._integrity.InvalidateFile(dataName);
+    this._InvalidateChecksums(dataName);
     this._cache.Pages.InvalidatePath(this._poolId, dataName);
     this._cache.Metadata.InvalidatePath(this._poolId, normalized);
   }
@@ -2866,7 +2928,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           // file that is no longer there. The same ordering fault as the promote's, with a window
           // of a few statements rather than minutes — which is a reason to think it harmless, not
           // a reason to leave it: the read that lands in it fails just as completely.
-          this._integrity.InvalidateFile(path);
+          this._InvalidateChecksums(path);
           this._Invalidate(path);
         }
 

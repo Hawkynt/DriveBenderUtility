@@ -1113,6 +1113,7 @@ on typical HW).
     "fastHash": "xxh3",                    // xxh3 | blake3
     "strongHash": null,                    // e.g. "blake3" for paranoia mode; null = fast only
     "onExternalEdit": "accept-newest",     // accept-newest | conflict-only | read-only-until-reconciled
+    "verifyReads": "never",                // never | before | after — check a copy against its stored checksum when read
     "scrubberSchedule": "idle-weekly",     // (also under background); quick vs deep per §6.15
     "deepScrubSchedule": null              // e.g. "monthly"; full re-hash (Could)
   },

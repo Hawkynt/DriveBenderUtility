@@ -129,7 +129,20 @@ scenarios only pass with the scrub run while nothing is mounted, which is what t
 user this means the obvious action — health-check the pool you have mounted — achieves nothing
 durable. The two processes need to agree on ownership of that file.
 
-**Decided, not open — reads are trusted and are not verified.** Hashing every block served would
+**Now a setting — `integrity.verifyReads`.** Trusting reads stays the default (`never`), for the
+reason below. `before` checks the copy that is about to serve a read against its recorded checksum
+before any of its bytes go out: a damaged copy is passed over for an intact one and repaired from it
+in the background, and the read fails only when no copy matches. `after` serves at full speed and
+checks in the background, logging a warning that damaged data may already have been handed out, and
+repairs it. Both check a COPY once per version of it — the first read after a file changes pays one
+streamed hash, every later read of that version pays nothing — because the database holds whole-file
+hashes and a block cannot be checked on its own. A copy with no baseline that still describes it is
+served, since refusing a file the database never saw would make the setting unusable on a pool that
+has not been scrubbed. `BitRot_GivenOneCopyIsSilentlyDamaged_…`, held back since the start, now runs
+under `before`; it had also been rotting a copy that was never the one serving the read, so it
+passed with checking switched off, and it now damages the primary.
+
+**The default — reads are trusted and are not verified.** Hashing every block served would
 trade the pool's throughput away for a check that nearly always passes. The bargain instead is:
 writes record what they can and MARK what they cannot, and a scheduled sweep re-baselines the marks
 and finds the damage. Marking rather than deleting is what makes the write side cheap — a

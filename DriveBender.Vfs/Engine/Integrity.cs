@@ -323,6 +323,45 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
   public IReadOnlyList<IntegrityIssue> ScrubAll(Action<string>? invalidateCaches = null, OperationContext? operation = null)
     => this._Scrub(quick: false, detectOnly: false, invalidateCaches, operation);
 
+  /// <summary>
+  /// The recorded checksum for one copy, if it can still be believed for the file as it is now.
+  ///
+  /// The same rule the scrub applies (see <see cref="_CollectCopies"/>): an entry flagged stale, or
+  /// one whose size or mtime no longer match the copy, describes content that is gone. Returning it
+  /// would call a legitimate edit damage. A mismatch is flagged in the database on the way past, so
+  /// the conclusion is recorded rather than re-derived.
+  /// </summary>
+  public ChecksumEntry? TrustedBaseline(IVolumeIO member, string normalizedPath, bool shadow, FileMeta meta) {
+    var physical = PoolPaths.ToPhysical(normalizedPath, shadow);
+    var recorded = this._Db(member).Get(physical);
+    if (recorded is not { Stale: false })
+      return null;
+
+    if (recorded.Size == meta.Length && recorded.MTimeTicks == meta.LastWriteTimeUtc.Ticks)
+      return recorded;
+
+    this._Db(member).MarkStale(physical);
+    return null;
+  }
+
+  /// <summary>
+  /// Scrubs ONE file: every copy re-hashed and classified exactly as a full scrub would — bit-rot
+  /// repaired from an intact copy and quarantined, edits and conflicts handled by the edit policy.
+  /// For when something other than the schedule has found reason to suspect a particular file.
+  /// </summary>
+  public IReadOnlyList<IntegrityIssue> ScrubFile(string normalizedPath, Action<string>? invalidateCaches = null) {
+    var issues = new List<IntegrityIssue>();
+    try {
+      var views = this._CollectCopies(normalizedPath, quick: false);
+      if (views != null)
+        this._ClassifyAndReconcile(normalizedPath, views, issues, invalidateCaches);
+    } finally {
+      this.SaveAll();
+    }
+
+    return issues;
+  }
+
   /// <summary>Mount-time delta scan (FR-OOB-MOUNT): only files whose (size, mtime) deviate from the DB are verified.</summary>
   public IReadOnlyList<IntegrityIssue> QuickScan(Action<string>? invalidateCaches = null, OperationContext? operation = null)
     => this._Scrub(quick: true, detectOnly: false, invalidateCaches, operation);
