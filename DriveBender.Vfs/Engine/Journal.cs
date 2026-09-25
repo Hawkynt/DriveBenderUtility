@@ -394,6 +394,11 @@ public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
   }
 
   public void Complete(long sequence, JournalOp op) {
+    // 0 is never a real sequence (they start at 1) and means "this operation was never journaled":
+    // callers that elide an intent can then complete unconditionally, as the write path already does
+    if (sequence == 0)
+      return;
+
     string line;
     lock (this._lock) {
       this._EnsureLoaded();

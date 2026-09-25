@@ -498,13 +498,26 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     if (!File.Exists(tempPath))
       throw new PoolFsException(PoolFsError.NotFound, $"Staged file not found: {tempRelative}");
 
-    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(finalPath)!);
+    // A staged temp sits beside its final name, so the folder already exists — and creating it
+    // anyway cost as much as the rename itself on every publish. Only a move into another folder
+    // needs it.
+    var finalFolder = System.IO.Path.GetDirectoryName(finalPath)!;
+    if (!string.Equals(finalFolder, System.IO.Path.GetDirectoryName(tempPath), StringComparison.OrdinalIgnoreCase))
+      Directory.CreateDirectory(finalFolder);
+
     this._pool.Invalidate(tempPath);
     this._pool.Invalidate(finalPath);
-    if (File.Exists(finalPath))
-      File.Replace(tempPath, finalPath, null, true);
-    else
+
+    // Move first: the common case is a brand-new name, and asking whether the target exists before
+    // every rename was a second filesystem round trip to learn what the rename reports anyway. A
+    // target that does exist fails the move with "already exists" and is then REPLACED, keeping the
+    // replace semantics (attributes and security carried over) for exactly the case that needs them.
+    try {
       File.Move(tempPath, finalPath);
+    } catch (IOException e) when (File.Exists(finalPath) && File.Exists(tempPath)) {
+      _ = e;
+      File.Replace(tempPath, finalPath, null, true);
+    }
     // invalidate again AFTER: a reader that re-cached the old finalPath during the replace must
     // not keep serving the pre-replace file (its handle stays valid under FileShare.Delete)
     this._pool.Invalidate(finalPath);

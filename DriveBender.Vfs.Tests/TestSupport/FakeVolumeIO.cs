@@ -311,8 +311,11 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       var staged = this._files.GetValueOrDefault(tempPhysical)
                    ?? throw new PoolFsException(PoolFsError.NotFound, $"Staged file not found: {tempRelative}");
 
-      // rename is atomic and durable: content is persisted as part of publication (SAFE-ATOMIC)
-      staged.Persisted = (byte[])staged.Current.Clone();
+      // The rename is atomic and moves the NAME — it does not make the content durable. This used to
+      // persist the content as part of the rename, which no real filesystem promises (NTFS does not,
+      // ext4 only heuristically), and it hid exactly the bug it should catch: an engine that renames
+      // a file into view before flushing it would pass every crash test here and lose the file on a
+      // real power cut. Content is durable when it was flushed, and only then.
       this._files.Remove(tempPhysical);
       this._EnsureParents(finalPhysical);
       this._files[finalPhysical] = staged;
