@@ -372,7 +372,10 @@ public class CrashConsistencyTests {
   // That is the moment that matters most, and the one a missing flush-before-rename would betray.
   public void Crash_GivenAFileWasWrittenAndClosed_ThenItSurvivesPowerLossWhole(
     [Values(1, 3)] int writes,
-    [Values("write-through", "write-back", "performance")] string policy) {
+    [Values("write-through", "write-back", "performance")] string policy,
+    [Values(false, true)] bool presized) {
+    // presized: Windows' copy engine sets a file's length BEFORE filling it, so every copied file
+    // is truncated while it is still a staging temp — a path with no journal intent of its own.
     // write-back and performance acknowledge a write before every copy has it and owe the rest —
     // exactly the blocks that reach a staging temp with no barrier of their own, and that only the
     // publish makes durable. The policy is the variable that matters here, not a detail.
@@ -383,6 +386,9 @@ public class CrashConsistencyTests {
              ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 2, "write": { "policy": "{{policy}}" }, "readAhead": { "enabled": false } }"""))) {
       fs.Mount(new(@"X:\"));
       var handle = fs.Create("saved.bin", NodeKind.File, CreateFlags.None);
+      if (presized)
+        fs.SetLength(handle, content.Length);
+
       var chunk = content.Length / writes;
       for (var i = 0; i < writes; ++i) {
         var from = i * chunk;

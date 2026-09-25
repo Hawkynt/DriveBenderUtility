@@ -2660,7 +2660,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
-      var sequence = this._journal.LogIntent(JournalOp.Truncate, dataPath, length: length);
+      // Copy engines size a file before filling it, so every copied file passes through here once
+      // while still a staging temp — where an intent recovers nothing (the temp is swept after a
+      // crash) and the publish's flush commits the size along with the content.
+      var sequence = _IsStagedName(dataPath) ? 0 : this._journal.LogIntent(JournalOp.Truncate, dataPath, length: length);
       foreach (var copy in copies)
         copy.Volume.Truncate(dataPath, copy.Shadow, length); // grows zero-filled or shrinks on all copies (FR-TRUNC)
 

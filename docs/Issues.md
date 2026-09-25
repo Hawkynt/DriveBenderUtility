@@ -1887,3 +1887,19 @@ it now persists only what was flushed, and removing the publish flush fails 25 c
 failed none before. And nothing ever lost power *after* an acknowledged close — every crash case
 interrupts an operation part-way. `Crash_GivenAFileWasWrittenAndClosed_…` now does, under every
 write policy, and fails in all six variants without the publish flush.
+
+### Directory listings cost in proportion to the whole pool, not the folder
+
+Profiled during a tree copy through the driver: the destination folder is re-listed constantly
+(every new file invalidates its listing), and each listing asked the shadow namespace for the
+folder's remembered children — which it found by scanning EVERY path the pool had ever surfaced,
+under the one lock the whole namespace shares. `Remove` and `Rename` did the same to find a subtree,
+even for a single file. So on a large pool every listing, every delete and every rename paid for the
+size of the pool. The namespace now keeps a parent→children index, and a file's remove or rename
+skips the subtree walk entirely. Pre-sizing a staging temp (which Windows' copy engine does for every
+file) no longer journals a truncate either, for the same reason as every other staged write.
+
+Measured with the same copy as above, alternating builds: **114 → 165 files/s** on top of the
+publish change — **63 → 165 against `main`**. A half-second free-space cache was tried as well and
+dropped: it bought 6% and made the reported free space lag behind what had just been written, which
+two capacity scenarios rightly caught.
