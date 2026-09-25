@@ -192,9 +192,39 @@ public class MetadataFidelityEndToEndTests {
     pool.Restore(1);
     MountedPool.WaitUntil(() => pool.PhysicalCopies("block-exact.bin").Count >= 2, TimeSpan.FromMinutes(3))
       .Should().BeTrue($"the healer must rebuild the emptied member."
-        + $"{Environment.NewLine}{pool.DescribeMembers()}");
+        + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
 
     _VerifyTree(pool, written, "after the pool rebuilt a member");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  [Description("A file that was only READ since the mount is still healed after its other copy is lost.")]
+  public void Heal_GivenTheFileWasOnlyReadThroughTheMount_ThenItsLostCopyIsStillRebuilt() {
+    // Windows only ever went wrong here, and invisibly: WinFsp was told to report a close only for a
+    // MODIFIED file, so reading one left the pool believing it was still open until the kernel let
+    // go of it — which the cache manager defers for any file with cached data, often until unmount.
+    // The healer skips open files. Every file read since the mount stayed one copy short after a
+    // member loss, with nothing logged; only 0- and 1-byte files, with nothing cached, escaped.
+    using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
+    var content = _Payload(64 * 1024, 93);
+    File.WriteAllBytes(pool.PathTo("read-only-since.bin"), content);
+    pool.WaitForPhysicalCopies("read-only-since.bin", atLeast: 2, TimeSpan.FromMinutes(2));
+
+    pool.Remount(); // nothing held over from writing it
+    File.ReadAllBytes(pool.PathTo("read-only-since.bin")).Should().Equal(content); // READ, never written
+
+    var holder = pool.PhysicalCopies("read-only-since.bin").First().where;
+    var member = Enumerable.Range(0, pool.MemberPaths.Count).First(i => holder.StartsWith(pool.MemberPaths[i], StringComparison.OrdinalIgnoreCase));
+    pool.Eject(member);
+    foreach (var candidate in Directory.EnumerateFiles(pool.StoragePaths[member], "read-only-since.bin", SearchOption.AllDirectories))
+      File.Delete(candidate);
+    pool.Restore(member);
+
+    MountedPool.WaitUntil(() => pool.PhysicalCopies("read-only-since.bin").Count >= 2, TimeSpan.FromMinutes(2))
+      .Should().BeTrue($"reading a file must not stop the pool restoring its copies."
+        + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+    File.ReadAllBytes(pool.PathTo("read-only-since.bin")).Should().Equal(content);
   }
 
   [Test]

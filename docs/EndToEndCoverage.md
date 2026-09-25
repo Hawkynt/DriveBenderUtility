@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36126326097](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36126326097).
+Generated from run: [36134221464](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36134221464).
 
-244 scenarios — 223 passing on at least one target, 0 failing.
+245 scenarios — 224 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -115,6 +115,7 @@ Generated from run: [36126326097](https://github.com/Hawkynt/DriveBenderUtility/
 | MemberLoss | `Eject_GivenAMemberReturnsWhileIoIsInFlight_ThenNothingIsCorruptedOrStalled` | Given AMember Returns While Io Is In Flight , then Nothing Is Corrupted Or Stalled | pass | pass |
 | MemberLoss | `Eject_GivenAMemberVanishesDuringAWrite_ThenTheDataThatWasAcknowledgedIsIntact` | Given AMember Vanishes During AWrite , then The Data That Was Acknowledged Is Intact | pass | pass |
 | MemberLoss | `Eject_GivenEveryMemberIsGone_ThenOperationsFailCleanlyInsteadOfHanging` | Given Every Member Is Gone , then Operations Fail Cleanly Instead Of Hanging | pass | pass |
+| MetadataFidelity | `Heal_GivenTheFileWasOnlyReadThroughTheMount_ThenItsLostCopyIsStillRebuilt` | A file that was only READ since the mount is still healed after its other copy is lost. | pass | pass |
 | MetadataFidelity | `Permissions_GivenAFileIsMadePrivate_ThenItStaysPrivate` | Permissions set on a file in the pool are actually kept, rather than reported as set and discarded. | skipped | pass |
 | MetadataFidelity | `Permissions_WhenThePoolCopiesTheFile_ThenTheModeIsCarriedWithIt` | A file's permissions survive a remount and the pool's own duplication of it. | skipped | pass |
 | MetadataFidelity | `Preserving_GivenCpDashPCopiesIntoThePool_ThenModeAndTimeArriveWithIt` | cp -p into the pool preserves mode and modification time, as it does onto any other filesystem. | skipped | pass |

@@ -1916,3 +1916,22 @@ Measured with the same copy as above, alternating builds: **114 → 165 files/s*
 publish change — **63 → 165 against `main`**. A half-second free-space cache was tried as well and
 dropped: it bought 6% and made the reported free space lag behind what had just been written, which
 two capacity scenarios rightly caught.
+
+### Resolved: on Windows, a file that had only been READ was never healed
+
+`Tree_GivenAWholeTreeIsWritten_…` had been an intermittent failure for a long time, written off as a
+flake and once proved to fail without any change of mine. It turned out to fail on every run on this
+machine, on `main`, which made it finally debuggable — and it was never a flake.
+
+WinFsp was configured with `PostCleanupWhenModifiedOnly`, so it sends CLEANUP — "the application has
+closed the file" — only for a file that was MODIFIED. An application that merely read a file never
+said so; the close that eventually arrives is the kernel's, which the cache manager defers for any
+file it has cached data for, often until unmount. The pool counts a file as open until the
+application is done with it, and the healer and the landing-zone drainer skip open files. So after a
+member loss, every file that had been read since the mount stayed one copy short, silently — the
+healer considered each of them 23 times in three minutes and put each one back as busy. Only 0- and
+1-byte files, with nothing to cache, escaped, which is exactly what the scenario showed.
+
+WinFsp now reports every close. A handle that was never writable skips the flush on close, so the
+extra callback stays cheap. `Heal_GivenTheFileWasOnlyReadThroughTheMount_…` covers it directly, and
+fails with the old setting. Linux was never affected: FUSE always sends `release`.

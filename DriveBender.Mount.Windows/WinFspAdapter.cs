@@ -18,6 +18,9 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
     public NodeHandle Handle = NodeHandle.Invalid;
     public required string Path;
     public bool IsDirectory;
+
+    /// <summary>Opened for writing — only such a handle can have anything to flush on close.</summary>
+    public bool Writable;
   }
 
   private const uint FILE_WRITE_DATA = 0x0002;
@@ -101,6 +104,7 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
         pool.MakeDir(path);
       else
         descriptor.Handle = pool.Create(path, NodeKind.File, CreateFlags.Exclusive);
+        descriptor.Writable = true;
 
       fileDesc = descriptor;
       normalizedName = fileName;
@@ -127,6 +131,7 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       if (!meta.IsDirectory) {
         var wantsWrite = (grantedAccess & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
         descriptor.Handle = pool.Open(path, wantsWrite ? AccessMode.ReadWrite : AccessMode.Read, ShareMode.Read | ShareMode.Write);
+        descriptor.Writable = wantsWrite;
       }
 
       fileDesc = descriptor;
@@ -351,7 +356,10 @@ public sealed class WinFspAdapter(IPoolFileSystem pool, string volumeLabel) : Fi
       // cached writes against it afterwards, and Close still does the real teardown.
       if (!descriptor.IsDirectory && descriptor.Handle != NodeHandle.Invalid)
         try {
-          pool.Flush(descriptor.Handle);
+          // a handle that was only ever read has nothing to flush or publish, and every close of
+          // one now arrives here (PostCleanupWhenModifiedOnly is off), so it must stay cheap
+          if (descriptor.Writable)
+            pool.Flush(descriptor.Handle);
 
           // Tell the engine the APPLICATION is done with the file, which Close would otherwise only
           // say once the kernel gets round to it. The engine's background work — the landing-zone
@@ -513,7 +521,15 @@ public sealed class WinFspMountHost : IDisposable {
       CasePreservedNames = true,
       UnicodeOnDisk = true,
       PersistentAcls = false,
-      PostCleanupWhenModifiedOnly = true,
+      // FALSE, deliberately. With it on, WinFsp sends CLEANUP only for a file that was MODIFIED, so an
+      // application that merely READ a file never told the pool it had closed it — and the close
+      // that does arrive is the kernel's, which the cache manager defers for any file it holds
+      // cached data for, often until unmount. The pool counts a file as open until the application
+      // is done with it, and the healer and the landing-zone drainer both skip open files: after a
+      // member was lost, every file that had been READ since the mount stayed one copy short.
+      // Only 0- and 1-byte files escaped, having nothing cached. The cost is one callback per close
+      // of an unmodified file, and Cleanup keeps that cheap for a handle that was never writable.
+      PostCleanupWhenModifiedOnly = false,
       VolumeCreationTime = (ulong)DateTime.UtcNow.ToFileTimeUtc(),
       VolumeSerialNumber = 0,
     };
