@@ -1862,3 +1862,28 @@ reporter's own pool settings, both file by file and with robocopy on eight threa
 failed on its very first folder before the fix and copies 157 folders and 1,800 files cleanly
 after it. `SetAttributes` now falls back to stamping the folder on every member that holds it, and
 still answers NotFound when the path is neither a file nor a folder (`FolderAttributesTests`).
+
+### Small files: durability moved to where it means something
+
+Profiled with the reporter's own settings (two members on one disk, duplication 2, `performance`),
+engine alone: 100 small files per second, and 41% of that time was forcing data to disk that could
+not be kept. A file being written lives under a temp name that recovery deletes after any crash, so
+every barrier paid *while* it was staged — journaling its create, flushing each write, journaling
+each owed copy, even building its duplicate through a full publish with its own flush and rename —
+made nothing durable. What must be durable is the content before the rename that makes it visible.
+
+So a staged file now pays for durability once: at publish, each copy is flushed (in parallel), then
+renamed. Its create is journaled only when the publish would REPLACE a visible file — the one case
+where a crash between two copies' renames could leave them disagreeing, and the one the intent
+exists for.
+
+Measured, same tree, same copy tool, alternating builds: **63 → 105 files/s through the WinFsp
+driver**, and 100 → 240 in the engine alone. The rest of the per-file cost through the driver is
+the driver's own traffic (directory listings, pre-sizing the file, volume queries), not the engine.
+
+Two safety nets had to be made honest first, because neither could see the bug this change risks.
+The fake member treated a *rename* as making content durable, which no real filesystem promises;
+it now persists only what was flushed, and removing the publish flush fails 25 crash cases where it
+failed none before. And nothing ever lost power *after* an acknowledged close — every crash case
+interrupts an operation part-way. `Crash_GivenAFileWasWrittenAndClosed_…` now does, under every
+write policy, and fails in all six variants without the publish flush.

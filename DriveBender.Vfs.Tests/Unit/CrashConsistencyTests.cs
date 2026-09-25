@@ -275,12 +275,14 @@ public class CrashConsistencyTests {
 
   [Test]
   [Category("EdgeCase")]
-  // 21, not 25: a write into a not-yet-published staging temp no longer journals an intent and a
-  // completion of its own, and each of those cost one volume write PER MEMBER — four operations
-  // that a create simply does not perform any more. The guard below caught the stale range the
-  // moment the path got shorter, which is exactly what it is for.
+  // 11, not 21: a new staged file is no longer journaled at all (its temp is invisible and the
+  // orphan sweep removes it after any crash), and its duplicate is created as a plain empty temp
+  // rather than through a full publish with a barrier and a rename. Before that it was 21 — a write
+  // into a not-yet-published temp had already stopped journaling an intent and a completion of its
+  // own. The guard below caught the stale range both times the path got shorter, which is exactly
+  // what it is for.
   public void Crash_GivenACreateInterruptedAtEveryStep_ThenNoHalfWrittenFileIsEverVisible(
-    [Range(1, 21)] int abortAfter) {
+    [Range(1, 11)] int abortAfter) {
     var content = _Version(5);
 
     using (var fs = _NewEngine()) {
@@ -308,6 +310,98 @@ public class CrashConsistencyTests {
 
     recovered.ReadDirectory("").Should().NotContain(e => e.Name.Contains("TEMP.$DRIVEBENDER", StringComparison.OrdinalIgnoreCase),
       "recovery must sweep the staging temps rather than leave them in the namespace");
+  }
+
+
+  [Test]
+  [Category("EdgeCase")]
+  // The one publish that REPLACES a visible file. A new staged file is not journaled, on the ground
+  // that nothing exists at its final name for an interrupted publish to disagree with — so the case
+  // where something does has to be proved separately. It is reachable: rename another file onto the
+  // name while this one is still being written, and the publish on close then renames over it copy
+  // by copy. Interrupted between two of those renames, one copy holds the new file and another the
+  // old, and after recovery they must agree on ONE whole version.
+  public void Crash_GivenAStagedFileIsPublishedOverAFileRenamedOntoItsName_ThenEveryCopyAgreesAfterRecovery(
+    [Range(1, 8)] int abortAfter) {
+    var renamed = _Version(31);
+    var staged = _Version(32);
+
+    using (var fs = _NewEngine()) {
+      fs.Mount(new(@"X:\"));
+      var other = fs.Create("other.bin", NodeKind.File, CreateFlags.None);
+      fs.Write(other, renamed, 0, WriteMode.Normal);
+      fs.Close(other);
+
+      var late = fs.Create("race.bin", NodeKind.File, CreateFlags.None);
+      fs.Write(late, staged, 0, WriteMode.Normal);
+      fs.Rename("other.bin", "race.bin", RenameFlags.ReplaceExisting); // the name is taken meanwhile
+
+      this._AbortAfter(abortAfter);
+      try {
+        fs.Close(late); // the publish now replaces a visible file
+      } catch (Exception) {
+        // interrupted mid-publish
+      } finally {
+        this._ClearHooks();
+      }
+    }
+
+    this._AssertTheCrashActuallyHappened(abortAfter);
+    using var recovered = this._RecoverAfterPowerLoss();
+
+    var found = _ReadWhole(recovered, "race.bin");
+    found.Should().NotBeNull($"a crash at step {abortAfter} lost a file that existed before the publish began");
+    (found.AsSpan().SequenceEqual(renamed) || found.AsSpan().SequenceEqual(staged)).Should().BeTrue(
+      $"after a crash at step {abortAfter} the file must be one whole version, not a mixture");
+
+    var copies = new[] { this._v1, this._v2 }
+      .SelectMany(v => new[] { false, true }.Select(shadow => v.GetContent("race.bin", shadow)))
+      .Where(c => c != null)
+      .ToArray();
+    copies.Should().HaveCountGreaterThan(0);
+    copies.All(c => c!.AsSpan().SequenceEqual(copies[0]!)).Should().BeTrue(
+      $"after a crash at step {abortAfter} the copies disagree — reads would return different content "
+      + "depending on which disk answered, and the scrub would have to guess which one to keep");
+  }
+
+
+  [Test]
+  [Category("HappyPath")]
+  // The invariant the step matrix cannot reach on its own: every case above interrupts an operation
+  // part-way, so none of them ever loses power AFTER the application was told the file was saved.
+  // That is the moment that matters most, and the one a missing flush-before-rename would betray.
+  public void Crash_GivenAFileWasWrittenAndClosed_ThenItSurvivesPowerLossWhole(
+    [Values(1, 3)] int writes,
+    [Values("write-through", "write-back", "performance")] string policy) {
+    // write-back and performance acknowledge a write before every copy has it and owe the rest —
+    // exactly the blocks that reach a staging temp with no barrier of their own, and that only the
+    // publish makes durable. The policy is the variable that matters here, not a detail.
+    var content = _Version(41, 3000);
+
+    using (var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)],
+             new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
+             ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 2, "write": { "policy": "{{policy}}" }, "readAhead": { "enabled": false } }"""))) {
+      fs.Mount(new(@"X:\"));
+      var handle = fs.Create("saved.bin", NodeKind.File, CreateFlags.None);
+      var chunk = content.Length / writes;
+      for (var i = 0; i < writes; ++i) {
+        var from = i * chunk;
+        var to = i == writes - 1 ? content.Length : from + chunk;
+        fs.Write(handle, content.AsSpan(from, to - from), from, WriteMode.Normal);
+      }
+
+      fs.Close(handle); // the application now believes the file is saved
+    }
+
+    using var recovered = this._RecoverAfterPowerLoss();
+    _ReadWhole(recovered, "saved.bin").Should().Equal(content,
+      $"under {policy}, a file whose close returned must survive a power cut whole — that is what 'saved' means");
+
+    // and not just from one disk: every copy that exists holds the whole file
+    foreach (var volume in new[] { this._v1, this._v2 })
+    foreach (var shadow in new[] { false, true })
+      if (volume.GetContent("saved.bin", shadow) is { } copy)
+        copy.Should().Equal(content, $"under {policy}, the copy on '{volume.DisplayName}' (shadow: {shadow}) lost bytes in the power cut");
   }
 
 }

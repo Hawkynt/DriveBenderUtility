@@ -64,7 +64,11 @@ public class WriteCascadeTests {
 
     this._DurableCopyCount("f.bin", [1, 2, 3]).Should().Be(2, "write-back acks at minCopiesBeforeAck (FR-WB)");
     fs.WriteBuffer.IsDirty("f.bin").Should().BeTrue("the third copy is owed");
-    fs.Journal.ReadIncomplete().Should().NotBeEmpty("the intent stays open until every copy is applied");
+
+    // Tracked by the write buffer, not the journal: the file is still an unpublished staging temp,
+    // which recovery sweeps after any crash, so an intent recording a lagging copy of it would
+    // recover nothing. The publish makes every copy durable before the file becomes visible.
+    fs.Journal.ReadIncomplete().Should().BeEmpty("an owed copy of a staging temp is not journaled");
 
     fs.CreateScheduler().Quiesce();
 

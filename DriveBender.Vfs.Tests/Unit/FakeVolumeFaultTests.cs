@@ -86,15 +86,35 @@ public class FakeVolumeFaultTests {
 
   [Test]
   [Category("HappyPath")]
-  public void SimulateCrash_GivenAtomicReplace_WhenCrashed_ThenPublishedContentSurvives() {
+  public void SimulateCrash_GivenContentFlushedBeforeTheRename_WhenCrashed_ThenPublishedContentSurvives() {
     var temp = "f.txt." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
-    using (var stream = this._volume.OpenWrite(temp, false, true))
+    using (var stream = this._volume.OpenWrite(temp, false, true)) {
       stream.Write([8], 0, 1);
+      stream.Flush();
+    }
 
     this._volume.AtomicReplace(temp, "f.txt", false);
     this._volume.SimulateCrash();
 
-    this._volume.GetContent("f.txt", false).Should().Equal(new byte[] { 8 }, "publication via atomic rename is durable (SAFE-ATOMIC)");
+    this._volume.GetContent("f.txt", false).Should().Equal(new byte[] { 8 }, "flush, then rename, is the durable publication (SAFE-ATOMIC)");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void SimulateCrash_GivenARenameOfContentNeverFlushed_WhenCrashed_ThenTheContentIsNotThere() {
+    // The fake used to treat the rename itself as making content durable. No real filesystem
+    // promises that, and modelling it hid the one ordering bug a crash test most needs to catch.
+    var temp = "g.txt." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+    using (var stream = this._volume.OpenWrite(temp, false, true))
+      stream.Write([9], 0, 1);
+
+    this._volume.AtomicReplace(temp, "g.txt", false);
+    this._volume.SimulateCrash();
+
+    // gone entirely, or reverted — either way the unflushed byte did not survive
+    var survived = this._volume.GetContent("g.txt", false);
+    (survived == null || !survived.AsSpan().SequenceEqual(new byte[] { 9 })).Should().BeTrue(
+      "a rename moves the name, not the unflushed bytes");
   }
 
   [Test]

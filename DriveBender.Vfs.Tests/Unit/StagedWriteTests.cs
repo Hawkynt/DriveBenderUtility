@@ -51,7 +51,7 @@ public class StagedWriteTests {
 
     new[] { this._v1, this._v2 }.Count(v => v.FileExists(_Staged("movie.mkv"), false) || v.FileExists(_Staged("movie.mkv"), true))
       .Should().Be(2, "the in-progress file lives under its temp physical name on every copy");
-    fs.Journal.ReadIncomplete().Should().NotBeEmpty("the Create intent stays open until the publish rename");
+    fs.Journal.ReadIncomplete().Should().BeEmpty("a new staged file is not journaled: its temp is invisible, and recovery sweeps orphaned temps on every mount (Crash_GivenACreateInterruptedAtEveryStep_...)");
 
     // the LOGICAL view is complete the whole time
     fs.GetAttributes("movie.mkv").Length.Should().Be(3);

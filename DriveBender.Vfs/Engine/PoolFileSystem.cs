@@ -105,6 +105,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   private static string _StagedNameOf(string normalized) => normalized + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
 
+  private static bool _IsStagedName(string physical)
+    => physical.EndsWith("." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, StringComparison.OrdinalIgnoreCase);
+
   /// <summary>The physical name data ops must use: the staged temp while the file is being written, the real name after.</summary>
   private string _DataName(string normalized) => this._staging.ContainsKey(normalized) ? _StagedNameOf(normalized) : normalized;
 
@@ -1074,13 +1077,23 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (target == null)
         break;
 
-      sequence = this._journal.LogIntent(JournalOp.Create, physical, memberId: target.MemberId);
+      // A STAGED new file is not journaled at all. The intent exists so recovery can reconcile an
+      // interrupted mutation, and nothing here can be left torn: the temp is invisible, recovery's
+      // orphan sweep removes it on every mount whatever the journal says, and nothing exists yet at
+      // the final name for an interrupted publish to disagree with. The publish journals for itself
+      // if that stops being true (see _PublishStagedLocked). Measured: this barrier and its
+      // completion were a quarter of what a small file cost. An unstaged create (a whole-file
+      // remote member writing the final name in place) still journals, because it IS the file.
+      sequence = staged ? 0 : this._journal.LogIntent(JournalOp.Create, physical, memberId: target.MemberId);
       try {
         if (parent.Length > 0)
           target.EnsureFolder(parent, false);
 
+        // A staged temp is created, not made durable: nothing about it survives a crash on
+        // purpose (recovery sweeps it), and its content is made durable once, at publish.
         using (var stream = target.OpenWrite(physical, false, true))
-          stream.Flush();
+          if (!staged)
+            stream.Flush();
 
         refusal = null;
         break;
@@ -1144,8 +1157,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var parent = PoolPaths.GetParent(normalized);
       try {
         target.EnsureFolder(parent, true);
-        WholeFilePublisher.CopyBetween(sourceVol, normalized, sourceShadow, target, normalized, true,
-          admit: this._AdmitBulkBetween(sourceVol, target));
+        if (size == 0 && _IsStagedName(normalized) && (target.Caps & BackendCaps.AtomicRename) != 0) {
+          // The duplicate of a brand-new file, made at Create before a byte is written. The full
+          // publish below — temp file, durability barrier, rename — protects a VISIBLE file from a
+          // torn copy, and there is nothing here to protect: the file is empty, invisible until it
+          // is published, and covered by the still-open Create intent; a crash leaves an orphaned
+          // temp that recovery's sweep removes on every mount. Measured, that publish was a quarter
+          // of the whole cost of creating a small file.
+          using (target.OpenWrite(normalized, true, true)) { }
+        } else
+          WholeFilePublisher.CopyBetween(sourceVol, normalized, sourceShadow, target, normalized, true,
+            admit: this._AdmitBulkBetween(sourceVol, target));
       } catch (PoolFsException e) {
         // A member with no ROOM for the second copy already defers it and lets the write succeed —
         // and a member that cannot take it because its filesystem went read-only under us, or its
@@ -2407,9 +2429,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         ? 0L
         : this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
 
-      long OwedIntent() => sequence != 0
-        ? sequence
-        : sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
+      // Nor does a copy OWED into a staging temp: the same reasoning, one step later. The temp is
+      // swept after any crash, so an intent recording that one of its copies lags recovers nothing,
+      // and the publish makes every copy durable before the rename anyway. Measured through the
+      // driver, these intents and their completions were a fifth of what a small file cost.
+      long OwedIntent() => staged ? 0
+        : sequence != 0
+          ? sequence
+          : sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
 
       void CompleteIfLogged() {
         if (sequence != 0)
@@ -2474,7 +2501,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
       stream.Seek(offset, SeekOrigin.Begin);
       stream.Write(bytes, 0, bytes.Length);
-      stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+
+      // Durability barrier per copy (SAFE-FSYNC) — except into a staging temp. A barrier there
+      // makes nothing durable that a crash could keep: recovery deletes unpublished temps outright.
+      // What must be durable is the content BEFORE the rename that makes it visible, and the
+      // publish does exactly that, once per copy, however many writes the file took.
+      if (!_IsStagedName(path))
+        stream.Flush();
     } catch (Exception) {
       this._NoteMemberFault(copy.Volume.MemberId); // the next block prefers a storage that still works
       throw;
@@ -2680,9 +2713,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     var (ops, journalSequences, durableCopies, firstStagedUtc) = drained.Value;
     var dataName = this._DataName(normalized); // a staging file's owed blocks land in its temp physical
+
+    // into a staging temp: no intent and no barrier — see the write path. The publish that makes the
+    // temp visible makes every copy durable first, and a crash before it sweeps the temp regardless.
+    var intoStaging = _IsStagedName(dataName);
     if (ops.Count > 0) {
       var copies = this._placement.ResolveCopies(dataName);
-      var volatileSequence = journalSequences.Count == 0 && copies.Count > 0
+      var volatileSequence = journalSequences.Count == 0 && copies.Count > 0 && !intoStaging
         ? this._journal.LogIntent(JournalOp.Write, dataName)
         : 0;
 
@@ -2699,7 +2736,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
             stream.Write(op.Data!, 0, op.Data!.Length);
           }
 
-          stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
+          if (!intoStaging)
+            stream.Flush(); // durability barrier per copy (SAFE-FSYNC)
         }
       } catch {
         // The drain above is destructive, and this buffer is the only record of what these copies
@@ -3262,8 +3300,31 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return; // another thread published concurrently
 
     var stagedName = _StagedNameOf(normalized);
+
+    // A staged create is not journaled, because nothing existed at the final name to be torn. If
+    // something does NOW — another client created and published the same name in between — this
+    // publish replaces a visible file copy by copy, and a crash between two of those renames would
+    // leave copies that disagree. That is exactly what the intent is for, so it is logged, durably,
+    // before the first rename: the same guarantee every staged create used to pay for up front.
+    if (createSequence == 0 && this._placement.ResolveCopies(normalized).Count > 0)
+      createSequence = this._journal.LogIntent(JournalOp.Create, stagedName);
+
     try {
       var copies = this._placement.ResolveCopies(stagedName);
+
+      // Content first, name second: writes into the temp skipped their barriers, so each copy is
+      // made durable here, BEFORE the rename can make it visible. Renaming first would let a power
+      // cut publish a name whose bytes never reached the disk — the textbook way to lose a file
+      // that an application was told had been saved.
+      // in parallel: each copy's barrier is a wait on its own disk queue, and there is no ordering
+      // between copies to preserve — only between every copy's content and any rename
+      _ForEachIndex(copies.Count, _ParallelOver(copies, copies.Count), i => {
+        var copy = copies[i];
+        if ((copy.Volume.Caps & BackendCaps.DurableFlush) != 0)
+          using (var stream = copy.Volume.OpenWrite(stagedName, copy.Shadow, false))
+            stream.Flush();
+      });
+
       foreach (var copy in copies)
         copy.Volume.AtomicReplace(stagedName, normalized, copy.Shadow);
     } catch {
