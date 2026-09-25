@@ -118,6 +118,70 @@ public sealed class ManagementDaemon : IDisposable {
     return JsonDocument.Parse(response.Content.ReadAsStringAsync().GetAwaiter().GetResult()).RootElement.Clone();
   }
 
+  /// <summary>POSTs a JSON body, the way the page's own <c>post(url, body)</c> does.</summary>
+  public JsonElement PostJson(string path, object body) {
+    using var response = this._http.PostAsync(path,
+      new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")).GetAwaiter().GetResult();
+    response.EnsureSuccessStatusCode();
+    return JsonDocument.Parse(response.Content.ReadAsStringAsync().GetAwaiter().GetResult()).RootElement.Clone();
+  }
+
+  /// <summary>
+  /// Holds the live stream open on a background thread and counts what arrives, so a scenario can
+  /// ask afterwards whether the page would have shown "reconnecting…" at any point.
+  /// </summary>
+  public sealed class StreamWatch : IDisposable {
+
+    private readonly CancellationTokenSource _stop = new();
+    private readonly Thread _thread;
+    private int _frames;
+    private int _drops;
+    private string? _lastError;
+
+    internal StreamWatch(HttpClient http, string token) {
+      this._thread = new(() => {
+        while (!this._stop.IsCancellationRequested)
+          try {
+            using var request = new HttpRequestMessage(HttpMethod.Get, "api/stream");
+            request.Headers.Add("Authorization", $"Bearer {token}");
+            using var response = http.Send(request, HttpCompletionOption.ResponseHeadersRead, this._stop.Token);
+            response.EnsureSuccessStatusCode();
+            using var reader = new StreamReader(response.Content.ReadAsStream());
+            while (!this._stop.IsCancellationRequested) {
+              var line = reader.ReadLine() ?? throw new IOException("the daemon closed the live stream");
+              if (line.StartsWith("data: ", StringComparison.Ordinal) || line.StartsWith(": ping", StringComparison.Ordinal))
+                Interlocked.Increment(ref this._frames);
+            }
+          } catch (Exception) when (this._stop.IsCancellationRequested) {
+            return;
+          } catch (Exception e) {
+            // exactly the moment EventSource.onerror fires and the page says "reconnecting…"
+            Interlocked.Increment(ref this._drops);
+            this._lastError = $"{e.GetType().Name}: {e.Message}";
+            Thread.Sleep(500);
+          }
+      }) { IsBackground = true, Name = "stream-watch" };
+      this._thread.Start();
+    }
+
+    public int Frames => Volatile.Read(ref this._frames);
+    public int Drops => Volatile.Read(ref this._drops);
+    public string? LastError => this._lastError;
+
+    public void Dispose() {
+      this._stop.Cancel();
+      this._thread.Join(TimeSpan.FromSeconds(5));
+      this._stop.Dispose();
+    }
+  }
+
+  /// <summary>Starts watching the live stream; dispose to stop.</summary>
+  public StreamWatch WatchStream() {
+    // a separate client with no timeout: the shared one's timeout would cut a healthy stream
+    var http = new HttpClient { BaseAddress = this.BaseAddress, Timeout = Timeout.InfiniteTimeSpan };
+    return new(http, this.Token);
+  }
+
   /// <summary>Reads the first Server-Sent-Events frame off the live stream, or times out.</summary>
   public string ReadFirstStreamFrame(TimeSpan timeout) {
     using var request = new HttpRequestMessage(HttpMethod.Get, "api/stream");

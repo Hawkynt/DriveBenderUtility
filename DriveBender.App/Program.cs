@@ -180,6 +180,22 @@ internal static class Program {
     }
 
     daemon.BeginOutputReadLine();
+
+    // Drained, not merely redirected. A redirected pipe nobody reads fills after about 4 KiB, and the
+    // daemon's next write to stderr then BLOCKS forever — it does not die, so the supervisor below
+    // never restarts it, and the page just sits at "reconnecting…". Forwarded to this process's own
+    // stderr, which costs nothing when there is no console to show it.
+    daemon.ErrorDataReceived += (_, e) => {
+      if (e.Data == null)
+        return;
+
+      try {
+        Console.Error.WriteLine(e.Data);
+      } catch (IOException) {
+        // no stderr to forward to; draining is what matters
+      }
+    };
+    daemon.BeginErrorReadLine();
     // if the daemon exits early (e.g. port bind failure) stop waiting immediately
     daemon.Exited += (_, _) => ready.Set();
     daemon.EnableRaisingEvents = true;
