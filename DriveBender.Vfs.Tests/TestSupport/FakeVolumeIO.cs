@@ -400,6 +400,25 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
     }
   }
 
+  private readonly Dictionary<string, (DateTime? created, DateTime? modified)> _folderStamps = new(StringComparer.OrdinalIgnoreCase);
+
+  public void SetFolderTimestamps(string relativeFolder, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) {
+    lock (this._lock) {
+      var physical = PoolPaths.ToPhysicalFolder(relativeFolder, false);
+      if (!this._folders.Contains(physical))
+        throw new PoolFsException(PoolFsError.NotFound, $"Folder not found: {relativeFolder}");
+
+      var (created, modified) = this._folderStamps.GetValueOrDefault(physical);
+      this._folderStamps[physical] = (creationTimeUtc ?? created, lastWriteTimeUtc ?? modified);
+    }
+  }
+
+  /// <summary>The times last stamped on a folder, for assertions; both null when never stamped.</summary>
+  public (DateTime? created, DateTime? modified) FolderStamp(string relativeFolder) {
+    lock (this._lock)
+      return this._folderStamps.GetValueOrDefault(PoolPaths.ToPhysicalFolder(relativeFolder, false));
+  }
+
   private sealed class FakeVolumeStream(FakeVolumeIO owner, FakeFile file, bool writable) : Stream {
 
     private long _position;
