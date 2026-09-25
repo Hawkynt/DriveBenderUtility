@@ -59,4 +59,93 @@ public class ShadowNamespaceTests {
     ns.Get("dir/x.txt").Should().BeNull("removing a directory removes its subtree");
     ns.Get("other.txt").Should().NotBeNull("unrelated paths are untouched");
   }
+
+  // The index behind Children/Remove/Rename. These used to scan EVERY remembered path — every
+  // listing, and every single-file delete or rename — so their cost grew with the pool rather than
+  // with the folder. Profiled during a tree copy, listings were a large share of the driver's time.
+  // What the index must preserve is below, including the awkward shapes a prefix scan got for free.
+
+  private static NamespaceNode _Dir() => new(NodeKind.Directory, 0, DateTime.MinValue);
+
+  [Test]
+  [Category("HappyPath")]
+  public void Children_GivenNestedPaths_WhenListed_ThenOnlyImmediateChildrenAreReturned() {
+    var ns = new ShadowNamespace(maxEntries: 100);
+    ns.Record("a", _Dir());
+    ns.Record("a/x.txt", _File(1));
+    ns.Record("a/b", _Dir());
+    ns.Record("a/b/deep.txt", _File(2));
+    ns.Record("ab.txt", _File(3)); // shares the prefix "a" as a STRING, is not a child of "a"
+
+    ns.Children("a").Select(c => c.Name).Should().BeEquivalentTo(["x.txt", "b"]);
+    ns.Children("").Select(c => c.Name).Should().BeEquivalentTo(["a", "ab.txt"], "the root lists its own children");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Remove_GivenADescendantUnderAFolderThatWasNeverRecorded_WhenTheAncestorIsRemoved_ThenTheDescendantGoesToo() {
+    // only the leaf was ever surfaced — its parent folder has no node of its own
+    var ns = new ShadowNamespace(maxEntries: 100);
+    ns.Record("top", _Dir());
+    ns.Record("top/unrecorded/leaf.txt", _File(1));
+
+    ns.Remove("top");
+
+    ns.Get("top/unrecorded/leaf.txt").Should().BeNull("a removed directory takes its whole subtree, recorded ancestors or not");
+    ns.Count.Should().Be(0);
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Rename_GivenASubtree_WhenTheFolderIsRenamed_ThenEveryDescendantMovesAndListsUnderTheNewName() {
+    var ns = new ShadowNamespace(maxEntries: 100);
+    ns.Record("old", _Dir());
+    ns.Record("old/a.txt", _File(1));
+    ns.Record("old/sub/b.txt", _File(2));
+
+    ns.Rename("old", "new");
+
+    ns.Get("old/a.txt").Should().BeNull();
+    ns.Get("new/a.txt")!.Length.Should().Be(1);
+    ns.Get("new/sub/b.txt")!.Length.Should().Be(2);
+    ns.Children("new").Select(c => c.Name).Should().Contain("a.txt");
+    ns.Children("old").Should().BeEmpty("nothing may still list under the old name");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Children_GivenAnEntryWasEvicted_WhenListed_ThenItIsNoLongerAChild() {
+    var ns = new ShadowNamespace(maxEntries: 2);
+    ns.Record("d/1.txt", _File(1));
+    ns.Record("d/2.txt", _File(2));
+    ns.Record("d/3.txt", _File(3)); // evicts d/1.txt
+
+    ns.Children("d").Select(c => c.Name).Should().BeEquivalentTo(["2.txt", "3.txt"], "the index must forget what eviction forgets");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Remove_GivenAFile_WhenRemoved_ThenSiblingsAndAPrefixSharingNeighbourSurvive() {
+    var ns = new ShadowNamespace(maxEntries: 100);
+    ns.Record("f.txt", _File(1));
+    ns.Record("f.txt.bak", _File(2));
+    ns.Record("dir/f.txt", _File(3));
+
+    ns.Remove("f.txt");
+
+    ns.Get("f.txt").Should().BeNull();
+    ns.Get("f.txt.bak").Should().NotBeNull("a name that merely starts with the removed one is not its child");
+    ns.Get("dir/f.txt").Should().NotBeNull();
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Clear_GivenEntries_WhenCleared_ThenNothingListsAnyMore() {
+    var ns = new ShadowNamespace(maxEntries: 100);
+    ns.Record("d/x.txt", _File(1));
+    ns.Clear();
+
+    ns.Children("d").Should().BeEmpty();
+    ns.Count.Should().Be(0);
+  }
 }
