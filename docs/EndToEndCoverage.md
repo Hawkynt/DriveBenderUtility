@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36107605935](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36107605935).
+Generated from run: [36118477782](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36118477782).
 
-242 scenarios — 220 passing on at least one target, 0 failing.
+243 scenarios — 221 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -127,6 +127,7 @@ Generated from run: [36107605935](https://github.com/Hawkynt/DriveBenderUtility/
 | PerformanceMatrix | `Large_SequentialThroughput_AcrossTiers` | Sequential throughput for a 1.5 GiB file: written, read back warm from cache, and read cold from storage. | skipped | skipped |
 | PerformanceMatrix | `Scatter_OverlappedIoAcrossStorages` | What overlapping the block loads is worth: one storage held at queue depth 1, the same storage overlapped, and a file whose two copies are read together. | skipped | skipped |
 | PerformanceMatrix | `Small_FileIops_AcrossConcurrency` | Small-file (<4 KiB) create/write/close and read IOPS, single- and multi-threaded. | skipped | skipped |
+| SettingsSave | `Save_GivenAMountedPoolUnderWrites_ThenNeitherTheServiceNorTheMountIsLost` | Settings are saved several times on a mounted pool that is being written to: the live stream stays up, the API keeps answering, the pool stays mounted and the writes keep succeeding. | pass | pass |
 | SharedAccess | `Durability_GivenAnUnmountAndRemount_ThenEverythingWrittenIsStillThere` | Given An Unmount And Remount , then Everything Written Is Still There | pass | pass |
 | SharedAccess | `Namespace_GivenParallelCreateRenameDelete_ThenTheDirectoryStaysConsistent` | Given Parallel Create Rename Delete , then The Directory Stays Consistent | pass | pass |
 | SharedAccess | `SharedFile_GivenAppendersOnSeparateFiles_ThenEveryByteSurvives` | Given Appenders On Separate Files , then Every Byte Survives | pass | pass |
