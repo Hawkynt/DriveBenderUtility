@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [35560977943](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/35560977943).
+Generated from run: [36107605935](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36107605935).
 
-240 scenarios — 218 passing on at least one target, 0 failing.
+242 scenarios — 220 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -37,6 +37,8 @@ Generated from run: [35560977943](https://github.com/Hawkynt/DriveBenderUtility/
 | Brownout | `Brownout_GivenTheVolatileAckOptIn_ThenTheWriteIsNotPacedByTheSickCopy` | The RAM-ack opt-in is the sanctioned way out: the write is taken at memory speed and both copies converge behind it. | pass | pass |
 | Brownout | `Brownout_WhenAMembersLimitIsLoweredLive_ThenItTakesEffectWithoutARemount` | A rate limit lowered on a mounted pool takes effect without a remount, rather than being ignored until the next mount. | pass | pass |
 | Brownout | `Brownout_WhenTheMemberRecovers_ThenThroughputComesBack` | When the collapsed member recovers, the pool's throughput comes back rather than staying degraded. | pass | pass |
+| BulkCopy | `Copy_GivenATreeCopiedByTheWindowsCopyEngineConcurrently_ThenEveryFileArrives` | The same tree copied by robocopy with eight threads — the Windows copy engine, run concurrently: every file arrives. | pass | skipped |
+| BulkCopy | `Copy_GivenATreeCopiedFolderByFolder_ThenEveryFileArrivesWithoutAnError` | A folder tree is copied in file by file, folders created as they are reached: every file arrives, nothing is refused. | pass | pass |
 | ConcurrentEngineGuard | `Mounted_GivenAVerbTheMountCannotRun_ThenItRefusesAndExplains` | A verb that changes the member set refuses against a mounted pool, and says where to run it. | pass | pass |
 | ConcurrentEngineGuard | `Mounted_GivenRestoreIsRunFromTheCli_ThenItIsExecutedByTheOwningProcess` | An administrative verb run against a mounted pool is executed by the process that owns it, not by a second engine. | pass | pass |
 | ConcurrentEngineGuard | `Unmounted_GivenRestoreIsRunFromTheCli_ThenItProceeds` | The same verb runs normally once the pool is unmounted. | pass | pass |
