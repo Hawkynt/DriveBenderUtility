@@ -76,8 +76,12 @@ public class ReadVerificationTests {
     this._fs.RunScrub();
   }
 
-  /// <summary>The copy a read is served from first — the one worth damaging.</summary>
-  private (FakeVolumeIO holder, bool shadow) _ServingCopy(string path) {
+  /// <summary>
+  /// The first copy placement resolves — the one "before" checks first, which makes it the one
+  /// worth damaging there. NOT necessarily the one an unchecked read is served from: the engine
+  /// picks the least-loaded, fastest copy for that.
+  /// </summary>
+  private (FakeVolumeIO holder, bool shadow) _FirstCopy(string path) {
     var copy = this._fs.Placement.ResolveCopies(path)[0];
     return ((FakeVolumeIO)copy.Volume, copy.Shadow);
   }
@@ -109,12 +113,17 @@ public class ReadVerificationTests {
     // the default, and exactly the old behaviour: fast, trusting, damage left to the scrub
     this._Mount("never");
     this._Store("f.bin");
-    var (holder, shadow) = this._ServingCopy("f.bin");
-    _Rot(holder, shadow, "f.bin");
+
+    // EVERY copy: which one serves a read is the engine's choice (the least-loaded, fastest one),
+    // and a test that damaged only "the first" passed or failed depending on which disk answered
+    var (first, firstShadow) = this._FirstCopy("f.bin");
+    var (second, secondShadow) = this._OtherCopy("f.bin");
+    _Rot(first, firstShadow, "f.bin");
+    _Rot(second, secondShadow, "f.bin");
 
     var read = this._ReadAll("f.bin");
 
-    read.Should().NotEqual(_ORIGINAL, "an unchecked read serves whatever the copy holds");
+    read.Should().NotEqual(_ORIGINAL, "an unchecked read serves whatever the copy holds, and is not refused");
     this._fs.WaitForReadVerifications(TimeSpan.FromSeconds(5));
     this._Warnings().Should().NotContain("checksum", "nothing checked it, so nothing can have warned");
   }
@@ -138,7 +147,7 @@ public class ReadVerificationTests {
   public void Before_GivenTheServingCopyIsDamaged_WhenRead_ThenTheIntactCopyIsServedAndTheDamagedOneRepaired() {
     this._Mount("before");
     this._Store("f.bin");
-    var (holder, shadow) = this._ServingCopy("f.bin");
+    var (holder, shadow) = this._FirstCopy("f.bin");
     _Rot(holder, shadow, "f.bin");
 
     this._ReadAll("f.bin").Should().Equal(_ORIGINAL, "a damaged copy must be passed over, not handed out, while an intact one exists");
@@ -153,7 +162,7 @@ public class ReadVerificationTests {
   public void Before_GivenEveryCopyIsDamaged_WhenRead_ThenTheReadFailsRatherThanHandingOverDamage() {
     this._Mount("before");
     this._Store("f.bin");
-    var (first, firstShadow) = this._ServingCopy("f.bin");
+    var (first, firstShadow) = this._FirstCopy("f.bin");
     var (second, secondShadow) = this._OtherCopy("f.bin");
     _Rot(first, firstShadow, "f.bin");
     _Rot(second, secondShadow, "f.bin");
@@ -218,12 +227,12 @@ public class ReadVerificationTests {
   public void After_GivenTheServingCopyIsDamaged_WhenRead_ThenTheDamageIsDeliveredThenWarnedAboutAndRepaired() {
     this._Mount("after");
     this._Store("f.bin");
-    var (holder, shadow) = this._ServingCopy("f.bin");
+    var (holder, shadow) = this._FirstCopy("f.bin");
     _Rot(holder, shadow, "f.bin");
 
-    var read = this._ReadAll("f.bin");
-
-    read.Should().NotEqual(_ORIGINAL, "\"after\" hands over first — that is its whole point, and its cost");
+    // served at once, whichever copy the engine chose to answer from — "after" never holds a read up,
+    // and so may hand over the damage; the promise is what happens NEXT
+    this._ReadAll("f.bin").Should().HaveCount(_ORIGINAL.Length);
     this._fs.WaitForReadVerifications(TimeSpan.FromSeconds(10)).Should().BeTrue();
     this._Warnings().Should().Contain("f.bin").And.Contain("already", "the warning must say the damage was served, not merely found");
     holder.GetContent("f.bin", shadow).Should().Equal(_ORIGINAL, "and the damaged copy is repaired so the next read is right");
