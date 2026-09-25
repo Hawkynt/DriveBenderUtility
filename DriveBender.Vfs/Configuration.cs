@@ -153,6 +153,33 @@ public enum ExternalEditPolicy {
   [JsonStringEnumMemberName("read-only-until-reconciled")] ReadOnlyUntilReconciled,
 }
 
+/// <summary>
+/// Whether a read is checked against the stored checksum, and when (<c>integrity.verifyReads</c>).
+///
+/// The database holds WHOLE-FILE hashes, so "checking a read" means checking the copy that serves
+/// it, once per version of that copy: the first read of a file after it changed pays for one
+/// streamed hash of it, and every later read of the same version reuses the verdict. A copy with no
+/// usable baseline — never recorded, or known to have changed since — cannot be judged and is served.
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter<ReadVerification>))]
+public enum ReadVerification {
+  /// <summary>Reads are trusted; damage is found by the scrub schedule and explicit health checks only.</summary>
+  [JsonStringEnumMemberName("never")] Never,
+
+  /// <summary>
+  /// A copy is checked BEFORE any of its bytes are handed over. A damaged copy is passed over for an
+  /// intact one (and repaired from it in the background); the read FAILS only when no copy matches.
+  /// The first read of a large file waits for its hash.
+  /// </summary>
+  [JsonStringEnumMemberName("before")] Before,
+
+  /// <summary>
+  /// The read is served at full speed and checked in the background afterwards: damage is delivered
+  /// once, then logged as a warning and repaired from an intact copy.
+  /// </summary>
+  [JsonStringEnumMemberName("after")] After,
+}
+
 /// <summary>What the mounted view does when a member drops out live (§10 SAFE-DEGRADE).</summary>
 [JsonConverter(typeof(JsonStringEnumConverter<MemberLossPolicy>))]
 public enum MemberLossPolicy {
@@ -276,6 +303,7 @@ public sealed record IntegrityConfig {
   [JsonPropertyName("fastHash")] public string? FastHash { get; init; }
   [JsonPropertyName("strongHash")] public string? StrongHash { get; init; }
   [JsonPropertyName("onExternalEdit")] public ExternalEditPolicy? OnExternalEdit { get; init; }
+  [JsonPropertyName("verifyReads")] public ReadVerification? VerifyReads { get; init; }
   [JsonPropertyName("scrubberSchedule")] public string? ScrubberSchedule { get; init; }
   [JsonPropertyName("deepScrubSchedule")] public string? DeepScrubSchedule { get; init; }
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
@@ -410,6 +438,7 @@ public static class ConfigResolver {
       "fastHash": "xxh3",
       "strongHash": null,
       "onExternalEdit": "accept-newest",
+      "verifyReads": "never",
       "scrubberSchedule": "idle-weekly",
       "deepScrubSchedule": null
     },

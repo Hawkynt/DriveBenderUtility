@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36118477782](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36118477782).
+Generated from run: [36126326097](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36126326097).
 
-243 scenarios — 221 passing on at least one target, 0 failing.
+244 scenarios — 223 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -19,7 +19,8 @@ Generated from run: [36118477782](https://github.com/Hawkynt/DriveBenderUtility/
 | BackgroundRace | `Read_WhileTheHealerIsCopying_ThenItIsServedAtOnceRatherThanAtTheCopysPace` | A file stays readable at full speed while the healer is copying it to another member. | pass | pass |
 | BackgroundRace | `Rename_WhileACopyIsStillInFlight_ThenItEndsUnderExactlyOneName` | A file renamed while the pool is still copying it ends under exactly one name, with its content intact. | pass | pass |
 | BitRot | `BitRot_GivenEveryCopyIsDamaged_ThenTheLossIsNotPassedOffAsGoodData` | Both copies rot differently: the pool must not silently hand back damaged data as if it were fine. | pass | pass |
-| BitRot | `BitRot_GivenOneCopyIsSilentlyDamaged_ThenTheIntactContentIsStillServed` | One copy rots silently: the pool still serves the intact content rather than the damaged bytes. _(held back: Reads are not verified against the checksum database, so a silently damaged copy is served even though an intact one sits on the other member. Not a quick fix: the database holds WHOLE-FILE hashes, and a read serves a block, so there is nothing to check a block against without per-block checksums - a format change with a real cost. A scrub detects and repairs the damage; the exposure is the window before one runs. See docs/Issues.md.)_ | skipped | skipped |
+| BitRot | `BitRot_GivenOneCopyIsSilentlyDamaged_ThenTheIntactContentIsStillServed` | One copy rots silently: the pool still serves the intact content rather than the damaged bytes. | pass | pass |
+| BitRot | `BitRot_GivenReadsAreCheckedAfterwards_ThenTheDamageIsLoggedAndRepaired` | verifyReads 'after': the read is served at once, then the damage is warned about in the log and the copy repaired. | pass | pass |
 | BitRot | `BitRot_GivenTheBaselineWasTakenWhileMounted_ThenRotIsStillRepaired` | A deep health check run while the pool is MOUNTED still leaves a usable baseline, so later rot is repairable. | pass | pass |
 | BitRot | `BitRot_WhenTheDeepHealthCheckRepairs_ThenBothCopiesAreIntactAgain` | A deep health check with --fix repairs the damaged copy from the intact one. | pass | pass |
 | BitRot | `BitRot_WhenTheDeepHealthCheckRuns_ThenTheDamageIsReported` | A deep health check finds silent damage that a shallow one cannot, and reports it. | pass | pass |

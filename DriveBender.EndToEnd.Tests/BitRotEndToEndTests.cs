@@ -66,8 +66,9 @@ public class BitRotEndToEndTests {
   }
 
   /// <summary>A pool with two REAL copies of every file, and one file written and settled.</summary>
-  private static MountedPool _PoolWithADuplicatedFile(string name, byte[] content, out IReadOnlyList<string> copies) {
-    var pool = MountedPool.Create(poolDefaults: MountedPool.DuplicatedOnOneDisk);
+  private static MountedPool _PoolWithADuplicatedFile(string name, byte[] content, out IReadOnlyList<string> copies,
+    string poolDefaults = MountedPool.DuplicatedOnOneDisk) {
+    var pool = MountedPool.Create(poolDefaults: poolDefaults);
     try {
       File.WriteAllBytes(pool.PathTo(name), content);
       var found = pool.WaitForPhysicalCopies(name, atLeast: 2, TimeSpan.FromMinutes(2));
@@ -86,28 +87,87 @@ public class BitRotEndToEndTests {
   [Test]
   [Category("EdgeCase")]
   [Description("One copy rots silently: the pool still serves the intact content rather than the damaged bytes.")]
-  [Ignore("Reads are not verified against the checksum database, so a silently damaged copy is "
-          + "served even though an intact one sits on the other member. Not a quick fix: the database "
-          + "holds WHOLE-FILE hashes, and a read serves a block, so there is nothing to check a block "
-          + "against without per-block checksums - a format change with a real cost. A scrub detects "
-          + "and repairs the damage; the exposure is the window before one runs. See docs/Issues.md.")]
   public void BitRot_GivenOneCopyIsSilentlyDamaged_ThenTheIntactContentIsStillServed() {
+    // Held back for a long time as "reads are not verified", which was a design gap rather than a
+    // bug: the database holds whole-file hashes and a read serves a block. integrity.verifyReads
+    // "before" closes it by checking the COPY once per version before any of its bytes go out.
+    // Under the default ("never") the damaged copy is still served — that is the documented trade.
     var content = _Payload(256 * 1024, 71);
-    using var pool = _PoolWithADuplicatedFile("rot.bin", content, out var copies);
+    using var pool = _PoolWithADuplicatedFile("rot.bin", content, out var copies, _VERIFY_BEFORE);
+
+    // The PRIMARY copy is the one reads are served from, so that is the one to damage. Rotting
+    // whichever copy happened to be listed first made this scenario pass with checking switched
+    // off — the intact copy was being served anyway, and nothing was being tested.
+    var serving = _Primary(copies);
 
     // the damage happens with nothing mounted: the engine pools open handles into its members, so
     // rotting a file under a live mount tests the handle cache rather than the stored data
     pool.WhileUnmounted(() => {
       _Baseline(pool);
-      _Rot(copies[0]);
+      _Rot(serving);
     });
 
     var served = File.ReadAllBytes(pool.PathTo("rot.bin"));
 
     served.Should().Equal(content,
       $"one damaged copy out of two must never reach the application — that is the entire purpose of "
-      + $"holding two.{Environment.NewLine}rotted: {copies[0]}{Environment.NewLine}{pool.DescribeMembers()}"
+      + $"holding two.{Environment.NewLine}rotted: {serving}{Environment.NewLine}{pool.DescribeMembers()}"
       + $"{Environment.NewLine}{pool.MountLog}");
+  }
+
+  private const string _VERIFY_BEFORE =
+    """{ "duplication": 2, "placement": { "shadowNeverSamePhysical": false }, "integrity": { "verifyReads": "before" } }""";
+
+  private const string _VERIFY_AFTER =
+    """{ "duplication": 2, "placement": { "shadowNeverSamePhysical": false }, "integrity": { "verifyReads": "after" } }""";
+
+  [Test]
+  [Category("EdgeCase")]
+  [Description("verifyReads 'after': the read is served at once, then the damage is warned about in the log and the copy repaired.")]
+  public void BitRot_GivenReadsAreCheckedAfterwards_ThenTheDamageIsLoggedAndRepaired() {
+    var content = _Payload(256 * 1024, 74);
+    using var pool = _PoolWithADuplicatedFile("after.bin", content, out var copies, _VERIFY_AFTER);
+    var serving = _Primary(copies);
+
+    pool.WhileUnmounted(() => {
+      _Baseline(pool);
+      _Rot(serving);
+    });
+
+    // whichever copy served it, the read itself is not held up — that is what "after" trades for
+    _ = File.ReadAllBytes(pool.PathTo("after.bin"));
+
+    var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(1);
+    while (DateTime.UtcNow < deadline && !pool.MountLog.Contains("after.bin"))
+      Thread.Sleep(250);
+
+    pool.MountLog.Should().Contain("Read check").And.Contain("after.bin",
+      $"damage found after the fact must be written down where the operator will look.{Environment.NewLine}{pool.DescribeMembers()}");
+
+    // and repaired, so the damage is not handed out again
+    var repaired = DateTime.UtcNow + TimeSpan.FromMinutes(1);
+    while (DateTime.UtcNow < repaired && !_Matches(serving, content))
+      Thread.Sleep(250);
+
+    _Matches(serving, content).Should().BeTrue(
+      $"the damaged copy must be repaired from the intact one.{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+    File.ReadAllBytes(pool.PathTo("after.bin")).Should().Equal(content);
+  }
+
+  /// <summary>The primary copy — the one outside the duplicate folder, and the one reads come from.</summary>
+  private static string _Primary(IReadOnlyList<string> copies)
+    => copies.First(c => !c.Contains("FOLDER.DUPLICATE.$DRIVEBENDER", StringComparison.OrdinalIgnoreCase));
+
+  /// <summary>Compares a physical copy with what it should hold, tolerating the pool holding it open.</summary>
+  private static bool _Matches(string physicalPath, byte[] expected) {
+    try {
+      using var stream = new FileStream(physicalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+      using var buffer = new MemoryStream();
+      stream.CopyTo(buffer);
+      return buffer.ToArray().AsSpan().SequenceEqual(expected);
+    } catch (IOException) {
+      return false;
+    }
   }
 
   [Test]

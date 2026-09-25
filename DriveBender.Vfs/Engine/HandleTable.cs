@@ -36,6 +36,13 @@ public sealed class FileState(string normalizedPath) {
   /// one thread until this stopped being a `lock`.
   /// </summary>
   internal readonly System.Collections.Concurrent.ConcurrentDictionary<long, ReadAheadState> ReadAhead = new();
+
+  /// <summary>
+  /// Per-handle read-check state, keyed by handle value: the copies a handle was cleared to read
+  /// from (<c>verifyReads: before</c>), or merely a marker that its background check is queued
+  /// (<c>after</c>, value null). Per handle so the check costs once per open, never once per read.
+  /// </summary>
+  internal readonly System.Collections.Concurrent.ConcurrentDictionary<long, HashSet<(Guid Member, bool Shadow)>?> ReadChecks = new();
 }
 
 /// <summary>
@@ -207,6 +214,7 @@ public sealed class HandleTable {
       // the map is concurrent, so a Read racing this Close cannot corrupt it; the worst case is a
       // read-ahead state recreated for a handle that is going away, which the next Close removes
       open.File.ReadAhead.TryRemove(handle.Value, out _);
+      open.File.ReadChecks.TryRemove(handle.Value, out _);
       --open.File.HandleCount;
       if (!open.ApplicationClosed) {
         open.ApplicationClosed = true; // a handle closed without an explicit cleanup still counts

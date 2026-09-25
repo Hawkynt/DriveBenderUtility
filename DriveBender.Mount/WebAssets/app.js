@@ -985,6 +985,10 @@ const SETTINGS_SCHEMA = [
   ]],
   ["Integrity", [
     { path: "integrity.checksumDb", label: "Maintain a checksum database (enables scrub / heal)", type: "bool" },
+    { path: "integrity.verifyReads", label: "Check reads against the stored checksum", type: "enum", options: [
+      ["never", "Never — fastest; damage is found by scheduled checks only"],
+      ["before", "Before handing data over — a damaged copy is skipped, the read fails only if every copy is damaged"],
+      ["after", "After handing data over — full speed; damage is logged and repaired afterwards"]] },
     { path: "integrity.onExternalEdit", label: "When a file is edited outside the pool", type: "enum", options: [
       ["accept-newest", "Accept the newest copy"],
       ["conflict-only", "Flag it as a conflict only"],
