@@ -41,6 +41,10 @@ public sealed record JournalRecord {
   [JsonPropertyName("length")] public long Length { get; init; }
   [JsonPropertyName("member")] public Guid MemberId { get; init; }
 
+  // Which of the member's two namespaces the named copy lives in. A member can hold both a
+  // primary and a shadow of one file, so the member alone does not say which copy a write went to.
+  [JsonPropertyName("shadow")] public bool Shadow { get; init; }
+
   // When the intent was logged. Recovery uses it to tell an interrupted operation from one that
   // finished long ago and came back on a restored disk: content NEWER than the intent cannot be the
   // content the intent was about. Absent (DateTime.MinValue) on records written before this field
@@ -365,7 +369,7 @@ public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
       throw mine.Failure;
   }
 
-  public long LogIntent(JournalOp op, string? path = null, string? targetPath = null, long offset = 0, long length = 0, Guid memberId = default) {
+  public long LogIntent(JournalOp op, string? path = null, string? targetPath = null, long offset = 0, long length = 0, Guid memberId = default, bool shadow = false) {
     string line;
     long sequence;
     lock (this._lock) {
@@ -378,6 +382,7 @@ public sealed class Journal(IJournalStore store, Func<DateTime>? clock = null) {
         Offset = offset,
         Length = length,
         MemberId = memberId,
+        Shadow = shadow,
         LoggedUtc = this._clock(),
       };
       line = JsonSerializer.Serialize(record, _OPTIONS);

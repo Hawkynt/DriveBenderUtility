@@ -29,8 +29,20 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
     var rolledForward = 0;
     var reconciled = 0;
 
-    foreach (var intent in journal.ReadIncomplete()) {
+    // In SEQUENCE order, not file order: records can reach the journal out of order under group
+    // commit, and replaying two writes to one range backwards would leave the older bytes on top.
+    var incomplete = journal.ReadIncomplete().OrderBy(i => i.Sequence).ToArray();
+
+    // Writes that name the copy which took their acknowledgement are replayed first, per file, by
+    // byte range (see _ReplayRanges), and then completed like everything else below.
+    foreach (var file in incomplete.Where(_NamesItsCopy).GroupBy(i => i.Path!, PoolPaths.PathComparer))
+      reconciled += this._ReplayRanges(file.Key, [.. file]) ? 1 : 0;
+
+    foreach (var intent in incomplete) {
       switch (intent.Op) {
+        case JournalOp.Write when _NamesItsCopy(intent):
+          break; // replayed by range above
+
         case JournalOp.Delete when intent.Path != null:
           // roll forward: some copies may already be gone; remove the rest (FR-DELETE)
           if (this._WouldDestroyNewerContent(intent, intent.Path))
@@ -227,6 +239,65 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
   /// shadow, so a stale primary must never win. Works with no surviving primary (shadow-only)
   /// and streams the source so a multi-GB file never lands in RAM (SAFE-BIGFILE).
   /// </summary>
+  private static bool _NamesItsCopy(JournalRecord intent)
+    => intent is { Op: JournalOp.Write, Path: not null, Length: > 0 } && intent.MemberId != Guid.Empty;
+
+  /// <summary>
+  /// Replays a file's interrupted writes by byte range: each write's bytes are carried FROM the
+  /// copy that took its acknowledgement TO every copy of the file.
+  ///
+  /// Whole-file resync picks one copy as the truth, which is only right when that copy holds every
+  /// acknowledged write. With fewer required copies than copies, acknowledgements rotate between
+  /// copies block by block, so after a power cut each copy can hold acknowledged bytes the others
+  /// lack — and a crash scenario lost one that way.
+  ///
+  /// Two phases, deliberately. Every range is READ before any is written, because replaying one at
+  /// a time reads a source an earlier step of the same replay has already overwritten: a newer wide
+  /// write on one copy then gets the older narrow write from the other copy put back on top of it.
+  /// Then each range is applied, oldest first, to EVERY copy including the one it came from, so a
+  /// source that an earlier range touched is set right again by the newer one. Where a write's copy
+  /// is gone, nothing can say which bytes are right, and the whole-file rule is the fallback.
+  /// </summary>
+  private bool _ReplayRanges(string path, IReadOnlyList<JournalRecord> writes) {
+    var captured = new List<(long offset, byte[] bytes)>(writes.Count);
+    foreach (var write in writes) {
+      var source = this._Online.FirstOrDefault(m => m.MemberId == write.MemberId);
+      if (source == null || !source.FileExists(path, write.Shadow))
+        return this._ResyncCopies(path);
+
+      try {
+        using var stream = source.OpenRead(path, write.Shadow);
+        if (write.Offset >= stream.Length)
+          continue; // truncated past this write since — nothing of it survives to carry
+
+        var bytes = new byte[(int)Math.Min(write.Length, stream.Length - write.Offset)];
+        stream.Seek(write.Offset, SeekOrigin.Begin);
+        stream.ReadExactly(bytes);
+        captured.Add((write.Offset, bytes));
+      } catch (PoolFsException) {
+        return this._ResyncCopies(path);
+      }
+    }
+
+    var changed = false;
+    foreach (var member in this._Online)
+    foreach (var shadow in new[] { false, true }) {
+      if (!member.FileExists(path, shadow))
+        continue;
+
+      using var stream = member.OpenWrite(path, shadow, false);
+      foreach (var (offset, bytes) in captured) {
+        stream.Seek(offset, SeekOrigin.Begin);
+        stream.Write(bytes, 0, bytes.Length);
+      }
+
+      stream.Flush(); // durable before the intents are completed
+      changed = true;
+    }
+
+    return changed;
+  }
+
   private bool _ResyncCopies(string path) {
     var copies = new List<(IVolumeIO member, bool shadow, FileMeta meta, string hash)>();
     foreach (var member in this._Online)
