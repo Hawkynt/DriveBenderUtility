@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36576039014](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36576039014).
+Generated from run: [36582138761](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36582138761).
 
-245 scenarios — 224 passing on at least one target, 1 failing.
+245 scenarios — 224 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -36,7 +36,7 @@ Generated from run: [36576039014](https://github.com/Hawkynt/DriveBenderUtility/
 | Brownout | `Brownout_GivenTheDefaultAckPolicy_ThenADuplicatedWriteIsPacedByTheSickCopy` | Under the default ack policy a duplicated write IS paced by its slowest copy — the durability promise costs exactly that. | pass | pass |
 | Brownout | `Brownout_GivenThePrimaryCopysMemberCollapses_ThenReadsAreServedFromTheHealthyCopy` | The member holding the primary copy collapses to a crawl: reads must be served from the healthy copy instead of crawling with it. | pass | pass |
 | Brownout | `Brownout_GivenTheVolatileAckOptIn_ThenTheWriteIsNotPacedByTheSickCopy` | The RAM-ack opt-in is the sanctioned way out: the write is taken at memory speed and both copies converge behind it. | pass | pass |
-| Brownout | `Brownout_WhenAMembersLimitIsLoweredLive_ThenItTakesEffectWithoutARemount` | A rate limit lowered on a mounted pool takes effect without a remount, rather than being ignored until the next mount. | **FAIL** | pass |
+| Brownout | `Brownout_WhenAMembersLimitIsLoweredLive_ThenItTakesEffectWithoutARemount` | A rate limit lowered on a mounted pool takes effect without a remount, rather than being ignored until the next mount. | pass | pass |
 | Brownout | `Brownout_WhenTheMemberRecovers_ThenThroughputComesBack` | When the collapsed member recovers, the pool's throughput comes back rather than staying degraded. | pass | pass |
 | BulkCopy | `Copy_GivenATreeCopiedByTheWindowsCopyEngineConcurrently_ThenEveryFileArrives` | The same tree copied by robocopy with eight threads — the Windows copy engine, run concurrently: every file arrives. | pass | skipped |
 | BulkCopy | `Copy_GivenATreeCopiedFolderByFolder_ThenEveryFileArrivesWithoutAnError` | A folder tree is copied in file by file, folders created as they are reached: every file arrives, nothing is refused. | pass | pass |
