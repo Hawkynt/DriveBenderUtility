@@ -119,6 +119,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   // FR-HEAL: paths whose duplication level must be re-established (a member returned, or a
   // scan found owed copies); drained incrementally by the background HealJob
   private readonly System.Collections.Concurrent.ConcurrentQueue<string> _healQueue = new();
+
+  // Open "edit session" intents, by data path: one journal intent covering every write to a file
+  // whose writes land on ALL its copies before returning, completed when the file is next flushed,
+  // closed by its last writer, deleted, or unmounted. See Write.
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _writeSessions = new(PoolPaths.PathComparer);
   private int _healScanRequested;
   private IEnumerator<string>? _healScan; // advanced only by HealStep (single pump thread)
 
@@ -581,6 +586,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._PublishStaged(stagedPath);
     foreach (var path in this._writeBuffer.DirtyPaths)
       this.FlushPath(path);
+
+    // every session's writes are on every copy; nothing is left for recovery to reconcile
+    foreach (var dataPath in this._writeSessions.Keys.ToArray())
+      this._CloseWriteSession(dataPath);
 
     this._integrity.SaveAll();
     this._mountOptions = null;
@@ -1617,6 +1626,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // exclusive for the whole delete: a background flush/heal must not be mid-way through
     // rewriting copies we are about to remove, and a reader must not observe a half-deleted set
     using var lease = this._handles.AcquireWrite(normalized);
+    this._CloseWriteSession(normalized); // nothing left to reconcile once the file is gone
 
     // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
     if (this._staging.TryRemove(normalized, out var createSequence)) {
@@ -1770,6 +1780,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._placement.Invalidate(normalized);
     this._cache.InvalidatePath(this._poolId, normalized);
     this._readVerifier.Forget(normalized);
+  }
+
+  /// <summary>Opens the edit-session intent for a file if none is open — durably, before the write it covers.</summary>
+  private void _OpenWriteSession(string dataPath) {
+    if (this._writeSessions.ContainsKey(dataPath))
+      return;
+
+    // callers hold the path's write lease, so two writers cannot both open one for the same file
+    this._writeSessions[dataPath] = this._journal.LogIntent(JournalOp.Write, dataPath);
+  }
+
+  /// <summary>Completes a file's edit session: every write it covered is on every copy by now.</summary>
+  private void _CloseWriteSession(string dataPath) {
+    if (this._writeSessions.TryRemove(dataPath, out var sequence))
+      this._journal.Complete(sequence, JournalOp.Write);
   }
 
   /// <summary>A write changed a file: its checksums are stale, and so is anything a read check concluded.</summary>
@@ -2496,10 +2521,23 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // write, and recovery replays each open write's byte range FROM that copy, in order.
       var mayOwe = requiredCopies < copies.Count;
       var ackCopy = copies[0];
-      var sequence = staged
+
+      // Where every copy takes every write before it returns (the default: as many required copies as
+      // there are copies), the per-write intent only guards the moment copies could disagree — a
+      // power cut DURING a write. One intent can guard a whole edit session just as well: logged,
+      // durably, before the first write of the session, left open while the file is written, and
+      // completed at the next flush, the last writer's close, a delete or the unmount. Recovery of an
+      // open session is the whole-file reconcile it always was, and every acknowledged write is on
+      // every copy, so it has nothing acknowledged to lose. Measured: the intent and its completion
+      // were two thirds of an in-place write, paid on every one of them. Where copies can be OWED,
+      // each write keeps its own intent naming its copy — recovery needs exactly that (see above).
+      if (!staged && !mayOwe)
+        this._OpenWriteSession(dataPath);
+
+      var sequence = staged || !mayOwe
         ? 0L
         : this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length,
-          memberId: mayOwe ? ackCopy.Volume.MemberId : default, shadow: mayOwe && ackCopy.Shadow);
+          memberId: ackCopy.Volume.MemberId, shadow: ackCopy.Shadow);
 
       // Nor does a copy OWED into a staging temp: the same reasoning, one step later. The temp is
       // swept after any crash, so an intent recording that one of its copies lags recovers nothing,
@@ -2529,12 +2567,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // The named copy failed and another took the write (mid-write failover): name the copy that
       // really holds it before acknowledging. Logged before the original is completed, so a crash in
       // between leaves both open — and replayed in order, the corrected one runs last and wins.
-      if (mayOwe && sequence != 0 && !appliedFlags[0] && Array.IndexOf(appliedFlags, true) is var holder and >= 0) {
-        var corrected = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length,
-          memberId: copies[holder].Volume.MemberId, shadow: copies[holder].Shadow);
-        this._journal.Complete(sequence, JournalOp.Write);
-        sequence = corrected;
-        ackCopy = copies[holder];
+      if (!appliedFlags[0] && Array.IndexOf(appliedFlags, true) is var holder and >= 0) {
+        ackCopy = copies[holder]; // any intent logged from here on names the copy that really has it
+        if (mayOwe && sequence != 0) {
+          var corrected = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length,
+            memberId: ackCopy.Volume.MemberId, shadow: ackCopy.Shadow);
+          this._journal.Complete(sequence, JournalOp.Write);
+          sequence = corrected;
+        }
       }
 
       if (appliedCount >= copies.Count) {
@@ -2795,8 +2835,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// <summary>The flush itself; the caller holds this path's write lease (or its handle lock).</summary>
   private void _FlushPathLocked(string normalized) {
     var drained = this._writeBuffer.Drain(normalized);
-    if (drained == null)
+    if (drained == null) {
+      this._CloseWriteSession(this._DataName(normalized)); // nothing owed: the session is already whole
       return;
+    }
 
     var (ops, journalSequences, durableCopies, firstStagedUtc) = drained.Value;
     var dataName = this._DataName(normalized); // a staging file's owed blocks land in its temp physical
@@ -2853,6 +2895,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._InvalidateChecksums(dataName);
     this._cache.Pages.InvalidatePath(this._poolId, dataName);
     this._cache.Metadata.InvalidatePath(this._poolId, normalized);
+    // a flush is a durability point: everything written in the session is on every copy
+    this._CloseWriteSession(dataName);
   }
 
   /// <summary>
@@ -3329,6 +3373,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var path = open.File.Path;
     var wrote = (open.Access & AccessMode.Write) != 0;
     this._handles.Close(handle);
+
+    // the last writer is done: complete the file's edit session. Under the file's write lease, so a
+    // write still in flight on another handle finishes first and cannot end up outside any intent.
+    if (wrote && this._writeSessions.ContainsKey(this._DataName(path)))
+      using (this._handles.AcquireWrite(path))
+        if (!this._handles.IsOpenForWrite(path))
+          this._CloseWriteSession(this._DataName(path));
 
     // last handle gone: publish the staged temp to its final name — the atomic rename is the
     // LAST action before the Create journal intent completes (FR-STAGED-WRITE)

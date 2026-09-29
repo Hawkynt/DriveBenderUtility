@@ -1957,3 +1957,20 @@ Also added: "saved means saved" for every way an existing file is saved — edit
 with truncate, temp-then-rename-over, append — plus completed renames, deletes and folder creation,
 each under every write policy and checked on every copy. All held; the tests were proved sensitive
 by removing the per-write barrier, which fails nine of them.
+
+### In-place writes: one journal intent per edit session, not two records per write
+
+With as many required copies as there are copies (the default), every write lands on every copy,
+flushed, before it returns. The intent logged before each write and completed after it guarded only
+one thing — copies disagreeing if the power fails DURING a write — and cost two thirds of an
+in-place write: each record is a durable append on every member. One intent now guards a whole edit
+session: logged durably before the first write, completed at the next flush, the last writer's
+close (under the file's write lease, so no write is still in flight), a delete, or the unmount.
+Recovery of an open session is the same whole-file reconcile as before, and every acknowledged
+write is already on every copy. Where copies can be owed, each write keeps its own intent naming its
+copy, because range replay needs exactly that.
+
+Measured, random 4 KiB writes to an existing file, engine only: **232 → ~720 per second** under
+every policy. Inside a session a write is now two storage operations — its two copies — where it
+was six. Removing the session intent fails six cases of the step-interrupted write scenario; a new
+scenario interrupts the third write of a session and requires the first two to survive.
