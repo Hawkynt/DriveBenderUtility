@@ -2487,9 +2487,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // fsync-before-mutate ordering exists so an interrupted mutation of LIVE data is
       // recoverable, and nothing about this temp survives a crash to need recovering.
       var staged = this._staging.ContainsKey(path);
+
+      // When fewer copies are required than exist, the acknowledgement lands on ONE copy — chosen
+      // by readiness and rotated by block — and the others are owed. Two acknowledged writes can
+      // then sit on DIFFERENT copies, so after a power cut no single copy holds both, and recovery
+      // that crowns one copy the winner throws an acknowledged write away. It did, before this: a
+      // crash scenario lost the first of two writes. So the intent names the copy that takes the
+      // write, and recovery replays each open write's byte range FROM that copy, in order.
+      var mayOwe = requiredCopies < copies.Count;
+      var ackCopy = copies[0];
       var sequence = staged
         ? 0L
-        : this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
+        : this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length,
+          memberId: mayOwe ? ackCopy.Volume.MemberId : default, shadow: mayOwe && ackCopy.Shadow);
 
       // Nor does a copy OWED into a staging temp: the same reasoning, one step later. The temp is
       // swept after any crash, so an intent recording that one of its copies lags recovers nothing,
@@ -2498,7 +2508,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       long OwedIntent() => staged ? 0
         : sequence != 0
           ? sequence
-          : sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length);
+          : sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length,
+            memberId: ackCopy.Volume.MemberId, shadow: ackCopy.Shadow);
 
       void CompleteIfLogged() {
         if (sequence != 0)
@@ -2514,6 +2525,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var appliedFlags = new bool[copies.Count];
       this._WriteAckQuorum(copies, requiredCopies, dataPath, bytes, offset, appliedFlags);
       var appliedCount = appliedFlags.Count(f => f);
+
+      // The named copy failed and another took the write (mid-write failover): name the copy that
+      // really holds it before acknowledging. Logged before the original is completed, so a crash in
+      // between leaves both open — and replayed in order, the corrected one runs last and wins.
+      if (mayOwe && sequence != 0 && !appliedFlags[0] && Array.IndexOf(appliedFlags, true) is var holder and >= 0) {
+        var corrected = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length,
+          memberId: copies[holder].Volume.MemberId, shadow: copies[holder].Shadow);
+        this._journal.Complete(sequence, JournalOp.Write);
+        sequence = corrected;
+        ackCopy = copies[holder];
+      }
 
       if (appliedCount >= copies.Count) {
         // every copy now durably holds these bytes: any older buffered write of this range is

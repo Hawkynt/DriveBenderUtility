@@ -410,4 +410,234 @@ public class CrashConsistencyTests {
         copy.Should().Equal(content, $"under {policy}, the copy on '{volume.DisplayName}' (shadow: {shadow}) lost bytes in the power cut");
   }
 
+
+  // ---------------------------------------------------------------------------------------------
+  // "Saved means saved" for every way an application saves — not just a brand-new file. Each case
+  // COMPLETES the operation (the application has been told it succeeded), then loses power, then
+  // requires the outcome to be there whole on every copy. The step matrix above cannot see these:
+  // it only ever interrupts an operation part-way.
+  // ---------------------------------------------------------------------------------------------
+
+  public enum SaveShape { EditInPlace, OverwriteTruncating, TempThenRenameOver, Append }
+
+  private PoolFileSystem _EngineWith(string policy)
+    => new(_pool, [new(this._v1), new(this._v2)],
+      new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
+      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 2, "write": { "policy": "{{policy}}" }, "readAhead": { "enabled": false } }"""));
+
+  private static void _WriteNew(PoolFileSystem fs, string path, byte[] content) {
+    var handle = fs.Create(path, NodeKind.File, CreateFlags.None);
+    fs.Write(handle, content, 0, WriteMode.Normal);
+    fs.Close(handle);
+  }
+
+  private void _AssertEveryCopyHolds(string path, byte[] expected, string because) {
+    var any = false;
+    foreach (var volume in new[] { this._v1, this._v2 })
+    foreach (var shadow in new[] { false, true })
+      if (volume.GetContent(path, shadow) is { } copy) {
+        any = true;
+        copy.Should().Equal(expected, $"{because} — the copy on '{volume.DisplayName}' (shadow: {shadow}) does not hold it");
+      }
+
+    any.Should().BeTrue($"{because} — no copy of '{path}' exists at all");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Crash_GivenAnExistingFileWasSavedAndClosed_ThenTheSavedVersionSurvivesPowerLossWhole(
+    [Values] SaveShape shape,
+    [Values("write-through", "write-back", "performance")] string policy) {
+    var original = _Version(51, 2048);
+    var saved = shape == SaveShape.Append ? [.. original, .. _Version(52, 700)] : _Version(52, 2048);
+
+    using (var fs = this._EngineWith(policy)) {
+      fs.Mount(new(@"X:\"));
+      _WriteNew(fs, "doc.bin", original);
+
+      switch (shape) {
+        case SaveShape.EditInPlace: {
+          var handle = fs.Open("doc.bin", AccessMode.ReadWrite, ShareMode.Read);
+          fs.Write(handle, saved, 0, WriteMode.Normal);
+          fs.Close(handle);
+          break;
+        }
+        case SaveShape.OverwriteTruncating: {
+          var handle = fs.Create("doc.bin", NodeKind.File, CreateFlags.Truncate);
+          fs.Write(handle, saved, 0, WriteMode.Normal);
+          fs.Close(handle);
+          break;
+        }
+        case SaveShape.TempThenRenameOver:
+          _WriteNew(fs, "doc.bin.tmp", saved);
+          fs.Rename("doc.bin.tmp", "doc.bin", RenameFlags.ReplaceExisting);
+          break;
+        case SaveShape.Append: {
+          var handle = fs.Open("doc.bin", AccessMode.ReadWrite, ShareMode.Read);
+          fs.Write(handle, saved.AsSpan(original.Length), 0, WriteMode.Append);
+          fs.Close(handle);
+          break;
+        }
+      }
+    }
+
+    using var recovered = this._RecoverAfterPowerLoss();
+    _ReadWhole(recovered, "doc.bin").Should().Equal(saved, $"{shape} under {policy}: the save completed, then the power went");
+    this._AssertEveryCopyHolds("doc.bin", saved, $"{shape} under {policy}");
+    if (shape == SaveShape.TempThenRenameOver)
+      _ReadWhole(recovered, "doc.bin.tmp").Should().BeNull("the temp name was renamed away and must not come back");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Crash_GivenNamespaceChangesCompleted_ThenTheyAllSurvivePowerLoss(
+    [Values("write-through", "write-back", "performance")] string policy) {
+    var kept = _Version(61, 1500);
+    var moved = _Version(62, 1500);
+
+    using (var fs = this._EngineWith(policy)) {
+      fs.Mount(new(@"X:\"));
+      fs.MakeDir("folder");
+      _WriteNew(fs, "folder/kept.bin", kept);
+      _WriteNew(fs, "old-name.bin", moved);
+      _WriteNew(fs, "doomed.bin", _Version(63, 900));
+
+      fs.Rename("old-name.bin", "folder/new-name.bin", RenameFlags.None);
+      fs.Unlink("doomed.bin");
+    }
+
+    using var recovered = this._RecoverAfterPowerLoss();
+    recovered.ReadDirectory("folder").Select(e => e.Name).Should().Contain(["kept.bin", "new-name.bin"], $"under {policy}");
+    _ReadWhole(recovered, "folder/kept.bin").Should().Equal(kept);
+    _ReadWhole(recovered, "folder/new-name.bin").Should().Equal(moved, $"a completed rename must survive under {policy}");
+    _ReadWhole(recovered, "old-name.bin").Should().BeNull("the file must live under exactly one name");
+    _ReadWhole(recovered, "doomed.bin").Should().BeNull($"a completed delete must not resurrect under {policy}");
+    this._AssertEveryCopyHolds("folder/new-name.bin", moved, $"rename under {policy}");
+  }
+
+
+  [Test]
+  [Category("Exception")]
+  // SAFE-NOLOSS read literally: a write that RETURNED was acknowledged, and "write-back after
+  // minCopiesBeforeAck" durable copies is part of the acknowledgement. The existing matrix only
+  // asks that a file end up as SOME whole version, and only under write-through — so a lower ack
+  // level, where the acknowledged bytes sit on one copy (chosen by load, not always the primary)
+  // while the other is owed, was never tested against a power cut at all.
+  public void Crash_GivenAWriteWasAcknowledgedButTheFileWasNeverClosed_ThenTheAcknowledgedBytesSurviveOnEveryCopy(
+    [Values("write-through", "write-back", "deferred", "performance")] string policy,
+    [Values(1, 2)] int minCopiesBeforeAck,
+    [Values(0, 512)] int offset) {
+    // offset 512 starts in the SECOND block (this engine's blocks are 512 bytes), and the ack copy
+    // rotates with the block — so with one required copy the acknowledgement lands on the other
+    // copy than at offset 0. Without it, every case could quietly be acking on the primary.
+    var original = _Version(71, 4096);
+    var patch = _Version(72, 512);
+    var acknowledged = (byte[])original.Clone();
+    patch.CopyTo(acknowledged, offset);
+    var config = $$"""{ "duplication": 2, "write": { "policy": "{{policy}}", "minCopiesBeforeAck": {{minCopiesBeforeAck}} }, "readAhead": { "enabled": false } }""";
+
+    PoolFileSystem Engine() => new(_pool, [new(this._v1), new(this._v2)],
+      new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
+      ConfigResolver.ResolveEffective(null, config));
+
+    using (var fs = Engine()) {
+      fs.Mount(new(@"X:\"));
+      _WriteNew(fs, "acked.bin", original);
+      fs.Unmount();
+    }
+
+    // Not disposed: disposing unmounts, and an unmount flushes everything owed, which is not what a
+    // power cut does. The engine is simply abandoned mid-flight.
+    var abandoned = Engine();
+    abandoned.Mount(new(@"X:\"));
+    var handle = abandoned.Open("acked.bin", AccessMode.ReadWrite, ShareMode.Read);
+    abandoned.Write(handle, patch, offset, WriteMode.Normal); // returned: acknowledged
+
+    using var recovered = this._RecoverAfterPowerLoss();
+    _ReadWhole(recovered, "acked.bin").Should().Equal(acknowledged,
+      $"{policy} with minCopiesBeforeAck {minCopiesBeforeAck} at offset {offset}: the write returned, so it was acknowledged, and a power cut must not take it back");
+    this._AssertEveryCopyHolds("acked.bin", acknowledged,
+      $"{policy} / {minCopiesBeforeAck}: after recovery every copy must agree on the acknowledged content");
+  }
+
+
+  [Test]
+  [Category("Exception")]
+  // With fewer required copies than there are copies, the copy that takes the acknowledgement
+  // ROTATES by block. Two acknowledged writes to different blocks can therefore land on DIFFERENT
+  // copies, each still owing the other — so after a power cut no single copy holds both. Recovery
+  // that picks one copy as the truth and overwrites the other with it discards an acknowledged
+  // write. One write at a time can never show this; it takes two.
+  public void Crash_GivenTwoAcknowledgedWritesLandedOnDifferentCopies_ThenBothSurvive(
+    [Values("write-back", "deferred", "performance")] string policy) {
+    var original = _Version(81, 4096);
+    var first = _Version(82, 512);
+    var second = _Version(83, 512);
+    var expected = (byte[])original.Clone();
+    first.CopyTo(expected, 0);     // block 0
+    second.CopyTo(expected, 512);  // block 1 — the other copy takes this acknowledgement
+    var config = $$"""{ "duplication": 2, "write": { "policy": "{{policy}}", "minCopiesBeforeAck": 1 }, "readAhead": { "enabled": false } }""";
+
+    PoolFileSystem Engine() => new(_pool, [new(this._v1), new(this._v2)],
+      new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
+      ConfigResolver.ResolveEffective(null, config));
+
+    using (var fs = Engine()) {
+      fs.Mount(new(@"X:\"));
+      _WriteNew(fs, "split.bin", original);
+      fs.Unmount();
+    }
+
+    var abandoned = Engine();
+    abandoned.Mount(new(@"X:\"));
+    var handle = abandoned.Open("split.bin", AccessMode.ReadWrite, ShareMode.Read);
+    abandoned.Write(handle, first, 0, WriteMode.Normal);    // acknowledged
+    abandoned.Write(handle, second, 512, WriteMode.Normal); // acknowledged
+
+    using var recovered = this._RecoverAfterPowerLoss();
+    _ReadWhole(recovered, "split.bin").Should().Equal(expected,
+      $"{policy} with one required copy: both writes returned, so both were acknowledged — a power cut must keep both");
+    this._AssertEveryCopyHolds("split.bin", expected, $"{policy}: every copy must end up with both acknowledged writes");
+  }
+
+
+  [Test]
+  [Category("EdgeCase")]
+  // The ordering trap in replaying writes by range. Three acknowledged writes: one on copy X at
+  // block 0, one on copy Y at block 1, then a wider one on X over BOTH blocks. After a power cut X
+  // holds the newest bytes everywhere and Y holds the older middle write. Replaying one range at a
+  // time reads a source that an earlier step of the same replay already overwrote, and puts the
+  // older middle write back on top of the newest — so every range must be read before any is written.
+  public void Crash_GivenOverlappingAcknowledgedWritesOnDifferentCopies_ThenTheNewestBytesWinEverywhere(
+    [Values("write-back", "performance")] string policy) {
+    var original = _Version(91, 2048);
+    var first = _Version(92, 512);   // block 0 → copy X
+    var middle = _Version(93, 512);  // block 1 → copy Y
+    var widest = _Version(94, 1024); // block 0 again → copy X, covering both earlier writes
+    var expected = (byte[])original.Clone();
+    widest.CopyTo(expected, 0);
+    var config = $$"""{ "duplication": 2, "write": { "policy": "{{policy}}", "minCopiesBeforeAck": 1 }, "readAhead": { "enabled": false } }""";
+
+    PoolFileSystem Engine() => new(_pool, [new(this._v1), new(this._v2)],
+      new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
+      ConfigResolver.ResolveEffective(null, config));
+
+    using (var fs = Engine()) {
+      fs.Mount(new(@"X:\"));
+      _WriteNew(fs, "overlap.bin", original);
+      fs.Unmount();
+    }
+
+    var abandoned = Engine();
+    abandoned.Mount(new(@"X:\"));
+    var handle = abandoned.Open("overlap.bin", AccessMode.ReadWrite, ShareMode.Read);
+    abandoned.Write(handle, first, 0, WriteMode.Normal);
+    abandoned.Write(handle, middle, 512, WriteMode.Normal);
+    abandoned.Write(handle, widest, 0, WriteMode.Normal);
+
+    using var recovered = this._RecoverAfterPowerLoss();
+    _ReadWhole(recovered, "overlap.bin").Should().Equal(expected, $"{policy}: the newest acknowledged bytes must win everywhere");
+    this._AssertEveryCopyHolds("overlap.bin", expected, $"{policy}: every copy must end on the newest bytes");
+  }
+
 }

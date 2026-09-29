@@ -1935,3 +1935,25 @@ healer considered each of them 23 times in three minutes and put each one back a
 WinFsp now reports every close. A handle that was never writable skips the flush on close, so the
 extra callback stays cheap. `Heal_GivenTheFileWasOnlyReadThroughTheMount_…` covers it directly, and
 fails with the old setting. Linux was never affected: FUSE always sends `release`.
+
+### Resolved: with one required copy, a power cut could lose an acknowledged write
+
+`write.minCopiesBeforeAck` below the number of copies (the Settings dialog offers it) acknowledges a
+write once ONE copy has it and owes the rest. Which copy takes the acknowledgement rotates by block,
+for throughput. So two acknowledged writes to different blocks could sit on different copies, each
+still owing the other — and after a power cut recovery crowned one whole copy the winner (newest
+mtime) and overwrote the other with it, discarding an acknowledged write. A new crash scenario lost
+the first of two writes exactly that way. Newest-mtime could not have been fixed as a rule either:
+the owed-copy sync later applies OLDER writes to the lagging copy, which makes it look newest.
+
+A write intent now names the copy that took the acknowledgement (member and namespace; a failover to
+another copy logs a corrected intent before acknowledging). Recovery replays each file's open writes
+by byte range from their own copies, oldest first — reading every range before writing any, because
+a newer wide write on one copy must not have an older narrow one from the other put back on top.
+Where the named copy is gone it falls back to the whole-file rule. The default of 2 required copies
+was never affected: every acknowledged write already sat on both.
+
+Also added: "saved means saved" for every way an existing file is saved — edit in place, overwrite
+with truncate, temp-then-rename-over, append — plus completed renames, deletes and folder creation,
+each under every write policy and checked on every copy. All held; the tests were proved sensitive
+by removing the per-write barrier, which fails nine of them.
