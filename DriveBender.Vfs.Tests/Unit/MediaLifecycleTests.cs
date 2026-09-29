@@ -63,14 +63,33 @@ public class MediaLifecycleTests {
 
   [Test]
   [Category("HappyPath")]
-  public void ScatterAndRemove_GivenDuplicatedFile_WhenRemoved_ThenSurvivingCopyKeptNoNeedlessMove() {
+  public void ScatterAndRemove_GivenDuplicatedFileAndADiskToSpare_WhenRemoved_ThenSurvivorKeptAndDuplicationRestored() {
+    // This used to assert that NOTHING was copied: one copy survived on v2, so the leaving copy was
+    // simply dropped — and the file sat at one copy with v3 free, until some later heal. Retiring a
+    // disk now keeps the configured level on the disks that stay: the survivor is left where it is,
+    // and one new copy goes to v3.
     this._v1.Seed("dup.bin", false, _Bytes(7, 7));
     this._v2.Seed("dup.bin", true, _Bytes(7, 7)); // already a copy on another domain
 
     var report = this._Lifecycle(2, this._v1, this._v2, this._v3).ScatterAndRemove(this._v1.MemberId);
 
-    report.FilesMoved.Should().Be(0, "a copy already survives on v2 — no relocation needed");
+    report.FilesMoved.Should().Be(1, "one copy is made on v3 to keep duplication 2 — the survivor itself is not moved");
     this._v1.FileExists("dup.bin", false).Should().BeFalse();
+    this._v2.GetContent("dup.bin", true).Should().Equal(new byte[] { 7, 7 }, "the surviving copy stays where it is");
+    (this._v3.GetContent("dup.bin", false) ?? this._v3.GetContent("dup.bin", true)).Should().Equal(new byte[] { 7, 7 });
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void ScatterAndRemove_GivenDuplicatedFileAndNoDiskToSpare_WhenRemoved_ThenSurvivorKeptAndNothingFails() {
+    // the other side of the boundary: with only two members there is nowhere for a second copy, so
+    // the survivor is kept, nothing is refused, and the healer is left to restore it later
+    this._v1.Seed("dup.bin", false, _Bytes(7, 7));
+    this._v2.Seed("dup.bin", true, _Bytes(7, 7));
+
+    var report = this._Lifecycle(2, this._v1, this._v2).ScatterAndRemove(this._v1.MemberId);
+
+    report.FilesMoved.Should().Be(0, "there is no third disk to copy to");
     this._v2.GetContent("dup.bin", true).Should().Equal(new byte[] { 7, 7 });
   }
 
