@@ -640,4 +640,49 @@ public class CrashConsistencyTests {
     this._AssertEveryCopyHolds("overlap.bin", expected, $"{policy}: every copy must end on the newest bytes");
   }
 
+
+  [Test]
+  [Category("EdgeCase")]
+  // An edit session: one intent covers every write to a file until it is next flushed or closed.
+  // This interrupts the THIRD write of a session at every step it takes: the two acknowledged writes
+  // before it must survive, the interrupted one must be whole or absent, and every copy must agree.
+  // 2 steps: inside an open session a write is just its two copies — the journal is not touched.
+  public void Crash_GivenAWriteInterruptedMidSession_ThenEarlierAcknowledgedWritesSurviveAndCopiesAgree(
+    [Range(1, 2)] int abortAfter) {
+    var original = _Version(101, 3072);
+    var first = _Version(102, 1024);
+    var second = _Version(103, 1024);
+    var third = _Version(104, 1024);
+
+    using (var fs = _NewEngine()) {
+      fs.Mount(new(@"X:\"));
+      _WriteNew(fs, "session.bin", original);
+      fs.Unmount();
+    }
+
+    var abandoned = _NewEngine();
+    abandoned.Mount(new(@"X:\"));
+    var handle = abandoned.Open("session.bin", AccessMode.ReadWrite, ShareMode.Read);
+    abandoned.Write(handle, first, 0, WriteMode.Normal);      // acknowledged
+    abandoned.Write(handle, second, 1024, WriteMode.Normal);  // acknowledged
+    this._AbortAfter(abortAfter);
+    try {
+      abandoned.Write(handle, third, 2048, WriteMode.Normal); // the power goes during this one
+    } catch (Exception) {
+      // interrupted — exactly the point
+    } finally {
+      this._ClearHooks();
+    }
+
+    this._AssertTheCrashActuallyHappened(abortAfter);
+    using var recovered = this._RecoverAfterPowerLoss();
+    var content = _ReadWhole(recovered, "session.bin")!;
+    content.AsSpan(0, 1024).SequenceEqual(first).Should().BeTrue($"step {abortAfter}: the first acknowledged write was lost");
+    content.AsSpan(1024, 1024).SequenceEqual(second).Should().BeTrue($"step {abortAfter}: the second acknowledged write was lost");
+    var tail = content.AsSpan(2048, 1024);
+    (tail.SequenceEqual(third) || tail.SequenceEqual(original.AsSpan(2048, 1024))).Should().BeTrue(
+      $"step {abortAfter}: the interrupted write must be whole or absent, never torn");
+    this._AssertEveryCopyHolds("session.bin", content, $"step {abortAfter}: copies must agree after recovery");
+  }
+
 }

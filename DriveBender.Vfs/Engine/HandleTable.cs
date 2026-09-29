@@ -27,6 +27,9 @@ public sealed class FileState(string normalizedPath) {
   /// </summary>
   internal int AppHandleCount;
 
+  /// <summary>Kernel handles open with WRITE access — whether anyone can still write through this file.</summary>
+  internal int WriteHandleCount;
+
   /// <summary>
   /// Per-handle read-ahead detectors keyed by handle value.
   ///
@@ -192,6 +195,8 @@ public sealed class HandleTable {
       ++file.RefCount;
       ++file.HandleCount;
       ++file.AppHandleCount;
+      if ((access & AccessMode.Write) != 0)
+        ++file.WriteHandleCount;
       var handle = new NodeHandle(++this._nextHandle);
       var open = new OpenHandle(handle, file, access);
       this._handles.Add(handle.Value, open);
@@ -216,6 +221,8 @@ public sealed class HandleTable {
       open.File.ReadAhead.TryRemove(handle.Value, out _);
       open.File.ReadChecks.TryRemove(handle.Value, out _);
       --open.File.HandleCount;
+      if ((open.Access & AccessMode.Write) != 0)
+        --open.File.WriteHandleCount;
       if (!open.ApplicationClosed) {
         open.ApplicationClosed = true; // a handle closed without an explicit cleanup still counts
         --open.File.AppHandleCount;
@@ -231,6 +238,12 @@ public sealed class HandleTable {
   /// pins the same state but is deliberately NOT counted — a background job holding its own
   /// lease must not read that back as "a foreground handle is open".
   /// </summary>
+  /// <summary>True while any handle that can write to the path is still open.</summary>
+  public bool IsOpenForWrite(string normalizedPath) {
+    lock (this._lock)
+      return this._files.TryGetValue(normalizedPath, out var file) && file.WriteHandleCount > 0;
+  }
+
   public bool IsOpen(string normalizedPath) {
     lock (this._lock)
       return this._files.TryGetValue(normalizedPath, out var file) && file.AppHandleCount > 0;
