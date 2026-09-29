@@ -268,7 +268,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // member is used, so the member not chosen kept its first reading forever — here a cold-start
     // sample from mount, on real hardware the half-second of a spun-down disk waking — and was never
     // chosen again to correct it. Forgotten, it takes the next file and is measured honestly; a
-    // member that really is slow shows it again at once, and is avoided again.
+    // member that really is slow shows it again at once, and is avoided again. One second, not
+    // five: a burst of new files is over in a few seconds, and on a CI runner's slow disk a
+    // five-second window let a mount-time reading decide an entire 21-file burst (21 / 0) — the
+    // cost of the shorter window is at most one probing file a second on a member idle and slow.
     const double perOperationFloorMs = 1.0;
     var measuredMs = volume is MeasuredVolumeIO { Samples: > 0 } measured && measured.SinceLastSample < LatencyStaleAfter
       ? measured.AverageLatencyMs
@@ -279,7 +282,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   /// <summary>How long a member's measured latency still counts for placement and read routing once it stops being refreshed.</summary>
-  public static readonly TimeSpan LatencyStaleAfter = TimeSpan.FromSeconds(5);
+  public static readonly TimeSpan LatencyStaleAfter = TimeSpan.FromSeconds(1);
   private readonly ShadowNamespace _shadow = new();
 
   // FR-PAR / §6.4: how wide a request may fan out across the storages behind it, and how much

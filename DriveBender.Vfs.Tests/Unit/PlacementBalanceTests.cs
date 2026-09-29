@@ -76,10 +76,10 @@ public class PlacementBalanceTests {
       $"two identical disks must both take new files; the split was {split[0]} / {split[1]}");
   }
 
-  [TestCase(4, false, TestName = "Placement_GivenAMemberLastMeasuredSlowFourSecondsAgo_WhenTheNextFileIsPlaced_ThenItIsStillAvoided")]
-  [TestCase(6, true, TestName = "Placement_GivenAMemberLastMeasuredSlowSixSecondsAgo_WhenTheNextFileIsPlaced_ThenItIsTriedAgain")]
+  [TestCase(500, false, TestName = "Placement_GivenAMemberLastMeasuredSlowHalfASecondAgo_WhenTheNextFileIsPlaced_ThenItIsStillAvoided")]
+  [TestCase(1500, true, TestName = "Placement_GivenAMemberLastMeasuredSlowOneAndAHalfSecondsAgo_WhenTheNextFileIsPlaced_ThenItIsTriedAgain")]
   [Category("EdgeCase")]
-  public void Placement_GivenAMemberWhoseOnlyMeasurementIsOldAndSlow_ThenItIsTriedAgainOnceThatMeasurementIsStale(int secondsAgo, bool expectTriedAgain) {
+  public void Placement_GivenAMemberWhoseOnlyMeasurementIsOldAndSlow_ThenItIsTriedAgainOnceThatMeasurementIsStale(int millisecondsAgo, bool expectTriedAgain) {
     // A spun-down disk takes half a second to wake for its first access. That one reading used to
     // keep it out of rotation for good: never chosen, so never measured again, so never chosen.
     var time = new ManualTime();
@@ -91,12 +91,12 @@ public class PlacementBalanceTests {
     _WriteFile(fs, "before.bin");
     this._v2.FileExists("before.bin", false).Should().BeTrue("a member measured slow a moment ago is avoided");
 
-    time.Advance(TimeSpan.FromSeconds(secondsAgo));
+    time.Advance(TimeSpan.FromMilliseconds(millisecondsAgo));
     busy.RecordLatency(0.5); // the chosen member keeps working, so its own reading stays current
 
     _WriteFile(fs, "after.bin");
     this._v1.FileExists("after.bin", false).Should().Be(expectTriedAgain,
-      $"a reading {secondsAgo}s old is {(expectTriedAgain ? "past" : "within")} the {PoolFileSystem.LatencyStaleAfter.TotalSeconds}s it counts for");
+      $"a reading {millisecondsAgo} ms old is {(expectTriedAgain ? "past" : "within")} the {PoolFileSystem.LatencyStaleAfter.TotalSeconds}s it counts for");
   }
 
   [Test]

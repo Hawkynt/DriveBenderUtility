@@ -2026,13 +2026,15 @@ member's measured latency. Two things let the measurement decide what it cannot 
   correct it. On real hardware that first reading can be a spun-down disk waking (half a second),
   which kept a healthy disk out of rotation for the life of the mount. The same score routes reads
   between duplicate copies, so a copy measured slow once was never read from again either. A
-  reading not refreshed within 5 s is now ignored: the member takes the next file and is measured
+  reading not refreshed within 1 s is now ignored: the member takes the next file and is measured
   honestly, and a member that really is slow shows it again at once and is avoided again.
 
 The effect on a pool of separate disks was one disk's throughput, however many it had. Engine
-tests reproduce both (0 / 20 before), with the staleness window pinned on both sides (4 s still
-avoided, 6 s tried again) and a genuinely slow member still avoided. Removing either rule fails its
+tests reproduce both (0 / 20 before), with the staleness window pinned on both sides (0.5 s still
+avoided, 1.5 s tried again) and a genuinely slow member still avoided. Removing either rule fails its
 own test. On the real driver the brownout baseline is now 11 / 10, and a collapsed member still
-sheds new files (2 / 19).
+sheds new files (2 / 19). A first cut ignored readings after 5 s; the Windows CI runner still
+came back 21 / 0, because on its slow disk the whole burst finished inside that window and a
+mount-time reading decided every file. The window is 1 s.
 
 Still open: the opt-in `lowest-latency` strategy ranks by measurement alone and ranks unmeasured members last, so it can latch the same way; it is left as it is, being an explicit choice to trust the measurement.
