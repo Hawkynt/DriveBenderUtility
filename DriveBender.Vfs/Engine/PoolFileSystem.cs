@@ -285,6 +285,63 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public static readonly TimeSpan LatencyStaleAfter = TimeSpan.FromSeconds(1);
   private readonly ShadowNamespace _shadow = new();
 
+  /// <summary>
+  /// Held SHARED by every operation that writes, creates, moves or removes something under a path —
+  /// foreground and background alike — and EXCLUSIVELY by a folder rename.
+  ///
+  /// A folder rename moves every file under it at once, and until this existed it held a lease on
+  /// the two folder paths and on no file inside them. So a write to a child could land between the
+  /// rename flushing the children and moving the tree: its acknowledged copy was already on disk
+  /// and moved with the folder, but the copy it still owed sat in the write buffer under the OLD
+  /// path — and when that flushed there was nothing there any more, so it was dropped. The copies
+  /// then disagreed for good: reads from the stale one returned the old bytes, and losing the
+  /// other disk lost the write. A crossing test caught it in about one trial in forty.
+  ///
+  /// Leasing each child instead cannot close it: a handle opened after the rename looked is a child
+  /// it never saw. And writes were only the first case: a CREATE that resolved its parent before the
+  /// rename and placed the file after it recreated the old folder to hold it — whereupon every later
+  /// create in the same copy saw that folder exist and went into it too, splitting one copy between
+  /// the new name and a resurrected old one. The landing-zone drainer and the healer did the same
+  /// with the folders they create on their target.
+  ///
+  /// Taken BEFORE any file lease, everywhere — the folder rename included — so it can never invert
+  /// against a lease. Uncontended except against a folder rename, which is rare, so an operation pays
+  /// one uncontended shared acquire.
+  /// </summary>
+  private readonly ReaderWriterLockSlim _folderRenameGate = new(LockRecursionPolicy.SupportsRecursion);
+
+  private readonly struct GateHold(ReaderWriterLockSlim gate, bool exclusive) : IDisposable {
+    public void Dispose() {
+      if (exclusive)
+        gate.ExitWriteLock();
+      else
+        gate.ExitReadLock();
+    }
+  }
+
+  private GateHold _EnterNamespaceShared() {
+    this._folderRenameGate.EnterReadLock();
+    return new(this._folderRenameGate, false);
+  }
+
+  private GateHold _EnterNamespaceExclusive() {
+    this._folderRenameGate.EnterWriteLock();
+    return new(this._folderRenameGate, true);
+  }
+
+  /// <summary>
+  /// Wraps a bulk copy's per-chunk pacing so the copy is ABANDONED at its next chunk once a folder
+  /// rename is waiting for the gate. A background move holds the gate for the whole file, which on a
+  /// throttled member can be minutes; a rename must not wait that out, and a move is always safe to
+  /// abandon — the original is untouched until the copy is complete.
+  /// </summary>
+  private Action<long> _AbandonForFolderRename(Action<long>? pace) => bytes => {
+    if (this._folderRenameGate.WaitingWriteCount > 0)
+      throw new OperationCanceledException("A folder rename is waiting; the move is retried after it");
+
+    pace?.Invoke(bytes);
+  };
+
   // FR-PAR / §6.4: how wide a request may fan out across the storages behind it, and how much
   // any one device is allowed to have outstanding at once (CFG.io.queueDepthPerVolume)
   private readonly VolumeQueues _queues;
@@ -539,6 +596,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// <summary>Restores a trashed item to its original path and re-establishes its duplication level (FR-TRASH).</summary>
   public void RestoreFromTrash(string originalPath) {
     this._RequireWritable();
+    using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(originalPath);
     var restored = this._trash.Restore(normalized)
                    ?? throw new PoolFsException(PoolFsError.NotFound, $"No trash entry for '{originalPath}'");
@@ -860,6 +918,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public void SetAttributes(string path, FileMetaPatch patch) {
     this._RequireWritable();
+    using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
     using var lease = this._handles.AcquireWrite(normalized); // copies must not move under the stamp
@@ -1042,6 +1101,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public NodeHandle Create(string path, NodeKind kind, CreateFlags flags) {
     this._RequireWritable();
+    using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
     if (kind == NodeKind.Directory) {
@@ -1248,28 +1308,51 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // case-insensitive on a platform that is not, so the member is asked rather than assumed.
     var caseOnly = fromNormalized.Equals(toNormalized, StringComparison.OrdinalIgnoreCase);
 
-    // exclusive on BOTH endpoints for the whole rename, acquired in a deterministic ordinal
-    // order so two renames in opposite directions can never deadlock. A case-only rename maps
-    // to ONE state (the table is case-insensitive) and therefore takes a single lease.
-    var takeFirst = string.CompareOrdinal(fromNormalized, toNormalized) <= 0 ? fromNormalized : toNormalized;
-    var takeSecond = takeFirst == fromNormalized ? toNormalized : fromNormalized;
-    using var leaseFirst = this._handles.AcquireWrite(takeFirst);
-    using var leaseSecond = sameFile ? null : this._handles.AcquireWrite(takeSecond);
+    // A folder rename takes the namespace gate EXCLUSIVELY, a file rename shares it — and either
+    // way BEFORE the leases, as every other operation does, so no order can invert. Which one this
+    // is has to be guessed before the leases and confirmed after; a guess of "file" that turns out
+    // to be a folder goes round again as a folder.
+    for (var asFolder = this._IsFolderOnly(fromNormalized); ; asFolder = true) {
+      using var namespaceHold = asFolder ? this._EnterNamespaceExclusive() : this._EnterNamespaceShared();
 
-    // renaming a file that is still being written publishes it first (temp → final), then renames
-    if (this._staging.ContainsKey(fromNormalized))
-      this._PublishStagedLocked(fromNormalized);
+      // exclusive on BOTH endpoints for the whole rename, acquired in a deterministic ordinal
+      // order so two renames in opposite directions can never deadlock. A case-only rename maps
+      // to ONE state (the table is case-insensitive) and therefore takes a single lease.
+      var takeFirst = string.CompareOrdinal(fromNormalized, toNormalized) <= 0 ? fromNormalized : toNormalized;
+      var takeSecond = takeFirst == fromNormalized ? toNormalized : fromNormalized;
+      using var leaseFirst = this._handles.AcquireWrite(takeFirst);
+      using var leaseSecond = sameFile ? null : this._handles.AcquireWrite(takeSecond);
 
-    var copies = this._placement.ResolveCopies(fromNormalized);
-    if (copies.Count == 0) {
-      // not a file — folders resolve by their directory presence (FR-RENAME for directories)
-      if (this._Online.Any(m => m.FolderExists(fromNormalized, false))) {
-        this._RenameFolder(fromNormalized, toNormalized);
-        return;
+      // renaming a file that is still being written publishes it first (temp → final), then renames
+      if (this._staging.ContainsKey(fromNormalized))
+        this._PublishStagedLocked(fromNormalized);
+
+      var copies = this._placement.ResolveCopies(fromNormalized);
+      if (copies.Count == 0) {
+        // not a file — folders resolve by their directory presence (FR-RENAME for directories)
+        if (this._Online.Any(m => m.FolderExists(fromNormalized, false))) {
+          if (!asFolder)
+            continue; // became a folder since the guess: again, with the gate held exclusively
+
+          this._RenameFolder(fromNormalized, toNormalized);
+          return;
+        }
+
+        throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {from}");
       }
 
-      throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {from}");
+      this._RenameFileLocked(from, to, flags, fromNormalized, toNormalized, sameFile, caseOnly, copies);
+      return;
     }
+  }
+
+  /// <summary>A path that is a folder on some member and a file on none — what a folder rename moves.</summary>
+  private bool _IsFolderOnly(string normalized)
+    => this._placement.ResolveCopies(normalized).Count == 0 && this._Online.Any(m => m.FolderExists(normalized, false));
+
+  /// <summary>The file half of <see cref="Rename"/>, under its gate and both leases.</summary>
+  private void _RenameFileLocked(string from, string to, RenameFlags flags, string fromNormalized, string toNormalized, bool sameFile, bool caseOnly,
+    IReadOnlyList<PhysicalCopy> copies) {
 
     if (!this._ParentExists(toNormalized))
       throw new PoolFsException(PoolFsError.NotFound, $"Target parent folder not found: {to}");
@@ -1343,6 +1426,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       throw new PoolFsException(PoolFsError.NotFound, $"Target parent folder not found: {toNormalized}");
     if (this._Online.Any(m => m.FolderExists(toNormalized, false) || m.FileExists(toNormalized, false)))
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toNormalized}");
+
+    // the caller holds the namespace gate EXCLUSIVELY: nothing reaches a child from the flush
+    // below until every open child follows the move
+    System.Diagnostics.Debug.Assert(this._folderRenameGate.IsWriteLockHeld);
 
     // dirty children must land under the old name before the tree moves (SAFE-NOLOSS), and
     // children still being written publish first so no temp names travel with the subtree
@@ -1640,6 +1727,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public void Unlink(string path) {
     this._RequireWritable();
+    using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
 
@@ -1748,6 +1836,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public void MakeDir(string path) {
     this._RequireWritable();
+    using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
     if (normalized.Length == 0)
@@ -1774,6 +1863,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public void RemoveDir(string path) {
     this._RequireWritable();
+    using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
     if (normalized.Length == 0)
@@ -1829,6 +1919,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// is left alone: its recorded checksums are stale anyway, and the scrub will see it later.
   /// </summary>
   private void _RepairAfterReadCheck(string normalized) {
+    using var namespaceHold = this._EnterNamespaceShared(); // it rewrites copies under the path, as the healer does
     using var lease = this._handles.AcquireWrite(normalized);
     if (this._writeBuffer.IsDirty(normalized))
       return;
@@ -2483,6 +2574,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // a private array the driver's span is copied into ONCE: it is handed to the copies, then
     // (if owed) to the write buffer, which takes ownership of it rather than cloning again
     var bytes = data.ToArray();
+    using var gate = this._EnterNamespaceShared(); // before the lease: a folder rename must not move the file mid-write
     using var lease = this._handles.AcquireWrite(open.File.Path); // by PATH — see Read
     try {
       var path = lease.File.Path;
@@ -2813,6 +2905,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (length < 0)
       throw new PoolFsException(PoolFsError.InvalidArgument, "Negative length");
 
+    using var gate = this._EnterNamespaceShared(); // before the lease, as in Write
     using var lease = this._handles.AcquireWrite(open.File.Path); // by PATH — see Read
     try {
       var path = lease.File.Path;
@@ -2848,6 +2941,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     // one lease covers both steps: a publish that raced the flush could otherwise rename the
     // temp away between them and strand the just-flushed blocks
+    using var namespaceHold = this._EnterNamespaceShared();
     using var lease = this._handles.AcquireWrite(open.File.Path);
     var path = lease.File.Path;
     this._FlushPathLocked(path); // fsync is an absolute durability barrier in every mode (SAFE-FSYNC)
@@ -2868,6 +2962,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // the buffer could be drained (so the overlay stops covering the owed bytes) while a
     // concurrent read is routed to the copy that has not received them yet — serving pre-write
     // content — or an older op could land after a newer foreground write (SAFE-NOLOSS)
+    using var namespaceHold = this._EnterNamespaceShared();
     using var lease = this._handles.AcquireWrite(normalized);
     this._FlushPathLocked(normalized);
   }
@@ -2980,6 +3075,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         //
         // A file a foreground op owns right now is skipped rather than waited on: the drainer must
         // never stall the pump.
+        //
+        // The whole move holds the namespace gate SHARED, so a folder rename cannot move this file's
+        // folder mid-copy. It did, and the copy then recreated the OLD folder on the target — the
+        // re-validation below threw the stale copy away but left the folder, so a renamed folder's
+        // old name came back, empty, beside the new one. Cleaning such a folder up afterwards is not
+        // safe: a user who renames "New folder" and makes another "New folder" gets exactly that
+        // shape on purpose. A waiting rename abandons the copy at its next chunk instead.
+        using var namespaceHold = this._EnterNamespaceShared();
         IVolumeIO? target;
         FileMeta? before;
         long size;
@@ -2993,7 +3096,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           var copies = this._placement.ResolveCopies(path);
           var holders = copies.Select(c => c.Volume).ToArray();
           before = landing.Stat(path, false);
-          size = before?.Length ?? 0;
+          if (before == null)
+            continue; // moved or deleted since the walk listed it: nothing to drain, and nothing to create
+          size = before.Value.Length;
           target = this._placement.ChooseDrainTarget(size, holders.Where(h => h.MemberId != landing.MemberId));
         }
 
@@ -3008,8 +3113,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
         // streamed drain — the file is copied through a fixed buffer, never held in RAM
         // (SAFE-BIGFILE), and with no lease held, so reads of it are served throughout
-        WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
-          admit: this._AdmitBulkBetween(landing, target));
+        try {
+          WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
+            admit: this._AbandonForFolderRename(this._AdmitBulkBetween(landing, target)));
+        } catch (OperationCanceledException) {
+          try {
+            target.Delete(path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, false);
+          } catch (PoolFsException) {
+            // an orphaned temp is swept on the next mount
+          }
+
+          this._journal.Complete(sequence, JournalOp.Drain);
+          return true; // the pump comes straight back, after the rename, and finds the file by its new name
+        }
 
         // TOCTOU guard (SAFE-NOLOSS): between the pre-image and here, a foreground write could have
         // opened, rewritten and closed this file. If it is now open/dirty, or its size/mtime
@@ -3156,6 +3272,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// (SAFE-DUP). Active files are skipped — they converge through the write path.
   /// </summary>
   private bool _HealOne(string normalized) {
+    using var namespaceHold = this._EnterNamespaceShared(); // as the drainer: its target folders must not outlive a rename
     if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized)) {
       // Busy right now — but PUT IT BACK. Dropping it here means a file that merely happened to be
       // open when the healer reached it is never healed at all, because nothing enumerates it again
@@ -3263,9 +3380,25 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       target.EnsureFolder(PoolPaths.GetParent(normalized), true);
       var from = source!;
       var before = from.Volume.Stat(normalized, from.Shadow);
-      var published = WholeFilePublisher.CopyBetween(from.Volume, normalized, from.Shadow, target, normalized, true,
-        admit: this._AdmitBulkBetween(from.Volume, target),
-        commit: () => this._CommitHealedCopy(normalized, from, before));
+      bool published;
+      try {
+        published = WholeFilePublisher.CopyBetween(from.Volume, normalized, from.Shadow, target, normalized, true,
+          admit: this._AbandonForFolderRename(this._AdmitBulkBetween(from.Volume, target)),
+          commit: () => this._CommitHealedCopy(normalized, from, before));
+      } catch (OperationCanceledException) {
+        // a folder rename is waiting: give way at once. The file is about to live under another
+        // name, so re-queueing THIS path would find nothing — ask for a rescan instead.
+        try {
+          target.Delete(normalized + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, true);
+        } catch (PoolFsException) {
+          // an orphaned temp is swept on the next mount
+        }
+
+        this._journal.Complete(sequence, JournalOp.ShadowCreate);
+        Interlocked.Exchange(ref this._healScanRequested, 1);
+        return true;
+      }
+
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
       if (!published) {
         // The file moved on under us and the staged copy was dropped, so this file is STILL under
@@ -3408,6 +3541,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._snapshotHandles.TryRemove(handle.Value, out _);
       return;
     }
+
+    using var namespaceHold = this._EnterNamespaceShared(); // a close can publish, and publishing writes under the path
 
     var open = this._handles.Get(handle);
     var path = open.File.Path;

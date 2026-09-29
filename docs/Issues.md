@@ -2038,3 +2038,55 @@ under exactly one name: landing-zone drain (21 steps), healing a lost copy (21),
 surviving shadow (33), folder rename (12), delete into the bin (16), restore from the bin (22),
 snapshot restore (32), retiring a disk (45). All pass. The delete-into-the-bin case found the loss
 above at step 6.
+
+### Resolved: renaming a folder while a file in it was being written could lose an acknowledged write
+
+With duplication and an ack after one copy (`minCopiesBeforeAck: 1`), a write acknowledges once one
+copy has it and owes the other from the write buffer. A folder rename flushed its children's owed
+copies, then moved the tree, but it held no lease on any file inside. So a write could land in
+between: its acknowledged copy was already on disk and moved with the folder, while the copy it
+owed sat in the buffer under the OLD path. When that flushed there was nothing there any more, and
+it was dropped. The two copies then disagreed for good. Reads served from the stale one returned
+the old bytes, and losing the other disk lost the write.
+
+Found by a new crossing test: a writer streams distinct blocks into an open file while its folder is
+renamed, and every acknowledged block must be in the file under its final name. It failed in about
+one trial in forty (the shadow held the block, the primary did not, nothing left dirty). It asserts
+that the rename genuinely crossed the writes in most trials, so it cannot pass by missing the window.
+
+Leasing each child cannot close this, because a handle opened after the rename looked is a child it
+never saw. Foreground writes and truncates now hold a pool-wide gate SHARED, and a folder rename
+holds it EXCLUSIVELY from its flush until every open child follows the move. Both sides take it
+before any file lease, so it cannot invert against the rename's own flush. A write pays one
+uncontended shared acquire. 15 consecutive runs are clean, and the concurrency stress suite finds
+no deadlock.
+
+### Resolved: a copy into a folder being renamed split between the new name and a resurrected old one
+
+The write race above was the first case of a wider one. Every operation that put something under a
+path resolved the parent first and placed the file after, so a folder rename could land in between.
+A CREATE then recreated the old folder to hold its file, and from that moment every later create in
+the same copy saw the old folder exist and went into it too. A copy into a folder the user renamed
+part-way through ended up split between the new name and a resurrected old one, with a stranded
+`.TEMP` in the duplicated case. Found by a crossing test (files created in a loop while their folder
+is renamed): the old folder came back in about one trial in forty, holding the rest of the copy.
+
+The pool's own movers did the same on their target disk. The landing-zone drainer copied a file whose
+folder was renamed mid-copy into a recreated old folder. Its re-validation threw the stale copy away
+but left the folder, so the old name came back, empty, beside the new one (8 of 30 trials). The
+healer had the same shape with the shadow folders it creates. Cleaning such folders up afterwards is
+not safe: renaming "New folder" and immediately making another "New folder" produces exactly that
+shape on purpose, and a cleanup would delete it.
+
+Now every operation that writes, creates, moves or removes under a path holds the namespace gate
+SHARED, foreground and background alike: create, mkdir, rmdir, unlink, file rename, attributes,
+write, truncate, flush, close, trash restore, the drainer, the healer and the repair a failed read check triggers. A folder rename holds it
+EXCLUSIVELY. The gate is taken before any file lease everywhere, the folder rename included (it used
+to take its two folder leases first), so no order can invert. A rename cannot know it is a folder
+rename until it holds its leases, so it guesses before and confirms after, going round again with
+the gate held exclusively if a "file" turned out to be a folder.
+
+The drainer and the healer hold the gate for a whole file, which on a throttled member can be
+minutes, so a waiting folder rename makes them abandon their copy at the next 1 MiB chunk. That is
+always safe, because the original is untouched until the copy is complete. They delete their temp,
+and retry after the rename under the new name.
