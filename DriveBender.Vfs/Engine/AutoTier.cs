@@ -8,12 +8,14 @@ namespace DivisonM.Vfs.Engine;
 /// observed latency, so a drive that turns slow or busy becomes visible to the auto-tier
 /// advisor without separate benchmarking I/O.
 /// </summary>
-public sealed class MeasuredVolumeIO(IVolumeIO inner) : IVolumeIO {
+public sealed class MeasuredVolumeIO(IVolumeIO inner, TimeProvider? time = null) : IVolumeIO {
 
   private const double _ALPHA = 0.2; // EWMA smoothing: recent behaviour dominates, spikes decay
   private readonly Lock _lock = new();
+  private readonly TimeProvider _time = time ?? TimeProvider.System;
   private double _ewmaMs;
   private long _samples;
+  private long _lastSampleTimestamp;
 
   public IVolumeIO Inner => inner;
 
@@ -31,10 +33,23 @@ public sealed class MeasuredVolumeIO(IVolumeIO inner) : IVolumeIO {
     }
   }
 
+  /// <summary>
+  /// How long ago the average last moved — <see cref="TimeSpan.MaxValue"/> when never measured.
+  /// An average only changes when the member is USED, so one nobody chooses keeps whatever it last
+  /// saw, however long ago and however unrepresentative; a decision that leans on it has to know.
+  /// </summary>
+  public TimeSpan SinceLastSample {
+    get {
+      lock (this._lock)
+        return this._samples == 0 ? TimeSpan.MaxValue : this._time.GetElapsedTime(this._lastSampleTimestamp);
+    }
+  }
+
   private void _Record(double milliseconds) {
     lock (this._lock) {
       this._ewmaMs = this._samples == 0 ? milliseconds : _ALPHA * milliseconds + (1 - _ALPHA) * this._ewmaMs;
       ++this._samples;
+      this._lastSampleTimestamp = this._time.GetTimestamp();
     }
   }
 

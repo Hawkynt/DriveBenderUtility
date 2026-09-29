@@ -256,13 +256,33 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // time the fast one was momentarily busy. Multiplying instead of adding keeps the load-spreading
     // (idle members still separate by queue depth, via the epsilon) and makes a slow member lose to
     // a busy fast one, which is the whole point of having two copies.
+    //
+    // Two further rules keep the measurement from deciding what it cannot tell apart. Both were found
+    // by placement sending every new file to ONE of two identical members, 20 / 0.
+    //
+    // Latency below the floor counts AS the floor. Sub-millisecond readings are noise — a cold first
+    // call, a cache hit, a scheduler tick — and ranked strictly they broke every tie, so the free-space
+    // tiebreak that is meant to spread an idle pool never got a turn: 0.25 ms beat 0.003 ms every time.
+    //
+    // A measurement not refreshed within LatencyStaleAfter is ignored. An average only moves when the
+    // member is used, so the member not chosen kept its first reading forever — here a cold-start
+    // sample from mount, on real hardware the half-second of a spun-down disk waking — and was never
+    // chosen again to correct it. Forgotten, it takes the next file and is measured honestly; a
+    // member that really is slow shows it again at once, and is avoided again. One second, not
+    // five: a burst of new files is over in a few seconds, and on a CI runner's slow disk a
+    // five-second window let a mount-time reading decide an entire 21-file burst (21 / 0) — the
+    // cost of the shorter window is at most one probing file a second on a member idle and slow.
     const double perOperationFloorMs = 1.0;
-    var perOperation = perOperationFloorMs
-                       + (volume is MeasuredVolumeIO { Samples: > 0 } measured ? measured.AverageLatencyMs : 0.0)
-                       + this._queues.ThrottleWaitMsFor(volume.MemberId);
+    var measuredMs = volume is MeasuredVolumeIO { Samples: > 0 } measured && measured.SinceLastSample < LatencyStaleAfter
+      ? measured.AverageLatencyMs
+      : 0.0;
+    var perOperation = Math.Max(perOperationFloorMs, measuredMs) + this._queues.ThrottleWaitMsFor(volume.MemberId);
 
     return (inflight + 1) * perOperation;
   }
+
+  /// <summary>How long a member's measured latency still counts for placement and read routing once it stops being refreshed.</summary>
+  public static readonly TimeSpan LatencyStaleAfter = TimeSpan.FromSeconds(1);
   private readonly ShadowNamespace _shadow = new();
 
   // FR-PAR / §6.4: how wide a request may fan out across the storages behind it, and how much
