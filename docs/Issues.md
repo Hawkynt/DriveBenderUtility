@@ -2029,3 +2029,33 @@ holds it EXCLUSIVELY from its flush until every open child follows the move. Bot
 before any file lease, so it cannot invert against the rename's own flush. A write pays one
 uncontended shared acquire. 15 consecutive runs are clean, and the concurrency stress suite finds
 no deadlock.
+
+### Resolved: a copy into a folder being renamed split between the new name and a resurrected old one
+
+The write race above was the first case of a wider one. Every operation that put something under a
+path resolved the parent first and placed the file after, so a folder rename could land in between.
+A CREATE then recreated the old folder to hold its file, and from that moment every later create in
+the same copy saw the old folder exist and went into it too. A copy into a folder the user renamed
+part-way through ended up split between the new name and a resurrected old one, with a stranded
+`.TEMP` in the duplicated case. Found by a crossing test (files created in a loop while their folder
+is renamed): the old folder came back in about one trial in forty, holding the rest of the copy.
+
+The pool's own movers did the same on their target disk. The landing-zone drainer copied a file whose
+folder was renamed mid-copy into a recreated old folder. Its re-validation threw the stale copy away
+but left the folder, so the old name came back, empty, beside the new one (8 of 30 trials). The
+healer had the same shape with the shadow folders it creates. Cleaning such folders up afterwards is
+not safe: renaming "New folder" and immediately making another "New folder" produces exactly that
+shape on purpose, and a cleanup would delete it.
+
+Now every operation that writes, creates, moves or removes under a path holds the namespace gate
+SHARED, foreground and background alike: create, mkdir, rmdir, unlink, file rename, attributes,
+write, truncate, flush, close, trash restore, the drainer, the healer and the repair a failed read check triggers. A folder rename holds it
+EXCLUSIVELY. The gate is taken before any file lease everywhere, the folder rename included (it used
+to take its two folder leases first), so no order can invert. A rename cannot know it is a folder
+rename until it holds its leases, so it guesses before and confirms after, going round again with
+the gate held exclusively if a "file" turned out to be a folder.
+
+The drainer and the healer hold the gate for a whole file, which on a throttled member can be
+minutes, so a waiting folder rename makes them abandon their copy at the next 1 MiB chunk. That is
+always safe, because the original is untouched until the copy is complete. They delete their temp,
+and retry after the rename under the new name.

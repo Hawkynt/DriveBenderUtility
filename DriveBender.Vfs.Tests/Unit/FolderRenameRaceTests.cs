@@ -108,4 +108,74 @@ public class FolderRenameRaceTests {
     failures.Should().BeEmpty("a write the pool acknowledged must be in the file under its final name");
   }
 
+  [TestCase("""{ "duplication": 1 }""", TestName = "RenameFolder_GivenFilesAreBeingCreatedInItInAnUnduplicatedPool_ThenEachEndsUpUnderTheNewNameOrWasRefused")]
+  [TestCase("""{ "duplication": 2 }""", TestName = "RenameFolder_GivenFilesAreBeingCreatedInItInADuplicatedPool_ThenEachEndsUpUnderTheNewNameOrWasRefused")]
+  [Category("EdgeCase")]
+  public void RenameFolder_GivenFilesAreBeingCreatedInIt_ThenEachEndsUpUnderTheNewNameOrWasRefused(string config) {
+    // A copy into a folder while somebody renames it. Each file is created either BEFORE the rename
+    // (so it moves with the folder) or AFTER it (so its parent is gone and the create is refused).
+    // What must never happen is the third outcome: the old folder brought back to hold it.
+    using var fs = _Engine(config, out var members);
+    var failures = new List<string>();
+    var overlapped = 0;
+
+    for (var trial = 0; trial < _TRIALS; ++trial) {
+      var from = $"c{trial}";
+      var to = $"d{trial}";
+      fs.Create(from, NodeKind.Directory, CreateFlags.None);
+
+      var created = new bool[_BLOCKS];
+      var started = new ManualResetEventSlim();
+      var copier = new Thread(() => {
+        for (var file = 0; file < _BLOCKS; ++file) {
+          if (file == 4)
+            started.Set();
+          try {
+            var handle = fs.Create($"{from}/f{file}.bin", NodeKind.File, CreateFlags.None);
+            fs.Write(handle, _Block(trial, file), 0, WriteMode.Normal);
+            fs.Close(handle);
+            created[file] = true;
+          } catch (PoolFsException) {
+            // refused because the folder is gone: the honest answer to a create that lost the race
+          }
+        }
+
+        started.Set();
+      });
+      copier.Start();
+      started.Wait();
+      fs.Rename(from, to, RenameFlags.None);
+      if (copier.IsAlive)
+        ++overlapped;
+      copier.Join();
+      fs.CreateScheduler().Quiesce();
+
+      foreach (var member in members)
+        if (member.FolderExists(from, false))
+          failures.Add($"trial {trial}: '{from}' came back on {member.DisplayName} holding "
+                       + string.Join(", ", member.FilePaths.Where(p => p.StartsWith(from + "/", StringComparison.Ordinal))));
+
+      for (var file = 0; file < _BLOCKS; ++file) {
+        if (!created[file])
+          continue;
+
+        var path = $"{to}/f{file}.bin";
+        var content = new byte[_BLOCK];
+        try {
+          var reader = fs.Open(path, AccessMode.Read, ShareMode.Read);
+          fs.Read(reader, content, 0);
+          fs.Close(reader);
+          if (!content.AsSpan().SequenceEqual(_Block(trial, file)))
+            failures.Add($"trial {trial}: created '{path}' is not whole");
+        } catch (PoolFsException e) {
+          failures.Add($"trial {trial}: created 'f{file}.bin' is not under '{to}' ({e.Error})");
+        }
+      }
+    }
+
+    TestContext.Out.WriteLine($"{overlapped} of {_TRIALS} renames landed while files were still being created");
+    overlapped.Should().BeGreaterThan(_TRIALS / 8, "the rename must genuinely cross the creates, or this proves nothing");
+    failures.Should().BeEmpty("a created file moves with its folder or was refused — the old folder never comes back");
+  }
+
 }
