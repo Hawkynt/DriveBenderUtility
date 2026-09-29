@@ -881,6 +881,20 @@ would touch; writing "the media operations relocate whole files, so a pinned ver
 too" is the kind of sentence that is easy to write and easy not to check. Checking it took one grep
 and turned up a live data-loss bug in a feature shipped two changes earlier.
 
+### Resolved: a replace-media that stopped part-way lost every file it had moved
+
+`pool-replace-media` MOVES each file (copy to the new disk, delete from the old) and added the new
+disk to the pool only once every file had gone across. Anything that stopped it part-way left the
+files moved so far on a folder the pool did not know about, and no longer on the old disk. That
+includes a read error on the old disk (the very disk being replaced because it is failing), a new
+disk too small, a power cut, or Ctrl+C. Reproduced end to end on an unduplicated pool: one file
+unreadable, the command failed, and the files it had already moved were gone from the mounted pool.
+
+The new disk now joins the pool before a single file moves, so a failure at any point leaves every
+file on a member, and running the same command again resumes the swap (an existing membership of
+the new folder is taken up rather than refused). The migration's journal intents now name the
+member id the manifest actually records; they used to name a throwaway id.
+
 ### The recycle bin, finished: API and screen
 
 The CLI verbs made the bin reachable; they did not make it usable, because a backup target is
