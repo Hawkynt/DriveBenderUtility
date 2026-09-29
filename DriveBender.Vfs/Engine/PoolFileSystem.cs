@@ -265,6 +265,38 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
   private readonly ShadowNamespace _shadow = new();
 
+  /// <summary>
+  /// Held SHARED by every foreground write and truncate, EXCLUSIVELY by a folder rename.
+  ///
+  /// A folder rename moves every file under it at once, and until this existed it held a lease on
+  /// the two folder paths and on no file inside them. So a write to a child could land between the
+  /// rename flushing the children and moving the tree: its acknowledged copy was already on disk
+  /// and moved with the folder, but the copy it still owed sat in the write buffer under the OLD
+  /// path — and when that flushed there was nothing there any more, so it was dropped. The copies
+  /// then disagreed for good: reads from the stale one returned the old bytes, and losing the
+  /// other disk lost the write. A crossing test caught it in about one trial in forty.
+  ///
+  /// Leasing each child instead cannot close it: a handle opened after the rename looked is a child
+  /// it never saw. Taken BEFORE any file lease, on both sides, so it cannot invert against the
+  /// rename's own flush of those children. Uncontended except against a folder rename, which is
+  /// rare, so a write pays one uncontended shared acquire.
+  /// </summary>
+  private readonly ReaderWriterLockSlim _folderRenameGate = new(LockRecursionPolicy.SupportsRecursion);
+
+  private readonly struct GateHold(ReaderWriterLockSlim gate, bool exclusive) : IDisposable {
+    public void Dispose() {
+      if (exclusive)
+        gate.ExitWriteLock();
+      else
+        gate.ExitReadLock();
+    }
+  }
+
+  private GateHold _EnterWriteGate() {
+    this._folderRenameGate.EnterReadLock();
+    return new(this._folderRenameGate, false);
+  }
+
   // FR-PAR / §6.4: how wide a request may fan out across the storages behind it, and how much
   // any one device is allowed to have outstanding at once (CFG.io.queueDepthPerVolume)
   private readonly VolumeQueues _queues;
@@ -1323,6 +1355,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       throw new PoolFsException(PoolFsError.NotFound, $"Target parent folder not found: {toNormalized}");
     if (this._Online.Any(m => m.FolderExists(toNormalized, false) || m.FileExists(toNormalized, false)))
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toNormalized}");
+
+    // no write may reach a child from the flush below until every open child follows the move
+    this._folderRenameGate.EnterWriteLock();
+    using var gate = new GateHold(this._folderRenameGate, true);
 
     // dirty children must land under the old name before the tree moves (SAFE-NOLOSS), and
     // children still being written publish first so no temp names travel with the subtree
@@ -2463,6 +2499,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // a private array the driver's span is copied into ONCE: it is handed to the copies, then
     // (if owed) to the write buffer, which takes ownership of it rather than cloning again
     var bytes = data.ToArray();
+    using var gate = this._EnterWriteGate(); // before the lease: a folder rename must not move the file mid-write
     using var lease = this._handles.AcquireWrite(open.File.Path); // by PATH — see Read
     try {
       var path = lease.File.Path;
@@ -2793,6 +2830,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (length < 0)
       throw new PoolFsException(PoolFsError.InvalidArgument, "Negative length");
 
+    using var gate = this._EnterWriteGate(); // before the lease, as in Write
     using var lease = this._handles.AcquireWrite(open.File.Path); // by PATH — see Read
     try {
       var path = lease.File.Path;
