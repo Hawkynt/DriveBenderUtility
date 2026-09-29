@@ -30,6 +30,20 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
     ? copies.Select(c => c.Member.MemberId).Distinct().Count()
     : copies.Select(c => c.Member.PhysicalVolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count();
 
+  /// <summary>The coverage the members staying behind can give a file: the duplication level, or every independent disk left.</summary>
+  private int _ReachableCoverage(IVolumeIO leaving) {
+    var staying = this._Online.Where(m => m != leaving).ToArray();
+    var reachable = allowSamePhysical
+      ? staying.Length
+      : staying.Select(m => m.PhysicalVolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+    return Math.Min(duplicationLevel, reachable);
+  }
+
+  /// <summary>Whether a copy exists that does not share the leaving member's fate.</summary>
+  private bool _SurvivesOffDomain(IReadOnlyList<Copy> elsewhere, IVolumeIO leaving) => allowSamePhysical
+    ? elsewhere.Count > 0
+    : elsewhere.Any(c => !string.Equals(c.Member.PhysicalVolumeId, leaving.PhysicalVolumeId, StringComparison.OrdinalIgnoreCase));
+
   /// <summary>Files that are below their duplication level or missing a primary (read-only audit for health checks).</summary>
   public int CountUnderDuplicated() {
     var count = 0;
@@ -131,14 +145,22 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
 
       var elsewhere = allCopies.Where(c => c.Member.MemberId != memberId).ToList();
       foreach (var copy in here) {
-        // ensure the content survives on another domain (or member, when co-location is allowed) first
-        var survivesElsewhere = allowSamePhysical
-          ? elsewhere.Count > 0
-          : elsewhere.Any(c => c.Member.PhysicalVolumeId != leaving.PhysicalVolumeId);
-        if (!survivesElsewhere) {
+        // Before this copy goes, the members that stay must hold the file at its duplication level —
+        // or on every independent disk left, when fewer remain. It used to be enough that ONE copy
+        // survived elsewhere, and no new ones were made: retiring a disk with duplication 2 and a disk
+        // to spare left every file it held with a single copy until some later mount's healer caught
+        // up, so protection quietly halved at the very moment somebody was changing hardware.
+        while (this._Coverage(elsewhere) < this._ReachableCoverage(leaving) || !this._SurvivesOffDomain(elsewhere, leaving)) {
           var size = _Size(copy);
-          var target = this._ChooseTarget(elsewhere, size, leaving)
-                       ?? throw new PoolFsException(PoolFsError.NoSpace, $"Nowhere to move '{path}' off '{leaving.DisplayName}'");
+          var target = this._ChooseTarget(elsewhere, size, leaving);
+          if (target == null) {
+            if (this._SurvivesOffDomain(elsewhere, leaving)) {
+              DriveBender.Logger($"[Warning]'{path}' is below its duplication level after removing '{leaving.DisplayName}' — no room for another copy; the healer will retry");
+              break;
+            }
+
+            throw new PoolFsException(PoolFsError.NoSpace, $"Nowhere to move '{path}' off '{leaving.DisplayName}'");
+          }
 
           var sequence = journal.LogIntent(JournalOp.Rebalance, path, memberId: target.MemberId);
           var parent = PoolPaths.GetParent(path);

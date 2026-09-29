@@ -1974,3 +1974,36 @@ Measured, random 4 KiB writes to an existing file, engine only: **232 → ~720 p
 every policy. Inside a session a write is now two storage operations — its two copies — where it
 was six. Removing the session intent fails six cases of the step-interrupted write scenario; a new
 scenario interrupts the third write of a session and requires the first two to survive.
+
+### Resolved: a power cut while deleting into the recycle bin could lose the file
+
+Found by interrupting a delete-into-the-bin at every storage step. The move renames the file into the
+bin first and writes its `.trashinfo` sidecar second; the bin only listed files that HAD a sidecar.
+A power cut between the two left the file neither in place nor listed — so neither restorable nor
+ever purged, lost to the user while its bytes sat on the disk — and recovery then finished the move
+for the other copy too. A sidecar deleted or mangled by hand stranded its file the same way.
+
+The bin no longer depends on the sidecar to find a file that is physically in it: a trashed file
+without a usable sidecar is listed and restored from its own name, which carries its original path.
+Its only known date is then the content's mtime, which says nothing about when it was deleted — a
+document last edited years ago and deleted today would be purged at once — so a purge first gives
+it a real sidecar dated now, and it gets its full retention from there.
+
+### Resolved: retiring a disk left its files below their duplication level
+
+`pool-remove-media` deleted each copy on the leaving disk as soon as ONE copy survived elsewhere, and
+made no new ones, though it is given the duplication level. With duplication 2 and a disk to spare,
+every file the retired disk held was left with a single copy until some later mount's healer caught
+up — protection quietly halved at the very moment somebody was changing hardware. It now tops each
+file up to its duplication level (or every independent disk left) on the members that stay, copying
+before deleting as before; with nowhere to put another copy it keeps the survivor, warns, and
+leaves the rest to the healer. An existing test asserted the old behaviour ("no relocation needed")
+and now asserts the new one, with the no-spare-disk case pinned beside it.
+
+### Crash coverage for everything that moves data in bulk
+
+Interrupted at every storage step, power lost, remounted — each must leave every file whole and
+under exactly one name: landing-zone drain (21 steps), healing a lost copy (21), promoting the only
+surviving shadow (33), folder rename (12), delete into the bin (16), restore from the bin (22),
+snapshot restore (32), retiring a disk (45). All pass. The delete-into-the-bin case found the loss
+above at step 6.

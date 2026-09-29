@@ -9,6 +9,13 @@ public sealed record TrashEntry(string OriginalPath, DateTime DeletedUtc, long L
 internal sealed record TrashInfo {
   [JsonPropertyName("originalPath")] public required string OriginalPath { get; init; }
   [JsonPropertyName("deletedUtc")] public required DateTime DeletedUtc { get; init; }
+
+  /// <summary>
+  /// Reconstructed from the trashed file's own name because its sidecar is missing or unreadable
+  /// — never written to disk as such. DeletedUtc is then only the content's mtime, which says
+  /// nothing about when it was deleted; a purge re-dates it before retention can act on it.
+  /// </summary>
+  [JsonIgnore] public bool Reconstructed { get; init; }
 }
 
 /// <summary>
@@ -28,6 +35,26 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
 
   private static string _BaseTrashPathFor(string normalizedPath) => $"{TrashPrefix}/{normalizedPath}";
   private static string _InfoPathFor(string trashPath) => trashPath + ".trashinfo";
+
+  /// <summary>
+  /// The original path a trashed file was deleted from, read back out of its trash name
+  /// (<c>trash/&lt;original&gt;.&lt;hex token&gt;.trashver</c>) - for when its sidecar is gone.
+  /// </summary>
+  private static bool _TryOriginalPathOf(string trashPath, out string original) {
+    const string suffix = ".trashver";
+    original = "";
+    var prefix = TrashPrefix + "/";
+    if (!trashPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || !trashPath.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+      return false;
+
+    var body = trashPath[prefix.Length..^suffix.Length];
+    var dot = body.LastIndexOf('.');
+    if (dot <= 0 || dot == body.Length - 1 || !body[(dot + 1)..].All(char.IsAsciiHexDigit))
+      return false;
+
+    original = PoolPaths.Normalize(body[..dot]);
+    return original.Length > 0;
+  }
 
   /// <summary>
   /// A unique trash destination for this deletion: the original path plus a monotonic token,
@@ -127,6 +154,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
         continue;
       }
 
+      var described = new HashSet<string>(PoolPaths.PathComparer);
       foreach (var item in items) {
         var childPath = $"{folder}/{item.Name}";
         if (item.IsDirectory) {
@@ -143,12 +171,31 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
           using var reader = new StreamReader(stream, Encoding.UTF8);
           info = JsonSerializer.Deserialize<TrashInfo>(reader.ReadToEnd());
         } catch (PoolFsException) {
-          // unreadable sidecar: skip; purge cleans it up eventually
+          // unreadable sidecar: the file it described is still found below, by its own name
         } catch (JsonException) {
         }
 
-        if (info != null)
+        if (info != null) {
+          described.Add(childPath[..^".trashinfo".Length]);
           yield return (childPath[..^".trashinfo".Length], info);
+        }
+      }
+
+      // A trashed file whose sidecar is missing or unreadable is still in the bin. It used to be
+      // invisible - neither in place nor listed, so neither restorable nor ever purged: lost to the
+      // user while its bytes sat on the disk. A power cut between moving a file into the bin and
+      // writing its sidecar did exactly that (a crash scenario lost the file at that step), and so
+      // did a sidecar deleted or mangled by hand. The file's own name carries its original path, so
+      // it is listed from that instead.
+      foreach (var item in items) {
+        if (item.IsDirectory || !item.Name.EndsWith(".trashver", StringComparison.OrdinalIgnoreCase))
+          continue;
+
+        var trashPath = $"{folder}/{item.Name}";
+        if (described.Contains(trashPath) || !_TryOriginalPathOf(trashPath, out var original))
+          continue;
+
+        yield return (trashPath, new() { OriginalPath = original, DeletedUtc = item.LastWriteTimeUtc, Reconstructed = true });
       }
     }
   }
@@ -181,6 +228,13 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   /// </summary>
   public int Purge(TimeSpan retention, long maxSizeBytes) {
     var now = clock();
+
+    // A file found in the bin without a usable sidecar is listed by its content's mtime, which says
+    // nothing about when it was deleted - a document last edited two years ago and deleted today
+    // would be purged on the spot. Give it a real sidecar first, dated now, so it gets the full
+    // retention it was promised from the moment the pool noticed it.
+    this._RepairReconstructed(now);
+
     var entries = this.List();
 
     // A deletion date in the FUTURE is nonsense, and the arithmetic below cannot survive it:
@@ -216,6 +270,25 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
     }
 
     return purged;
+  }
+
+  /// <summary>Writes a real sidecar, dated <paramref name="now"/>, for every trashed file that lacks a usable one.</summary>
+  private void _RepairReconstructed(DateTime now) {
+    foreach (var member in this._Online)
+    foreach (var (trashPath, info) in this._EntriesOn(member).ToArray()) {
+      if (!info.Reconstructed)
+        continue;
+
+      try {
+        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new TrashInfo { OriginalPath = info.OriginalPath, DeletedUtc = now }));
+        using var stream = member.OpenWrite(_InfoPathFor(trashPath), false, true);
+        stream.SetLength(0);
+        stream.Write(bytes, 0, bytes.Length);
+        stream.Flush();
+      } catch (PoolFsException e) {
+        DriveBender.Logger($"[Warning]Could not re-describe trashed '{info.OriginalPath}' on '{member.DisplayName}': {e.Message}");
+      }
+    }
   }
 
   /// <summary>
