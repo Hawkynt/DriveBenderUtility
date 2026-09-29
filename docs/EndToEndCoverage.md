@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36582138761](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36582138761).
+Generated from run: [36610607518](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36610607518).
 
-245 scenarios — 224 passing on at least one target, 0 failing.
+246 scenarios — 225 passing on at least one target, 1 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -96,6 +96,7 @@ Generated from run: [36582138761](https://github.com/Hawkynt/DriveBenderUtility/
 | MediaReplace | `Replace_GivenAMemberHoldsFiles_ThenTheyAreServedFromTheReplacement` | Replacing a disk carries the ordinary files across and the pool serves them from the new one. | pass | pass |
 | MediaReplace | `Replace_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable` | Replacing the disk that holds a snapshot's preserved versions: the snapshot is still restorable afterwards. | pass | pass |
 | MediaReplace | `Replace_GivenTheMemberHoldsTheRecycleBin_ThenDeletedFilesAreStillRecoverable` | Replacing the disk that holds the recycle bin: deleted files are still listed and still restorable. | pass | pass |
+| MediaReplace | `Replace_GivenTheMigrationFailsPartWay_ThenEveryFileIsStillInThePoolAndARerunFinishesIt` | A replace that fails part-way leaves every file in the pool, and running it again finishes the job. | pass | pass |
 | MediaReplace | `Replace_GivenTheOldMemberIsOffline_ThenItIsRefusedRatherThanAbandoningItsData` | Replacing a member that is not there is refused: its data would be abandoned rather than migrated. | pass | pass |
 | MemberFailureLatency | `Cripple_GivenAMemberFailsEveryOperationWithoutGoingOffline_ThenReadsStillCompletePromptly` | A member that is still present but fails every operation is routed around: reads keep completing promptly from the healthy copy. | skipped | pass |
 | MemberFailureLatency | `Eject_GivenEveryMemberGoesAndOneComesBack_ThenItsContentIsServedAgain` | Every member goes away and one comes back: its content is served again rather than the pool staying dark. | pass | pass |
@@ -112,7 +113,7 @@ Generated from run: [36582138761](https://github.com/Hawkynt/DriveBenderUtility/
 | MemberLoss | `Eject_GivenAFileIsDeletedWhileAMemberIsAway_ThenItDoesNotResurrectOnItsReturn` | Given AFile Is Deleted While AMember Is Away , then It Does Not Resurrect On Its Return | pass | pass |
 | MemberLoss | `Eject_GivenAMemberIsAway_ThenWritesStillSucceedAndHealWhenItReturns` | Given AMember Is Away , then Writes Still Succeed And Heal , when It Returns | pass | pass |
 | MemberLoss | `Eject_GivenAMemberIsPulled_ThenExistingFilesStayReadableFromTheSurvivor` | Given AMember Is Pulled , then Existing Files Stay Readable From The Survivor | pass | pass |
-| MemberLoss | `Eject_GivenAMemberReturnsWhileIoIsInFlight_ThenNothingIsCorruptedOrStalled` | Given AMember Returns While Io Is In Flight , then Nothing Is Corrupted Or Stalled | pass | pass |
+| MemberLoss | `Eject_GivenAMemberReturnsWhileIoIsInFlight_ThenNothingIsCorruptedOrStalled` | Given AMember Returns While Io Is In Flight , then Nothing Is Corrupted Or Stalled | **FAIL** | pass |
 | MemberLoss | `Eject_GivenAMemberVanishesDuringAWrite_ThenTheDataThatWasAcknowledgedIsIntact` | Given AMember Vanishes During AWrite , then The Data That Was Acknowledged Is Intact | pass | pass |
 | MemberLoss | `Eject_GivenEveryMemberIsGone_ThenOperationsFailCleanlyInsteadOfHanging` | Given Every Member Is Gone , then Operations Fail Cleanly Instead Of Hanging | pass | pass |
 | MetadataFidelity | `Heal_GivenTheFileWasOnlyReadThroughTheMount_ThenItsLostCopyIsStillRebuilt` | A file that was only READ since the mount is still healed after its other copy is lost. | pass | pass |
