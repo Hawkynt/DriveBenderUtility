@@ -158,6 +158,57 @@ public class MediaReplaceEndToEndTests {
 
   [Test]
   [Category("Exception")]
+  [Description("A replace that fails part-way leaves every file in the pool, and running it again finishes the job.")]
+  public void Replace_GivenTheMigrationFailsPartWay_ThenEveryFileIsStillInThePoolAndARerunFinishesIt() {
+    // Replace MOVES each file: copy to the new disk, delete from the old. It used to add the new disk
+    // to the pool only at the very end — so anything that stopped it part-way (a read error, a new
+    // disk too small, a power cut, Ctrl+C) left every file moved so far on a folder the pool did not
+    // know about, and gone from the pool. Unduplicated here, so there is no other copy to hide it.
+    using var pool = MountedPool.Create(members: 2);
+    var contents = new Dictionary<string, byte[]>();
+    for (var i = 0; i < 8; ++i) {
+      var name = $"doc{i}.bin";
+      contents[name] = _Payload(16 * 1024, 310 + i);
+      File.WriteAllBytes(pool.PathTo(name), contents[name]);
+    }
+
+    var replacement = _NewDisk(pool, "swap-in-partial");
+    var old = "";
+    pool.WhileUnmounted(() => {
+      string[] HeldBy(string member) => [.. contents.Keys.Where(n => File.Exists(Path.Combine(member, n))).Order(StringComparer.Ordinal)];
+      old = pool.MemberPaths.OrderByDescending(m => HeldBy(m).Length).First();
+      var held = HeldBy(old);
+      held.Length.Should().BeGreaterThanOrEqualTo(2, $"the swapped disk must hold files to strand.{Environment.NewLine}{pool.DescribeMembers()}");
+
+      // the last file in walk order cannot be read, so the migration fails after moving the rest
+      using (File.Open(Path.Combine(old, held[^1]), FileMode.Open, FileAccess.Read, FileShare.None)) {
+        var failed = DbMount.Run(_CLI, "pool-replace-media", pool.PoolName, "--old", old, "--new", replacement);
+        failed.Succeeded.Should().BeFalse($"a file it cannot read must fail the replace.{Environment.NewLine}{failed.Output}");
+      }
+
+      Directory.EnumerateFiles(replacement, "doc*.bin").Should().NotBeEmpty(
+        $"the migration must have got part-way, or this scenario strands nothing.{Environment.NewLine}{pool.DescribeMembers()}");
+    });
+
+    foreach (var (name, content) in contents)
+      File.ReadAllBytes(pool.PathTo(name)).Should().Equal(content,
+        $"'{name}' must still be in the pool after a replace that failed part-way — the files already "
+        + $"moved live on the new disk, which must therefore already be part of the pool."
+        + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+
+    pool.WhileUnmounted(() => DbMount.RunExpectingSuccess(_CLI,
+      "pool-replace-media", pool.PoolName, "--old", old, "--new", replacement));
+
+    foreach (var (name, content) in contents)
+      File.ReadAllBytes(pool.PathTo(name)).Should().Equal(content,
+        $"and running it again finishes the swap without losing '{name}'."
+        + $"{Environment.NewLine}{pool.DescribeMembers()}{Environment.NewLine}{pool.MountLog}");
+
+    contents.Keys.Where(n => File.Exists(Path.Combine(replacement, n))).Should().NotBeEmpty("the new disk holds the migrated files");
+  }
+
+  [Test]
+  [Category("Exception")]
   [Description("Replacing a member that is not there is refused: its data would be abandoned rather than migrated.")]
   public void Replace_GivenTheOldMemberIsOffline_ThenItIsRefusedRatherThanAbandoningItsData() {
     // Replace reads the departing disk to copy it. A source that cannot be read migrates nothing,

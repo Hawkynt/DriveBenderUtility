@@ -430,15 +430,30 @@ internal static class PoolOpsCommand {
     // the replacement is a fresh local member folder (created if missing)
     if (!host.DirectoryExists(options.New))
       host.CreateDirectory(options.New);
-    var replacementId = Guid.NewGuid();
-    IVolumeIO replacement = new LocalVolumeIO(replacementId, options.New, options.New, host.GetVolumeIdentity(options.New).PhysicalVolumeId);
 
-    var ios = online.Select(m => m.io).Append(replacement).ToArray();
+    // The replacement joins the pool BEFORE a single file moves. Replace moves each file — copy to
+    // the new disk, delete from the old — and the new disk used to be added only once all of them
+    // had gone across. Anything that stopped it part-way (a read error, a new disk too small, a
+    // power cut, Ctrl+C) left every file moved so far on a folder the pool did not know about: gone
+    // from the pool, with the old disk no longer holding it either. As a member from the start, the
+    // new disk keeps them in the pool whatever happens, and running the command again resumes the
+    // swap — which is why an existing membership is taken up rather than refused.
+    var newPath = MemberSchemes.ExpandLocal(options.New);
+    var manifest = pool.Manifest;
+    var joined = manifest.Members.FirstOrDefault(m => m.Path.Equals(newPath, StringComparison.OrdinalIgnoreCase));
+    if (joined == null) {
+      var before = manifest.Members.Select(m => m.MemberId).ToHashSet();
+      manifest = lifecycle.AddMember(manifest, new(options.New), force: true);
+      joined = manifest.Members.Single(m => !before.Contains(m.MemberId));
+    } else if (joined.MemberId == oldMember.MemberId)
+      throw new ManifestException($"'{options.New}' is the member being replaced");
+
+    IVolumeIO replacement = new LocalVolumeIO(joined.MemberId, newPath, newPath, host.GetVolumeIdentity(newPath).PhysicalVolumeId);
+    var ios = online.Select(m => m.io).Where(io => io.MemberId != joined.MemberId).Append(replacement).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
     new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit).Replace(oldMember.MemberId, replacement);
 
-    var withReplacement = lifecycle.AddMember(pool.Manifest, new(options.New), force: true);
-    lifecycle.RemoveMember(withReplacement, oldMember.MemberId);
+    lifecycle.RemoveMember(manifest, oldMember.MemberId);
     Console.WriteLine($"Replaced media '{oldMember.Label ?? oldMember.Path}' with '{options.New}' in pool '{pool.Name}'.");
     return 0;
   }
