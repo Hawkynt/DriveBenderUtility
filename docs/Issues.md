@@ -2007,3 +2007,32 @@ under exactly one name: landing-zone drain (21 steps), healing a lost copy (21),
 surviving shadow (33), folder rename (12), delete into the bin (16), restore from the bin (22),
 snapshot restore (32), retiring a disk (45). All pass. The delete-into-the-bin case found the loss
 above at step 6.
+
+### Resolved: placement could latch onto one member and never use the others
+
+The brownout placement scenario failed on Windows CI with its HEALTHY baseline at 0 / 21: every new
+file on one member of two, with nothing wrong with either. Earlier lopsided baselines in the same
+scenario (12 / 1, above) had been put down to the host. They were this.
+
+Placement ranks members by `(work in flight + 1) × (cost per operation)`, the cost coming from each
+member's measured latency. Two things let the measurement decide what it cannot tell apart:
+
+- **Sub-millisecond differences were ranked strictly.** Whichever member saw a cold first call at
+  mount read a quarter of a millisecond slower, and that decided every file. The free-space
+  tiebreak that is meant to spread an idle pool never got a turn. Latency below the 1 ms floor now
+  counts as the floor.
+- **A measurement nobody refreshes never expired.** A latency average only moves when its member is
+  used, so the member not chosen kept its first reading forever and was never chosen again to
+  correct it. On real hardware that first reading can be a spun-down disk waking (half a second),
+  which kept a healthy disk out of rotation for the life of the mount. The same score routes reads
+  between duplicate copies, so a copy measured slow once was never read from again either. A
+  reading not refreshed within 5 s is now ignored: the member takes the next file and is measured
+  honestly, and a member that really is slow shows it again at once and is avoided again.
+
+The effect on a pool of separate disks was one disk's throughput, however many it had. Engine
+tests reproduce both (0 / 20 before), with the staleness window pinned on both sides (4 s still
+avoided, 6 s tried again) and a genuinely slow member still avoided. Removing either rule fails its
+own test. On the real driver the brownout baseline is now 11 / 10, and a collapsed member still
+sheds new files (2 / 19).
+
+Still open: the opt-in `lowest-latency` strategy ranks by measurement alone and ranks unmeasured members last, so it can latch the same way; it is left as it is, being an explicit choice to trust the measurement.
