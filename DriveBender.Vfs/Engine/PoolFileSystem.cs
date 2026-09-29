@@ -2052,6 +2052,26 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// the write path lands here on every write: with the common minCopiesBeforeAck of 1 the ack
   /// set is exactly one copy, so that whole apparatus was set up to schedule one call.
   /// </summary>
+  /// <summary>
+  /// Runs <paramref name="body"/> for every copy in parallel and rethrows the first failure AS IT WAS
+  /// thrown. Parallel.For wraps failures in an AggregateException, which every engine caller and the
+  /// driver adapters read as "unexpected" — so a full disk or a dropped member would surface as a
+  /// generic I/O error instead of the specific one the application should see.
+  /// </summary>
+  private static void _ForEachCopy(IReadOnlyList<PhysicalCopy> copies, Action<int> body) {
+    var failures = new Exception?[copies.Count];
+    _ForEachIndex(copies.Count, _ParallelOver(copies, copies.Count), i => {
+      try {
+        body(i);
+      } catch (Exception e) {
+        failures[i] = e;
+      }
+    });
+
+    if (failures.FirstOrDefault(f => f != null) is { } first)
+      System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(first);
+  }
+
   private static void _ForEachIndex(int count, ParallelOptions options, Action<int> body) {
     if (count <= 0)
       return;
@@ -3405,13 +3425,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // that an application was told had been saved.
       // in parallel: each copy's barrier is a wait on its own disk queue, and there is no ordering
       // between copies to preserve — only between every copy's content and any rename
-      _ForEachIndex(copies.Count, _ParallelOver(copies, copies.Count), i => {
+      _ForEachCopy(copies, i => {
         var copy = copies[i];
         if ((copy.Volume.Caps & BackendCaps.DurableFlush) != 0)
           using (var stream = copy.Volume.OpenWrite(stagedName, copy.Shadow, false))
             stream.Flush();
       });
 
+      // One after another, deliberately: renaming the copies in parallel was measured and bought
+      // nothing (the members shared a disk, and the renames queued there either way).
       foreach (var copy in copies)
         copy.Volume.AtomicReplace(stagedName, normalized, copy.Shadow);
     } catch {
