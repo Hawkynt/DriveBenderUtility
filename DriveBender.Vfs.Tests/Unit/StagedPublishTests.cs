@@ -75,4 +75,61 @@ public class StagedPublishTests {
         "and what is published is what was written");
   }
 
+
+  [Test]
+  [Category("Exception")]
+  public void Publish_GivenOnlyOneCopysRenameFails_ThenTheErrorIsTheRealOneAndEveryCopyEndsPublished() {
+    // Renames of the copies run in parallel, so one can succeed while the other fails. The caller
+    // must see the member's own error — not a wrapper the driver would report as "unexpected" — and
+    // the retry must finish the copy that is still under its temp name without disturbing the other.
+    var fs = this._Mounted();
+
+    var handle = fs.Create("half.doc", NodeKind.File, CreateFlags.None);
+    fs.Write(handle, [5, 6, 7], 0, WriteMode.Normal);
+
+    this._a.FailNext(VolumeOp.AtomicReplace, PoolFsError.NoSpace);
+
+    // caught by hand: FluentAssertions' Throw<T> looks INSIDE an AggregateException, so it cannot
+    // tell the wrapped failure this guards against from the real one
+    _Thrown(() => fs.Close(handle)).Should().BeOfType<PoolFsException>("the driver adapters translate only the engine's own error type")
+      .Which.Error.Should().Be(PoolFsError.NoSpace, "a full disk must reach the application as a full disk");
+
+    this._a.ClearFaults();
+    fs.Unmount();
+
+    foreach (var volume in new[] { this._a, this._b }) {
+      volume.FilePaths.Should().NotContain(path => path.Contains(".TEMP.", StringComparison.OrdinalIgnoreCase),
+        $"no copy may be left under its temp name on '{volume.DisplayName}'");
+      if (this._AnyCopy(volume, "half.doc") is { } copy)
+        copy.Should().Equal(new byte[] { 5, 6, 7 });
+    }
+  }
+
+
+  [Test]
+  [Category("Exception")]
+  public void Publish_GivenTheDurabilityFlushFailsOnOneCopy_ThenTheApplicationSeesTheRealError() {
+    // The publish flushes every copy in parallel before renaming. A failure there used to escape
+    // wrapped in an AggregateException, which the driver adapters translate as "unexpected" — so a
+    // full disk reached the application as a generic I/O error, and nothing it could act on.
+    var fs = this._Mounted();
+
+    var handle = fs.Create("flushed.doc", NodeKind.File, CreateFlags.None);
+    fs.Write(handle, [9, 9, 9], 0, WriteMode.Normal);
+
+    this._a.FailNext(VolumeOp.Flush, PoolFsError.NoSpace);
+
+    _Thrown(() => fs.Close(handle)).Should().BeOfType<PoolFsException>("the driver adapters translate only the engine's own error type")
+      .Which.Error.Should().Be(PoolFsError.NoSpace);
+  }
+
+  private static Exception? _Thrown(Action action) {
+    try {
+      action();
+      return null;
+    } catch (Exception e) {
+      return e;
+    }
+  }
+
 }
