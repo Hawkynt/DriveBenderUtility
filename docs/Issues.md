@@ -2100,6 +2100,78 @@ that never finishes, the daemon not answering, or any uncaught script error, and
 (`DBE2E_FUZZ_SEED` replays it; `DBE2E_FUZZ_SECONDS` sets how long it runs). After the fix, the seed
 that crashed it and three more ran two minutes each (about 3,100 actions) clean.
 
+### Resolved: snapshots and the recycle bin against stripes, owed copies, idle disks and links
+
+An audit of the two stores against everything built after them. Each defect was reproduced by a
+failing test before it was fixed (`SnapshotInteractionTests`, `TrashInteractionTests`,
+`SnapshotCloneTests`, `SnapshotScheduleTests`), and each test was run against the old code to prove
+it catches it.
+
+Snapshots:
+
+- **A closed file whose publish was pending was left out of a snapshot.** Under the performance
+  policy a striped file is published in the background; until then it is a hidden temp, and the
+  snapshot records published names. Its content was then not kept when overwritten. A snapshot now
+  publishes closed-but-pending files first.
+- **Writes through a handle opened before the snapshot were not preserved.** Preservation hung off
+  opening for writing. `Write` and `SetLength` now preserve first when the path is still pinned (a
+  lock-free lookup; `ConcurrentDictionary.IsEmpty`, which takes every lock of an empty dictionary,
+  is no longer on that path).
+- **A version could miss an acknowledged write.** It is made from one copy, and under write-back a
+  copy can still be owed bytes; a delete then discarded them. Owed bytes are now applied first.
+- **New times on a pinned file broke the snapshot's read of it** ("preserved, and that copy is not
+  available"): the live file is proved unchanged by its modification time. `SetAttributes` now
+  preserves first.
+- **A create over a name still being written for the first time made a second file.** The only file
+  there was a staged temp, which `ResolveCopies` does not see: a restore — or any create — staged a
+  second temp under the same name and replaced the first stripe session. Both were published: two
+  primaries of one path. `O_EXCL` answered success over a file that existed. It now joins the file.
+- **A version set aside in the same clock tick as the snapshot was not the snapshot's.** Instants
+  are compared strictly; a coarse or frozen clock made them equal, a clock stepped backwards made
+  them wrong. Snapshot and aside instants are now strictly increasing, seeded from the store.
+- **Smaller:** a rename refused for an existing target copied that target into the store first;
+  restoring an unchanged file copied it and kept a duplicate version; a second snapshot of an
+  existing name was unreachable in `.snapshots/`, and a name with a separator could not be a folder.
+  All fixed.
+
+Recycle bin:
+
+- **A binned file could miss an acknowledged write** — the same owed-copy cause: the bin keeps one
+  copy, and it was simply the first. Owed bytes are applied before a copy is binned.
+- **Deleting a closed file whose publish was pending bypassed the bin.** It took the "never finished
+  writing" branch and was dropped. With the bin on it is now published first, then binned.
+- **Restore renamed over whatever held the name by then** — replacing a newer file outright on the
+  same disk, or leaving two primaries on two disks, without a lease. It is now refused (`Exists`)
+  under the path's lease, including over a name still being written.
+- **Restore put the file back on an idle or read-only disk.** The entry now moves (file and sidecar
+  copied, then the originals dropped, sidecar first) to where a new file would be placed, and is
+  restored there; with nowhere to go it is refused and stays in the bin. Crash-tested at every step.
+
+Retiring a disk:
+
+- **A snapshot version and its sidecar could land on different disks** — each file went to whichever
+  member had the most room at that moment, and moving the first changed the answer. The store only
+  sees a version with its sidecar beside it, so the snapshot reported its content lost; a bin entry
+  lost its deletion date. The scatter now moves each kept file with its sidecar.
+
+Verified, no change needed: the space optimizer never walks `.drivebenderutility`, so nothing in the
+bin or the store is linked, cloned, sparsified or re-timed; and a binned file or a version that shares
+its data with a live file through a hard link is never reached by a write, truncate, new times or a
+restore of that live file — the live file is separated first (`SpaceSavingInteractionTests`: three
+of the four link cases fail with the separation removed, and both optimizer cases fail when it is
+made to walk the utility folder).
+
+Faster: keeping a version for an in-place change is now a verified block clone where the member can
+clone (ReFS, Btrfs, XFS), and a copy only where it cannot. On a 1 MiB file the bytes written drop from
+the whole file to the journal record and the sidecar. The bin's shadow-copy move uses the same path.
+
+Added: scheduled snapshots (`snapshots.schedule`, off by default) — see docs/Snapshots.md, slice 8.
+
+! Not changed, only noted: a stripe session chooses its helper disks by the roles the engine was
+built with, not the roles a live reload set (`UpdateMemberRoles`), so a disk made idle while mounted
+can still receive a new file's temporary blocks until the next mount. Placement of the file itself
+already honours the live role.
+
 ### Resolved: with one required copy, a power cut could lose an acknowledged write
 
 `write.minCopiesBeforeAck` below the number of copies (the Settings dialog offers it) acknowledges a

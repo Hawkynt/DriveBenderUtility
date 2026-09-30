@@ -3,8 +3,8 @@
 Written before any code, because a screen over a feature that does not exist is worse than no
 feature. The most important section here is the one about what this approach cannot do.
 
-Nothing here is implemented. Every occurrence of "snapshot" in the codebase today is the unrelated
-metrics snapshot.
+Every slice in "Delivery" below has since been built; the design text is kept as it was written, and
+what the implementation changed or found is recorded under each slice.
 
 The mechanism below is not the one this document first proposed. The first draft copied a file's old
 content aside before the first write to it, which is both expensive and unnecessary: the engine
@@ -249,6 +249,68 @@ Honestly enumerated, because this is the part that decides the schedule:
    A pool that already contains a real folder named `.snapshots` finds it shadowed by the view. That
    is a known and accepted collision, in exchange for a path users can guess.
 
+7. **The engine that came after.** ✅ **Done.** Stripe sessions, deferred publishes, write-back
+   copies and the space optimizer all arrived after slices 1–6, and each one opened a way for a
+   snapshot to lose what it promised. Every case below was reproduced by a failing test first
+   (`SnapshotInteractionTests`, `SnapshotCloneTests`, `SnapshotScheduleTests`,
+   `SpaceSavingInteractionTests`).
+
+   - **A closed file whose publish was pending was not in the snapshot.** The performance policy
+     publishes a striped file in the background, so a file its writer had closed was still a hidden
+     temp, and the snapshot walks published names. A snapshot now publishes every closed-but-pending
+     file first. A file still open for its FIRST write stays out — it has no content yet.
+   - **A handle opened before the snapshot wrote straight into it.** Preserving was keyed on opening
+     for writing; a log or a database open all day never passed that door again. The first write or
+     truncate through any handle after a snapshot now preserves first.
+   - **The version could miss an acknowledged write.** It is made from one copy, and under write-back
+     a copy can be behind for the defer window; a delete then discarded the owed bytes. The owed
+     bytes are applied before any copy is kept (the same fix protects the recycle bin).
+   - **`touch` made the snapshot refuse to serve the file.** An untouched live file is proved to be
+     the snapshot's content by its modification time, so new times on it read as "changed, and the
+     version is lost". New times, and a new mode, now preserve first, like a write.
+   - **Two creates of one name.** A restore (or any create) over a name whose only file was a staged
+     temp still being written started a second file under the same staged name: two primaries were
+     published, and `O_EXCL` answered success. The create now joins the file that is there.
+   - **Equal instants.** A version belongs to a snapshot when it was set aside AFTER it. On a clock
+     that did not move between the two — or one stepped backwards — the version was not "after", and
+     the snapshot reported its content lost. Instants are now handed out strictly increasing,
+     seeded from the store at mount.
+   - **Retiring a disk split a version from its sidecar.** Each file went to whichever member had
+     the most room at that moment, and moving the version changed which one that was. The store only
+     sees a version whose sidecar is beside it. They now move together.
+   - **Smaller things:** a refused rename no longer copies the target it did not replace; restoring a
+     file that is unchanged since the snapshot is a no-op rather than a full copy and a duplicate
+     version; a snapshot name must be a valid folder name and unique (the `.snapshots/<name>` view
+     finds one by name, and a second of the same name was unreachable).
+
+   Verified rather than changed: the space optimizer never walks `.drivebenderutility`, so nothing
+   in the store is ever linked, cloned or sparsified; and a version that shares its data with a live
+   file through a hard link is never reached by a write, truncate or new times on that file — the
+   live file is separated first.
+
+   **Cheaper preserve-by-copy.** The version always lives on the SAME member as the file, so where
+   that member can clone blocks (`BackendCaps.BlockClone`: ReFS, Btrfs, XFS) an in-place
+   modification now keeps its version as a clone — no data copied; the two share blocks until the
+   live file is written. The clone is published like any copy (temp, check, times, flush, rename),
+   and checked by length and by the bytes at both ends; one that does not match is discarded and the
+   copy made instead. The recycle bin uses the same path for a shadow copy it keeps.
+
+8. **Scheduled snapshots.** ✅ **Done**, off by default — `snapshots.schedule`:
+
+   ```jsonc
+   "snapshots": { "reserve": "10%", "onReserveFull": "drop-oldest",
+                  "schedule": { "every": "6h", "keep": 28 } }
+   ```
+
+   The mounted pool's background pump takes one every `every` (at least a minute; `"off"` is the
+   default), named after the moment (`auto-20260930-060000`), and deletes the oldest SCHEDULED
+   snapshots beyond `keep` (default 7). Hand-taken snapshots are never dropped by the schedule.
+   The interval counts from the newest scheduled snapshot on disk that is not dated in the future,
+   so a remount takes no extra one and a clock stepped backwards does not stall the schedule. Under
+   `onReserveFull: refuse` a scheduled snapshot is refused like any other; the pump logs it and
+   tries again after the interval or an hour, whichever is sooner. The setting is read on every pump,
+   so a live reload turns it on or off without a remount.
+
 The order is deliberate: every earlier slice is useful without the later ones, and the screen comes
 last because a screen over a half-built engine is the mistake this project has already made twice —
 `ChMod` answering success and storing nothing, `ChOwn` doing the same. Both were dangerous precisely
@@ -267,4 +329,6 @@ because the surface said one thing and the storage did another.
   meant to be a promise rather than a convenience on these pools, `onReserveFull: refuse` is the
   other half of that question and it is one setting away.
 - **Scheduled snapshots, or manual only?** Scheduling is small once the engine exists, and it changes
-  the reserve maths from "an operator's choice" to "a rate".
+  the reserve maths from "an operator's choice" to "a rate". **Decided: both** — scheduled snapshots
+  exist and are off by default (slice 8). What a schedule costs is what changes between two
+  snapshots, times how many are kept; the reserve still bounds it.

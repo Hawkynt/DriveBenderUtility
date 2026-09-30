@@ -120,8 +120,11 @@ bandwidth an application needs.
 a whole file (`File.WriteAllBytes`, an editor saving through a temp, a copy into the pool), is written
 to a staged temp and renamed into place. The name then points at new data, and a hard link breaks by
 itself at no cost. Snapshots (`docs/Snapshots.md`) protect an older *version* the same way: a file a
-snapshot pins is renamed into the snapshot store when it is replaced, and copied there before it is
-opened for writing in place. What neither covers is an **in-place edit** of a file that shares its
+snapshot pins is renamed into the snapshot store when it is replaced, and copied there — cloned, on
+a member that can clone blocks — before it is changed in place. The optimizer never walks the pool's
+own `.drivebenderutility` tree, so nothing in the snapshot store or the recycle bin is ever linked,
+cloned or sparsified; and a kept version that still shares data with a live file (a link made before
+the file was set aside) is left alone by any change to that file, which is separated first. What neither covers is an **in-place edit** of a file that shares its
 data with a *different* file: a database, a VM image, an append. Those write straight into the file
 where it lies, and that is where a hard link would carry the write into the other name. So the
 engine separates a linked file before an in-place change, and only then.
