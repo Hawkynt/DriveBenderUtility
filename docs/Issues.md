@@ -2171,6 +2171,47 @@ built with, not the roles a live reload set (`UpdateMemberRoles`), so a disk mad
 can still receive a new file's temporary blocks until the next mount. Placement of the file itself
 already honours the live role.
 
+### Resolved: a retried striped publish could put a copy with holes under the real name
+
+Completing a stripe session fills each final and returns the ones that are whole; only those are
+published. A final that could not be filled is deleted, and if that delete fails too, the temp is
+left for the next mount's sweep. When the publish itself then failed (a rename refused), it was
+retried later from "every temp that still has the staged name", which includes that unfilled final.
+The retry renamed it into place. The file then had one whole copy and one with holes, and reads
+routed to the second returned zeros.
+
+The whole finals are now remembered until the publish succeeds, and a retry publishes only those
+that still wait for their rename. Found by reading the publish path. Covered by
+`StripeCrashTests.Stripe_GivenAFinalCouldNotBeFilledNorRemovedAndThePublishIsRetried_…`, which
+fails without the change: three injected faults (the fill, the delete, one rename).
+
+### Resolved: a file renamed onto a name still being written was lost at the writer's close
+
+A file being written has no copy under its name yet, only a temp, which its last close publishes.
+A rename onto that name while it was open (`rename x t` on Linux; Windows refuses a rename over an
+open file) replaced nothing, and the writer's close then renamed its temp over the file just renamed
+in. `x`'s bytes were gone, after the rename had been acknowledged. Until the close, reads of `t`
+also returned the writer's data rather than the renamed file's. The fix for the pending-publish case
+above covered closed files only, because an open file cannot be published.
+
+A replacing rename now discards the file being written, the way a delete of it already did (the
+shared code is `_DiscardStagedLocked`), so the close publishes nothing. A non-replacing rename onto
+the name is refused with `Exists`: the name is taken, even if only by a temp. This changes a
+deliberate earlier behaviour. `CrashConsistencyTests` had a matrix that expected the close to publish
+over the renamed file. It now cuts the power at each of the 15 steps of the rename and the close, and
+requires the renamed content to be whole under exactly one name, with every copy agreeing. Without
+the fix it fails 13 of 15, and the two new `StripeCrashTests` cases fail too.
+
+Still open: a handle stays bound to its path, not to its file. So the writer's handle, if used again
+after the rename, writes into the file now at that name. Deleting an open file has the same shape.
+Neither is new here, and neither is covered.
+
+Also audited this pass, with no defect found: the drainer's and the healer's commit paths
+(`_CommitDrainedCopy`, `_CommitHealedCopy`: check, rename and copy-list refresh all under one lease),
+`_CompleteStripe`'s own failure path (the session is put back), and `_RehomeStripe`. No new crash
+matrix was added for them; the existing ones (drain 21 steps, heal 21, striped write and close 19
+and 27) still pass.
+
 ### Resolved: with one required copy, a power cut could lose an acknowledged write
 
 `write.minCopiesBeforeAck` below the number of copies (the Settings dialog offers it) acknowledges a

@@ -315,14 +315,14 @@ public class CrashConsistencyTests {
 
   [Test]
   [Category("EdgeCase")]
-  // The one publish that REPLACES a visible file. A new staged file is not journaled, on the ground
-  // that nothing exists at its final name for an interrupted publish to disagree with — so the case
-  // where something does has to be proved separately. It is reachable: rename another file onto the
-  // name while this one is still being written, and the publish on close then renames over it copy
-  // by copy. Interrupted between two of those renames, one copy holds the new file and another the
-  // old, and after recovery they must agree on ONE whole version.
-  public void Crash_GivenAStagedFileIsPublishedOverAFileRenamedOntoItsName_ThenEveryCopyAgreesAfterRecovery(
-    [Range(1, 8)] int abortAfter) {
+  // A rename onto the name of a file that is still being written. That file has no copy under its
+  // name yet, only a temp, and its publish at the last close used to rename the temp over whatever
+  // was renamed in — the renamed file's bytes were then gone, after the rename had been acknowledged.
+  // The rename now replaces the file being written, as a delete of it does, so the close publishes
+  // nothing. Interrupted at every step of the rename and the close, the renamed content must survive
+  // whole under exactly one of its two names, with every copy agreeing.
+  public void Crash_GivenAFileIsRenamedOntoAFileStillBeingWritten_ThenTheRenamedContentSurvivesWhole(
+    [Range(1, 15)] int abortAfter) {
     var renamed = _Version(31);
     var staged = _Version(32);
 
@@ -334,13 +334,13 @@ public class CrashConsistencyTests {
 
       var late = fs.Create("race.bin", NodeKind.File, CreateFlags.None);
       fs.Write(late, staged, 0, WriteMode.Normal);
-      fs.Rename("other.bin", "race.bin", RenameFlags.ReplaceExisting); // the name is taken meanwhile
 
       this._AbortAfter(abortAfter);
       try {
-        fs.Close(late); // the publish now replaces a visible file
+        fs.Rename("other.bin", "race.bin", RenameFlags.ReplaceExisting); // the name is taken meanwhile
+        fs.Close(late);
       } catch (Exception) {
-        // interrupted mid-publish
+        // interrupted
       } finally {
         this._ClearHooks();
       }
@@ -349,19 +349,24 @@ public class CrashConsistencyTests {
     this._AssertTheCrashActuallyHappened(abortAfter);
     using var recovered = this._RecoverAfterPowerLoss();
 
-    var found = _ReadWhole(recovered, "race.bin");
-    found.Should().NotBeNull($"a crash at step {abortAfter} lost a file that existed before the publish began");
-    (found.AsSpan().SequenceEqual(renamed) || found.AsSpan().SequenceEqual(staged)).Should().BeTrue(
-      $"after a crash at step {abortAfter} the file must be one whole version, not a mixture");
+    var atNew = _ReadWhole(recovered, "race.bin");
+    var atOld = _ReadWhole(recovered, "other.bin");
+    var holders = new[] { atNew, atOld }.Count(c => c != null && c.AsSpan().SequenceEqual(renamed));
+    holders.Should().Be(1,
+      $"after a crash at step {abortAfter} the renamed content must be whole under exactly one name "
+      + $"(race.bin: {atNew?.Length.ToString() ?? "absent"} bytes, other.bin: {atOld?.Length.ToString() ?? "absent"} bytes)");
+    if (atNew != null)
+      (atNew.AsSpan().SequenceEqual(renamed) || (atOld != null && atNew.AsSpan().SequenceEqual(staged))).Should().BeTrue(
+        $"after a crash at step {abortAfter}, race.bin is the renamed file, or the one being written while the rename had not happened");
 
-    var copies = new[] { this._v1, this._v2 }
-      .SelectMany(v => new[] { false, true }.Select(shadow => v.GetContent("race.bin", shadow)))
-      .Where(c => c != null)
-      .ToArray();
-    copies.Should().HaveCountGreaterThan(0);
-    copies.All(c => c!.AsSpan().SequenceEqual(copies[0]!)).Should().BeTrue(
-      $"after a crash at step {abortAfter} the copies disagree — reads would return different content "
-      + "depending on which disk answered, and the scrub would have to guess which one to keep");
+    foreach (var name in new[] { "race.bin", "other.bin" }) {
+      var copies = new[] { this._v1, this._v2 }
+        .SelectMany(v => new[] { false, true }.Select(shadow => v.GetContent(name, shadow)))
+        .Where(c => c != null)
+        .ToArray();
+      copies.All(c => c!.AsSpan().SequenceEqual(copies[0]!)).Should().BeTrue(
+        $"after a crash at step {abortAfter} the copies of '{name}' disagree — reads would depend on which disk answered");
+    }
   }
 
 

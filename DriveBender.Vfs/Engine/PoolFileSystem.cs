@@ -112,6 +112,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// <summary>Files being written through a stripe session (docs/IncomingFiles.md), by pool path.</summary>
   private readonly System.Collections.Concurrent.ConcurrentDictionary<string, StripeSession> _stripes = new(PoolPaths.PathComparer);
 
+  /// <summary>
+  /// Stripe sessions already completed whose publish has not yet succeeded: the finals that are
+  /// WHOLE, and whether the file is short of its duplication level. A retried publish must use this
+  /// list rather than "every temp with the staged name", which also names a final whose fill failed
+  /// and whose temp could not be removed — a torn copy, which the retry would rename into place.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (IReadOnlyList<PhysicalCopy> Whole, bool HealAfter)> _completedStripes = new(PoolPaths.PathComparer);
+
   /// <summary>Striped files closed under the performance policy, published in the background.</summary>
   private readonly System.Collections.Concurrent.ConcurrentQueue<string> _deferredPublishes = new();
 
@@ -1303,9 +1311,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._integrity.RecordWholeFile(target, physical, false, []);
     this._EnsureShadows(physical, []);
-    if (staged)
+    if (staged) {
+      this._completedStripes.TryRemove(normalized, out _); // a new file: nothing of an earlier one's session applies
       this._staging[normalized] = sequence; // the Create intent stays open until the publish rename
-    else
+    } else
       this._journal.Complete(sequence, JournalOp.Create);
 
     this._Invalidate(normalized);
@@ -1838,7 +1847,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // changes nothing, so the refusal comes before any preserving: a copy made first was store space
     // spent on nothing, with the target dropped from the pinned set on the way.
     var targetCopies = sameFile ? [] : this._placement.ResolveCopies(toNormalized);
-    if (targetCopies.Count > 0 && (flags & RenameFlags.ReplaceExisting) == 0)
+
+    // A target still being written (open, so its publish could not be done above) has no copy under
+    // its name yet — only a temp — but the name is taken all the same. Left alone, its publish at the
+    // last close renamed the temp over this rename's file and the renamed file's bytes were gone.
+    var stagedTarget = !sameFile && this._staging.ContainsKey(toNormalized);
+    if ((targetCopies.Count > 0 || stagedTarget) && (flags & RenameFlags.ReplaceExisting) == 0)
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {to}");
 
     this._PreserveIfPinned(fromNormalized, wholeFileReplaced: false);
@@ -1846,6 +1860,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._PreserveIfPinned(toNormalized, wholeFileReplaced: false);
 
     this._FlushPathLocked(fromNormalized); // pending mutations land under the old name first
+
+    // replaced, as a delete of a file still being written replaces it: it never becomes visible
+    if (stagedTarget)
+      this._DiscardStagedLocked(toNormalized);
 
     this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
@@ -2426,32 +2444,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._PublishStagedLocked(normalized);
 
     // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
-    if (this._staging.TryRemove(normalized, out var createSequence)) {
-      if (this._stripes.TryRemove(normalized, out var stripe))
-        foreach (var helper in stripe.CreatedHelpers())
-          try {
-            helper.Volume.Delete(helper.Path, helper.Shadow);
-          } catch (PoolFsException) {
-            // swept on the next mount
-          }
-
-      var stagedName = _StagedNameOf(normalized);
-      var discardedStaged = this._writeBuffer.Drain(normalized); // buffered blocks are moot
-      foreach (var member in this._Online)
-      foreach (var shadow in new[] { false, true })
-        if (member.FileExists(stagedName, shadow))
-          member.Delete(stagedName, shadow);
-
-      // complete the Create intent AND every owed-write intent the buffer held — otherwise they
-      // linger open forever and are replayed (noisily) at every subsequent mount
-      this._journal.Complete(createSequence, JournalOp.Create);
-      if (discardedStaged != null)
-        foreach (var staleSequence in discardedStaged.Value.journalSequences)
-          this._journal.Complete(staleSequence, JournalOp.Write);
-
-      this._InvalidateChecksums(stagedName);
-      this._Invalidate(stagedName);
-      this._Invalidate(normalized);
+    if (this._DiscardStagedLocked(normalized)) {
       this._shadow.Remove(normalized);
       return;
     }
@@ -2535,6 +2528,45 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._Invalidate(normalized);
     this._shadow.Remove(normalized);
+  }
+
+  /// <summary>
+  /// Drops a file that never finished writing — its temps, its stripe helpers, its buffered blocks and
+  /// its open intents — as though it had never existed; false when the path is not being written.
+  /// Deleting such a file, and renaming another over it, both end it this way. The caller holds the
+  /// path's write lease.
+  /// </summary>
+  private bool _DiscardStagedLocked(string normalized) {
+    if (!this._staging.TryRemove(normalized, out var createSequence))
+      return false;
+
+    this._completedStripes.TryRemove(normalized, out _);
+    if (this._stripes.TryRemove(normalized, out var stripe))
+      foreach (var helper in stripe.CreatedHelpers())
+        try {
+          helper.Volume.Delete(helper.Path, helper.Shadow);
+        } catch (PoolFsException) {
+          // swept on the next mount
+        }
+
+    var stagedName = _StagedNameOf(normalized);
+    var discardedStaged = this._writeBuffer.Drain(normalized); // buffered blocks are moot
+    foreach (var member in this._Online)
+    foreach (var shadow in new[] { false, true })
+      if (member.FileExists(stagedName, shadow))
+        member.Delete(stagedName, shadow);
+
+    // complete the Create intent AND every owed-write intent the buffer held — otherwise they
+    // linger open forever and are replayed (noisily) at every subsequent mount
+    this._journal.Complete(createSequence, JournalOp.Create);
+    if (discardedStaged != null)
+      foreach (var staleSequence in discardedStaged.Value.journalSequences)
+        this._journal.Complete(staleSequence, JournalOp.Write);
+
+    this._InvalidateChecksums(stagedName);
+    this._Invalidate(stagedName);
+    this._Invalidate(normalized);
+    return true;
   }
 
   public void MakeDir(string path) {
@@ -4523,12 +4555,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // those it vouches for are published
     IReadOnlyList<PhysicalCopy>? striped = null;
     var healAfter = false;
-    if (this._stripes.TryRemove(normalized, out var stripe))
+    if (this._stripes.TryRemove(normalized, out var stripe)) {
       (striped, healAfter) = this._CompleteStripe(normalized, stripe);
+      this._completedStripes[normalized] = (striped, healAfter); // until the publish succeeds
+    } else if (this._completedStripes.TryGetValue(normalized, out var completed)) {
+      // a retry: only the finals that were whole, and of those only the ones still waiting for the
+      // rename (an earlier attempt may have renamed some before it failed)
+      var stagedTemp = _StagedNameOf(normalized);
+      (striped, healAfter) = ([.. completed.Whole.Where(c => c.Volume.IsOnline && c.Volume.FileExists(stagedTemp, c.Shadow))], completed.HealAfter);
+    }
 
     this._FlushPathLocked(normalized); // owed blocks land in the temp physical first (mapping still active)
-    if (!this._staging.TryRemove(normalized, out var createSequence))
+    if (!this._staging.TryRemove(normalized, out var createSequence)) {
+      this._completedStripes.TryRemove(normalized, out _);
       return; // another thread published concurrently
+    }
 
     var stagedName = _StagedNameOf(normalized);
 
@@ -4577,6 +4618,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       throw;
     }
 
+    this._completedStripes.TryRemove(normalized, out _);
     this._integrity.RenameFile(stagedName, normalized);
     this._journal.Complete(createSequence, JournalOp.Create);
     this._Invalidate(stagedName);
