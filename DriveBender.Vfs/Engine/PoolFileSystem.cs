@@ -2484,28 +2484,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         // all of its readers behind a single monitor on the hottest path there is. The state itself
         // is per HANDLE, so the lock below contends only with the same caller's own reads.
         var state = lease.File.ReadAhead.GetOrAdd(handle.Value,
-          _ => new ReadAheadState(this._readAheadMin, this._readAheadMax, this._readAheadAdaptive));
+          static (_, fs) => new ReadAheadState(fs._readAheadMin, fs._readAheadMax, fs._readAheadAdaptive), this);
 
         long prefetchBytes;
         lock (state)
           prefetchBytes = state.OnRead(offset, count);
 
-        // background prefetch (FR-RA): the window loads on the thread pool so the foreground read
-        // returns at once. Up to _MAX_PREFETCH_CHAINS run at a time, so window N+1 is already on
-        // its way while N is being consumed; a second chain that overlaps the first costs nothing
-        // extra because _LoadBlock single-flights and _Prefetch skips blocks already in flight.
-        if (prefetchBytes > 0 && this._TryBeginPrefetch(path)) {
-          var from = offset + count;
-          ThreadPool.QueueUserWorkItem(_ => {
-            try {
-              this._Prefetch(dataPath, copies, from, prefetchBytes, length, durableExpected ? length : 0);
-            } catch (Exception) {
-              // prefetch is strictly best-effort — the foreground read surfaces real errors
-            } finally {
-              this._EndPrefetch(path);
-            }
-          });
-        }
+        if (prefetchBytes > 0 && this._TryBeginPrefetch(path))
+          this._StartPrefetch(path, dataPath, copies, offset + count, prefetchBytes, length, durableExpected ? length : 0);
       }
 
       return count;
@@ -2513,6 +2499,27 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // the lease's own dispose releases the lock
     }
   }
+
+  /// <summary>
+  /// Background prefetch (FR-RA): the window loads on the thread pool so the foreground read
+  /// returns at once. Up to _MAX_PREFETCH_CHAINS run at a time, so window N+1 is already on its way
+  /// while N is being consumed; a second chain that overlaps the first costs nothing extra because
+  /// _LoadBlock single-flights and _Prefetch skips blocks already in flight.
+  ///
+  /// A method of its own for the sake of the READ, not the prefetch: a lambda inside Read captures
+  /// Read's locals, and C# allocates that closure where those locals are declared — at the top of
+  /// the method, on every read, whether a prefetch is started or not.
+  /// </summary>
+  private void _StartPrefetch(string path, string dataPath, IReadOnlyList<PhysicalCopy> copies, long from, long prefetchBytes, long length, long fileLength)
+    => ThreadPool.QueueUserWorkItem(_ => {
+      try {
+        this._Prefetch(dataPath, copies, from, prefetchBytes, length, fileLength);
+      } catch (Exception) {
+        // prefetch is strictly best-effort — the foreground read surfaces real errors
+      } finally {
+        this._EndPrefetch(path);
+      }
+    });
 
   /// <summary>
   /// The order in which a block's copies are tried (FR-MIRROR, FR-STRIPE-READY): readiest first,
