@@ -510,7 +510,9 @@ retention/size policy purges oldest-first in the background.
 
 Restoring from a pool that is mounted goes through the process that owns it, and re-establishes the
 file's duplication level on the way back — a recovered file that is one bad sector from being lost again is
-only half recovered.
+only half recovered. A restore never lands over a file that has taken the name since (it is refused;
+rename or delete that file first), and never onto a disk that takes no new files: an entry kept on an
+idle or read-only member is moved to where a new file would go and restored there.
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontSize":"15px","lineColor":"#90A4AE","textColor":"#37474F","clusterBkg":"#FAFAFA","clusterBorder":"#E0E0E0","edgeLabelBackground":"#FFFFFF"}}}%%
@@ -550,8 +552,8 @@ design:
 | What happens to a pinned file | What it costs |
 | --- | --- |
 | Replaced outright (truncate + write — `File.WriteAllBytes`, editors, backup tools) | **Nothing.** The old file is *renamed* into the store; the new content is staged and renamed into place. Two renames. |
-| Modified in place (write at an offset, keep the rest) | **A copy.** The untouched bytes must survive in the live file *and* in the version. |
-| Renamed, or renamed over | A copy — the live file has to stay put for the rename to have something to move. |
+| Modified in place (write at an offset, keep the rest), or given new times | **A copy** — or a **clone** where the disk can clone blocks (ReFS, Btrfs, XFS): nothing copied. The untouched bytes must survive in the live file *and* in the version. |
+| Renamed, or renamed over | A copy (or a clone) — the live file has to stay put for the rename to have something to move. |
 | Deleted | Nothing. The file is renamed into the store. |
 | Never touched again | **Nothing at all** — the snapshot's copy *is* the live file. Most of a backup pool. |
 
@@ -588,6 +590,27 @@ flowchart TD
 
 > **A snapshot is not a backup.** It shares the pool's disks and its failure domains: it protects
 > against deleting or overwriting a file, not against losing the storage underneath it.
+
+A snapshot holds every file whose writer had closed it — including one closed a moment earlier whose
+publish was still pending — and a write through a handle opened *before* the snapshot is preserved
+like any other. A file still open for its first write is not in it: it has no content yet.
+
+#### Scheduled snapshots
+
+Off by default. `snapshots.schedule` makes the mounted pool take one on an interval, named after the
+moment (`auto-20260930-060000`), and keep the newest few:
+
+```jsonc
+"snapshots": {
+  "reserve": "10%",                  // what the version store may occupy
+  "onReserveFull": "drop-oldest",    // or "refuse": a scheduled snapshot is then skipped and retried
+  "schedule": { "every": "6h", "keep": 28 }   // "off" (default); at least "1m"; keep >= 1 (default 7)
+}
+```
+
+Only scheduled snapshots are dropped by `keep`; hand-taken ones stay until deleted. The interval is
+counted from the newest scheduled snapshot on disk, so a remount does not take an extra one. A
+schedule turns the reserve into a rate: the store holds what changes between snapshots, times `keep`.
 
 #### Browsing snapshots from the pool itself
 
@@ -806,6 +829,7 @@ common knobs:
                                           //   missing (owed copies heal on return); false = refuse
   },
   "trash": { "enabled": true, "retention": "7d" },   // recoverable deletes
+  "snapshots": { "reserve": "10%", "schedule": { "every": "1d", "keep": 7 } },  // off unless "every" is set
   "space": { "deduplicate": true, "sparsify": true },  // saved with the health scan (docs/SpaceSavings.md)
   "folders": {
     "Documents/**": { "write": { "policy": "write-through" }, "duplication": 3 }

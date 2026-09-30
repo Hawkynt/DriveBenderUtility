@@ -358,7 +358,37 @@ public sealed record SnapshotsConfig {
   /// </summary>
   [JsonPropertyName("onReserveFull")] public SnapshotReservePolicy? OnReserveFull { get; init; }
 
+  /// <summary>Snapshots the mounted pool takes by itself, on an interval; off unless set.</summary>
+  [JsonPropertyName("schedule")] public SnapshotScheduleConfig? Schedule { get; init; }
+
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+}
+
+/// <summary>
+/// Scheduled snapshots (docs/Snapshots.md): every <see cref="Every"/> the mounted pool takes one,
+/// named after the moment (<c>auto-20260930-060000</c>), and drops its oldest SCHEDULED snapshots
+/// beyond <see cref="Keep"/>. Snapshots taken by hand are never dropped by the schedule.
+///
+/// A schedule turns the reserve from an operator's choice into a rate: what the store costs is what
+/// changes between two snapshots, times how many are kept. The reserve and its policy still apply —
+/// under <c>refuse</c> a scheduled snapshot is refused like any other and tried again later.
+/// </summary>
+public sealed record SnapshotScheduleConfig {
+  /// <summary>The interval ("6h", "1d"); "off" or absent turns the schedule off. At least a minute.</summary>
+  [JsonPropertyName("every")] public string? Every { get; init; }
+
+  /// <summary>How many scheduled snapshots are kept; the oldest beyond this are deleted. At least 1.</summary>
+  [JsonPropertyName("keep")] public int? Keep { get; init; }
+
+  [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+
+  /// <summary>The shortest interval a schedule may have: every snapshot walks the whole namespace.</summary>
+  public static readonly TimeSpan MinimumInterval = TimeSpan.FromMinutes(1);
+
+  /// <summary>The interval this schedule asks for, or <see cref="TimeSpan.Zero"/> when it is off.</summary>
+  public TimeSpan Interval => this.Every is not { } every || every.Trim().Equals("off", StringComparison.OrdinalIgnoreCase)
+    ? TimeSpan.Zero
+    : DurationSpec.Parse(every);
 }
 
 [JsonConverter(typeof(JsonStringEnumConverter<SnapshotReservePolicy>))]
@@ -463,7 +493,7 @@ public static class ConfigResolver {
       "deepScrubSchedule": null
     },
     "trash": { "enabled": false, "retention": "7d", "maxSize": "5%", "dropDuplicatesInTrash": true },
-    "snapshots": { "reserve": "10%", "onReserveFull": "drop-oldest" },
+    "snapshots": { "reserve": "10%", "onReserveFull": "drop-oldest", "schedule": { "every": "off", "keep": 7 } },
     "locale": "auto",
     "duplication": 1,
     "observability": { "logLevel": "info", "metrics": { "enabled": true, "endpoint": "127.0.0.1:9723" } }

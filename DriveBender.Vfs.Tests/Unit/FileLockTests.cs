@@ -68,6 +68,24 @@ public class FileLockTests {
     }).Should().BeTrue("the lock is free again");
   }
 
+  [TestCase(1, TestName = "Enter_GivenTheTimedWaitOverranItsDeadlineByExactlyOneMillisecond_ThenItTimesOutInsteadOfWaitingForever")]
+  [TestCase(0, TestName = "Enter_GivenTheTimedWaitEndedExactlyOnItsDeadline_ThenItTimesOut")]
+  [TestCase(250, TestName = "Enter_GivenTheTimedWaitOverranItsDeadlineByMuch_ThenItTimesOut")]
+  [Category("Exception")]
+  public void Enter_GivenATimeoutThatHasPassed_ThenTheEnterGivesUp(int overrunMs) {
+    // "Remaining" was deadline - now, and a remaining of exactly -1 is Timeout.Infinite: a wait that
+    // overran its deadline by one millisecond (a coarse timer, a busy runner) went back to sleep
+    // for ever, and came back only when something else released the lock. Found on the Linux
+    // runner: a 100 ms read wait took the waiting writer's whole 10 s and then got in ahead of it.
+    long calls = 0;
+    var fileLock = new FileLock(() => Interlocked.Increment(ref calls) == 1 ? 0 : 100 + overrunMs); // start, then every later look
+    _OnOtherThread(() => fileLock.TryEnterWriteLock(_long)).Should().BeTrue(); // held by a thread that is gone, and never released
+
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    _OnOtherThread(() => fileLock.TryEnterReadLock(TimeSpan.FromMilliseconds(100))).Should().BeFalse("the lock is held for good");
+    clock.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(5), "a timeout that has passed is not a reason to wait for ever");
+  }
+
   [Test]
   [Category("EdgeCase")]
   public void Read_GivenAWriterIsWaiting_ThenANewReaderIsHeldBackUntilTheWriterHasBeenIn() {

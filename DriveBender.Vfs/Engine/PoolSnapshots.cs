@@ -55,9 +55,15 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
   private const string _INDEX_FOLDER = SnapshotPrefix + "/index";
   private const string _VERSION_FOLDER = SnapshotPrefix + "/versions";
   private const string _VERSION_SUFFIX = ".snapver";
-  private const string _INFO_SUFFIX = ".snapinfo";
+  private const string _INFO_SUFFIX = InfoSuffix;
 
-  private long _uniquifier;
+  /// <summary>What a version's sidecar is named after it: the version path plus this.</summary>
+  public const string InfoSuffix = ".snapinfo";
+
+  /// <summary>The last instant handed out, in ticks; -1 until seeded from what the store already records.</summary>
+  private long _lastInstant = -1;
+
+  private readonly Lock _instantLock = new();
 
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
@@ -69,14 +75,45 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
   private static string _InfoPathFor(string versionPath) => InfoPathFor(versionPath);
 
   /// <summary>
+  /// The instant of a snapshot or an aside: the clock, but never the same instant twice and never
+  /// earlier than one already handed out or recorded in the store.
+  ///
+  /// Everything here is decided by comparing instants — a version belongs to a snapshot when it was
+  /// set aside AFTER the snapshot was taken — so two that compare equal cannot be ordered at all. A
+  /// clock that ticks coarsely, or not at all, gave a snapshot and the aside right after it the SAME
+  /// instant: the version was then "not after" the snapshot, invisible to it, and the snapshot
+  /// reported its content lost. A clock stepped backwards (an NTP correction, a VM resumed) did the
+  /// same the other way round. Seeded once per mount from the store, so a restart keeps the order.
+  /// </summary>
+  private DateTime _Now() {
+    lock (this._instantLock) {
+      if (this._lastInstant < 0)
+        this._lastInstant = this._NewestRecordedTicks();
+
+      this._lastInstant = Math.Max(clock().Ticks, this._lastInstant + 1);
+      return new(this._lastInstant, DateTimeKind.Utc);
+    }
+  }
+
+  private long _NewestRecordedTicks() {
+    long newest = 0;
+    foreach (var (_, index) in this._Indexes())
+      newest = Math.Max(newest, index.CreatedUtc.Ticks);
+    foreach (var (_, versionPath, info) in this._Versions())
+      newest = Math.Max(newest, Math.Max(info.AsidedUtc.Ticks, _TokenOf(versionPath)));
+
+    return newest;
+  }
+
+  /// <summary>
   /// A version destination that sorts by WHEN it was set aside.
   ///
   /// The token is the aside instant, so "the earliest version after snapshot S" is a comparison
-  /// rather than a lookup, and two asides of the same path in the same tick still get distinct
-  /// names. Hex so the name sorts the same way the number does.
+  /// rather than a lookup, and two asides of the same path never get the same name: every instant
+  /// is handed out once. Hex so the name sorts the same way the number does.
   /// </summary>
   private string _NewVersionPathFor(string normalizedPath) {
-    var token = clock().Ticks + (Interlocked.Increment(ref this._uniquifier) & 0xFFFF);
+    var token = this._Now().Ticks;
     return $"{_VERSION_FOLDER}/{normalizedPath}.{token:x16}{_VERSION_SUFFIX}";
   }
 
@@ -95,7 +132,7 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
   /// </summary>
   public SnapshotEntry Take(string name, IReadOnlyCollection<string> paths) {
     var id = Guid.NewGuid();
-    var index = new SnapshotIndex { Id = id, Name = name, CreatedUtc = clock(), Paths = [.. paths] };
+    var index = new SnapshotIndex { Id = id, Name = name, CreatedUtc = this._Now(), Paths = [.. paths] };
     var sequence = journal.LogIntent(JournalOp.SnapshotTake, _IndexPathFor(id));
 
     // Mirrored onto every online member, like the manifest. A snapshot that lived on one member
@@ -213,16 +250,16 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
 
     member.EnsureFolder(PoolPaths.GetParent(versionPath), false);
     if (shadow)
-      // a shadow cannot be renamed across the shadow/primary namespace in one step; streamed, so a
-      // multi-GB copy never lands in RAM (SAFE-BIGFILE)
-      WholeFilePublisher.CopyBetween(member, normalizedPath, true, member, versionPath, false,
+      // a shadow cannot be renamed across the shadow/primary namespace in one step: cloned where the
+      // member can, else streamed, so a multi-GB copy never lands in RAM (SAFE-BIGFILE)
+      WholeFilePublisher.CloneOrCopyWithin(member, normalizedPath, true, versionPath, false,
         admit: WholeFilePublisher.Pace(admit, member, member));
     else
       member.AtomicReplace(normalizedPath, versionPath, false);
 
     _WriteJson(member, _InfoPathFor(versionPath), new SnapshotVersionInfo {
       OriginalPath = normalizedPath,
-      AsidedUtc = clock(),
+      AsidedUtc = this._Now(),
       Pins = [.. pins],
     });
 
@@ -249,7 +286,7 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
 
     _WriteJson(member, InfoPathFor(versionPath), new SnapshotVersionInfo {
       OriginalPath = normalizedPath,
-      AsidedUtc = clock(),
+      AsidedUtc = this._Now(),
       Pins = [.. this.SnapshotsNeeding(normalizedPath)],
     });
   }
@@ -259,19 +296,22 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
   ///
   /// For a modification that does not replace the whole file: the bytes the writer does not touch
   /// have to survive in the live file as well as in the version, so there is nothing to rename and
-  /// this is the case that genuinely costs. Streamed, so a multi-gigabyte file never lands in RAM.
+  /// this is the case that genuinely costs — on storage that cannot clone. The version lives on the
+  /// SAME member as the file, so where the member can clone blocks (ReFS, Btrfs, XFS) the version is
+  /// a clone: nothing is copied, and the two share their blocks until the live file is written.
+  /// Otherwise it is streamed, so a multi-gigabyte file never lands in RAM.
   /// </summary>
   public string AsideByCopy(IVolumeIO member, string normalizedPath, bool shadow, IReadOnlyCollection<Guid> pins) {
     var versionPath = this._NewVersionPathFor(normalizedPath);
     var sequence = journal.LogIntent(JournalOp.SnapshotAside, normalizedPath, versionPath);
 
     member.EnsureFolder(PoolPaths.GetParent(versionPath), false);
-    WholeFilePublisher.CopyBetween(member, normalizedPath, shadow, member, versionPath, false,
+    WholeFilePublisher.CloneOrCopyWithin(member, normalizedPath, shadow, versionPath, false,
       admit: WholeFilePublisher.Pace(admit, member, member));
 
     _WriteJson(member, _InfoPathFor(versionPath), new SnapshotVersionInfo {
       OriginalPath = normalizedPath,
-      AsidedUtc = clock(),
+      AsidedUtc = this._Now(),
       Pins = [.. pins],
     });
 

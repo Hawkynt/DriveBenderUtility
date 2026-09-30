@@ -21,6 +21,7 @@ public static class ConfigValidator {
     _ValidateCaches(config, totalPhysicalRamBytes);
     _ValidateIntegrity(config.Integrity);
     _ValidateTrash(config.Trash);
+    _ValidateSnapshots(config.Snapshots);
     _ValidateFolderOverrides(config);
   }
 
@@ -210,6 +211,35 @@ public static class ConfigValidator {
       DurationSpec.Parse(retention);
     if (trash.MaxSize is { } maxSize)
       SizeSpec.Parse(maxSize);
+  }
+
+  private static void _ValidateSnapshots(SnapshotsConfig? snapshots) {
+    if (snapshots == null)
+      return;
+
+    if (snapshots.Reserve is { } reserve)
+      try {
+        SizeSpec.Parse(reserve);
+      } catch (ManifestException e) {
+        throw new ConfigValidationException($"'snapshots.reserve' must be a size or a percentage, got '{reserve}': {e.Message}");
+      }
+
+    if (snapshots.Schedule is not { } schedule)
+      return;
+
+    TimeSpan interval;
+    try {
+      interval = schedule.Interval;
+    } catch (ManifestException e) {
+      throw new ConfigValidationException($"'snapshots.schedule.every' must be an interval like \"6h\" or \"1d\", or \"off\": {e.Message}");
+    }
+
+    var off = schedule.Every is not { } every || every.Trim().Equals("off", StringComparison.OrdinalIgnoreCase);
+    if (!off && interval < SnapshotScheduleConfig.MinimumInterval)
+      throw new ConfigValidationException(
+        $"'snapshots.schedule.every' ({schedule.Every}) is shorter than {SnapshotScheduleConfig.MinimumInterval.TotalMinutes:0} minute — every snapshot walks the whole pool");
+    if (schedule.Keep is { } keep && keep < 1)
+      throw new ConfigValidationException($"'snapshots.schedule.keep' must be at least 1, got {keep}");
   }
 
   private static void _ValidateFolderOverrides(PoolConfig config) {

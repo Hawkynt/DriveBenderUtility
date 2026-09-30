@@ -294,6 +294,18 @@ nobody reads a claim into it.
 - **Still allocated per read (240 B)**: the path lease and three cache keys. The keys are classes
   because `ICacheEvictionPolicy<TKey>` requires `class`.
 
+### Resolved (found by CI on Linux): a timed wait for a file's lock could become a wait for ever
+
+`FileLock` computed a waiter's remaining time as `deadline - now` and passed it to `Monitor.Wait`,
+treating `-1` as "no deadline". But `-1` is also what a wait that overran its deadline by exactly one
+millisecond computes. A coarse timer or a busy runner makes that overrun ordinary, and the waiter then
+slept until something else released the lock. On the Linux runner a reader asked to wait 100 ms slept
+through the waiting writer's whole 10-second timeout, then got in ahead of the writer it was meant to
+yield to. In the engine, a lease with a timeout (the drainer's swap window, the heal's commit) could
+have hung the same way. An infinite wait is now decided by the deadline itself, never by the number.
+`FileLock` takes an optional clock, so the test places the wake-up exactly one millisecond late; it
+hung for the test's full 30 seconds before the change.
+
 ### Why writes look slow, and how much of it is deliberate
 
 The write rows in `docs/Performance.md` were all within a few percent of each other — around
@@ -1018,6 +1030,20 @@ What it needs before a UI is worth drawing: a version-addressed layer under the 
 path-addressed one, block sharing with per-snapshot reference counts, a reserve that placement
 understands and that the drainer and healer respect, and recovery semantics for each of those. That
 is a design, then an engine, then a screen — in that order.
+
+### Resolved (found by CI on Linux): a file deleted while still open went to the bin as `.fuse_hidden…`
+
+On Linux, deleting a file that is still open is not an unlink. FUSE renames the file to
+`.fuse_hiddenNNNN` in the same folder and unlinks that name when the last handle closes. A read handle
+counts: `File.ReadAllBytes` followed at once by `File.Delete` is enough, because the kernel sends the
+read's `release` asynchronously. The recycle bin recorded the hidden name, so the deleted file was in
+the bin under a name nobody deleted, would recognise, or could restore by.
+`TamperEndToEndTests.Trash_GivenASidecarIsDatedInTheFuture_…` listed exactly that, one entry named
+`.fuse_hidden0000000200000001`, and failed.
+
+The engine now remembers what a file was called when it is renamed to a `.fuse_hidden` name, and a
+delete of that name bins the file under its earlier name. A user's own rename is left alone: only the
+kernel's set-aside name is undone. The memory is dropped on every delete, binned or not.
 
 ### The recycle bin was built and unreachable
 
@@ -2099,6 +2125,78 @@ creating or deleting pools, installing prerequisites). It fails on a lost live c
 that never finishes, the daemon not answering, or any uncaught script error, and prints its seed
 (`DBE2E_FUZZ_SEED` replays it; `DBE2E_FUZZ_SECONDS` sets how long it runs). After the fix, the seed
 that crashed it and three more ran two minutes each (about 3,100 actions) clean.
+
+### Resolved: snapshots and the recycle bin against stripes, owed copies, idle disks and links
+
+An audit of the two stores against everything built after them. Each defect was reproduced by a
+failing test before it was fixed (`SnapshotInteractionTests`, `TrashInteractionTests`,
+`SnapshotCloneTests`, `SnapshotScheduleTests`), and each test was run against the old code to prove
+it catches it.
+
+Snapshots:
+
+- **A closed file whose publish was pending was left out of a snapshot.** Under the performance
+  policy a striped file is published in the background; until then it is a hidden temp, and the
+  snapshot records published names. Its content was then not kept when overwritten. A snapshot now
+  publishes closed-but-pending files first.
+- **Writes through a handle opened before the snapshot were not preserved.** Preservation hung off
+  opening for writing. `Write` and `SetLength` now preserve first when the path is still pinned (a
+  lock-free lookup; `ConcurrentDictionary.IsEmpty`, which takes every lock of an empty dictionary,
+  is no longer on that path).
+- **A version could miss an acknowledged write.** It is made from one copy, and under write-back a
+  copy can still be owed bytes; a delete then discarded them. Owed bytes are now applied first.
+- **New times on a pinned file broke the snapshot's read of it** ("preserved, and that copy is not
+  available"): the live file is proved unchanged by its modification time. `SetAttributes` now
+  preserves first.
+- **A create over a name still being written for the first time made a second file.** The only file
+  there was a staged temp, which `ResolveCopies` does not see: a restore — or any create — staged a
+  second temp under the same name and replaced the first stripe session. Both were published: two
+  primaries of one path. `O_EXCL` answered success over a file that existed. It now joins the file.
+- **A version set aside in the same clock tick as the snapshot was not the snapshot's.** Instants
+  are compared strictly; a coarse or frozen clock made them equal, a clock stepped backwards made
+  them wrong. Snapshot and aside instants are now strictly increasing, seeded from the store.
+- **Smaller:** a rename refused for an existing target copied that target into the store first;
+  restoring an unchanged file copied it and kept a duplicate version; a second snapshot of an
+  existing name was unreachable in `.snapshots/`, and a name with a separator could not be a folder.
+  All fixed.
+
+Recycle bin:
+
+- **A binned file could miss an acknowledged write** — the same owed-copy cause: the bin keeps one
+  copy, and it was simply the first. Owed bytes are applied before a copy is binned.
+- **Deleting a closed file whose publish was pending bypassed the bin.** It took the "never finished
+  writing" branch and was dropped. With the bin on it is now published first, then binned.
+- **Restore renamed over whatever held the name by then** — replacing a newer file outright on the
+  same disk, or leaving two primaries on two disks, without a lease. It is now refused (`Exists`)
+  under the path's lease, including over a name still being written.
+- **Restore put the file back on an idle or read-only disk.** The entry now moves (file and sidecar
+  copied, then the originals dropped, sidecar first) to where a new file would be placed, and is
+  restored there; with nowhere to go it is refused and stays in the bin. Crash-tested at every step.
+
+Retiring a disk:
+
+- **A snapshot version and its sidecar could land on different disks** — each file went to whichever
+  member had the most room at that moment, and moving the first changed the answer. The store only
+  sees a version with its sidecar beside it, so the snapshot reported its content lost; a bin entry
+  lost its deletion date. The scatter now moves each kept file with its sidecar.
+
+Verified, no change needed: the space optimizer never walks `.drivebenderutility`, so nothing in the
+bin or the store is linked, cloned, sparsified or re-timed; and a binned file or a version that shares
+its data with a live file through a hard link is never reached by a write, truncate, new times or a
+restore of that live file — the live file is separated first (`SpaceSavingInteractionTests`: three
+of the four link cases fail with the separation removed, and both optimizer cases fail when it is
+made to walk the utility folder).
+
+Faster: keeping a version for an in-place change is now a verified block clone where the member can
+clone (ReFS, Btrfs, XFS), and a copy only where it cannot. On a 1 MiB file the bytes written drop from
+the whole file to the journal record and the sidecar. The bin's shadow-copy move uses the same path.
+
+Added: scheduled snapshots (`snapshots.schedule`, off by default) — see docs/Snapshots.md, slice 8.
+
+! Not changed, only noted: a stripe session chooses its helper disks by the roles the engine was
+built with, not the roles a live reload set (`UpdateMemberRoles`), so a disk made idle while mounted
+can still receive a new file's temporary blocks until the next mount. Placement of the file itself
+already honours the live role.
 
 ### Resolved: with one required copy, a power cut could lose an acknowledged write
 
