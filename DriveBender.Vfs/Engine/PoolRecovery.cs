@@ -285,6 +285,7 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
       if (!member.FileExists(path, shadow))
         continue;
 
+      WholeFilePublisher.SeparateIfLinked(member, path, shadow); // a replay must not write through a link into another file
       using var stream = member.OpenWrite(path, shadow, false);
       foreach (var (offset, bytes) in captured) {
         stream.Seek(offset, SeekOrigin.Begin);

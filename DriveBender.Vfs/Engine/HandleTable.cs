@@ -12,6 +12,13 @@ public sealed class FileState(string normalizedPath) {
   /// <summary>Total pins keeping this state alive: open handles PLUS outstanding path leases.</summary>
   internal int RefCount;
 
+  /// <summary>
+  /// The file's copies were checked for shared (hard-linked) data, and separated where they had it,
+  /// since this state came to life — so the write path pays that check once per open file, not once
+  /// per write. The optimizer never links a file that is open, so it stays true while the state lives.
+  /// </summary>
+  public bool LinksSeparated;
+
   /// <summary>Open handles only — a lease must not make a path look "open" to the drain/heal guards.</summary>
   internal int HandleCount;
 

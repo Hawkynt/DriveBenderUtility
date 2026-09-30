@@ -302,6 +302,23 @@ public static class WholeFilePublisher {
       };
   }
 
+  /// <summary>
+  /// Copy-on-write for hard links (docs/SpaceSavings.md): before a physical file is changed IN PLACE,
+  /// a file that shares its data with another name gets data of its own — copied to a temp, made
+  /// durable with the original's times and mode, and renamed over its own name. Only this name moves
+  /// to the new data; every other name keeps the old. Changed in place without this, a write, a
+  /// truncate, a time stamp or a crash-recovery replay on one file would land in the other too.
+  /// True when a copy was made.
+  /// </summary>
+  public static bool SeparateIfLinked(IVolumeIO volume, string path, bool shadow) {
+    if ((volume.Caps & BackendCaps.HardLinks) == 0 || volume.LinkCount(path, shadow) <= 1)
+      return false;
+
+    var meta = volume.Stat(path, shadow);
+    PublishStream(volume, path, shadow, () => volume.OpenRead(path, shadow), meta?.Length, preserve: meta);
+    return true;
+  }
+
   /// <summary>A member can hold an acknowledged durable copy only when its flush is a real durability barrier (SAFE-REMOTE).</summary>
   public static bool CanSatisfyAckQuorum(IVolumeIO member) => (member.Caps & BackendCaps.DurableFlush) != 0;
 
