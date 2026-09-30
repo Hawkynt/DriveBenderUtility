@@ -119,11 +119,12 @@ bandwidth an application needs.
 **Isn't the pool copy-on-write already?** For most writes, yes. A new file, and a save that replaces
 a whole file (`File.WriteAllBytes`, an editor saving through a temp, a copy into the pool), is written
 to a staged temp and renamed into place. The name then points at new data, and a hard link breaks by
-itself at no cost. Snapshots (`docs/Snapshots.md`) are a design built on the same renames, not yet
-code. What is not copy-on-write is an **in-place edit** of an existing file: a database, a VM
-image, an append. Those write straight into the file where it lies, and that is where a hard link
-would carry the write into the other name. So the engine separates a linked file before an in-place
-change, and only then.
+itself at no cost. Snapshots (`docs/Snapshots.md`) protect an older *version* the same way: a file a
+snapshot pins is renamed into the snapshot store when it is replaced, and copied there before it is
+opened for writing in place. What neither covers is an **in-place edit** of a file that shares its
+data with a *different* file: a database, a VM image, an append. Those write straight into the file
+where it lies, and that is where a hard link would carry the write into the other name. So the
+engine separates a linked file before an in-place change, and only then.
 
 A block clone separates by itself on a write. A hard link does not: a write into one name is a
 write into both. So before the engine changes a file in place through the pool, it checks the
