@@ -461,6 +461,9 @@ dialog) so it takes new files too.
 
 ### Tiering: land fast, drain later
 
+How a new file travels, step by step, from arrival through the stripe session to its final disks:
+[docs/IncomingFiles.md](docs/IncomingFiles.md).
+
 With a **landing zone** member, new files go to the fast tier and a background drainer moves settled
 files down to capacity. Placement declines the fast tier once it is past its low watermark, so a full
 SSD stops absorbing rather than wedging the pool.
