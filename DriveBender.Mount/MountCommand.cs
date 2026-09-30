@@ -202,7 +202,7 @@ internal static class MountCommand {
         pool.Manifest.Members.ToDictionary(m => m.MemberId, m => m.Role));
       switch (op) {
         case "health" or "health-deep" or "fix": {
-          var service = new HealthService(ios, new SmartctlMonitor(), fs.Integrity, media);
+          var service = new HealthService(ios, new SmartctlMonitor(), fs.Integrity, media, space: fs.CreateSpaceOptimizer());
           var report = op == "fix"
             ? service.CheckAndCorrect(operation: context)
             : service.Check(deep: op == "health-deep", operation: context);

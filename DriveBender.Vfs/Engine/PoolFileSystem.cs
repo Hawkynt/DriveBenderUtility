@@ -1495,6 +1495,48 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     return true;
   }
 
+  /// <summary>
+  /// The space optimizer for this mounted pool (docs/SpaceSavings.md), or null when the pool's
+  /// settings turn both of its jobs off. It changes a file only under the file's lease and the
+  /// namespace gate, and skips any file that is open, dirty or still being written.
+  /// </summary>
+  public SpaceOptimizer? CreateSpaceOptimizer() {
+    var space = this._config.Space;
+    var deduplicate = space?.Deduplicate ?? true;
+    var sparsify = space?.Sparsify ?? true;
+    if (!deduplicate && !sparsify || this.IsReadOnly)
+      return null;
+
+    return new([.. this._members.Select(m => m.Io)], this._LockForSpace, deduplicate, sparsify);
+  }
+
+  /// <summary>Runs the space optimizer now; an empty report when it is off.</summary>
+  public SpaceReport OptimizeSpace(OperationContext? operation = null) => this.CreateSpaceOptimizer()?.Run(operation) ?? SpaceReport.Empty;
+
+  private IDisposable? _LockForSpace(string path) {
+    var gate = this._EnterNamespaceShared();
+    var lease = this._handles.TryAcquireWrite(path, TimeSpan.Zero);
+    if (lease == null || this._staging.ContainsKey(path) || this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path)) {
+      lease?.Dispose();
+      gate.Dispose();
+      return null; // busy: the optimizer skips it this pass
+    }
+
+    return new _SpaceLock(this, path, lease, gate);
+  }
+
+  /// <summary>Releases a space lock — after dropping what the pool cached about the path, whose data may now be shared.</summary>
+  private sealed class _SpaceLock(PoolFileSystem fs, string path, IDisposable lease, IDisposable gate) : IDisposable {
+    public void Dispose() {
+      try {
+        fs._Invalidate(path);
+      } finally {
+        lease.Dispose();
+        gate.Dispose();
+      }
+    }
+  }
+
   /// <summary>Publishes one striped file closed under the performance policy; false when there was none to do.</summary>
   public bool PublishOneDeferredStripe() {
     while (this._deferredPublishes.TryDequeue(out var path)) {

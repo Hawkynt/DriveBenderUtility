@@ -256,6 +256,17 @@ public sealed record IoConfig {
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
 }
 
+/// <summary>Space savings run with the health scan (docs/SpaceSavings.md); both on unless set to false.</summary>
+public sealed record SpaceConfig {
+  /// <summary>Share the data of different files with identical content on one disk (block clones; hard links only where metadata matches).</summary>
+  [JsonPropertyName("deduplicate")] public bool? Deduplicate { get; init; }
+
+  /// <summary>Release long runs of zeros to the filesystem.</summary>
+  [JsonPropertyName("sparsify")] public bool? Sparsify { get; init; }
+
+  [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+}
+
 public sealed record PlacementConfig {
   [JsonPropertyName("strategy")] public PlacementStrategy? Strategy { get; init; }
   [JsonPropertyName("shadowNeverSamePhysical")] public bool? ShadowNeverSamePhysical { get; init; }
@@ -383,6 +394,7 @@ public sealed record PoolConfig {
   [JsonPropertyName("resilience")] public ResilienceConfig? Resilience { get; init; }
   [JsonPropertyName("integrity")] public IntegrityConfig? Integrity { get; init; }
   [JsonPropertyName("trash")] public TrashConfig? Trash { get; init; }
+  [JsonPropertyName("space")] public SpaceConfig? Space { get; init; }
   [JsonPropertyName("snapshots")] public SnapshotsConfig? Snapshots { get; init; }
   [JsonPropertyName("locale")] public string? Locale { get; init; }
 
