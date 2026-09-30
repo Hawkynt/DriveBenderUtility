@@ -68,6 +68,16 @@ public sealed class StripeSession {
     this._readAt = readAt ?? _DirectRead;
   }
 
+  /// <summary>
+  /// Times and mode an application set on the file while it was open (<c>cp -p</c> stamps the file
+  /// before closing it). Filling writes to the finals after that, which moves their modification
+  /// time, so the engine applies these again once they are filled. A write after the stamp clears the
+  /// times: then the write's time is the right one.
+  /// </summary>
+  public DateTime? PendingCreationTimeUtc { get; set; }
+  public DateTime? PendingLastWriteTimeUtc { get; set; }
+  public UnixFileMode? PendingPermissions { get; set; }
+
   public int BlockSize { get; }
   public int CopiesPerBlock { get; }
   public long Length { get; private set; }
@@ -112,6 +122,8 @@ public sealed class StripeSession {
   public void Write(long offset, byte[] bytes) {
     if (bytes.Length == 0)
       return;
+
+    this.PendingLastWriteTimeUtc = null; // written after it was stamped: the write's time is the file's
 
     var first = offset / this.BlockSize;
     var last = (offset + bytes.Length - 1) / this.BlockSize;

@@ -947,6 +947,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {path}");
     }
 
+    // a file still being written through a stripe session gets filled at close, which would move
+    // these times again: the session keeps them and puts them back on the finished copies
+    if (this._stripes.TryGetValue(normalized, out var striped)) {
+      striped.PendingCreationTimeUtc = patch.CreationTimeUtc ?? striped.PendingCreationTimeUtc;
+      striped.PendingLastWriteTimeUtc = patch.LastWriteTimeUtc ?? striped.PendingLastWriteTimeUtc;
+      striped.PendingPermissions = patch.Permissions ?? striped.PendingPermissions;
+    }
+
     foreach (var copy in copies) {
       copy.Volume.SetTimestamps(dataName, copy.Shadow, patch.CreationTimeUtc, patch.LastWriteTimeUtc);
 
@@ -1370,7 +1378,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           refusals.FirstOrDefault() ?? new PoolFsException(PoolFsError.IoError, $"No disk could complete '{normalized}'")).Throw();
 
       var fill = whole.OrderBy(f => f.Shadow).ToArray();
-      foreach (var member in stripe.Members.Except(fill))
+
+      // what the application stamped on the open file, back on every finished copy (filling moved it)
+      if (stripe.PendingCreationTimeUtc != null || stripe.PendingLastWriteTimeUtc != null || stripe.PendingPermissions != null)
+        foreach (var final in fill) {
+          if (stripe.PendingPermissions is { } mode && (final.Volume.Caps & BackendCaps.Permissions) != 0)
+            final.Volume.SetPermissions(final.Path, final.Shadow, mode);
+          if ((final.Volume.Caps & BackendCaps.Timestamps) != 0)
+            final.Volume.SetTimestamps(final.Path, final.Shadow, stripe.PendingCreationTimeUtc, stripe.PendingLastWriteTimeUtc);
+        }
+      // only temps that exist: a helper that never took a block has none, and deleting it anyway cost
+      // every disk of the group an operation per file — and, being quick, taught placement that an
+      // idle slow disk was fast
+      foreach (var member in finals.Except(fill).Concat(stripe.CreatedHelpers()).Distinct())
         try {
           member.Volume.Delete(member.Path, member.Shadow);
         } catch (PoolFsException) {

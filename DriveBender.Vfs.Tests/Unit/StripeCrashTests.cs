@@ -189,4 +189,37 @@ public class StripeCrashTests {
       .Should().Be(duplication, "every copy the folder asks for exists, whole");
   }
 
+
+  [Test]
+  [Category("HappyPath")]
+  public void Stripe_GivenTheOpenFileIsStampedBeforeItIsClosed_ThenEveryCopyKeepsTheStampedTime() {
+    // cp -p: write, set the source's times on the still-open file, close. Filling at close writes to
+    // the copies after the stamp, which used to leave them with the time of the fill.
+    var stamped = new DateTime(2019, 3, 14, 15, 9, 26, DateTimeKind.Utc);
+    using var fs = this._Engine(2);
+    var handle = fs.Create("kept.bin", NodeKind.File, CreateFlags.None);
+    fs.Write(handle, _Content(), 0, WriteMode.Normal);
+    fs.SetAttributes("kept.bin", new(LastWriteTimeUtc: stamped));
+    fs.Close(handle);
+
+    fs.GetAttributes("kept.bin").LastWriteTimeUtc.Should().Be(stamped);
+    foreach (var volume in this._All)
+    foreach (var shadow in new[] { false, true })
+      if (volume.Stat("kept.bin", shadow) is { } meta)
+        meta.LastWriteTimeUtc.Should().Be(stamped, $"the copy on '{volume.DisplayName}' (shadow: {shadow}) keeps the stamped time");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Stripe_GivenTheFileIsWrittenAfterItWasStamped_ThenTheWriteDecidesTheTime() {
+    var stamped = new DateTime(2019, 3, 14, 15, 9, 26, DateTimeKind.Utc);
+    using var fs = this._Engine(1);
+    var handle = fs.Create("later.bin", NodeKind.File, CreateFlags.None);
+    fs.SetAttributes("later.bin", new(LastWriteTimeUtc: stamped));
+    fs.Write(handle, _Content(), 0, WriteMode.Normal);
+    fs.Close(handle);
+
+    fs.GetAttributes("later.bin").LastWriteTimeUtc.Should().BeAfter(stamped.AddYears(1), "a write after the stamp is the newer truth");
+  }
+
 }

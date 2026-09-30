@@ -99,6 +99,16 @@ public class PlacementBalanceTests {
       $"a reading {millisecondsAgo} ms old is {(expectTriedAgain ? "past" : "within")} the {PoolFileSystem.LatencyStaleAfter.TotalSeconds}s it counts for");
   }
 
+  /// <summary>
+  /// Spends exactly <paramref name="milliseconds"/>. Thread.Sleep(3) sleeps about 15 ms on Windows and
+  /// about 3 ms on Linux, so the same test measured two different disks — and only the Linux one sat
+  /// close enough to the 1 ms floor to expose a disk being taught it was fast.
+  /// </summary>
+  private static void _Busy(int milliseconds) {
+    var until = System.Diagnostics.Stopwatch.GetTimestamp() + System.Diagnostics.Stopwatch.Frequency * milliseconds / 1000;
+    while (System.Diagnostics.Stopwatch.GetTimestamp() < until) { }
+  }
+
   [Test]
   [Category("HappyPath")]
   public void Placement_GivenOneMemberGenuinelySlow_WhenFilesAreWritten_ThenTheFasterMemberTakesMost() {
@@ -106,7 +116,7 @@ public class PlacementBalanceTests {
     // floor — must still lose to the fast one; ignoring noise must not mean ignoring measurements
     this._v2.BeforeOperation = (op, _) => {
       if (op is VolumeOp.Write or VolumeOp.Flush or VolumeOp.OpenWrite)
-        Thread.Sleep(3);
+        _Busy(3);
     };
 
     var fs = _Engine(new MeasuredVolumeIO(this._v1), new MeasuredVolumeIO(this._v2));

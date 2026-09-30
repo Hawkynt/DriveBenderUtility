@@ -2241,3 +2241,18 @@ back old (2 of 5 runs).
   moved blocks the commit. Only watched paths are counted, so a write pays one read when nothing is
   being copied. Simulated by pausing a heal after its copy and putting the source's time back after
   a same-length rewrite: without the watch the stale copy is published.
+
+### Resolved (found by CI on Linux): striped publishes touched every disk of the group, and `cp -p` lost its times
+
+- **Deletes of temps that never existed.** Publishing a striped file deleted the temp of every helper
+  disk, including helpers that never took a block and had none: one pointless operation per disk per
+  file. Being quick, those deletes also taught placement that an idle slow disk was fast (its average
+  sank to the 1 ms floor), so it won ties again. Seen only on Linux, where `Thread.Sleep(3)` really
+  sleeps 3 ms rather than Windows' 15 ms: half of twenty files went to the slow disk, and the test
+  took 8 s. Only temps that exist are deleted now (200 ms), and the test spends an exact 3 ms per
+  operation on both platforms.
+- **`cp -p` times lost.** GNU `cp -p` stamps the file's times while it is still open, then closes it.
+  Filling the finals at close wrote to them after the stamp, so the published file carried the time
+  of the fill. The session now keeps what was stamped (times and mode) and puts it back on every
+  finished copy before the rename. A write after the stamp clears the stamped time, because then the
+  write's time is the right one.
