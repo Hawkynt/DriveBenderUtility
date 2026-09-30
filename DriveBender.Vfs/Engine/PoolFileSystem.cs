@@ -632,7 +632,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._RequireWritable();
     using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(originalPath);
-    var restored = this._trash.Restore(normalized)
+    _RefuseWriteToSnapshotTree(normalized);
+
+    // Under the path's lease, and only onto a free name. The restore renames the binned file into
+    // place, and it used to do that over whatever held the name by then: on the same disk the newer
+    // file was replaced outright (not binned, not preserved for a snapshot), on another disk the pool
+    // was left with two primaries of one path. A name being written for the first time is taken too.
+    using var lease = this._handles.AcquireWrite(normalized);
+    if (this._staging.ContainsKey(normalized) || this._placement.ResolveCopies(normalized).Count > 0)
+      throw new PoolFsException(PoolFsError.Exists,
+        $"'{normalized}' exists again since it was deleted — rename or delete that file first, then restore");
+
+    // The bin keeps a file on the disk it was deleted from. A disk that has since become idle (it is
+    // being retired) or read-only takes no new files, and a restored file is new to it: the entry is
+    // moved to where a new file of its size would be placed, and restored there.
+    var restored = this._trash.Restore(normalized, this._TakesNewFiles, this._placement.ChoosePrimaryTarget)
                    ?? throw new PoolFsException(PoolFsError.NotFound, $"No trash entry for '{originalPath}'");
 
     this._Invalidate(normalized);
@@ -972,6 +986,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {path}");
     }
 
+    // A snapshot proves an untouched live file is still its content by the file's modification time,
+    // so new times on a pinned file would turn the snapshot's read of it into "that copy is not
+    // available" — for a `touch` that changed no byte. The content is kept first, as for a write.
+    if (patch.CreationTimeUtc != null || patch.LastWriteTimeUtc != null || patch.Permissions != null) {
+      this._PreserveIfPinned(normalized, wholeFileReplaced: false);
+      copies = this._placement.ResolveCopies(dataName);
+    }
+
     // a file still being written through a stripe session gets filled at close, which would move
     // these times again: the session keeps them and puts them back on the finished copies
     if (this._stripes.TryGetValue(normalized, out var striped)) {
@@ -1169,6 +1191,23 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // than staging a second temp under the same name, after which the older publish would land last.
     if (this._staging.ContainsKey(normalized) && !this._handles.IsOpen(normalized))
       this._PublishStagedLocked(normalized);
+
+    // A name another handle is still writing for the first time HAS a file at it — only its staged
+    // temp so far, which ResolveCopies does not see. Treated as absent, a second create staged a
+    // second temp under the same name and replaced the first one's stripe session: two primaries
+    // published side by side, and O_EXCL answered success over a file that existed. It is the
+    // existing file: joined, and truncated if asked, exactly like a published one.
+    if (this._staging.ContainsKey(normalized)) {
+      if ((flags & CreateFlags.Exclusive) != 0)
+        throw new PoolFsException(PoolFsError.Exists, $"File already exists: {path}");
+
+      var joined = this._handles.Open(normalized, AccessMode.ReadWrite).Handle;
+      lease.Dispose(); // SetLength re-takes this very lock through the handle (NoRecursion)
+      if ((flags & CreateFlags.Truncate) != 0)
+        this.SetLength(joined, 0);
+
+      return joined;
+    }
 
     var existing = this._placement.ResolveCopies(normalized);
     if (existing.Count > 0) {
@@ -1435,6 +1474,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   private MemberRole _RoleOf(IVolumeIO volume) => this._members.FirstOrDefault(m => m.Io.MemberId == volume.MemberId)?.Role ?? MemberRole.Capacity;
+
+  /// <summary>Whether a member may receive a file the pool did not already have there: never an idle or read-only one (live roles).</summary>
+  private bool _TakesNewFiles(IVolumeIO volume) => this._placement.RoleOf(volume.MemberId) is not (MemberRole.Idle or MemberRole.ReadOnly);
 
   /// <summary>
   /// Keeps a landing-zone file inside the landing zone only while it fits there (docs/IncomingFiles.md):
@@ -1786,15 +1828,18 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // where it is for the rename itself to have something to move. A rename of a pinned file
     // therefore costs what an in-place modification costs, and is rare enough for that to be the
     // right trade against making the rename itself a multi-step operation that can fail half way.
-    this._PreserveIfPinned(fromNormalized, wholeFileReplaced: false);
-    if (!sameFile)
-      this._PreserveIfPinned(toNormalized, wholeFileReplaced: false);
-
-    // a case-only rename has no distinct target to conflict with or overwrite — its "target
-    // copies" ARE the source; only a genuinely different path is a real target
+    //
+    // A case-only rename has no distinct target to conflict with or overwrite — its "target copies"
+    // ARE the source; only a genuinely different path is a real target. And a rename that is refused
+    // changes nothing, so the refusal comes before any preserving: a copy made first was store space
+    // spent on nothing, with the target dropped from the pinned set on the way.
     var targetCopies = sameFile ? [] : this._placement.ResolveCopies(toNormalized);
     if (targetCopies.Count > 0 && (flags & RenameFlags.ReplaceExisting) == 0)
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {to}");
+
+    this._PreserveIfPinned(fromNormalized, wholeFileReplaced: false);
+    if (!sameFile)
+      this._PreserveIfPinned(toNormalized, wholeFileReplaced: false);
 
     this._FlushPathLocked(fromNormalized); // pending mutations land under the old name first
 
@@ -1900,12 +1945,38 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           + "delete a snapshot, or raise snapshots.reserve.");
     }
 
+    this._PublishClosedStaged();
     var paths = this._AllLogicalFiles().ToArray();
     var taken = this._snapshots.Take(name, paths);
     foreach (var path in paths)
       this._pinned[path] = 0;
 
     return taken;
+  }
+
+  /// <summary>
+  /// Publishes every file whose writer has closed it but whose publish is still pending (the
+  /// performance policy publishes a striped file in the background).
+  ///
+  /// Such a file is saved as far as its writer can tell, yet on disk it is still a hidden temp, and a
+  /// snapshot records the published names — so it was simply not in the snapshot, and nothing kept
+  /// its content when it was later overwritten. A file still OPEN for its first write stays out: it
+  /// has no content yet that anybody has finished.
+  /// </summary>
+  private void _PublishClosedStaged() {
+    foreach (var path in this._staging.Keys.ToArray()) {
+      if (this._handles.IsOpen(path))
+        continue;
+
+      try {
+        using var namespaceHold = this._EnterNamespaceShared();
+        using var lease = this._handles.AcquireWrite(path);
+        if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path))
+          this._PublishStagedLocked(path);
+      } catch (PoolFsException e) {
+        DriveBender.Logger($"[Warning]'{path}' could not be published before the snapshot and is not in it: {e.Message}");
+      }
+    }
   }
 
   public IReadOnlyList<SnapshotEntry> ListSnapshots() => this._snapshots.List();
@@ -2063,8 +2134,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void RestoreFromSnapshot(Guid id, string path) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(path);
-    using var source = this.OpenSnapshotFile(id, normalized);
+    var snapshot = this._snapshots.List().FirstOrDefault(s => s.Id == id)
+                   ?? throw new PoolFsException(PoolFsError.NotFound, $"No snapshot {id:D}");
 
+    // A file untouched since the snapshot IS its content already (the resolver has just proved it,
+    // or it would have thrown). Restoring it anyway set the live file aside and wrote it back byte
+    // for byte: a full copy, and a version in the store identical to the file beside it.
+    var located = this._ResolveSnapshotSource(snapshot, normalized);
+    if (!located.path.StartsWith(PoolSnapshots.SnapshotPrefix + "/", PoolPaths.PathComparison)) {
+      DriveBender.Logger($" - '{normalized}' is unchanged since snapshot {id:D}; nothing to restore");
+      return;
+    }
+
+    using var source = located.member.OpenRead(located.path, located.shadow);
     var handle = this.Create(normalized, NodeKind.File, CreateFlags.Truncate);
     try {
       var buffer = new byte[WholeFilePublisher.CopyBufferSize];
@@ -2096,7 +2178,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// editor and every backup tool does; the second is what costs.
   /// </summary>
   private void _PreserveIfPinned(string normalized, bool wholeFileReplaced) {
-    if (this._pinned.IsEmpty || !this._pinned.ContainsKey(normalized))
+    // ContainsKey alone: it reads without a lock, where IsEmpty on an EMPTY dictionary takes every
+    // one of its locks — on the write path of a pool with no snapshots, that is every write
+    if (!this._pinned.ContainsKey(normalized))
       return;
 
     var pins = this._snapshots.SnapshotsNeeding(normalized);
@@ -2104,6 +2188,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._pinned.TryRemove(normalized, out _);
       return;
     }
+
+    // The version is made from ONE copy, and under write-back a copy can be behind an acknowledged
+    // write for the length of the defer window. The caller holds this path's write lease, so the owed
+    // bytes are applied first and every copy is the file the pool acknowledged. Set aside unflushed,
+    // the version missed that write — and a delete then discarded the owed bytes for good.
+    this._FlushBeforeKeeping(normalized);
 
     var copies = this._placement.ResolveCopies(this._DataName(normalized));
     if (copies.Count == 0) {
@@ -2125,6 +2215,24 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._pinned.TryRemove(normalized, out _);
     this._Invalidate(normalized);
     this._EnforceSnapshotReserve();
+  }
+
+  /// <summary>
+  /// Applies the writes still owed to a file's lagging copies before one of its copies is kept aside —
+  /// in the snapshot store or the recycle bin. The caller holds the path's write lease.
+  ///
+  /// A member refusing the owed bytes does not stop the operation that asked (a delete must not fail
+  /// because a disk is full); the copy kept is then as current as that member allows, and it is said.
+  /// </summary>
+  private void _FlushBeforeKeeping(string normalized) {
+    if (!this._writeBuffer.IsDirty(normalized))
+      return;
+
+    try {
+      this._FlushPathLocked(normalized);
+    } catch (PoolFsException e) {
+      DriveBender.Logger($"[Warning]'{normalized}' still owes a copy acknowledged bytes ({e.Message}); the copy kept aside may be behind them");
+    }
   }
 
   #endregion
@@ -2157,6 +2265,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var lease = this._handles.AcquireWrite(normalized);
     this._writeWatch.Changed(normalized); // under the lease: a copy committing after this sees it
     this._CloseWriteSession(normalized); // nothing left to reconcile once the file is gone
+
+    // A file its writer has CLOSED but whose publish is still pending (the performance policy
+    // publishes striped files in the background) was saved as far as anybody could tell. With the
+    // recycle bin on it is published first, so the delete below bins it like any other file; it used
+    // to take the branch that follows, which drops it as a file that never existed.
+    var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(normalized));
+    var binned = effective.Trash?.Enabled == true;
+    if (binned && this._staging.ContainsKey(normalized) && !this._handles.IsOpen(normalized))
+      this._PublishStagedLocked(normalized);
 
     // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
     if (this._staging.TryRemove(normalized, out var createSequence)) {
@@ -2203,14 +2320,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return;
     }
 
+    // The bin keeps ONE copy (dropDuplicatesInTrash), and a copy can be behind an acknowledged write
+    // for the length of the write-back window. The owed bytes are applied before a copy is binned —
+    // discarded with the delete instead, the file restored later was one the pool never held.
+    if (binned)
+      this._FlushBeforeKeeping(normalized);
+
     // pending buffered mutations are moot once the file dies; their intents complete with the delete
     var discarded = this._writeBuffer.Drain(normalized);
 
     // offline members keep their stale copies — record what they missed so no ghost resurrects
     this._RecordTombstoneForOffline(JournalOp.Delete, normalized);
 
-    var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(normalized));
-    if (effective.Trash?.Enabled == true) {
+    if (binned) {
       // recoverable delete: all copies move to the hidden pool trash instead of dying (FR-TRASH)
       this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true);
       this._InvalidateChecksums(normalized);
@@ -2415,8 +2537,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // preserved by copy. A caller that goes on to truncate has already been given the cheap path by
     // SetLength; this is the conservative case, and being conservative here is the difference
     // between a snapshot and a suggestion.
-    if ((mode & AccessMode.Write) != 0)
+    //
+    // Under the path's write lease, like every other preserve: the version is a copy of the file, and
+    // a writer on another handle must not change it half-way through the copy.
+    if ((mode & AccessMode.Write) != 0 && this._pinned.ContainsKey(normalized)) {
+      using var namespaceHold = this._EnterNamespaceShared();
+      using var lease = this._handles.AcquireWrite(normalized);
       this._PreserveIfPinned(normalized, wholeFileReplaced: false);
+    }
 
     return this._handles.Open(normalized, mode).Handle;
   }
@@ -3046,6 +3174,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         return length;
       }
 
+      // A handle opened BEFORE a snapshot was taken never passed the preserve in Open, so the first
+      // write through it after the snapshot keeps the content first. One lookup on an empty set in a
+      // pool without snapshots; once per file and snapshot otherwise, as the path then leaves the set.
+      this._PreserveIfPinned(path, wholeFileReplaced: false);
+
       IReadOnlyList<PhysicalCopy> copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
@@ -3416,6 +3549,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._writeWatch.Changed(path);
         return;
       }
+
+      this._PreserveIfPinned(path, wholeFileReplaced: false); // a handle opened before the snapshot, as in Write
 
       // already holding this file's lock through the handle — the locked core, never the
       // lease-taking shell, which would recurse on a NoRecursion lock

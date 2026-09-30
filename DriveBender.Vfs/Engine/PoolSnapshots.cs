@@ -55,7 +55,10 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
   private const string _INDEX_FOLDER = SnapshotPrefix + "/index";
   private const string _VERSION_FOLDER = SnapshotPrefix + "/versions";
   private const string _VERSION_SUFFIX = ".snapver";
-  private const string _INFO_SUFFIX = ".snapinfo";
+  private const string _INFO_SUFFIX = InfoSuffix;
+
+  /// <summary>What a version's sidecar is named after it: the version path plus this.</summary>
+  public const string InfoSuffix = ".snapinfo";
 
   private long _uniquifier;
 

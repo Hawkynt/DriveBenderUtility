@@ -92,8 +92,11 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
     return roleFilter == null || role == roleFilter;
   }
 
-  private MemberRole _RoleOf(IVolumeIO member)
-    => this._roles != null && this._roles.TryGetValue(member.MemberId, out var role) ? role : MemberRole.Capacity;
+  private MemberRole _RoleOf(IVolumeIO member) => this.RoleOf(member.MemberId);
+
+  /// <summary>A member's role as placement currently sees it — live, after any role reload.</summary>
+  public MemberRole RoleOf(Guid memberId)
+    => this._roles != null && this._roles.TryGetValue(memberId, out var role) ? role : MemberRole.Capacity;
 
   /// <summary>
   /// Picks the member for a new primary (FR-PLACE): fast tier first when one exists and

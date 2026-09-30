@@ -222,10 +222,29 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
     return moved;
   }
 
+  /// <summary>The sidecars that describe a kept file, named after it: the bin's and the snapshot store's.</summary>
+  private static readonly string[] _SIDECAR_SUFFIXES = [".trashinfo", PoolSnapshots.InfoSuffix];
+
+  /// <summary>
+  /// Moves one recoverable tree off the leaving member, each kept file TOGETHER with its sidecar.
+  ///
+  /// The two were placed one file at a time, each on whichever member had the most room at that
+  /// moment — and moving the file changes which member that is. A snapshot version landed on one disk
+  /// and the sidecar naming it on another: the store only sees a version whose sidecar sits beside it,
+  /// so the version was on a disk, paid for, and invisible, and the snapshot reported it lost. A bin
+  /// entry split the same way lost its deletion date, and its sidecar was left describing nothing.
+  /// </summary>
   private int _ScatterHiddenTree(IVolumeIO leaving, string root) {
     var moved = 0;
-    foreach (var path in this._WalkFolder(leaving, root)) {
-      var size = leaving.Stat(path, false)?.Length ?? 0;
+    var files = this._WalkFolder(leaving, root).ToList();
+    var present = new HashSet<string>(files, StringComparer.OrdinalIgnoreCase);
+    foreach (var path in files) {
+      // a sidecar travels with the file it describes; only one whose file is gone travels alone
+      if (_SIDECAR_SUFFIXES.Any(s => path.EndsWith(s, StringComparison.OrdinalIgnoreCase) && present.Contains(path[..^s.Length])))
+        continue;
+
+      string[] unit = [path, .. _SIDECAR_SUFFIXES.Select(s => path + s).Where(present.Contains)];
+      var size = unit.Sum(file => leaving.Stat(file, false)?.Length ?? 0);
       var target = this._ChooseTarget([], size, leaving, retiring: true);
       if (target == null) {
         // Said out loud rather than swallowed: the bin is the one thing here that has no second
@@ -238,12 +257,19 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
       if (parent.Length > 0)
         target.EnsureFolder(parent, false);
 
-      var sequence = journal.LogIntent(JournalOp.Rebalance, path, memberId: target.MemberId);
-      WholeFilePublisher.CopyBetween(leaving, path, false, target, path, false,
-        admit: WholeFilePublisher.Pace(admit, leaving, target));
-      journal.Complete(sequence, JournalOp.Rebalance);
-      leaving.Delete(path, false);
-      ++moved;
+      // every half copied before any original goes, and the sidecars go first: an interruption leaves
+      // the entry whole on one member or both, never a sidecar describing a file that is not there
+      foreach (var file in unit) {
+        var sequence = journal.LogIntent(JournalOp.Rebalance, file, memberId: target.MemberId);
+        WholeFilePublisher.CopyBetween(leaving, file, false, target, file, false,
+          admit: WholeFilePublisher.Pace(admit, leaving, target));
+        journal.Complete(sequence, JournalOp.Rebalance);
+      }
+
+      for (var index = unit.Length - 1; index >= 0; --index) {
+        leaving.Delete(unit[index], false);
+        ++moved;
+      }
     }
 
     return moved;

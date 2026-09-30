@@ -200,14 +200,34 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
     }
   }
 
-  /// <summary>Restores the NEWEST trashed version to its original path; the engine re-establishes duplication afterwards.</summary>
-  public (IVolumeIO member, string restoredPath)? Restore(string originalPath) {
+  /// <summary>
+  /// Restores the NEWEST trashed version to its original path; the engine re-establishes duplication
+  /// afterwards. The caller makes sure the path is free.
+  /// </summary>
+  /// <param name="takesFiles">
+  /// Whether a member may receive the restored file. One that may not (idle, read-only) has the entry
+  /// moved first — version and sidecar, copied before the originals go — onto the member
+  /// <paramref name="chooseTarget"/> names for a file of its size, and it is restored there.
+  /// </param>
+  /// <exception cref="PoolFsException">NoSpace when the entry has to move and no member can take it; nothing is moved then.</exception>
+  public (IVolumeIO member, string restoredPath)? Restore(string originalPath, Func<IVolumeIO, bool>? takesFiles = null,
+    Func<long, IVolumeIO?>? chooseTarget = null) {
     var normalized = PoolPaths.Normalize(originalPath);
     var newest = this._VersionsOf(normalized).OrderByDescending(v => v.info.DeletedUtc).FirstOrDefault();
     if (newest.member == null)
       return null;
 
     var (member, trashPath, _) = newest;
+    if (takesFiles != null && !takesFiles(member)) {
+      var size = member.Stat(trashPath, false)?.Length ?? 0;
+      var target = chooseTarget?.Invoke(size)
+                   ?? throw new PoolFsException(PoolFsError.NoSpace,
+                     $"'{normalized}' is in the recycle bin of '{member.DisplayName}', which takes no new files, and no other member can take {size:N0} bytes");
+
+      this._MoveEntry(member, trashPath, target);
+      member = target;
+    }
+
     var sequence = journal.LogIntent(JournalOp.TrashMove, trashPath, normalized);
     var parent = PoolPaths.GetParent(normalized);
     if (parent.Length > 0)
@@ -219,6 +239,25 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
 
     journal.Complete(sequence, JournalOp.TrashMove);
     return (member, normalized);
+  }
+
+  /// <summary>
+  /// Moves one bin entry — the file and its sidecar — to the same place in another member's bin.
+  /// Both are copied (temp + rename, so neither half is ever torn) before either original is removed:
+  /// a power cut leaves the entry on one member or on both, never on neither. On both it is listed
+  /// once and restored or purged like any other.
+  /// </summary>
+  private void _MoveEntry(IVolumeIO from, string trashPath, IVolumeIO to) {
+    var info = _InfoPathFor(trashPath);
+    var hasInfo = from.FileExists(info, false);
+    to.EnsureFolder(PoolPaths.GetParent(trashPath), false);
+    WholeFilePublisher.CopyBetween(from, trashPath, false, to, trashPath, false, admit: WholeFilePublisher.Pace(admit, from, to));
+    if (hasInfo)
+      WholeFilePublisher.CopyBetween(from, info, false, to, info, false);
+
+    if (hasInfo)
+      from.Delete(info, false);
+    from.Delete(trashPath, false);
   }
 
   /// <summary>
