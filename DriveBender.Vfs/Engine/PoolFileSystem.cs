@@ -981,6 +981,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     foreach (var copy in copies) {
+      if (!_IsStagedName(dataName))
+        WholeFilePublisher.SeparateIfLinked(copy.Volume, dataName, copy.Shadow); // linked names share times and mode as well
       copy.Volume.SetTimestamps(dataName, copy.Shadow, patch.CreationTimeUtc, patch.LastWriteTimeUtc);
 
       // EVERY copy, not just the primary: a file that is private on one member and readable on
@@ -990,6 +992,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     this._cache.Metadata.InvalidatePath(this._poolId, normalized);
+    this._writeWatch.Changed(normalized); // new times are a change too: a hard link is only made between files whose times match
   }
 
   /// <summary>
@@ -1491,6 +1494,110 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._activity.Publish(ActivityKind.Rebalance, normalized, size, toMember: primary.DisplayName,
       reason: stripe.Length == 0 ? "does not fit the landing zone — written to storage" : "outgrew the landing zone — continues in storage");
     return true;
+  }
+
+  /// <summary>
+  /// The space optimizer for this mounted pool (docs/SpaceSavings.md), or null when the pool's
+  /// settings turn both of its jobs off. It holds no file while it reads (<see cref="_SpaceFeed"/>),
+  /// and its reads are charged to each member's background allowance like any other pool job.
+  /// </summary>
+  public SpaceOptimizer? CreateSpaceOptimizer() {
+    var space = this._config.Space;
+    var deduplicate = space?.Deduplicate ?? true;
+    var sparsify = space?.Sparsify ?? true;
+    if (!deduplicate && !sparsify || this.IsReadOnly)
+      return null;
+
+    return new([.. this._members.Select(m => m.Io)], () => new _SpaceFeed(this), deduplicate, sparsify, this.AdmitBulk);
+  }
+
+  /// <summary>Runs the space optimizer now; an empty report when it is off.</summary>
+  public SpaceReport OptimizeSpace(OperationContext? operation = null) => this.CreateSpaceOptimizer()?.Run(operation) ?? SpaceReport.Empty;
+
+  /// <summary>
+  /// The space optimizer's view of this pool. A watch hears every change the engine makes to a path
+  /// (<see cref="WriteWatch"/>: writes, truncates, renames, deletes, new times, owed copies landing)
+  /// and every change anyone makes on a member's disk (<see cref="MemberChangeFeed"/>). The commit
+  /// window takes the path's lease WITHOUT waiting and only when the file is closed, clean and not
+  /// staged, so an application never waits on the optimizer for longer than one rename; when the
+  /// window cannot be had at once, the file waits for the next pass instead.
+  /// </summary>
+  private sealed class _SpaceFeed(PoolFileSystem fs) : IChangeFeed, IDisposable {
+
+    private readonly MemberChangeFeed _disks = new(fs._members.Select(m => m.Io));
+
+    public IPathWatch Watch(string path) {
+      var normalized = PoolPaths.Normalize(path);
+      var disk = this._disks.Watch(normalized);
+      var token = fs._writeWatch.Begin(normalized);
+
+      // a file with writes still owed to a copy, or still being written, is not as its copies show
+      var unsettled = fs._staging.ContainsKey(normalized) || fs._writeBuffer.IsDirty(normalized);
+      return new _Watch(fs, normalized, token, disk, unsettled);
+    }
+
+    public IDisposable? TryCommit(IReadOnlyList<IPathWatch> watches) {
+      if (watches.Any(w => w.Changed))
+        return null;
+
+      var paths = watches.Select(w => w.Path).Distinct(PoolPaths.PathComparer).Order(StringComparer.Ordinal).ToList();
+      // a folder rename must not move a path mid-commit; one that is under way or waiting wins
+      if (!fs._folderRenameGate.TryEnterReadLock(0))
+        return null;
+
+      IDisposable? gate = new GateHold(fs._folderRenameGate, false);
+      var leases = new List<IDisposable>();
+      try {
+        foreach (var path in paths) {
+          if (fs._handles.TryAcquireWrite(path, TimeSpan.Zero) is not { } lease)
+            return null;
+
+          leases.Add(lease);
+          if (fs._staging.ContainsKey(path) || fs._writeBuffer.IsDirty(path) || fs._handles.IsOpen(path))
+            return null;
+        }
+
+        // checked again with the leases held: no write can be in flight now, and one that landed
+        // since the watch began has reported itself
+        if (watches.Any(w => w.Changed))
+          return null;
+
+        var window = new _Window(fs, paths, leases, gate);
+        leases = [];
+        gate = null;
+        return window;
+      } finally {
+        foreach (var lease in leases)
+          lease.Dispose();
+        gate?.Dispose();
+      }
+    }
+
+    public void Dispose() => this._disks.Dispose();
+
+    private sealed class _Watch(PoolFileSystem fs, string path, long token, IPathWatch disk, bool unsettled) : IPathWatch {
+      public string Path => path;
+      public bool Changed => unsettled || disk.Changed || fs._writeWatch.Changed(path, token);
+
+      public void Dispose() {
+        fs._writeWatch.End(path);
+        disk.Dispose();
+      }
+    }
+
+    /// <summary>Closes a commit window, after dropping what the pool cached about paths whose data may now be shared.</summary>
+    private sealed class _Window(PoolFileSystem fs, List<string> paths, List<IDisposable> leases, IDisposable gate) : IDisposable {
+      public void Dispose() {
+        try {
+          foreach (var path in paths)
+            fs._Invalidate(path);
+        } finally {
+          foreach (var lease in leases)
+            lease.Dispose();
+          gate.Dispose();
+        }
+      }
+    }
   }
 
   /// <summary>Publishes one striped file closed under the performance policy; false when there was none to do.</summary>
@@ -2928,6 +3035,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
+      // copy-on-write: a copy sharing its data with another file (a hard link the optimizer made)
+      // gets data of its own before it is written in place — checked once per open file
+      if (!lease.File.LinksSeparated && !_IsStagedName(dataPath)) {
+        foreach (var copy in copies)
+          if (WholeFilePublisher.SeparateIfLinked(copy.Volume, dataPath, copy.Shadow))
+            this._activity.Publish(ActivityKind.Write, path, reason: $"separated from a shared (hard-linked) file on {copy.Volume.DisplayName} before writing");
+
+        lease.File.LinksSeparated = true;
+      }
+
       if (mode == WriteMode.Append)
         offset = this._writeBuffer.OverlayLength(path, copies[0].Volume.Stat(dataPath, copies[0].Shadow)?.Length ?? 0);
 
@@ -3279,8 +3396,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // while still a staging temp — where an intent recovers nothing (the temp is swept after a
       // crash) and the publish's flush commits the size along with the content.
       var sequence = _IsStagedName(dataPath) ? 0 : this._journal.LogIntent(JournalOp.Truncate, dataPath, length: length);
-      foreach (var copy in copies)
+      foreach (var copy in copies) {
+        WholeFilePublisher.SeparateIfLinked(copy.Volume, dataPath, copy.Shadow, keepBytes: length); // copy-on-write, of what survives the cut
         copy.Volume.Truncate(dataPath, copy.Shadow, length); // grows zero-filled or shrinks on all copies (FR-TRUNC)
+      }
 
       this._journal.Complete(sequence, JournalOp.Truncate);
       this._InvalidateChecksums(dataPath);
@@ -3348,6 +3467,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       try {
         foreach (var copy in copies) {
+          if (!intoStaging)
+            WholeFilePublisher.SeparateIfLinked(copy.Volume, dataName, copy.Shadow); // copy-on-write: a copy that was away may still share
           using var stream = copy.Volume.OpenWrite(dataName, copy.Shadow, false);
           foreach (var op in ops) {
             if (op.TruncateLength is { } truncateLength) {
@@ -3389,6 +3510,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._InvalidateChecksums(dataName);
     this._cache.Pages.InvalidatePath(this._poolId, dataName);
     this._cache.Metadata.InvalidatePath(this._poolId, normalized);
+    if (ops.Count > 0)
+      this._writeWatch.Changed(normalized); // the owed copies changed only now: a job that read them before must hear it
     // a flush is a durability point: everything written in the session is on every copy
     this._CloseWriteSession(dataName);
   }

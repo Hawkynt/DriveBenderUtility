@@ -674,6 +674,7 @@ async function healthDialog(pool, fix, deep) {
        ${r.deep ? '<span class="badge info">deep scan — every byte verified</span>' : '<span class="badge info">metadata scan</span>'}</p>
     <div class="report-row"><span>Files below their duplication level</span><b>${r.underDuplicatedFiles}</b></div>
     ${r.corrected ? `<div class="report-row"><span>Copies repaired / created</span><b>${r.copiesRepaired}</b></div>` : ""}
+    ${r.spaceSaved ? `<div class="report-row"><span>Space saved (identical files shared, zeros released)</span><b>${fmtBytes((r.spaceSaved.bytesDeduplicated || 0) + (r.spaceSaved.bytesReleased || 0))}</b></div>` : ""}
     ${r.issues && r.issues.length ? `<label>Integrity issues</label><div class="issues">${r.issues.map(i =>
       `<div>⚠ <b>${esc(i.kind)}</b> ${esc(i.path)}<br><span class="rsn">${esc(i.message)}</span></div>`).join("")}</div>` : ""}
     <label>Device health (SMART)</label>

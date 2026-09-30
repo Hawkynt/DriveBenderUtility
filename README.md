@@ -273,6 +273,13 @@ on its return, stale content re-syncs to the newest write, and missing copies
 are recreated in the background until the pool is back at full duplication — no
 manual repair needed.
 
+The same health scan also **saves space** where a member's filesystem allows it:
+different files with identical content on one disk come to share their data
+(block clones, or hard links where the files' metadata already matches), and long
+runs of zeros are released. Nothing a file holds changes, and a write through the
+pool to one of two files sharing data never reaches the other — see
+[docs/SpaceSavings.md](docs/SpaceSavings.md).
+
 Run `dbmount --help` (or `dbmount <verb> --help`) for the full option list.
 
 ## 🖼️ Screenshots
@@ -799,6 +806,7 @@ common knobs:
                                           //   missing (owed copies heal on return); false = refuse
   },
   "trash": { "enabled": true, "retention": "7d" },   // recoverable deletes
+  "space": { "deduplicate": true, "sparsify": true },  // saved with the health scan (docs/SpaceSavings.md)
   "folders": {
     "Documents/**": { "write": { "policy": "write-through" }, "duplication": 3 }
   }

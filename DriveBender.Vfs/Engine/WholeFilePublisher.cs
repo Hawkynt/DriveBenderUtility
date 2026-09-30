@@ -302,6 +302,65 @@ public static class WholeFilePublisher {
       };
   }
 
+  /// <summary>
+  /// Copy-on-write for hard links (docs/SpaceSavings.md): before a physical file is changed IN PLACE,
+  /// a file that shares its data with another name gets data of its own — copied to a temp, made
+  /// durable with the original's times and mode, and renamed over its own name. Only this name moves
+  /// to the new data; every other name keeps the old. Changed in place without this, a write, a
+  /// truncate, a time stamp or a crash-recovery replay on one file would land in the other too.
+  /// True when a copy was made.
+  ///
+  /// New files and whole-file saves never come here: they are written to a temp and renamed into
+  /// place, which gives the name new data of its own anyway. Only an in-place change does.
+  /// </summary>
+  /// <param name="keepBytes">
+  /// For a truncate: the length the file is about to be cut to. Only what survives the cut is
+  /// copied, so emptying a shared file (what an overwrite does first) copies nothing at all.
+  /// </param>
+  public static bool SeparateIfLinked(IVolumeIO volume, string path, bool shadow, long? keepBytes = null) {
+    if ((volume.Caps & BackendCaps.HardLinks) == 0 || volume.LinkCount(path, shadow) <= 1)
+      return false;
+
+    var meta = volume.Stat(path, shadow);
+    if (keepBytes is { } keep && meta is { } full && keep < full.Length)
+      PublishStream(volume, path, shadow, () => keep == 0 ? Stream.Null : new _Prefix(volume.OpenRead(path, shadow), keep), keep, preserve: meta);
+    else
+      PublishStream(volume, path, shadow, () => volume.OpenRead(path, shadow), meta?.Length, preserve: meta);
+
+    return true;
+  }
+
+  /// <summary>The first <paramref name="limit"/> bytes of a stream, read-only.</summary>
+  private sealed class _Prefix(Stream inner, long limit) : Stream {
+    private readonly long _limit = limit;
+    private long _read;
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => this._limit;
+    public override long Position { get => this._read; set => throw new NotSupportedException(); }
+
+    public override int Read(byte[] buffer, int offset, int count) {
+      if (this._read >= this._limit)
+        return 0;
+
+      var read = inner.Read(buffer, offset, (int)Math.Min(count, this._limit - this._read));
+      this._read += read;
+      return read;
+    }
+
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing) {
+      if (disposing)
+        inner.Dispose();
+      base.Dispose(disposing);
+    }
+  }
+
   /// <summary>A member can hold an acknowledged durable copy only when its flush is a real durability barrier (SAFE-REMOTE).</summary>
   public static bool CanSatisfyAckQuorum(IVolumeIO member) => (member.Caps & BackendCaps.DurableFlush) != 0;
 

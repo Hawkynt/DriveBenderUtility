@@ -129,6 +129,14 @@ public sealed class MeasuredVolumeIO(IVolumeIO inner, TimeProvider? time = null)
   // same trap as SetPermissions: inheriting the no-op default would drop every folder stamp
   public void SetFolderTimestamps(string relativeFolder, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) => inner.SetFolderTimestamps(relativeFolder, creationTimeUtc, lastWriteTimeUtc);
 
+  // forwarded explicitly: an inherited default would report a shared file as unshared
+  public int LinkCount(string relativePath, bool shadow) => inner.LinkCount(relativePath, shadow);
+  public bool TryHardLink(string existingRelative, bool existingShadow, string newRelative, bool newShadow) => inner.TryHardLink(existingRelative, existingShadow, newRelative, newShadow);
+  public bool TryClone(string sourceRelative, bool sourceShadow, string targetRelative, bool targetShadow) => inner.TryClone(sourceRelative, sourceShadow, targetRelative, targetShadow);
+  public bool TryPunchHole(string relativePath, bool shadow, long offset, long length) => inner.TryPunchHole(relativePath, shadow, offset, length);
+  public long AllocatedBytes(string relativePath, bool shadow) => inner.AllocatedBytes(relativePath, shadow);
+  public IDisposable? WatchChanges(Action<string?> changed) => inner.WatchChanges(changed);
+
   /// <summary>Times the actual data movement — where a busy disk really shows.</summary>
   private sealed class MeasuredStream(Stream inner, MeasuredVolumeIO owner) : Stream {
     public override bool CanRead => inner.CanRead;

@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36704205189](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36704205189).
+Generated from run: [36731282012](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36731282012).
 
-249 scenarios — 228 passing on at least one target, 0 failing.
+251 scenarios — 230 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -176,6 +176,8 @@ Generated from run: [36704205189](https://github.com/Hawkynt/DriveBenderUtility/
 | SnapshotBrowsing | `Browse_GivenAnAttemptToChangeTheView_ThenItIsRefusedAsAPermissionProblem` | Nothing under the snapshot view can be written, deleted or renamed — and the refusal is a permission error, not an I/O error. | pass | pass |
 | SnapshotBrowsing | `Browse_GivenARecursiveWalk_ThenTheSnapshotViewIsNotPartOfIt` | A walk of the whole pool never descends into the snapshot view. | pass | pass |
 | SnapshotBrowsing | `Browse_GivenNestedContent_ThenEachLevelOfTheViewListsWhatIsUnderIt` | The snapshot view can be walked by hand: snapshots, then folders, then files. | pass | pass |
+| SpaceSaving | `Space_GivenIdenticalFilesAndARunOfZeros_ThenAFixSavesSpaceAndWritingOneTwinLeavesTheOtherAlone` | Given Identical Files And ARun Of Zeros , then AFix Saves Space And Writing One Twin Leaves The Other Alone | pass | pass |
+| SpaceSaving | `Space_WhileAFileIsWrittenThroughTheMountedPool_ThenTheWriterNeverStallsAndOnlyIdleFilesAreShared` | While AFile Is Written Through The Mounted Pool , then The Writer Never Stalls And Only Idle Files Are Shared | pass | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(RAM + RAM)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(RAM + RAM) | skipped | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(RAM + SD card)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(RAM + SD card) | skipped | pass |
 | StorageFailureMatrix | `Failing_GivenAMemberErrorsOnEveryOperation_ThenTheHealthyCopyStillServesPromptly(SSD + cloud)` | Given AMember Errors On Every Operation , then The Healthy Copy Still Serves Promptly(SSD + cloud) | skipped | pass |

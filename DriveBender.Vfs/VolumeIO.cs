@@ -15,6 +15,19 @@ public enum BackendCaps {
 
   /// <summary>The member's storage keeps a POSIX mode, so one set on the pool survives on it.</summary>
   Permissions = 256,
+
+  /// <summary>Two names can share one file (a hard link). Shared names share their metadata too — times, mode, attributes.</summary>
+  HardLinks = 512,
+
+  /// <summary>
+  /// A file can be cloned without copying its data: the clone shares the blocks and gets copies of
+  /// them only when either side is written (ReFS/Dev Drive block cloning, Btrfs/XFS reflinks). Each
+  /// name keeps its own metadata.
+  /// </summary>
+  BlockClone = 1024,
+
+  /// <summary>Ranges of zeros can be released to the filesystem (sparse files), keeping the file's content and size.</summary>
+  Sparse = 2048,
 }
 
 /// <summary>
@@ -120,6 +133,34 @@ public interface IVolumeIO {
   /// folders to stamp — and wrong for any decorator, which must forward it explicitly.
   /// </summary>
   void SetFolderTimestamps(string relativeFolder, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) { }
+
+  // ---- space savings (docs/SpaceSavings.md). Every default declines, which is right for storage
+  // that cannot do these things and WRONG for any decorator: a decorator that inherits them reports a
+  // shared file as unshared, and the engine then writes through a link into somebody else's file.
+
+  /// <summary>How many names share this file's data (1 unless hard-linked).</summary>
+  int LinkCount(string relativePath, bool shadow) => 1;
+
+  /// <summary>Gives <paramref name="existing"/>'s file a second name; false when this storage cannot.</summary>
+  bool TryHardLink(string existingRelative, bool existingShadow, string newRelative, bool newShadow) => false;
+
+  /// <summary>Makes <paramref name="targetRelative"/> a block-sharing clone of the source; false when this storage cannot.</summary>
+  bool TryClone(string sourceRelative, bool sourceShadow, string targetRelative, bool targetShadow) => false;
+
+  /// <summary>Releases a range of zeros to the filesystem, keeping content and size; false when this storage cannot.</summary>
+  bool TryPunchHole(string relativePath, bool shadow, long offset, long length) => false;
+
+  /// <summary>Bytes the file actually occupies on the storage, or -1 when unknown.</summary>
+  long AllocatedBytes(string relativePath, bool shadow) => -1;
+
+  /// <summary>
+  /// Reports changes made to the member's files by anyone, the pool or not, until disposed: the
+  /// pool path of each changed file or folder (see <see cref="PoolPaths.FromPhysical"/>), or null
+  /// when the member cannot tell what changed (its notifications overflowed). Reports may arrive
+  /// late, so a caller treats them as a hint on top of its own checks. Null when the member cannot
+  /// watch at all.
+  /// </summary>
+  IDisposable? WatchChanges(Action<string?> changed) => null;
 }
 
 /// <summary>Descriptor a backend needs to open a member (path/URI, tuning, credential reference).</summary>

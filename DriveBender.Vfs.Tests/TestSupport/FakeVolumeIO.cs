@@ -32,6 +32,8 @@ public enum VolumeOp {
 public sealed class FakeVolumeIO(Guid memberId, string displayName, string physicalVolumeId, long capacity = 1L << 40) : IVolumeIO {
 
   private sealed class FakeFile {
+    /// <summary>Bytes released to the filesystem by punching holes; cleared by any later write.</summary>
+    public long HoleBytes;
     public byte[] Current = [];
     public byte[]? Persisted;
     public DateTime CreationTimeUtc = _now;
@@ -137,6 +139,35 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
 
   private void _Before(VolumeOp op, string relativePath) => this.BeforeOperation?.Invoke(op, relativePath);
 
+  private Action<string?>? _changeListeners;
+
+  /// <summary>As a filesystem watcher: every change, by the pool or by a test acting outside it.</summary>
+  public IDisposable? WatchChanges(Action<string?> changed) {
+    lock (this._lock)
+      this._changeListeners += changed;
+
+    return new _Unsubscribe(this, changed);
+  }
+
+  private sealed class _Unsubscribe(FakeVolumeIO owner, Action<string?> changed) : IDisposable {
+    public void Dispose() {
+      lock (owner._lock)
+        owner._changeListeners -= changed;
+    }
+  }
+
+  /// <summary>Reports a changed name; the caller holds <see cref="_lock"/>.</summary>
+  private void _Changed(string physical) => this._changeListeners?.Invoke(PoolPaths.FromPhysical(physical));
+
+  /// <summary>Reports every name of a changed file (hard links share it); the caller holds <see cref="_lock"/>.</summary>
+  private void _Changed(FakeFile file) {
+    if (this._changeListeners == null)
+      return;
+
+    foreach (var (name, _) in this._files.Where(kv => ReferenceEquals(kv.Value, file)).ToArray())
+      this._Changed(name);
+  }
+
   private void _After(VolumeOp op, string relativePath) => this.AfterOperation?.Invoke(op, relativePath);
 
   /// <summary>Fault gate; the caller holds <see cref="_lock"/>.</summary>
@@ -168,6 +199,83 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   public IReadOnlyCollection<string> FilePaths {
     get { lock (this._lock) return [.. this._files.Keys]; }
   }
+
+  #region space savings
+
+  /// <summary>The number of names that point at the same file object.</summary>
+  public int LinkCount(string relativePath, bool shadow) {
+    lock (this._lock) {
+      var file = this._files.GetValueOrDefault(PoolPaths.ToPhysical(relativePath, shadow));
+      return file == null ? 0 : this._files.Values.Count(f => ReferenceEquals(f, file));
+    }
+  }
+
+  public bool TryHardLink(string existingRelative, bool existingShadow, string newRelative, bool newShadow) {
+    if ((this.Caps & BackendCaps.HardLinks) == 0)
+      return false;
+
+    this._Before(VolumeOp.OpenWrite, newRelative);
+    lock (this._lock) {
+      this._Check(VolumeOp.OpenWrite);
+      var file = this._files.GetValueOrDefault(PoolPaths.ToPhysical(existingRelative, existingShadow))
+                 ?? throw new PoolFsException(PoolFsError.NotFound, $"File not found: {existingRelative}");
+      var target = PoolPaths.ToPhysical(newRelative, newShadow);
+      if (this._files.ContainsKey(target))
+        throw new PoolFsException(PoolFsError.Exists, $"Already exists: {newRelative}");
+
+      this._EnsureParents(target);
+      this._files[target] = file; // the SAME object: one content, one set of times
+      return true;
+    }
+  }
+
+  public bool TryClone(string sourceRelative, bool sourceShadow, string targetRelative, bool targetShadow) {
+    if ((this.Caps & BackendCaps.BlockClone) == 0)
+      return false;
+
+    this._Before(VolumeOp.OpenWrite, targetRelative);
+    lock (this._lock) {
+      this._Check(VolumeOp.OpenWrite);
+      var file = this._files.GetValueOrDefault(PoolPaths.ToPhysical(sourceRelative, sourceShadow))
+                 ?? throw new PoolFsException(PoolFsError.NotFound, $"File not found: {sourceRelative}");
+      var target = PoolPaths.ToPhysical(targetRelative, targetShadow);
+      this._EnsureParents(target);
+      this._files[target] = new() {
+        Current = (byte[])file.Current.Clone(),
+        Persisted = file.Persisted == null ? null : (byte[])file.Persisted.Clone(), // clones share durable blocks
+      };
+      return true;
+    }
+  }
+
+  public bool TryPunchHole(string relativePath, bool shadow, long offset, long length) {
+    if ((this.Caps & BackendCaps.Sparse) == 0)
+      return false;
+
+    this._Before(VolumeOp.Truncate, relativePath);
+    lock (this._lock) {
+      this._Check(VolumeOp.Truncate);
+      var file = this._files.GetValueOrDefault(PoolPaths.ToPhysical(relativePath, shadow))
+                 ?? throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
+      var end = Math.Min(file.Current.Length, offset + length);
+      if (end <= offset)
+        return true;
+
+      Array.Clear(file.Current, (int)offset, (int)(end - offset)); // a hole reads as zeros
+      file.HoleBytes = Math.Min(file.Current.Length, file.HoleBytes + (end - offset));
+      this._Changed(file);
+      return true;
+    }
+  }
+
+  public long AllocatedBytes(string relativePath, bool shadow) {
+    lock (this._lock) {
+      var file = this._files.GetValueOrDefault(PoolPaths.ToPhysical(relativePath, shadow));
+      return file == null ? -1 : file.Current.Length - file.HoleBytes;
+    }
+  }
+
+  #endregion
 
   public byte[]? GetContent(string relativePath, bool shadow) {
     lock (this._lock) {
@@ -243,6 +351,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       Array.Copy(file.Current, resized, Math.Min(file.Current.Length, length));
       file.Current = resized;
       file.LastWriteTimeUtc = DateTime.UtcNow;
+      this._Changed(file);
     }
   }
 
@@ -252,6 +361,8 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       this._Check(VolumeOp.Delete);
       if (!this._files.Remove(PoolPaths.ToPhysical(relativePath, shadow)))
         throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
+
+      this._Changed(PoolPaths.ToPhysical(relativePath, shadow));
     }
   }
 
@@ -300,6 +411,8 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
 
       this._folders.Remove(fromPhysical);
       this._folders.Add(toPhysical);
+      this._Changed(fromPhysical);
+      this._Changed(toPhysical);
 
       foreach (var (key, file) in this._files.Where(kv => kv.Key.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray()) {
         this._files.Remove(key);
@@ -328,6 +441,8 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       this._files.Remove(tempPhysical);
       this._EnsureParents(finalPhysical);
       this._files[finalPhysical] = staged;
+      this._Changed(tempPhysical);
+      this._Changed(finalPhysical);
     }
 
     this._After(VolumeOp.AtomicReplace, finalRelative); // the name is visible from here on
@@ -412,6 +527,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
         file.CreationTimeUtc = created;
       if (lastWriteTimeUtc is { } modified)
         file.LastWriteTimeUtc = modified;
+      this._Changed(file);
     }
   }
 
@@ -494,6 +610,8 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
         Array.Copy(buffer, offset, file.Current, this._position, accepted);
         this._position = end;
         file.LastWriteTimeUtc = DateTime.UtcNow;
+        file.HoleBytes = 0; // written into: allocated again, conservatively all of it
+        owner._Changed(file);
 
         if (tornWrite)
           throw new PoolFsException(PoolFsError.IoError, "Injected partial write");
@@ -525,6 +643,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
         var resized = new byte[value];
         Array.Copy(file.Current, resized, Math.Min(file.Current.Length, value));
         file.Current = resized;
+        owner._Changed(file);
       }
     }
   }

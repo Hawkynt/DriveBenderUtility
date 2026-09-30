@@ -2279,3 +2279,38 @@ space) the tie-break then kept all 21 files of a burst on the first disk, 0 / 21
 a file must still receive every block of it, so placement now counts each open file a disk will keep
 as work queued there. Block routing does not count it, which would only make the fill copy more. A
 burst of four open files now splits 2 / 2; without the change it was 4 / 0.
+
+### Added: space savings with the health scan: shared identical files, released zeros
+
+The scheduled scrub of a mounted pool, and `pool health --fix`, now save space where a member's
+filesystem allows it (`docs/SpaceSavings.md`). Different files with identical content on one disk
+come to share their data: by block cloning where the filesystem has it (ReFS, Btrfs, XFS), otherwise
+by a hard link, and a hard link only when the two files' times, attributes and mode already match.
+Long runs of zeros are released (sparse files). Both are on by default (`space.deduplicate`,
+`space.sparsify`).
+
+- **Copy-on-write for hard links.** Before the engine changes a linked file in place (a write, a
+  truncate, new times or attributes, a copy the write buffer owes, a journal replay), it gives the
+  file data of its own through a temp and an atomic rename. A power-cut matrix proves the other file
+  never changes.
+- **Never a file's own copies.** A primary and its shadow on one disk are identical by design and are
+  never paired; sharing them would undo the duplication.
+- **Nothing is held while it works.** The first version locked both files for the whole byte
+  compare, so an application opening a large file waited for the pass. Now it watches instead: the
+  engine reports every change to a watched path, and a filesystem watcher on each member reports
+  changes made outside the pool. Hashing, comparing and preparing a clone hold nothing. Only the
+  final link and rename (or the hole punches) take the file's lease, without waiting, and only when
+  it is closed, clean and unchanged. The size and time are compared once more in that window,
+  because filesystem notifications can come late. Anything else is left for the next health scan.
+  A test has an application write, stamp and delete mid-compare. With the old locking, each of those
+  waited on the pass.
+- **Two changes the pool did not report.** Setting a file's times, and a second copy that the write
+  buffer wrote later, changed a file without telling the jobs that watch it. Both report now.
+- **Emptying a shared file copied it first.** A truncate of a hard-linked file copied all of it before
+  cutting; it now copies only what survives the cut, and nothing for a truncate to zero.
+- **A pooled read handle blocked the link.** A hard link's temp is the kept file itself, and a
+  rename on Windows needs delete access to the whole file. The handle the member kept pooled on the
+  kept name (from hashing it) has no delete sharing, so every link failed "being used by another
+  process". Linking now retires pooled handles on the existing name first.
+- **Limit:** a program writing straight into a member's folder, bypassing the pool, writes into both
+  names of a hard link. Block-cloned files are not affected.

@@ -115,6 +115,11 @@ public sealed class ScrubJob(PoolFileSystem fs, TimeSpan quickEvery, TimeSpan de
   private DateTime _lastQuick = clock();
   private DateTime _lastDeep = clock();
 
+  private static void _LogSaved(SpaceReport saved) {
+    if (saved.BytesSaved > 0)
+      DriveBender.Logger($" - Space saved: {saved.FilesDeduplicated} file(s) deduplicated ({saved.BytesDeduplicated:N0} bytes), {saved.FilesSparsified} sparsified ({saved.BytesReleased:N0} bytes)");
+  }
+
   public string Name => "scrub";
 
   public bool RunOnce() {
@@ -126,12 +131,14 @@ public sealed class ScrubJob(PoolFileSystem fs, TimeSpan quickEvery, TimeSpan de
       this._lastDeep = this._lastQuick = now;
       var issues = fs.RunScrub();
       DriveBender.Logger($" - Scheduled deep scrub finished: {issues.Count} issue(s)");
+      _LogSaved(fs.OptimizeSpace());
       return true;
     }
 
     if (quickEvery > TimeSpan.Zero && now - this._lastQuick >= quickEvery) {
       this._lastQuick = now;
       fs.RunQuickScrub();
+      _LogSaved(fs.OptimizeSpace()); // the health scan is also when space is saved (docs/SpaceSavings.md)
       return true;
     }
 

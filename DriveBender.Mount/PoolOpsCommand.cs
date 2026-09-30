@@ -59,10 +59,26 @@ internal static class PoolOpsCommand {
 
   /// <summary>Runs the health scan (optionally deep / correcting) and returns the structured report — shared by the CLI verb and the daemon's API.</summary>
   public static HealthReport RunHealth(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, string poolNameOrId, bool fix, bool deep = false) {
-    var (_, online, duplication, allowSamePhysical, admit) = _Open(host, provider, remoteResolver, poolNameOrId);
+    var (pool, online, duplication, allowSamePhysical, admit) = _Open(host, provider, remoteResolver, poolNameOrId);
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
-    var service = new HealthService(ios, new SmartctlMonitor(), new IntegrityService(ios, admit: admit), new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online)));
+
+    // Saving space changes files, so it runs only with --fix, which holds the pool's exclusive engine
+    // lock: nothing can mount the pool meanwhile. A program writing to a member's disk directly still
+    // can, so the pass watches the disks themselves and leaves any file that changed alone.
+    SpaceOptimizer? space = null;
+    if (fix) {
+      var config = ConfigResolver.ResolveEffective(
+        host.FileExists(Path.Combine(host.ConfigRoot, "config.json")) ? host.ReadAllText(Path.Combine(host.ConfigRoot, "config.json")) : null,
+        pool.Manifest.Defaults?.GetRawText());
+      var deduplicate = config.Space?.Deduplicate ?? true;
+      var sparsify = config.Space?.Sparsify ?? true;
+      if (deduplicate || sparsify)
+        space = new(ios, () => new MemberChangeFeed(ios), deduplicate, sparsify, admit);
+    }
+
+    var service = new HealthService(ios, new SmartctlMonitor(), new IntegrityService(ios, admit: admit),
+      new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online)), space: space);
     return fix ? service.CheckAndCorrect() : service.Check(deep);
   }
 
@@ -74,6 +90,12 @@ internal static class PoolOpsCommand {
     deep = report.DeepScan,
     underDuplicatedFiles = report.UnderDuplicatedFiles,
     copiesRepaired = report.CopiesRepaired,
+    spaceSaved = report.Space == null ? null : new {
+      filesDeduplicated = report.Space.FilesDeduplicated,
+      bytesDeduplicated = report.Space.BytesDeduplicated,
+      filesSparsified = report.Space.FilesSparsified,
+      bytesReleased = report.Space.BytesReleased,
+    },
     issues = report.IntegrityIssues.Select(i => new { kind = i.Kind.ToString(), path = i.Path, message = i.Message }),
     members = report.Members.Select(m => new {
       name = m.Member,
@@ -175,6 +197,9 @@ internal static class PoolOpsCommand {
     Console.WriteLine($"  Under-duplicated files: {report.UnderDuplicatedFiles}");
     if (report.Corrected)
       Console.WriteLine($"  Copies repaired/created: {report.CopiesRepaired}");
+    if (report.Space is { } space)
+      Console.WriteLine($"  Space saved: {space.FilesDeduplicated} file(s) deduplicated ({space.BytesDeduplicated:N0} bytes), "
+                        + $"{space.FilesSparsified} sparsified ({space.BytesReleased:N0} bytes)");
 
     foreach (var issue in report.IntegrityIssues)
       Console.WriteLine($"  [{issue.Kind}] {issue.Path}: {issue.Message}");

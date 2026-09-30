@@ -14,7 +14,8 @@ public sealed record HealthReport(
   int UnderDuplicatedFiles,
   int CopiesRepaired,
   bool Corrected,
-  bool DeepScan = false
+  bool DeepScan = false,
+  SpaceReport? Space = null
 ) {
   public bool Healthy => this.UnderDuplicatedFiles == 0
     && this.IntegrityIssues.All(i => i.Kind == IntegrityIssueKind.ExternalEditAccepted)
@@ -33,7 +34,8 @@ public sealed class HealthService(
   ISmartMonitor smart,
   IntegrityService integrity,
   MediaLifecycle media,
-  Func<IVolumeIO, string>? deviceOf = null) {
+  Func<IVolumeIO, string>? deviceOf = null,
+  SpaceOptimizer? space = null) {
 
   private readonly Func<IVolumeIO, string> _deviceOf = deviceOf ?? (m => m.PhysicalVolumeId);
 
@@ -71,7 +73,14 @@ public sealed class HealthService(
     foreach (var member in this._MemberHealth().Where(m => m.Smart.Health is DiskHealth.Warning or DiskHealth.Failing))
       DriveBender.Logger($"[Alert]Device '{member.Member}' health {member.Smart.Health}: {member.Smart.Detail} (temp {member.Smart.TemperatureCelsius}°C, reallocated {member.Smart.ReallocatedSectors})");
 
-    return new(this._MemberHealth(), issues, underDuplicatedAfter, restore.CopiesCreated, Corrected: true, DeepScan: true);
+    // after the repairs: only healthy, whole files are worth sharing or thinning out
+    SpaceReport? saved = null;
+    if (space != null) {
+      context.Phase("saving space: identical files and runs of zeros");
+      saved = space.Run(context);
+    }
+
+    return new(this._MemberHealth(), issues, underDuplicatedAfter, restore.CopiesCreated, Corrected: true, DeepScan: true, saved);
   }
 
 }
