@@ -1729,71 +1729,27 @@ nothing exercised end to end before.
 Two items that stood here are closed; they moved to "Closed, kept as a record" below rather than
 being deleted, because what they cost is the point.
 
-1. **A file replaced by rename keeps serving its OLD content to new readers — Windows.** After
-   `File.Move(source, target, overwrite: true)` succeeds, a reader that opens the target path
-   afresh still gets the pre-replacement bytes. Measured through a real WinFsp mount: six
-   replacements landed and the file settled on version 40, while all 3,200 reads taken during the
-   run returned version 1 — so the replacements were real and every reader missed all of them.
-   Atomic replace-by-rename is the pattern careful software uses precisely to publish a new
-   version safely, so this makes the safe pattern the broken one. Pinned by
-   `SharedAccessEndToEndTests.SharedFile_GivenWritersReplacingItByRename_...`, `[Ignore]`d with
-   this reason rather than weakened.
+1. **Withdrawn: "a file replaced by rename keeps serving its OLD content to new readers — Windows".**
+   It never served stale content. The scenario stopped its readers after a fixed 800 rounds each.
+   Windows refuses a rename over a file that has open handles (WinFsp's `FspFileNodeRenameCheck`
+   answers `STATUS_ACCESS_DENIED` unless the rename is POSIX, which this mount does not enable),
+   and four readers nearly always hold one. Under load the readers therefore finished every round
+   while each replacement was being refused, and the replacements landed afterwards. That is
+   exactly what was measured: "16 replacements landed, all 3,200 reads returned version 1, and the
+   read taken afterwards returned version 60". Reproduced this pass under CPU load, with timestamps:
+   31 replacements, 3,200 reads of version 1, and **0 of those reads started after any replacement
+   had completed**.
 
-   **Ruled out: IndexNumber.** `WinFspAdapter._Fill` never sets `FspFileInfo.IndexNumber`, so
-   every file reports file id 0, and Windows associates a file's cached data section with its
-   IndexNumber — a good story for why the section survives a replacing rename. It was implemented
-   (a real per-file identity from path plus creation time, which stays constant across appends and
-   changes when the name comes to hold a different file) and it does NOT fix this. Reverted rather
-   than carried, because it costs a hash on every `GetFileInfo`, which is a hot path, and bought
-   nothing measurable. Setting it may still be worth doing for its own sake; it is not the lever
-   here.
+   The earlier lead does not hold either. The Windows cache manager is not involved on this mount:
+   WinFsp sets `FO_CACHE_SUPPORTED` only when `FileInfoTimeout` is infinite (`create.c`), and ours
+   is 1000 ms, so every read reaches the adapter's `Read` callback.
 
-   **New evidence, and it narrows things a lot.** Re-measured this pass: 16 replacements landed,
-   all 3,200 reads during the run returned version 1 — and the read taken AFTER the workers stopped
-   returned version 60. So the bytes on disk are correct and the invalidation is not permanently
-   broken; the staleness lasts exactly as long as readers keep the name open. Whatever serves those
-   reads is pinned by an open handle and outlives the rename underneath it.
-
-   **Also ruled out, so the next pass need not re-walk them:**
-   - The engine's `Rename` does invalidate both endpoints, and `_Invalidate` clears placement and
-     the path's cache entry under the same name it caches them — no mismatch there.
-   - The pooled physical handles in `LocalVolumeIO.HandlePool` are not it. `AtomicReplace`
-     invalidates before AND after the swap, and `_Retire` removes the key from the dictionary, so a
-     handle rented before the replace is closed when its borrower returns it rather than re-pooled
-     — a later reader cannot be served the pre-replace file out of the pool.
-
-   **Read-ahead was the standing lead and it is wrong.** `FileState.ReadAhead` survives a rename,
-   which made it look promising, but `ReadAheadState` holds **no data**: it is a sequential-access
-   detector whose whole state is `_expectedNextOffset` and a window size, and `OnRead` returns a
-   prefetch *length*. There are no buffers in it to go stale. Reading the type settles this without
-   an experiment.
-
-   **The engine is clean — measured, not argued.** The same shape was driven straight against
-   `PoolFileSystem` with no driver in the way: three writers staging and renaming over a target,
-   four readers opening the target **fresh every time** and recording the version they saw. Result:
-   564 replacements, 13,513 reads, **0 torn reads, 179 distinct versions observed**, settling on the
-   newest. So a fresh open through the engine resolves to new content, and the defect is added
-   **above** the engine, in the driver layer.
-
-   That is the useful narrowing: with the engine, the handle pool, `_Invalidate`, `IndexNumber` and
-   read-ahead all eliminated, what is left is WinFsp and the Windows cache manager — the FSD can
-   answer a read out of a file's cached section without the filesystem being called at all, and the
-   section is associated with the name's FCB, which stays alive exactly as long as readers keep
-   re-opening it. That matches the one behaviour nothing else explained: the staleness lasts
-   precisely as long as the readers do.
-
-   **The next attempt belongs in `WinFspAdapter`, not the engine**, and it should start by
-   establishing whether the Linux/FUSE target shows the same thing — if it does not, that confirms
-   the layer outright. Worth doing before writing any code, since the last three attempts each cost
-   an implementation.
-
-   To re-run the engine probe: a console project referencing `DriveBender.Vfs`, two
-   `LocalVolumeIO` members and a `CacheInstance`, duplication 2, then the writer/reader threads
-   described above using `fs.Create`/`fs.Write`/`fs.Rename(..., RenameFlags.ReplaceExisting)` and
-   `fs.Open`/`fs.Read`/`fs.Close` per read. It needs no driver and runs in ten seconds.
-
-   It also passes when run ALONE and fails in the full suite, so it is timing-sensitive; a single
-   green run of this scenario means nothing without the whole suite behind it.
+   The scenario (`SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeCurrentVersion`)
+   is un-ignored. Its readers now run until the last writer finishes. It also has an oracle that can
+   tell a stale read from an early one: a read that starts after a replacement returned must not
+   see a version already superseded before that replacement began. Proved sensitive by making the
+   adapter serve the target from the first bytes it ever read: fails 2 of 2. Passes 6 of 6 under
+   18 busy CPU threads (about 54,000 judged reads, none stale) and 5 of 5 unloaded.
 2. **`_RenameFolder` holds leases on the two folder paths but on NO CHILD FILE while moving them.**
    It flushes dirty children and publishes staged ones first, but takes no lease on any of them, so
    a write can land between that flush and the member-level `RenameFolder` and address a path whose
