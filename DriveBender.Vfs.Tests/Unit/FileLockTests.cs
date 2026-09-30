@@ -78,20 +78,33 @@ public class FileLockTests {
 
     using var writerIn = new ManualResetEventSlim();
     using var writerMayLeave = new ManualResetEventSlim();
+    var writerEntered = false;
     var writer = new Thread(() => {
-      fileLock.TryEnterWriteLock(_long).Should().BeTrue();
+      // no assertion here: one failing on a bare thread takes the whole test host down with it
+      writerEntered = fileLock.TryEnterWriteLock(_long);
       writerIn.Set();
+      if (!writerEntered)
+        return;
+
       writerMayLeave.Wait();
       fileLock.ExitWriteLock();
     }) { IsBackground = true };
     writer.Start();
-    SpinWait.SpinUntil(() => false, 200); // let the writer queue up behind our read lock
 
-    _OnOtherThread(() => fileLock.TryEnterReadLock(TimeSpan.FromMilliseconds(100)))
-      .Should().BeFalse("a new reader must not overtake a waiting writer");
+    // queued for real, not "probably by now": a sleep was a bet on the scheduler, and a slow runner
+    // lost it, let the reader in ahead of a writer that had not started, and never saw it leave
+    SpinWait.SpinUntil(() => fileLock.HasWaitingWriter, _long).Should().BeTrue("the writer queues behind our read lock");
+
+    _OnOtherThread(() => {
+      var entered = fileLock.TryEnterReadLock(TimeSpan.FromMilliseconds(100));
+      if (entered)
+        fileLock.ExitReadLock();
+      return entered;
+    }).Should().BeFalse("a new reader must not overtake a waiting writer");
 
     fileLock.ExitReadLock();
     writerIn.Wait(_long).Should().BeTrue("the writer gets in once the last reader leaves");
+    writerEntered.Should().BeTrue("the writer gets in once the last reader leaves");
     writerMayLeave.Set();
     writer.Join(_long).Should().BeTrue();
 
@@ -112,7 +125,7 @@ public class FileLockTests {
     fileLock.TryEnterReadLock(_long).Should().BeTrue();
 
     var writer = Task.Run(() => _OnOtherThread(() => fileLock.TryEnterWriteLock(TimeSpan.FromMilliseconds(300))));
-    SpinWait.SpinUntil(() => false, 100);
+    SpinWait.SpinUntil(() => fileLock.HasWaitingWriter, _long).Should().BeTrue("the writer queues behind our read lock");
     var reader = Task.Run(() => _OnOtherThread(() => {
       var clock = System.Diagnostics.Stopwatch.StartNew();
       var entered = fileLock.TryEnterReadLock(TimeSpan.FromSeconds(20));

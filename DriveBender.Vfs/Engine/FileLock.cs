@@ -32,6 +32,9 @@ public sealed class FileLock {
   [ThreadStatic]
   private static List<FileLock>? _held;
 
+  /// <summary>Whether a writer is queued for the lock, holding new readers back. For diagnostics and tests; it can change the moment it is read.</summary>
+  public bool HasWaitingWriter => Volatile.Read(ref this._waitingWriters) > 0;
+
   public bool TryEnterReadLock(TimeSpan timeout) {
     this._RefuseRecursion();
     if (!this._TryEnterReadFast() && !this._Wait(write: false, timeout))
