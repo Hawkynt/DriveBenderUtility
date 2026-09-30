@@ -140,7 +140,15 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   private void _After(VolumeOp op, string relativePath) => this.AfterOperation?.Invoke(op, relativePath);
 
   /// <summary>Fault gate; the caller holds <see cref="_lock"/>.</summary>
+  /// <summary>
+  /// Runs for EVERY operation, stream reads, writes and flushes included — a slow disk. Unlike
+  /// <see cref="BeforeOperation"/> (which only sees the volume-level calls, and which the crash
+  /// matrices count steps with), this is not a step: it only costs time.
+  /// </summary>
+  public Action<VolumeOp>? Delay { get; set; }
+
   private void _Check(VolumeOp op) {
+    this.Delay?.Invoke(op);
     if (!this._online)
       throw new PoolFsException(PoolFsError.Offline, $"Member '{this.DisplayName}' is offline");
 

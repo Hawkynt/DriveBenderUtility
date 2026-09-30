@@ -45,8 +45,9 @@ public class StripeCrashTests {
     return fs;
   }
 
-  // eight blocks per write: enough that a write spreads over the whole group, so there is something to fill
-  private static byte[] _Content() => [.. Enumerable.Range(0, 512 * 8 + 100).Select(i => (byte)(i * 11 + 3))];
+  // three stripe units and a bit: enough that the write spreads over the whole group, so there is
+  // something to fill (a write smaller than a unit stays on one disk)
+  private static byte[] _Content() => [.. Enumerable.Range(0, (int)(StripeSession.MinimumStripeUnit * 3) + 100).Select(i => (byte)(i * 11 + 3))];
 
   private void _AbortAfter(int operations) {
     var remaining = operations;
@@ -127,8 +128,8 @@ public class StripeCrashTests {
   }
 
   // measured lengths of the whole striped write + close; the guard fails the moment one gets shorter
-  [TestCase(1, 30)]
-  [TestCase(2, 38)]
+  [TestCase(1, 19)]
+  [TestCase(2, 27)]
   [Category("EdgeCase")]
   public void Stripe_GivenThePowerIsCutAtEveryStep_ThenTheFileIsWholeOrAbsentAndNoStripeTempSurvives(int duplication, int steps) {
     var content = _Content();

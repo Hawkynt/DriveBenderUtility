@@ -51,8 +51,9 @@ public sealed class StripeSession {
   /// as the unstriped write path applies it per write.
   /// </param>
   public StripeSession(IReadOnlyList<Member> members, int blockSize, int copiesPerBlock, Func<IVolumeIO, double>? loadOf = null,
-    WriteAt? writeAt = null, ReadAt? readAt = null, bool allowDegraded = true) {
+    WriteAt? writeAt = null, ReadAt? readAt = null, bool allowDegraded = true, long minimumUnit = MinimumStripeUnit) {
     this._allowDegraded = allowDegraded;
+    this._minimumUnit = Math.Max(1, minimumUnit);
     if (members.Count == 0 || members.Count > MaxMembers)
       throw new ArgumentOutOfRangeException(nameof(members), members.Count, $"A stripe session spans 1..{MaxMembers} disks");
     if (!members.Any(m => m.IsFinal))
@@ -249,6 +250,18 @@ public sealed class StripeSession {
   /// block: the sort-and-allocate version of this ran per block too, and a single write of a few
   /// hundred small blocks turned into a few hundred sorts.
   /// </summary>
+  /// <summary>
+  /// The smallest contiguous piece a write is split into. Blocks were handed out one at a time, and
+  /// with two disks costing the same that alternated them: a write became a run of single-block
+  /// writes on each disk, and nothing coalesced — 256 separate writes per disk for one 4 KiB write
+  /// with the small blocks a test uses, and a thousand operations per file. A small write now stays
+  /// on one disk, and a large one is split into big contiguous pieces.
+  /// </summary>
+  public const long MinimumStripeUnit = 1024 * 1024;
+
+  private readonly long _minimumUnit;
+  private int _BlocksPerUnit => (int)Math.Max(1, this._minimumUnit / this.BlockSize);
+
   private Plan _Plan(long first, long last, int copies) {
     var count = this._members.Count;
     var usable = new bool[count];
@@ -270,56 +283,87 @@ public sealed class StripeSession {
     var assignments = new List<(long, ulong)>((int)Math.Min(int.MaxValue, last - first + 1));
     var usedDomains = new bool[domains.Count];
 
+    // the readiest disks for a piece of `blocks` new blocks, each on a different physical disk (the
+    // whole point of a second copy is that it does not share the first one's fate); a final wins a tie
+    ulong Fresh(int blocks) {
+      var mask = 0UL;
+      Array.Clear(usedDomains);
+      for (var taken = 0; taken < copies; ++taken) {
+        var best = -1;
+        for (var i = 0; i < count; ++i) {
+          if (!usable[i] || (mask & (1UL << i)) != 0 || usedDomains[domain[i]])
+            continue;
+
+          if (best < 0 || this._Before(i, best, baseLoad, queued))
+            best = i;
+        }
+
+        // fewer physical disks than copies per block: co-locate rather than refuse
+        if (best < 0)
+          for (var i = 0; i < count; ++i)
+            if (usable[i] && (mask & (1UL << i)) == 0 && (best < 0 || queued[i] < queued[best]))
+              best = i;
+
+        if (best < 0)
+          break;
+
+        mask |= 1UL << best;
+        usedDomains[domain[best]] = true;
+        queued[best] += blocks;
+      }
+
+      return mask;
+    }
+
+    // a held block keeps its disks: they hold its other bytes, so a partial write must land there
+    ulong Kept(ulong held) {
+      var mask = 0UL;
+      for (var taken = 0; taken < copies; ++taken) {
+        var best = -1;
+        for (var i = 0; i < count; ++i)
+          if (usable[i] && (held & (1UL << i)) != 0 && (mask & (1UL << i)) == 0
+              && (best < 0 || this._Cost(baseLoad[i], queued[i]) < this._Cost(baseLoad[best], queued[best])))
+            best = i;
+
+        if (best < 0)
+          break;
+
+        mask |= 1UL << best;
+        ++queued[best];
+      }
+
+      return mask;
+    }
+
+    var perUnit = this._BlocksPerUnit;
     lock (this._lock)
-      for (var block = first; block <= last; ++block) {
-        var mask = 0UL;
+      for (var block = first; block <= last;) {
+        var unitEnd = Math.Min(last, (block / perUnit + 1) * perUnit - 1);
+        var anyHeld = false;
+        for (var b = block; b <= unitEnd && !anyHeld; ++b)
+          anyHeld = this._holders.TryGetValue(b, out var h) && h != 0;
 
-        // a block keeps its disks: they hold its other bytes, so a partial write must land there
-        if (this._holders.TryGetValue(block, out var held) && held != 0)
-          for (var taken = 0; taken < copies; ++taken) {
-            var best = -1;
-            for (var i = 0; i < count; ++i)
-              if (usable[i] && (held & (1UL << i)) != 0 && (mask & (1UL << i)) == 0
-                  && (best < 0 || this._Cost(baseLoad[i], queued[i]) < this._Cost(baseLoad[best], queued[best])))
-                best = i;
+        if (!anyHeld) {
+          // a whole unit of new blocks goes to the same disks, as one contiguous piece
+          var mask = Fresh((int)(unitEnd - block + 1));
+          for (var b = block; b <= unitEnd; ++b)
+            assignments.Add((b, mask));
+        } else {
+          // Part of this unit is held already — a write that does not start on a unit boundary. Its
+          // new blocks join the disks holding the rest of the unit, so the piece stays contiguous;
+          // handed out one by one they alternated the disks and every block became its own write.
+          var unitMask = 0UL;
+          for (var b = block; b <= unitEnd && unitMask == 0; ++b)
+            if (this._holders.TryGetValue(b, out var h) && h != 0)
+              unitMask = Kept(h);
 
-            if (best < 0)
-              break;
-
-            mask |= 1UL << best;
-            ++queued[best];
-          }
-
-        if (mask == 0) {
-          // a new block: the readiest disks, each on a different physical disk (the whole point of
-          // a second copy is that it does not share the first one's fate); a final wins a tie
-          Array.Clear(usedDomains);
-          for (var taken = 0; taken < copies; ++taken) {
-            var best = -1;
-            for (var i = 0; i < count; ++i) {
-              if (!usable[i] || (mask & (1UL << i)) != 0 || usedDomains[domain[i]])
-                continue;
-
-              if (best < 0 || this._Before(i, best, baseLoad, queued))
-                best = i;
-            }
-
-            // fewer physical disks than copies per block: co-locate rather than refuse
-            if (best < 0)
-              for (var i = 0; i < count; ++i)
-                if (usable[i] && (mask & (1UL << i)) == 0 && (best < 0 || queued[i] < queued[best]))
-                  best = i;
-
-            if (best < 0)
-              break;
-
-            mask |= 1UL << best;
-            usedDomains[domain[best]] = true;
-            ++queued[best];
+          for (var b = block; b <= unitEnd; ++b) {
+            var mask = this._holders.TryGetValue(b, out var held) && held != 0 ? Kept(held) : unitMask;
+            assignments.Add((b, mask != 0 ? mask : Fresh(1)));
           }
         }
 
-        assignments.Add((block, mask));
+        block = unitEnd + 1;
       }
 
     return new(assignments);

@@ -114,7 +114,10 @@ public class PlacementBalanceTests {
   public void Placement_GivenOneMemberGenuinelySlow_WhenFilesAreWritten_ThenTheFasterMemberTakesMost() {
     // the other side of the boundary: a member that really is slow — every operation, well above the
     // floor — must still lose to the fast one; ignoring noise must not mean ignoring measurements
-    this._v2.BeforeOperation = (op, _) => {
+    // slow at everything that moves data or opens a file — through Delay, which every stream
+    // operation passes; BeforeOperation never sees a stream's writes, so a disk slowed through it
+    // was only ever slow at opening
+    this._v2.Delay = op => {
       if (op is VolumeOp.Write or VolumeOp.Flush or VolumeOp.OpenWrite)
         _Busy(3);
     };

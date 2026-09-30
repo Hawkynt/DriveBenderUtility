@@ -112,7 +112,9 @@ Two decisions are made, at two different times:
   `least-used`, `lowest-latency`) choose the final disks when the file arrives. Nothing re-decides
   them afterwards, except a disk failing during the write, or the landing-zone overflow above.
 - **Per block, the session decides.** Between arrival and close, the stripe session sends each block
-  to the disk of the group that can take it first.
+  to the disk of the group that can take it first, in contiguous pieces of at least 1 MiB: a small
+  write stays on one disk, and a large one is split into big pieces rather than scattered block by
+  block.
 - **Never a half file under the real name.** Everything is written to temp names first. Only a
   complete, flushed temp is renamed to the real name, so a power cut at any moment leaves either the
   whole file or no file under that name. Temps a power cut leaves behind are swept at the next mount.

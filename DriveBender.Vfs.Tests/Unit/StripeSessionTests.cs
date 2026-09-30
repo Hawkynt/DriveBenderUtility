@@ -34,12 +34,12 @@ public class StripeSessionTests {
 
   private static void _Truncate(StripeSession.Member member, long length) => member.Volume.Truncate(member.Path, member.Shadow, length);
 
-  /// <summary>One final on a, helpers on b and c.</summary>
-  private StripeSession _Session(Func<IVolumeIO, double>? load = null, int copiesPerBlock = 1) => new([
+  /// <summary>One final on a, helpers on b and c; every block its own stripe unit unless told otherwise.</summary>
+  private StripeSession _Session(Func<IVolumeIO, double>? load = null, int copiesPerBlock = 1, long unit = _BLOCK) => new([
       new(this._a, _TEMP, false, IsFinal: true),
       new(this._b, _HELPER, false, IsFinal: false),
       new(this._c, _HELPER, false, IsFinal: false),
-    ], _BLOCK, copiesPerBlock, load);
+    ], _BLOCK, copiesPerBlock, load, minimumUnit: unit);
 
   [Test]
   [Category("HappyPath")]
@@ -61,6 +61,42 @@ public class StripeSessionTests {
 
     Enumerable.Range(0, 9).Select(b => session.HoldersOf(b).Single().Volume.DisplayName).Distinct()
       .Should().BeEquivalentTo(["a", "b", "c"], "a write the size of nine blocks keeps all three disks busy");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Write_GivenStripeUnitsOfFourBlocks_ThenEachUnitIsOneContiguousPieceOnOneDisk() {
+    // handing blocks out one by one alternated equally cheap disks and nothing coalesced
+    var session = this._Session(unit: _BLOCK * 4);
+    session.Write(0, _Data(_BLOCK * 12));
+
+    for (var unit = 0; unit < 3; ++unit)
+      Enumerable.Range(unit * 4, 4).Select(b => session.HoldersOf(b).Single().Volume.DisplayName).Distinct()
+        .Should().HaveCount(1, $"unit {unit} is written as one piece");
+    Enumerable.Range(0, 12).Select(b => session.HoldersOf(b).Single().Volume.DisplayName).Distinct()
+      .Should().HaveCount(3, "and the units still spread over the group");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Write_GivenAWriteThatStartsInsideAUnitAlreadyBegun_ThenItsBlocksJoinThatUnitsDisk() {
+    // unaligned writes are the norm; the first unit of the second write is half written already
+    var session = this._Session(unit: _BLOCK * 8);
+    session.Write(0, _Data(_BLOCK * 5));
+    session.Write(_BLOCK * 5, _Data(_BLOCK * 11));
+
+    Enumerable.Range(0, 8).Select(b => session.HoldersOf(b).Single().Volume.DisplayName).Distinct()
+      .Should().HaveCount(1, "the unit that two writes share is still one contiguous piece on one disk");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Write_GivenAWriteSmallerThanAUnit_ThenItStaysOnOneDisk() {
+    var session = this._Session(unit: _BLOCK * 64);
+    session.Write(0, _Data(_BLOCK * 9));
+
+    Enumerable.Range(0, 9).Select(b => session.HoldersOf(b).Single().Volume.DisplayName).Distinct()
+      .Should().Equal(["a"], "a small write is one piece, on the final");
   }
 
   [Test]

@@ -2256,3 +2256,17 @@ back old (2 of 5 runs).
   of the fill. The session now keeps what was stamped (times and mode) and puts it back on every
   finished copy before the rename. A write after the stamp clears the stamped time, because then the
   write's time is the right one.
+- **Blocks handed out one at a time.** With two disks costing the same, blocks alternated between
+  them, so nothing coalesced: a 3 MiB striped write took about 2,400 storage operations. Measuring
+  per kind (below) exposed it. Blocks now go out in contiguous units of at least 1 MiB, and a write
+  that starts inside a unit already begun joins that unit's disk; unaligned writes had kept the old
+  behaviour. The same write now takes 17 operations, and the striped power-cut matrices cover the
+  whole operation at 19 and 27 steps.
+- **Latency measured per kind.** One average blended every operation, so a disk slow at moving data
+  but quick at renames and truncates could sink under placement's 1 ms floor when its recent work was
+  mostly metadata, and win ties. Striping shifted exactly that mix (a final does a few long fill
+  writes and a tail of quick metadata), and a CI runner split twenty files 10 / 10 with a disk three
+  times slower. Latency is now averaged per kind (data, flush, metadata) and reported as their mean.
+  The test's slow disk also turned out to be slow only at opening files, because the fake's
+  operation hook never sees stream writes. It now slows through a new `Delay` knob that every
+  operation passes.
