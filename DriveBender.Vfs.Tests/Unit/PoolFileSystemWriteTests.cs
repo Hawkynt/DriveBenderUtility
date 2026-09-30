@@ -368,4 +368,130 @@ public class PoolFileSystemWriteTests {
     copies.Should().Be(1, "copies are never co-located in one failure domain (SAFE-PHYS)");
   }
 
+  [Test]
+  [Category("HappyPath")]
+  public void Write_GivenEveryCopyIsRequired_WhenLargeWritesAreAcknowledged_ThenTheirBytesAreNotCopiedOntoTheHeap() {
+    // Every write used to begin with data.ToArray(): an 8 MiB write put 8 MiB on the large object
+    // heap, so a long transfer made its own size in garbage and a gen-2 collection every few writes.
+    // The private array exists so the write buffer can KEEP the bytes for a copy that is owed; where
+    // every copy takes the write before it returns, nothing is owed and nothing needs keeping.
+    // Real local members: the fake one clones a file on every flush, which would be measured instead.
+    var roots = Enumerable.Range(0, 2).Select(_ => Directory.CreateTempSubdirectory("dbwrite").FullName).ToArray();
+    try {
+      using var fs = new PoolFileSystem(_pool,
+        [.. roots.Select((root, i) => new EngineMember(new LocalVolumeIO(Guid.NewGuid(), $"m{i}", root, $"PHYS-W{i}")))],
+        new("w" + Guid.NewGuid().ToString("N"), new() { Size = "33554432" }),
+        ConfigResolver.ResolveEffective(null, """{ "duplication": 2 }"""));
+      fs.Mount(new(@"W:\"));
+      fs.Close(fs.Create("big.bin", NodeKind.File, CreateFlags.None));
+
+      const int chunk = 4 << 20;
+      var data = new byte[chunk];
+      new Random(3).NextBytes(data);
+      var handle = fs.Open("big.bin", AccessMode.ReadWrite, ShareMode.None);
+      fs.Write(handle, data, 0, WriteMode.Normal); // warm: the session intent, the pooled buffer, the member handles
+
+      const int writes = 4;
+      var before = GC.GetAllocatedBytesForCurrentThread();
+      for (var i = 1; i <= writes; ++i)
+        fs.Write(handle, data, (long)i * chunk, WriteMode.Normal);
+      var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+      fs.Close(handle);
+
+      allocated.Should().BeLessThan(chunk / 4,
+        $"{writes} writes of {chunk} bytes allocated {allocated} bytes — the write is copying the caller's bytes onto the heap again");
+      var back = new byte[chunk];
+      var read = fs.Open("big.bin", AccessMode.Read, ShareMode.Read);
+      fs.Read(read, back, (long)writes * chunk).Should().Be(chunk);
+      fs.Close(read);
+      back.Should().Equal(data);
+    } finally {
+      foreach (var root in roots)
+        Directory.Delete(root, true);
+    }
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Write_GivenANewFileIsStripedOverTwoDisks_WhenLargeWritesAreAcknowledged_ThenTheirBytesAreNotCopiedOntoTheHeap() {
+    // the stripe session writes every block to its disks before Write returns, and keeps only the
+    // block map — so it has no more need of a private array than the unstriped path does
+    var roots = Enumerable.Range(0, 2).Select(_ => Directory.CreateTempSubdirectory("dbstripe").FullName).ToArray();
+    try {
+      using var fs = new PoolFileSystem(_pool,
+        [.. roots.Select((root, i) => new EngineMember(new LocalVolumeIO(Guid.NewGuid(), $"m{i}", root, $"PHYS-S{i}")))],
+        new("s" + Guid.NewGuid().ToString("N"), new() { Size = "33554432" }),
+        ConfigResolver.ResolveEffective(null, """{ "duplication": 1 }"""));
+      fs.Mount(new(@"S:\"));
+
+      const int chunk = 4 << 20;
+      var data = new byte[chunk];
+      new Random(5).NextBytes(data);
+      var handle = fs.Create("striped.bin", NodeKind.File, CreateFlags.None);
+      fs.Write(handle, data, 0, WriteMode.Normal); // warm
+
+      const int writes = 4;
+      var before = GC.GetAllocatedBytesForCurrentThread();
+      for (var i = 1; i <= writes; ++i)
+        fs.Write(handle, data, (long)i * chunk, WriteMode.Normal);
+      var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+      fs.Close(handle);
+
+      allocated.Should().BeLessThan(chunk / 4,
+        $"{writes} striped writes of {chunk} bytes allocated {allocated} bytes — the write is copying the caller's bytes onto the heap again");
+      var back = new byte[chunk];
+      var read = fs.Open("striped.bin", AccessMode.Read, ShareMode.Read);
+      fs.Read(read, back, (long)writes * chunk).Should().Be(chunk);
+      fs.Close(read);
+      back.Should().Equal(data);
+    } finally {
+      foreach (var root in roots)
+        Directory.Delete(root, true);
+    }
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Write_GivenACopyIsOwed_WhenTheCallerReusesItsBufferAfterTheAck_ThenTheOwedCopyStillGetsTheAcknowledgedBytes() {
+    // The other half of the contract above: where a copy IS owed, the write buffer keeps the bytes
+    // until they reach it, so they must be the pool's own — never the caller's buffer, which the
+    // driver reuses the moment the write returns, and never a pooled one, which the next write reuses.
+    var fs = this._CreateFs("""{ "duplication": 2, "write": { "policy": "write-back", "minCopiesBeforeAck": 1 } }""");
+    fs.Mount(new(@"Y:\"));
+    fs.Close(fs.Create("owed.bin", NodeKind.File, CreateFlags.None));
+    fs.Close(fs.Create("other.bin", NodeKind.File, CreateFlags.None));
+
+    var buffer = new byte[] { 1, 2, 3, 4 };
+    var handle = fs.Open("owed.bin", AccessMode.ReadWrite, ShareMode.None);
+    fs.Write(handle, buffer, 0, WriteMode.Normal);
+    buffer.AsSpan().Fill(0xEE); // the caller's buffer, reused
+    var other = fs.Open("other.bin", AccessMode.ReadWrite, ShareMode.None);
+    fs.Write(other, new byte[] { 9, 9, 9, 9 }, 0, WriteMode.Normal); // a second write that could reuse a pooled buffer
+    fs.Close(other);
+    fs.Flush(handle); // the owed copy is written now, from whatever the buffer kept
+    fs.Close(handle);
+
+    foreach (var volume in new[] { this._volume1, this._volume2 })
+      foreach (var shadow in new[] { false, true })
+        if (volume.FileExists("owed.bin", shadow))
+          volume.GetContent("owed.bin", shadow).Should().Equal([1, 2, 3, 4], $"every copy holds the acknowledged bytes ({volume.DisplayName}, shadow: {shadow})");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Write_GivenEveryCopyIsRequired_WhenFilesAreWrittenBackToBackFromOneReusedBuffer_ThenEachHoldsItsOwnBytesOnEveryCopy() {
+    var buffer = new byte[64];
+    for (var file = 0; file < 4; ++file) {
+      buffer.AsSpan().Fill((byte)(file + 1));
+      var handle = this._CreateFileWithContent($"f{file}.bin", buffer);
+      this._fs.Close(handle);
+    }
+
+    for (var file = 0; file < 4; ++file)
+      foreach (var volume in new[] { this._volume1, this._volume2 })
+        foreach (var shadow in new[] { false, true })
+          if (volume.FileExists($"f{file}.bin", shadow))
+            volume.GetContent($"f{file}.bin", shadow).Should().OnlyContain(b => b == file + 1, $"f{file}.bin on {volume.DisplayName} (shadow: {shadow})");
+  }
+
 }
