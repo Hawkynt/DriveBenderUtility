@@ -1931,6 +1931,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     foreach (var dirty in this._writeBuffer.DirtyPaths.Where(p => p.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray())
       this.FlushPath(dirty);
 
+    // Edit sessions are keyed by path too, and the close that ends one looks under the file's NEW
+    // name, so a session left open here would never be completed. Completing it is safe: every
+    // write takes the gate this rename holds exclusively, so none is in flight, and each copy
+    // already has every acknowledged write. The next write opens a session under the new name.
+    foreach (var session in this._writeSessions.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray())
+      this._CloseWriteSession(session);
+
+    // A snapshot recorded its files by PATH, and after the move those paths name nothing, so each
+    // pinned child is preserved first, as a file rename preserves its source. Without it the moved
+    // file looks like any other live file, and the first edit to it overwrites the only bytes the
+    // snapshot promised. Only pinned children pay; the settled content is what gets set aside.
+    foreach (var pinnedChild in this._pinned.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray())
+      using (this._handles.AcquireWrite(pinnedChild))
+        this._PreserveIfPinned(pinnedChild, wholeFileReplaced: false);
+
     this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
 
@@ -1947,8 +1962,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._handles.RenameSubtree(fromNormalized, toNormalized);
     this._shadow.Rename(fromNormalized, toNormalized);
 
-    // every cached child listing/placement under the old prefix is stale — drop the pool's caches
+    // every cached child listing/placement under the old prefix is stale — drop the pool's caches —
+    // and so are the children's cached blocks, under both names. The new name may hold blocks left
+    // there before: reads do not wait for this rename, so one in flight can cache the old path's
+    // bytes after the old side is dropped, and such blocks turn stale only when a folder takes that
+    // name back — the rename that brings it back drops them here as its target.
     this._cache.Metadata.InvalidatePool(this._poolId);
+    this._cache.Pages.InvalidateSubtree(this._poolId, fromNormalized);
+    this._cache.Pages.InvalidateSubtree(this._poolId, toNormalized);
     this._placement.InvalidateAll();
     DriveBender.Logger($"Renamed folder '{fromNormalized}' to '{toNormalized}' across {this._Online.Count(m => m.FolderExists(toNormalized, false))} member(s)");
   }
@@ -4407,6 +4428,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// application that wrote the file keeps running.
   /// </summary>
   public void MarkApplicationClosed(NodeHandle handle) {
+    // As Close: this can publish, and a publish takes the file off the staging list before it renames
+    // the temp on each member. A folder rename landing in between would see no staged child, carry the
+    // temp away with the folder, and leave it a temp for good — which recovery deletes.
+    using var namespaceHold = this._EnterNamespaceShared();
     var wrote = this._handles.TryGet(handle) is { } open && (open.Access & AccessMode.Write) != 0;
     this._handles.MarkApplicationClosed(handle);
 

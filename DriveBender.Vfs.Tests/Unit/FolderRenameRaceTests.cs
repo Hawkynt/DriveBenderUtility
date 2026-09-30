@@ -178,4 +178,61 @@ public class FolderRenameRaceTests {
     failures.Should().BeEmpty("a created file moves with its folder or was refused — the old folder never comes back");
   }
 
+  [Test]
+  [Category("EdgeCase")]
+  public void RenameFolder_GivenTheApplicationClosedAChildThatIsBeingPublished_ThenTheFileIsPublishedUnderTheNewName() {
+    // "The application closed it" is where a new file is published on Windows (CLEANUP arrives long
+    // before the kernel's CLOSE). The publish takes the file off the staging list BEFORE it renames
+    // the temp on each member, so a folder rename landing in between saw no staged child, moved the
+    // temp with the folder, and left the publish renaming a temp that was no longer there: the file
+    // stayed a temp under the new folder, which is exactly what recovery deletes at the next mount.
+    using var fs = _Engine("""{ "duplication": 1 }""", out var members);
+    var content = Enumerable.Range(0, 3000).Select(i => (byte)(i % 251)).ToArray();
+    fs.MakeDir("a");
+    var handle = fs.Create("a/x.bin", NodeKind.File, CreateFlags.None);
+    fs.Write(handle, content, 0, WriteMode.Normal);
+
+    var publishing = new ManualResetEventSlim();
+    var resume = new ManualResetEventSlim();
+    Thread? closer = null;
+    foreach (var member in members)
+      member.BeforeOperation = (op, path) => {
+        if (op == VolumeOp.AtomicReplace && path == "a/x.bin" && Thread.CurrentThread == closer) {
+          publishing.Set();
+          resume.Wait(TimeSpan.FromSeconds(10));
+        }
+      };
+
+    Exception? closeFailure = null;
+    closer = new(() => {
+      try {
+        fs.MarkApplicationClosed(handle);
+      } catch (Exception e) {
+        closeFailure = e;
+      }
+    });
+    closer.Start();
+    publishing.Wait(TimeSpan.FromSeconds(10)).Should().BeTrue("the close must publish the file, or this tests nothing");
+
+    var renamer = new Thread(() => fs.Rename("a", "b", RenameFlags.None));
+    renamer.Start();
+    renamer.Join(TimeSpan.FromMilliseconds(500)); // lands inside the publish, unless the publish holds it off
+    resume.Set();
+    closer.Join(TimeSpan.FromSeconds(10)).Should().BeTrue();
+    renamer.Join(TimeSpan.FromSeconds(10)).Should().BeTrue();
+    foreach (var member in members)
+      member.BeforeOperation = null;
+    fs.Close(handle);
+
+    closeFailure.Should().BeNull("closing a file the application has finished with must not fail");
+    members.Any(m => m.FileExists("b/x.bin", false)).Should().BeTrue("the file must be published under its folder's new name");
+    members.Any(m => m.FileExists("b/x.bin." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, false)).Should().BeFalse(
+      "a temp left behind is deleted by recovery at the next mount, and with it the file");
+    var reader = fs.Open("b/x.bin", AccessMode.Read, ShareMode.Read);
+    var read = new byte[content.Length];
+    fs.Read(reader, read, 0);
+    fs.Close(reader);
+    read.Should().Equal(content);
+  }
+
 }

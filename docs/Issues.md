@@ -1750,37 +1750,39 @@ being deleted, because what they cost is the point.
    see a version already superseded before that replacement began. Proved sensitive by making the
    adapter serve the target from the first bytes it ever read: fails 2 of 2. Passes 6 of 6 under
    18 busy CPU threads (about 54,000 judged reads, none stale) and 5 of 5 unloaded.
-2. **`_RenameFolder` holds leases on the two folder paths but on NO CHILD FILE while moving them.**
-   It flushes dirty children and publishes staged ones first, but takes no lease on any of them, so
-   a write can land between that flush and the member-level `RenameFolder` and address a path whose
-   physical file has since moved. Not reproduced end to end; the stress suite races file renames
-   only, which is why it would not be caught. Fixing it needs a lock-ordering story for an unbounded
-   set of children, which is why it is written down rather than attempted in passing.
+2. **Narrowed: `_RenameFolder` holds no lease on any child file.** The window this entry described
+   (a write landing between the rename's flush and the member-level move) is closed, not by child
+   leases but by the namespace gate added with "renaming a folder while a file in it was being
+   written" below. Every operation that writes, creates, moves or publishes under a path holds the
+   gate shared, and a folder rename holds it exclusively from its flush to the end of the move.
+   Checking that claim against every caller this pass found one that did not hold it, and three kinds
+   of per-path state the move left behind. All four are fixed, each with a test that fails without
+   the fix:
+   - **`MarkApplicationClosed` published without the gate — a closed file could be lost.** It is
+     where a new file is published on Windows. The publish takes the file off the staging list
+     before renaming the temp on each member, so a folder rename landing in between moved the temp
+     with the folder, and the publish then failed. The file stayed a temp under the new folder, which
+     the next mount's recovery deletes. It takes the gate now, as `Close` does
+     (`FolderRenameRaceTests`, deterministic: the publish is held at its rename while the folder
+     moves).
+   - **Snapshots lost the files of a renamed folder.** A file rename preserves a pinned source
+     first; a folder rename did not, so the snapshot's paths named nothing, and the first edit of a
+     moved file overwrote the only copy of the snapshot's version. Pinned children are now preserved
+     before the move (`SnapshotTests`).
+   - **A folder moved away and back served blocks cached before it left.** Cached blocks are keyed
+     by path, and a folder rename dropped the metadata cache but not the page cache. The children's
+     blocks are now dropped under both names; the target side is what also catches a read that was
+     in flight during the move and cached old-path bytes after the drop (`PoolFileSystemWriteTests`,
+     two cases).
+   - **An edit session under the old name was never completed.** The close that ends a session
+     looks it up under the file's new name, so a Write intent stayed open in the journal for every
+     later mount's recovery. Children's sessions are completed before the move; no write is in flight
+     under the exclusive gate.
 
-   **It now has an end-to-end guard, and the guard did not trip it.** `FolderRenameRaceEndToEndTests`
-   races four writers against a folder renamed back and forth underneath them, repeated, through a
-   real mount — the case the note says the stress suite misses because it races file renames only.
-   Its oracle is the one that matters and needs no timing: a write the pool ACKNOWLEDGED must be
-   findable afterwards, and a file must hold ONE version rather than a blend of two. Several
-   thousand acknowledged writes across dozens of renames later, nothing was lost.
-
-   One thing the guard turned up on its own: **on Windows the race cannot be built at all.** The OS
-   refuses to rename a directory while files beneath it are open, so with writers hammering four
-   children every attempt is declined before the pool ever sees it — the scenario came back with
-   zero renames there and now skips with that reason. Which also says the window is far harder to
-   reach on that platform, because the rename that would open it mostly cannot start. That does not
-   prove the window cannot open — a race that does not reproduce is not a race that cannot happen,
-   and the reasoning about the missing child lease still stands — but the risk is no longer
-   unobserved, and anything that makes it real from here fails a test instead of quietly losing a
-   file. The lock-ordering story for an unbounded set of children is still what a fix needs.
-
-   **Half of this entry was wrong and is withdrawn.** It also claimed `HandleTable.RenameSubtree`
-   repeats the defect fixed in `4ad2094` by re-keying children over any state already there. It does
-   re-key that way — and so does `RenamePath`, the method that fix landed in. Displacing an entry was
-   never the defect; the defect was the CLOSE path unkeying an entry that had come to belong to
-   somebody else, and `4ad2094` fixed that centrally by guarding both removal sites with
-   `ReferenceEquals(current, file)`. `RenameSubtree` therefore has the shape of the FIXED code, not
-   of the bug. Checked against the commit rather than inferred from the shape a second time.
+   Still outside the gate, looked at and not changed: reads, which may fail against a moving file
+   but do not mutate it, and `Open` for writing, whose snapshot preservation copies a pinned file
+   and could fail the open if the folder moves mid-copy. Neither is known to lose data; neither is
+   covered by a test.
 
 The three throughput items that stood here — sync-over-async across the providers, the absence of
 provider-level range reads, and the whole-object RAM spikes — are closed above.
