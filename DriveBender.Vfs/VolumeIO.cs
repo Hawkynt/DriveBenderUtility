@@ -152,6 +152,15 @@ public interface IVolumeIO {
 
   /// <summary>Bytes the file actually occupies on the storage, or -1 when unknown.</summary>
   long AllocatedBytes(string relativePath, bool shadow) => -1;
+
+  /// <summary>
+  /// Reports changes made to the member's files by anyone, the pool or not, until disposed: the
+  /// pool path of each changed file or folder (see <see cref="PoolPaths.FromPhysical"/>), or null
+  /// when the member cannot tell what changed (its notifications overflowed). Reports may arrive
+  /// late, so a caller treats them as a hint on top of its own checks. Null when the member cannot
+  /// watch at all.
+  /// </summary>
+  IDisposable? WatchChanges(Action<string?> changed) => null;
 }
 
 /// <summary>Descriptor a backend needs to open a member (path/URI, tuning, credential reference).</summary>

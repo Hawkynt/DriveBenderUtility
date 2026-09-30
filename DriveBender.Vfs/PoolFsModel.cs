@@ -106,6 +106,15 @@ public static class PoolPaths {
   }
 
   /// <summary>
+  /// The pool path a member-relative physical path belongs to: <see cref="ToPhysical"/> backwards.
+  /// A shadow copy and the primary map to the same pool path, since a change to either is a change
+  /// to that file. Separators of either kind are accepted.
+  /// </summary>
+  public static string FromPhysical(string physicalRelative)
+    => string.Join('/', physicalRelative.Split(['/', '\\'],StringSplitOptions.RemoveEmptyEntries)
+      .Where(segment => !segment.Equals(DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase)));
+
+  /// <summary>
   /// Physical location of a folder: its shadow side is the folder's own
   /// FOLDER.DUPLICATE.$DRIVEBENDER container (the marker that enables duplication and
   /// holds its files' shadow copies) — unlike files, whose shadow lives in the parent.

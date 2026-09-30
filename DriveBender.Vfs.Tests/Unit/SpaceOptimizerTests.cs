@@ -10,7 +10,8 @@ namespace DivisonM.Vfs.Tests.Unit;
 /// <summary>
 /// The space optimizer (docs/SpaceSavings.md): it may share data between different files with the
 /// same content and release runs of zeros — and must never change what any file holds, never pair a
-/// file with its own copy, and never make a hard link where the files' metadata differs.
+/// file with its own copy, never make a hard link where the files' metadata differs, and never act on
+/// a file that changed while it worked with it.
 /// </summary>
 [TestFixture]
 [Category("Unit")]
@@ -21,14 +22,33 @@ public class SpaceOptimizerTests {
 
   private static readonly byte[] _CONTENT = [.. Enumerable.Range(0, 200_000).Select(i => (byte)(i * 7 + 1))];
 
-  private sealed class Held : IDisposable {
-    public void Dispose() { }
+  /// <summary>A feed that hears nothing and refuses the commit for the paths it is told are busy.</summary>
+  private sealed class BusyFeed(IChangeFeed inner, string busyPath) : IChangeFeed {
+    public IPathWatch Watch(string path) => inner.Watch(path);
+
+    public IDisposable? TryCommit(IReadOnlyList<IPathWatch> watches)
+      => watches.Any(w => w.Path == busyPath) ? null : inner.TryCommit(watches);
   }
 
   private static FakeVolumeIO _Disk(BackendCaps extra) => new(Guid.NewGuid(), "disk", "PHYS-1", capacity: 1L << 26) { Caps = _BASE | extra };
 
-  private static SpaceReport _Optimize(FakeVolumeIO disk, Func<string, IDisposable?>? lockPath = null, bool deduplicate = true, bool sparsify = true)
-    => new SpaceOptimizer([disk], lockPath ?? (_ => new Held()), deduplicate, sparsify).Run();
+  private static SpaceReport _Optimize(FakeVolumeIO disk, Func<IChangeFeed>? feed = null, bool deduplicate = true, bool sparsify = true)
+    => new SpaceOptimizer([disk], feed ?? (() => new MemberChangeFeed([disk])), deduplicate, sparsify).Run();
+
+  /// <summary>Runs <paramref name="act"/> once, on the <paramref name="nth"/> time the pass opens <paramref name="path"/> to read it.</summary>
+  private static void _OnRead(FakeVolumeIO disk, string path, int nth, Action act) {
+    var seen = 0;
+    disk.BeforeOperation = (op, p) => {
+      if (op == VolumeOp.OpenRead && p == path && ++seen == nth)
+        act();
+    };
+  }
+
+  private static void _WriteOutside(FakeVolumeIO disk, string path, long offset, byte value) {
+    using var stream = disk.OpenWrite(path, false, false);
+    stream.Position = offset;
+    stream.WriteByte(value);
+  }
 
   [Test]
   [Category("HappyPath")]
@@ -98,7 +118,7 @@ public class SpaceOptimizerTests {
     disk.Seed("a.bin", false, _CONTENT);
     disk.Seed("b.bin", false, _CONTENT);
 
-    var report = _Optimize(disk, path => path == "b.bin" ? null : new Held());
+    var report = _Optimize(disk, () => new BusyFeed(new MemberChangeFeed([disk]), "b.bin"));
 
     report.SkippedBusy.Should().Be(1);
     disk.LinkCount("b.bin", false).Should().Be(1);
@@ -144,6 +164,76 @@ public class SpaceOptimizerTests {
     disk.Seed("b.bin", false, _CONTENT);
 
     _Optimize(disk).Should().Be(SpaceReport.Empty);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Dedup_WhenAFileIsWrittenWhileItIsCompared_ThenItIsLeftAloneAndTheWriteIsKept() {
+    // nothing is held while the pass compares: the write goes ahead, and the pass hears of it
+    var disk = _Disk(BackendCaps.HardLinks);
+    disk.Seed("a.bin", false, _CONTENT);
+    disk.Seed("b.bin", false, _CONTENT);
+    _OnRead(disk, "b.bin", nth: 2, () => _WriteOutside(disk, "b.bin", 5, 0xEE)); // the 2nd read is the byte compare
+
+    var report = _Optimize(disk);
+
+    report.FilesDeduplicated.Should().Be(0);
+    report.SkippedChanged.Should().Be(1);
+    disk.GetContent("b.bin", false)![5].Should().Be(0xEE, "the write made during the pass is kept");
+    disk.GetContent("a.bin", false).Should().Equal(_CONTENT);
+    disk.LinkCount("a.bin", false).Should().Be(1);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Dedup_WhenAChangeIsNeverReported_ThenTheSizeAndTimeCheckAtTheCommitStillCatchesIt() {
+    // filesystem notifications can come late, or be lost: the commit compares what it read
+    var disk = _Disk(BackendCaps.HardLinks);
+    disk.Seed("a.bin", false, _CONTENT);
+    disk.Seed("b.bin", false, _CONTENT);
+    _OnRead(disk, "b.bin", nth: 2, () => disk.SetTimestamps("b.bin", false, null, new DateTime(2011, 1, 1, 0, 0, 0, DateTimeKind.Utc)));
+
+    var report = _Optimize(disk, () => new MemberChangeFeed([])); // hears nothing at all
+
+    report.FilesDeduplicated.Should().Be(0);
+    report.SkippedChanged.Should().Be(1);
+    disk.LinkCount("a.bin", false).Should().Be(1);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Sparse_WhenARunOfZerosIsWrittenAfterItWasScanned_ThenNothingIsReleased() {
+    var disk = _Disk(BackendCaps.Sparse);
+    var content = new byte[SpaceOptimizer.SparseUnit * 5];
+    content[0] = 1;
+    content[^1] = 2;
+    disk.Seed("image.bin", false, content);
+    // after the scan, just before the commit: a write lands in the middle of a run it found
+    var written = false;
+    var optimizer = new SpaceOptimizer([disk], () => new _WriteBeforeCommit(new MemberChangeFeed([disk]), () => {
+      if (!written) {
+        written = true;
+        _WriteOutside(disk, "image.bin", SpaceOptimizer.SparseUnit * 2 + 7, 0x42);
+      }
+    }), deduplicate: false);
+
+    var report = optimizer.Run();
+
+    report.FilesSparsified.Should().Be(0);
+    report.SkippedChanged.Should().Be(1);
+    disk.GetContent("image.bin", false)![SpaceOptimizer.SparseUnit * 2 + 7].Should().Be(0x42, "a write into a run found empty is never punched away");
+  }
+
+  /// <summary>Runs something just before each commit is asked for: the latest a racing write can land.</summary>
+  private sealed class _WriteBeforeCommit(IChangeFeed inner, Action beforeCommit) : IChangeFeed, IDisposable {
+    public IPathWatch Watch(string path) => inner.Watch(path);
+
+    public IDisposable? TryCommit(IReadOnlyList<IPathWatch> watches) {
+      beforeCommit();
+      return inner.TryCommit(watches);
+    }
+
+    public void Dispose() => (inner as IDisposable)?.Dispose();
   }
 
   [Test]

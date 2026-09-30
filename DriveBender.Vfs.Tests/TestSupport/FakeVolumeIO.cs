@@ -139,6 +139,35 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
 
   private void _Before(VolumeOp op, string relativePath) => this.BeforeOperation?.Invoke(op, relativePath);
 
+  private Action<string?>? _changeListeners;
+
+  /// <summary>As a filesystem watcher: every change, by the pool or by a test acting outside it.</summary>
+  public IDisposable? WatchChanges(Action<string?> changed) {
+    lock (this._lock)
+      this._changeListeners += changed;
+
+    return new _Unsubscribe(this, changed);
+  }
+
+  private sealed class _Unsubscribe(FakeVolumeIO owner, Action<string?> changed) : IDisposable {
+    public void Dispose() {
+      lock (owner._lock)
+        owner._changeListeners -= changed;
+    }
+  }
+
+  /// <summary>Reports a changed name; the caller holds <see cref="_lock"/>.</summary>
+  private void _Changed(string physical) => this._changeListeners?.Invoke(PoolPaths.FromPhysical(physical));
+
+  /// <summary>Reports every name of a changed file (hard links share it); the caller holds <see cref="_lock"/>.</summary>
+  private void _Changed(FakeFile file) {
+    if (this._changeListeners == null)
+      return;
+
+    foreach (var (name, _) in this._files.Where(kv => ReferenceEquals(kv.Value, file)).ToArray())
+      this._Changed(name);
+  }
+
   private void _After(VolumeOp op, string relativePath) => this.AfterOperation?.Invoke(op, relativePath);
 
   /// <summary>Fault gate; the caller holds <see cref="_lock"/>.</summary>
@@ -234,6 +263,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
 
       Array.Clear(file.Current, (int)offset, (int)(end - offset)); // a hole reads as zeros
       file.HoleBytes = Math.Min(file.Current.Length, file.HoleBytes + (end - offset));
+      this._Changed(file);
       return true;
     }
   }
@@ -321,6 +351,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       Array.Copy(file.Current, resized, Math.Min(file.Current.Length, length));
       file.Current = resized;
       file.LastWriteTimeUtc = DateTime.UtcNow;
+      this._Changed(file);
     }
   }
 
@@ -330,6 +361,8 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       this._Check(VolumeOp.Delete);
       if (!this._files.Remove(PoolPaths.ToPhysical(relativePath, shadow)))
         throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
+
+      this._Changed(PoolPaths.ToPhysical(relativePath, shadow));
     }
   }
 
@@ -378,6 +411,8 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
 
       this._folders.Remove(fromPhysical);
       this._folders.Add(toPhysical);
+      this._Changed(fromPhysical);
+      this._Changed(toPhysical);
 
       foreach (var (key, file) in this._files.Where(kv => kv.Key.StartsWith(fromPrefix, StringComparison.OrdinalIgnoreCase)).ToArray()) {
         this._files.Remove(key);
@@ -406,6 +441,8 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       this._files.Remove(tempPhysical);
       this._EnsureParents(finalPhysical);
       this._files[finalPhysical] = staged;
+      this._Changed(tempPhysical);
+      this._Changed(finalPhysical);
     }
 
     this._After(VolumeOp.AtomicReplace, finalRelative); // the name is visible from here on
@@ -490,6 +527,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
         file.CreationTimeUtc = created;
       if (lastWriteTimeUtc is { } modified)
         file.LastWriteTimeUtc = modified;
+      this._Changed(file);
     }
   }
 
@@ -573,6 +611,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
         this._position = end;
         file.LastWriteTimeUtc = DateTime.UtcNow;
         file.HoleBytes = 0; // written into: allocated again, conservatively all of it
+        owner._Changed(file);
 
         if (tornWrite)
           throw new PoolFsException(PoolFsError.IoError, "Injected partial write");
@@ -604,6 +643,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
         var resized = new byte[value];
         Array.Copy(file.Current, resized, Math.Min(file.Current.Length, value));
         file.Current = resized;
+        owner._Changed(file);
       }
     }
   }

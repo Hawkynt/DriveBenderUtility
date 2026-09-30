@@ -63,9 +63,9 @@ internal static class PoolOpsCommand {
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
 
-    // Saving space changes files, so it runs only with --fix — which holds the pool's exclusive
-    // engine lock (Health takes it), so nothing can mount the pool and write mid-way: a per-file lock
-    // has nothing left to guard against here.
+    // Saving space changes files, so it runs only with --fix, which holds the pool's exclusive engine
+    // lock: nothing can mount the pool meanwhile. A program writing to a member's disk directly still
+    // can, so the pass watches the disks themselves and leaves any file that changed alone.
     SpaceOptimizer? space = null;
     if (fix) {
       var config = ConfigResolver.ResolveEffective(
@@ -74,16 +74,12 @@ internal static class PoolOpsCommand {
       var deduplicate = config.Space?.Deduplicate ?? true;
       var sparsify = config.Space?.Sparsify ?? true;
       if (deduplicate || sparsify)
-        space = new(ios, _ => new _Unlocked(), deduplicate, sparsify);
+        space = new(ios, () => new MemberChangeFeed(ios), deduplicate, sparsify, admit);
     }
 
     var service = new HealthService(ios, new SmartctlMonitor(), new IntegrityService(ios, admit: admit),
       new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online)), space: space);
     return fix ? service.CheckAndCorrect() : service.Check(deep);
-  }
-
-  private sealed class _Unlocked : IDisposable {
-    public void Dispose() { }
   }
 
   /// <summary>The wire shape shared by the daemon relay, the pool process and the transient worker.</summary>

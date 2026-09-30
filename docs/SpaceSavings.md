@@ -52,13 +52,15 @@ either.
 Only files on the **same disk** can share data, so each member is handled on its own:
 
 1. Files of at least 64 KiB are grouped by size; only a size shared by two or more files is hashed.
+   Each file is watched from before its first byte is read (see below).
 2. Files with the same SHA-256 are a candidate pair. The first path in ordinal order is kept.
-3. Both files are locked, in a fixed order so two passes cannot deadlock. A file that is open, still
-   being written, dirty in the write buffer or staged is **skipped** this pass and counted as busy.
-4. Under the locks the two files are **compared byte for byte**. A hash only chooses the pair.
-5. The shared file is made as a temp (`<name>.<token>.DEDUP.TEMP.$DRIVEBENDER`) and renamed over the
-   duplicate atomically, so a power cut leaves the old file, or the shared one, and at worst a temp
-   that the next mount sweeps.
+3. The two files are **compared byte for byte**. A hash only chooses the pair.
+4. A block clone is prepared and verified as a temp (`<name>.<token>.DEDUP.TEMP.$DRIVEBENDER`).
+5. In a short commit window, a hard link is made as that temp if cloning is not available, and the
+   temp is renamed over the duplicate atomically. A power cut leaves the old file, or the shared one,
+   and at worst a temp that the next mount sweeps.
+
+Steps 1 to 4 hold nothing: applications keep reading and writing both files meanwhile.
 
 How the data is shared depends on the filesystem:
 
@@ -75,7 +77,53 @@ How the data is shared depends on the filesystem:
 primary and its shadow copy on one disk, they are identical by design; sharing their data would
 silently undo the duplication. Only different pool paths are ever paired.
 
+## Working alongside applications
+
+The pass never makes an application wait on it. It does not lock a file while it hashes, compares
+or scans for zeros. It watches the file instead, and acts only if nothing changed:
+
+```
+  watch the file ----> read it, hash it, compare it, prepare a clone      (nothing held)
+       |                                   |
+       |  hears every change:              v
+       |   - from the pool engine:    commit window: take the file's lease WITHOUT waiting
+       |     writes, truncates,            |
+       |     renames, deletes,             +-- lease taken by someone, file open, still being
+       |     new times, owed copies        |   written, dirty in the write buffer  --> skip (busy)
+       |     landing                       +-- a change was heard                  --> skip (changed)
+       |   - from the disk itself:         +-- size or time differs from what      --> skip (changed)
+       |     a filesystem watcher on       |   was read
+       |     each member                   v
+       +------------------------------ link / rename / punch holes, release   (milliseconds)
+```
+
+- **The pool engine** reports every change it makes to a watched path the moment the bytes have
+  landed. That includes new times and a second copy that the write buffer writes later. Inside a
+  mounted pool this is the authoritative source.
+- **The disk itself.** During a pass, a filesystem watcher on each member reports changes made by
+  anything, including a program writing to a member folder behind the pool's back. That is all
+  `pool health --fix` has, since it runs with the pool unmounted. Reads are not reported, so the
+  pass's own hashing does not flag its own files.
+- **The last word.** Filesystem notifications can come late or overflow, so under the commit window
+  the file's size and modification time are compared once more with what the pass read.
+
+The commit window takes the file's lease without waiting, and only when the file is closed, clean and
+not staged. A pending folder rename also wins. The window is held for one link and one rename, or for
+the hole punches, and then released. A file that is open, busy or changed is simply left for the next
+health scan: the report counts it as skipped, never as an error. The pass also reads through each
+member's background allowance, the same budget the healer and the drainer use, so it does not take
+bandwidth an application needs.
+
 ## Copy-on-write for hard links
+
+**Isn't the pool copy-on-write already?** For most writes, yes. A new file, and a save that replaces
+a whole file (`File.WriteAllBytes`, an editor saving through a temp, a copy into the pool), is written
+to a staged temp and renamed into place. The name then points at new data, and a hard link breaks by
+itself at no cost. Snapshots (`docs/Snapshots.md`) are a design built on the same renames, not yet
+code. What is not copy-on-write is an **in-place edit** of an existing file: a database, a VM
+image, an append. Those write straight into the file where it lies, and that is where a hard link
+would carry the write into the other name. So the engine separates a linked file before an in-place
+change, and only then.
 
 A block clone separates by itself on a write. A hard link does not: a write into one name is a
 write into both. So before the engine changes a file in place through the pool, it checks the
@@ -96,14 +144,16 @@ file's link count, and a file that shares its data gets data of its own first:
       still has the old one, untouched  -->  change it in place
 ```
 
-This happens once per open file, on its first change. It also covers the paths that write in place
+This happens once per open file, on its first change. A truncate copies only what survives the cut,
+so emptying a shared file (what an overwrite does first) copies nothing at all. It also covers the paths that write in place
 without an ordinary write: a copy the write buffer still owes to a second disk, and a journal replay
 after a power cut. A power cut in the middle leaves the shared file intact, because the temp is
 renamed only when it is whole.
 
 ## Sparsifying
 
-Files of at least 2 MiB are read in aligned 1 MiB units. Every run of whole zero units is released
+Files of at least 2 MiB are read in aligned 1 MiB units, without holding the file. The runs found are
+released in the commit window, only if the file did not change since the scan. Every run of whole zero units is released
 to the filesystem (`FSCTL_SET_ZERO_DATA` on a sparse file on Windows, `fallocate` with
 `PUNCH_HOLE | KEEP_SIZE` on Linux). The file keeps its size and reads back the same zeros. The
 filesystem counts the release as a write, so the file's times are put back afterwards. The saving
