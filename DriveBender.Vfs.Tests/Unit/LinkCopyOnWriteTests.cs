@@ -75,6 +75,28 @@ public class LinkCopyOnWriteTests {
 
   [Test]
   [Category("EdgeCase")]
+  public void SetLength_GivenTheFileSharesItsData_WhenItIsEmptied_ThenNothingIsCopiedToSeparateIt() {
+    // what an overwrite does first: the shared data would be copied only to be thrown away
+    _Twins(this._v1);
+    using var fs = this._Engine();
+    var reads = 0;
+    this._v1.BeforeOperation = (op, path) => {
+      if (op == VolumeOp.OpenRead && path == "b.bin")
+        Interlocked.Increment(ref reads);
+    };
+
+    var handle = fs.Open("b.bin", AccessMode.ReadWrite, ShareMode.Read);
+    fs.SetLength(handle, 0);
+    fs.Close(handle);
+
+    reads.Should().Be(0, "nothing of the old content survives the cut, so none of it is read");
+    this._v1.GetContent("a.bin", false).Should().Equal(_TWIN);
+    this._v1.GetContent("b.bin", false).Should().BeEmpty();
+    this._v1.LinkCount("a.bin", false).Should().Be(1);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
   public void SetAttributes_GivenTheFileSharesItsData_ThenTheOtherKeepsItsTimes() {
     // a hard link shares metadata as well as content: stamping one name stamped both
     _Twins(this._v1);

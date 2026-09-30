@@ -86,6 +86,7 @@ public sealed class ProbeVolumeIO(IVolumeIO inner, TimeSpan readDelay = default)
   public bool TryClone(string sourceRelative, bool sourceShadow, string targetRelative, bool targetShadow) => inner.TryClone(sourceRelative, sourceShadow, targetRelative, targetShadow);
   public bool TryPunchHole(string relativePath, bool shadow, long offset, long length) => inner.TryPunchHole(relativePath, shadow, offset, length);
   public long AllocatedBytes(string relativePath, bool shadow) => inner.AllocatedBytes(relativePath, shadow);
+  public IDisposable? WatchChanges(Action<string?> changed) => inner.WatchChanges(changed);
 
   /// <summary>Holds the member's "a read is open" count until the engine actually lets the stream go.</summary>
   private sealed class CountingStream(Stream inner, ProbeVolumeIO owner) : Stream {

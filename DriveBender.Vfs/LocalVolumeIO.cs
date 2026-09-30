@@ -349,6 +349,42 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
   public long AllocatedBytes(string relativePath, bool shadow) => this._Guard(() => SpaceNative.AllocatedBytes(this._Resolve(relativePath, shadow)));
 
   /// <summary>
+  /// A filesystem watcher over the whole member: what any program changes on the disk, the pool or
+  /// not. Reads are not reported (last-access is not watched), so a job hashing files does not
+  /// flag its own work. An overflowing watcher (a burst of changes, or on Linux the inotify limit)
+  /// reports null: something changed, and it cannot say what.
+  /// </summary>
+  public IDisposable? WatchChanges(Action<string?> changed) {
+    try {
+      var watcher = new FileSystemWatcher(this._rootPath) {
+        IncludeSubdirectories = true,
+        InternalBufferSize = 64 * 1024,
+        NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size | NotifyFilters.LastWrite
+                       | NotifyFilters.Attributes | NotifyFilters.CreationTime | NotifyFilters.Security,
+      };
+
+      void Report(string fullPath) {
+        var relative = System.IO.Path.GetRelativePath(this._rootPath, fullPath);
+        if (!relative.StartsWith("..", StringComparison.Ordinal) && !System.IO.Path.IsPathRooted(relative))
+          changed(PoolPaths.FromPhysical(relative));
+      }
+
+      watcher.Changed += (_, e) => Report(e.FullPath);
+      watcher.Created += (_, e) => Report(e.FullPath);
+      watcher.Deleted += (_, e) => Report(e.FullPath);
+      watcher.Renamed += (_, e) => {
+        Report(e.OldFullPath);
+        Report(e.FullPath);
+      };
+      watcher.Error += (_, _) => changed(null);
+      watcher.EnableRaisingEvents = true;
+      return watcher;
+    } catch (Exception e) when (e is IOException or ArgumentException or PlatformNotSupportedException or UnauthorizedAccessException) {
+      return null; // a member that cannot be watched is checked by its callers' own means only
+    }
+  }
+
+  /// <summary>
   /// Capacity of the volume behind this member, or ZERO when it cannot be interrogated — the
   /// documented FR-STAT convention for "capacity unknown", which <see cref="PoolFileSystem.StatFs"/>
   /// excludes from the aggregate and placement treats as ineligible.

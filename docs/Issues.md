@@ -2295,8 +2295,19 @@ Long runs of zeros are released (sparse files). Both are on by default (`space.d
   never changes.
 - **Never a file's own copies.** A primary and its shadow on one disk are identical by design and are
   never paired; sharing them would undo the duplication.
-- **Busy files are skipped.** A file that is open, dirty, staged or still written is left for the
-  next pass. Pairs are compared byte for byte under both files' locks; a hash only chooses them.
+- **Nothing is held while it works.** The first version locked both files for the whole byte
+  compare, so an application opening a large file waited for the pass. Now it watches instead: the
+  engine reports every change to a watched path, and a filesystem watcher on each member reports
+  changes made outside the pool. Hashing, comparing and preparing a clone hold nothing. Only the
+  final link and rename (or the hole punches) take the file's lease, without waiting, and only when
+  it is closed, clean and unchanged. The size and time are compared once more in that window,
+  because filesystem notifications can come late. Anything else is left for the next health scan.
+  A test has an application write, stamp and delete mid-compare. With the old locking, each of those
+  waited on the pass.
+- **Two changes the pool did not report.** Setting a file's times, and a second copy that the write
+  buffer wrote later, changed a file without telling the jobs that watch it. Both report now.
+- **Emptying a shared file copied it first.** A truncate of a hard-linked file copied all of it before
+  cutting; it now copies only what survives the cut, and nothing for a truncate to zero.
 - **A pooled read handle blocked the link.** A hard link's temp is the kept file itself, and a
   rename on Windows needs delete access to the whole file. The handle the member kept pooled on the
   kept name (from hashing it) has no delete sharing, so every link failed "being used by another
