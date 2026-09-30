@@ -269,6 +269,79 @@ public static class WholeFilePublisher {
       blockingSource: source.BlocksCallingThread, admit: admit, commit: commit, preserve: from);
   }
 
+  /// <summary>How much of each end of a clone is read back to verify it — a sample, not the file: reading it all would cost what the clone saves.</summary>
+  public const int CloneVerifyBytes = 64 * 1024;
+
+  /// <summary>
+  /// Makes <paramref name="targetPath"/> a copy of <paramref name="sourcePath"/> ON THE SAME MEMBER —
+  /// by block cloning where the member can (no data is copied: the two share blocks until either is
+  /// written), by a streamed copy otherwise. True when it was a clone.
+  ///
+  /// The clone is published exactly as a copy is: made under a temp name, checked, stamped with the
+  /// source's times and mode, made durable, and only then renamed into place — so the target is
+  /// always either absent or whole, whichever way it was made. The check is the length and the bytes
+  /// at both ends; a clone the filesystem reported as made but that does not match is discarded and
+  /// the copy is made instead, so a misbehaving clone costs time, never content.
+  /// </summary>
+  public static bool CloneOrCopyWithin(IVolumeIO member, string sourcePath, bool sourceShadow, string targetPath, bool targetShadow,
+    Action<long>? admit = null) {
+    if ((member.Caps & BackendCaps.BlockClone) != 0 && (member.Caps & BackendCaps.AtomicRename) != 0
+        && member.Stat(sourcePath, sourceShadow) is { } meta) {
+      var temp = targetPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+      try {
+        if (member.FileExists(temp, targetShadow))
+          member.Delete(temp, targetShadow); // a clone is created, never written into an old temp
+
+        if (member.TryClone(sourcePath, sourceShadow, temp, targetShadow) && _SameEnds(member, sourcePath, sourceShadow, temp, targetShadow, meta.Length)) {
+          _Preserve(member, temp, targetShadow, meta);
+          using (var stream = member.OpenWrite(temp, targetShadow, false))
+            stream.Flush(); // durable before it has a name, like every publish
+
+          member.AtomicReplace(temp, targetPath, targetShadow);
+          return true;
+        }
+
+        DriveBender.Logger($"[Warning]A clone of '{sourcePath}' on '{member.DisplayName}' did not match its source — copying instead");
+      } catch (PoolFsException e) {
+        DriveBender.Logger($"[Warning]Could not clone '{sourcePath}' on '{member.DisplayName}' ({e.Message}) — copying instead");
+      }
+
+      try {
+        if (member.FileExists(temp, targetShadow))
+          member.Delete(temp, targetShadow);
+      } catch (PoolFsException) {
+        // the copy below truncates the temp it reuses; an orphan is swept on the next mount
+      }
+    }
+
+    CopyBetween(member, sourcePath, sourceShadow, member, targetPath, targetShadow, admit: admit);
+    return false;
+  }
+
+  /// <summary>Whether a clone has its source's length and the same bytes at both ends.</summary>
+  private static bool _SameEnds(IVolumeIO member, string sourcePath, bool sourceShadow, string clonePath, bool cloneShadow, long length) {
+    if (member.Stat(clonePath, cloneShadow)?.Length != length)
+      return false;
+
+    var head = (int)Math.Min(CloneVerifyBytes, length);
+    var tailOffset = Math.Max(head, length - CloneVerifyBytes);
+    var tail = (int)(length - tailOffset);
+    using var source = member.OpenRead(sourcePath, sourceShadow);
+    using var clone = member.OpenRead(clonePath, cloneShadow);
+    return _SameRange(source, clone, 0, head) && _SameRange(source, clone, tailOffset, tail);
+  }
+
+  private static bool _SameRange(Stream left, Stream right, long offset, int count) {
+    if (count == 0)
+      return true;
+
+    var a = new byte[count];
+    var b = new byte[count];
+    left.Seek(offset, SeekOrigin.Begin);
+    right.Seek(offset, SeekOrigin.Begin);
+    return _ReadFully(left, a, count) == count && _ReadFully(right, b, count) == count && a.AsSpan().SequenceEqual(b);
+  }
+
   /// <summary>
   /// Turns a per-member admission callback into the per-chunk one <see cref="CopyBetween"/> takes,
   /// charging BOTH ends of the copy.

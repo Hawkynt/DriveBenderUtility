@@ -229,6 +229,14 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
     }
   }
 
+  /// <summary>Clones report success but differ from their source in the last byte — for proving a clone is verified.</summary>
+  public bool CorruptClones { get; set; }
+
+  /// <summary>Bytes written through this volume's streams so far — what a copy costs and a clone does not.</summary>
+  public long BytesWritten => Interlocked.Read(ref this._bytesWritten);
+
+  private long _bytesWritten;
+
   public bool TryClone(string sourceRelative, bool sourceShadow, string targetRelative, bool targetShadow) {
     if ((this.Caps & BackendCaps.BlockClone) == 0)
       return false;
@@ -240,10 +248,14 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
                  ?? throw new PoolFsException(PoolFsError.NotFound, $"File not found: {sourceRelative}");
       var target = PoolPaths.ToPhysical(targetRelative, targetShadow);
       this._EnsureParents(target);
-      this._files[target] = new() {
+      var clone = new FakeFile {
         Current = (byte[])file.Current.Clone(),
         Persisted = file.Persisted == null ? null : (byte[])file.Persisted.Clone(), // clones share durable blocks
       };
+      if (this.CorruptClones && clone.Current.Length > 0)
+        clone.Current[^1] ^= 0xFF; // a filesystem that answered success and shared the wrong block
+
+      this._files[target] = clone;
       return true;
     }
   }
@@ -608,6 +620,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
         }
 
         Array.Copy(buffer, offset, file.Current, this._position, accepted);
+        Interlocked.Add(ref owner._bytesWritten, accepted);
         this._position = end;
         file.LastWriteTimeUtc = DateTime.UtcNow;
         file.HoleBytes = 0; // written into: allocated again, conservatively all of it

@@ -102,9 +102,10 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   }
 
   private void _MoveShadowIntoTrash(IVolumeIO member, string normalizedPath, string trashPath) {
-    // a shadow copy cannot be renamed across the shadow/primary namespace in one step: stage +
-    // publish, STREAMED so a multi-GB shadow copy never lands in RAM (SAFE-BIGFILE)
-    WholeFilePublisher.CopyBetween(member, normalizedPath, true, member, trashPath, false,
+    // a shadow copy cannot be renamed across the shadow/primary namespace in one step: cloned where
+    // the member can (nothing copied), else staged + published, STREAMED so a multi-GB shadow copy
+    // never lands in RAM (SAFE-BIGFILE)
+    WholeFilePublisher.CloneOrCopyWithin(member, normalizedPath, true, trashPath, false,
       admit: WholeFilePublisher.Pace(admit, member, member));
     member.Delete(normalizedPath, true);
   }

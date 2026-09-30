@@ -216,9 +216,9 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
 
     member.EnsureFolder(PoolPaths.GetParent(versionPath), false);
     if (shadow)
-      // a shadow cannot be renamed across the shadow/primary namespace in one step; streamed, so a
-      // multi-GB copy never lands in RAM (SAFE-BIGFILE)
-      WholeFilePublisher.CopyBetween(member, normalizedPath, true, member, versionPath, false,
+      // a shadow cannot be renamed across the shadow/primary namespace in one step: cloned where the
+      // member can, else streamed, so a multi-GB copy never lands in RAM (SAFE-BIGFILE)
+      WholeFilePublisher.CloneOrCopyWithin(member, normalizedPath, true, versionPath, false,
         admit: WholeFilePublisher.Pace(admit, member, member));
     else
       member.AtomicReplace(normalizedPath, versionPath, false);
@@ -262,14 +262,17 @@ public sealed class PoolSnapshots(IReadOnlyList<IVolumeIO> members, Journal jour
   ///
   /// For a modification that does not replace the whole file: the bytes the writer does not touch
   /// have to survive in the live file as well as in the version, so there is nothing to rename and
-  /// this is the case that genuinely costs. Streamed, so a multi-gigabyte file never lands in RAM.
+  /// this is the case that genuinely costs — on storage that cannot clone. The version lives on the
+  /// SAME member as the file, so where the member can clone blocks (ReFS, Btrfs, XFS) the version is
+  /// a clone: nothing is copied, and the two share their blocks until the live file is written.
+  /// Otherwise it is streamed, so a multi-gigabyte file never lands in RAM.
   /// </summary>
   public string AsideByCopy(IVolumeIO member, string normalizedPath, bool shadow, IReadOnlyCollection<Guid> pins) {
     var versionPath = this._NewVersionPathFor(normalizedPath);
     var sequence = journal.LogIntent(JournalOp.SnapshotAside, normalizedPath, versionPath);
 
     member.EnsureFolder(PoolPaths.GetParent(versionPath), false);
-    WholeFilePublisher.CopyBetween(member, normalizedPath, shadow, member, versionPath, false,
+    WholeFilePublisher.CloneOrCopyWithin(member, normalizedPath, shadow, versionPath, false,
       admit: WholeFilePublisher.Pace(admit, member, member));
 
     _WriteJson(member, _InfoPathFor(versionPath), new SnapshotVersionInfo {
