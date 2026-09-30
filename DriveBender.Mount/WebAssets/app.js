@@ -167,7 +167,7 @@ function updateFlowmap(wrap, pool) {
   }
   const m = pool.metrics || {};
 
-  // live labels: measured per-member latency (the auto-tier signal) + cache state
+  // live labels: measured per-member latency (what placement weighs) + cache state
   const lat = {};
   (m.memberLatencies || []).forEach(l => lat[l.memberId] = l.avgMs);
   pool.members.forEach(mm => {
@@ -244,7 +244,8 @@ const KINDS = [
   ["azblob", "Azure Blob"], ["azfile", "Azure File"], ["dropbox", "Dropbox"], ["onedrive", "OneDrive"],
   ["gdrive", "Google Drive"], ["gcs", "Google Cloud Storage"]
 ];
-const ROLES = ["capacity", "landing", "readonly"];
+// idle: joined to receive a retiring disk's files — takes no new files, nothing is balanced onto it
+const ROLES = ["capacity", "landing", "readonly", "idle"];
 
 // local kinds are picked with the folder browser and need no credentials; every other kind is
 // a remote service with a scheme-specific credential form (mapped to the daemon's user/secret).
@@ -533,7 +534,7 @@ function patchCard(c, pool) {
 
   const topHtml = `
     <h2>${esc(pool.name)} ${health} ${mountBadge}</h2>
-    <div class="sub">${esc(pool.source)} · ${pool.failureDomains} failure domain(s) · <span title="primary placement strategy — change it via the Duplication dialog">⚖ ${esc(pool.placementStrategy || "most-free-space")}</span>${pool.autoLandingZone ? ' · <span title="placement.autoLandingZone: the landing zone follows the measured-fastest drive automatically">🚀 auto-LZ</span>' : ""}</div>
+    <div class="sub">${esc(pool.source)} · ${pool.failureDomains} failure domain(s) · <span title="primary placement strategy — change it via the Duplication dialog">⚖ ${esc(pool.placementStrategy || "most-free-space")}</span></div>
     <div class="capacity-row">
       ${donut(pool.bytesFree, pool.bytesTotal)}
       <div class="cap-legend">
@@ -975,7 +976,6 @@ const SETTINGS_SCHEMA = [
   ["Safety", [
     { path: "safety.journalEnabled", label: "Write-ahead journal (crash-consistent)", type: "bool" },
     { path: "safety.refuseMountOnUnrecoverable", label: "Refuse to mount on unrecoverable damage", type: "bool" },
-    { path: "placement.autoLandingZone", label: "Auto landing zone — let the fastest drive lead", type: "bool" },
   ]],
   ["Resilience", [
     { path: "resilience.onMemberLoss", label: "When a member drive goes offline", type: "enum", options: [

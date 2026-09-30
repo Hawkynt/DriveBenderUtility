@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36674545650](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36674545650).
+Generated from run: [36686086596](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36686086596).
 
-246 scenarios — 225 passing on at least one target, 0 failing.
+247 scenarios — 226 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -75,6 +75,7 @@ Generated from run: [36674545650](https://github.com/Hawkynt/DriveBenderUtility/
 | HeterogeneousDevice | `SlowMember_WhenItRunsCompletelyOutOfSpace_ThenTheRefusalIsCleanAndStoredDataIsIntact` | Filling the only disk in a pool right up is refused cleanly, and everything already stored stays readable and whole. | skipped | skipped |
 | HeterogeneousDevice | `Tiering_GivenTheCapacityDiskIsGenuinelySlow_ThenAWriteBurstRunsAtTheFastTiersPace` | With a genuinely slow capacity disk behind a fast landing zone, a write burst still runs at the fast tier's pace rather than the slow disk's. | skipped | skipped |
 | HeterogeneousDevice | `Tiering_WhenTheBurstDrainsDownToTheSlowDisk_ThenEveryByteArrivesIntact` | Everything the fast tier absorbed arrives byte-for-byte on the slow capacity disk when the drainer moves it down. | skipped | skipped |
+| IdleMember | `Idle_GivenADiskJoinedAsIdle_ThenItTakesNothingUntilAnotherDiskIsRetiredOntoIt` | A disk joined as idle takes no new files, and retiring another disk moves that disk's files onto it. | pass | pass |
 | LargeFile | `LargeFile_GivenItExceedsTwoGiB_ThenItsLengthIsReportedInFull` | A file larger than 2 GiB reports its true length rather than a 32-bit wrapped one. | pass | pass |
 | LargeFile | `LargeFile_GivenReadsAroundTheThirtyTwoBitBoundaries_ThenEveryByteIsCorrect` | Reads on both sides of the 2 GiB and 4 GiB-relevant boundaries return the right bytes. | pass | pass |
 | LargeFile | `LargeFile_WhenAppendedTo_ThenTheNewBytesLandPastTheOldEnd` | Appending to a file that is already past 2 GiB puts the bytes at the true end, not at a wrapped offset. | pass | pass |

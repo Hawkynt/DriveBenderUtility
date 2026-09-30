@@ -275,7 +275,8 @@ internal static class Program {
       "capacity" => MemberRole.Capacity,
       "landing" => MemberRole.Landing,
       "readonly" => MemberRole.ReadOnly,
-      _ => throw new ManifestException($"Unknown role '{options.Role}' (capacity | landing | readonly)"),
+      "idle" => MemberRole.Idle,
+      _ => throw new ManifestException($"Unknown role '{options.Role}' (capacity | landing | readonly | idle)"),
     };
 
     var reserve = options.Reserve == null ? 0 : SizeSpec.ParseBytes(options.Reserve);

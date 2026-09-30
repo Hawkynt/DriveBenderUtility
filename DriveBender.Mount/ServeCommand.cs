@@ -420,7 +420,6 @@ internal sealed class ServeCommand(
           configuredTarget = pool.Manifest.Mount?.Target,
           duplication = _DuplicationOf(pool.Manifest),
           allowSamePhysical = _AllowSamePhysicalOf(pool.Manifest),
-          autoLandingZone = _PlacementFlagOf(pool.Manifest, "autoLandingZone"),
           placementStrategy = _PlacementStringOf(pool.Manifest, "strategy") ?? "most-free-space",
           bytesFree = snapshot?.BytesFree ?? health.BytesFree,
           bytesTotal = snapshot?.BytesTotal ?? health.BytesTotal,
@@ -541,12 +540,6 @@ internal sealed class ServeCommand(
     => manifest.Defaults is { ValueKind: JsonValueKind.Object } defaults
        && defaults.TryGetProperty("placement", out var p) && p.ValueKind == JsonValueKind.Object
        && p.TryGetProperty("shadowNeverSamePhysical", out var s) && s.ValueKind == JsonValueKind.False;
-
-  /// <summary>A boolean flag from the manifest's placement block (e.g. autoLandingZone).</summary>
-  private static bool _PlacementFlagOf(PoolManifest manifest, string flag)
-    => manifest.Defaults is { ValueKind: JsonValueKind.Object } defaults
-       && defaults.TryGetProperty("placement", out var p) && p.ValueKind == JsonValueKind.Object
-       && p.TryGetProperty(flag, out var f) && f.ValueKind == JsonValueKind.True;
 
   /// <summary>A string value from the manifest's placement block (e.g. strategy).</summary>
   private static string? _PlacementStringOf(PoolManifest manifest, string key)
@@ -1172,6 +1165,7 @@ internal sealed class ServeCommand(
   private static MemberRole _ParseRole(string? role) => role?.ToLowerInvariant() switch {
     "landing" => MemberRole.Landing,
     "readonly" => MemberRole.ReadOnly,
+    "idle" => MemberRole.Idle,
     _ => MemberRole.Capacity,
   };
 

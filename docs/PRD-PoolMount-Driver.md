@@ -339,7 +339,10 @@ A JSON manifest is the authoritative definition of a manifest pool:
   `memberId`; the actual location is resolved at mount time (§6.0.3) because
   removable drives change letters and UNC hosts move.
 - **`role`**: `capacity` | `landing` | `readonly` (contributes reads only, never
-  receives writes/duplicates). `role` is shorthand for tier membership —
+  receives writes/duplicates) | `idle` (joined to receive a retiring disk's files:
+  never a target for new files, their copies, drains or heals; the moving service
+  fills it first). A landing zone is only ever assigned by the operator, never by
+  the pool itself. `role` is shorthand for tier membership —
   `landing` ⇒ the **fast tier**, `capacity` ⇒ the **capacity tier** (§6.7); it
   may be overridden per member by `tier` in `memberOverrides`. All tier sources
   for a member must agree (`CFG-VALIDATE`, §8).

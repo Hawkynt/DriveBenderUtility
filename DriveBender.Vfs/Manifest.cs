@@ -6,12 +6,20 @@ namespace DivisonM.Vfs;
 /// <summary>A manifest, marker or config file is structurally invalid (CFG-VALIDATE / CFG-SCHEMA).</summary>
 public class ManifestException(string message, Exception? inner = null) : Exception(message, inner);
 
-/// <summary>Tier shorthand of a member (§6.0.1): landing ⇒ fast tier, capacity ⇒ capacity tier.</summary>
+/// <summary>
+/// Tier shorthand of a member (§6.0.1): landing ⇒ fast tier, capacity ⇒ capacity tier.
+///
+/// <see cref="Idle"/> is a disk joined to the pool to RECEIVE the files of a disk being retired: it
+/// never takes new files or their copies, and the drainer and the healer never put anything on it —
+/// only the moving service does, and it fills an idle member first. Its files are ordinary pool
+/// files, read and written like any other; once the old disk is gone, switch it to capacity.
+/// </summary>
 [JsonConverter(typeof(JsonStringEnumConverter<MemberRole>))]
 public enum MemberRole {
   [JsonStringEnumMemberName("capacity")] Capacity,
   [JsonStringEnumMemberName("landing")] Landing,
   [JsonStringEnumMemberName("readonly")] ReadOnly,
+  [JsonStringEnumMemberName("idle")] Idle,
 }
 
 /// <summary>

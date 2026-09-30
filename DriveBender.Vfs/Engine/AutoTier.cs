@@ -3,10 +3,10 @@
 namespace DivisonM.Vfs.Engine;
 
 /// <summary>
-/// Latency-measuring decorator over a member (FR-AUTO-TIER): every storage-touching
-/// operation — including the returned streams' reads/writes/flushes — feeds an EWMA of
-/// observed latency, so a drive that turns slow or busy becomes visible to the auto-tier
-/// advisor without separate benchmarking I/O.
+/// Latency-measuring decorator over a member: every storage-touching operation — including the
+/// returned streams' reads/writes/flushes — feeds an EWMA of observed latency, so a drive that
+/// turns slow or busy becomes visible to placement, read routing and the dashboard without
+/// separate benchmarking I/O.
 /// </summary>
 public sealed class MeasuredVolumeIO(IVolumeIO inner, TimeProvider? time = null) : IVolumeIO {
 
@@ -146,59 +146,6 @@ public sealed class MeasuredVolumeIO(IVolumeIO inner, TimeProvider? time = null)
         inner.Dispose();
       base.Dispose(disposing);
     }
-  }
-
-}
-
-/// <summary>One member's measured speed for the auto-tier decision.</summary>
-public sealed record MemberSpeed(Guid MemberId, string DisplayName, double AverageLatencyMs, long Samples, bool Network, MemberRole Role);
-
-/// <summary>The advisor's recommendation: promote one member to landing (demoting the current one, when set).</summary>
-public sealed record TierAdvice(Guid PromoteToLanding, Guid? DemoteToCapacity, string Reason);
-
-/// <summary>
-/// Auto landing-zone advisor (FR-AUTO-TIER): watches measured member latencies and
-/// recommends re-tiering — promote a clearly faster member when no landing zone exists,
-/// or swap when the current landing zone has become slow/busy. Hysteresis (a required
-/// speed advantage) plus a cooldown keep it from flapping; remote and read-only members
-/// are never landing candidates.
-/// </summary>
-public sealed class AutoTierAdvisor(double requiredSpeedAdvantage = 2.0, long minSamples = 50, TimeSpan? cooldown = null, Func<DateTime>? clock = null) {
-
-  private readonly TimeSpan _cooldown = cooldown ?? TimeSpan.FromMinutes(10);
-  private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
-  private DateTime _lastChangeUtc = DateTime.MinValue;
-
-  public TierAdvice? Advise(IReadOnlyList<MemberSpeed> members) {
-    if (this._clock() - this._lastChangeUtc < this._cooldown)
-      return null;
-
-    var eligible = members.Where(m => m is { Network: false, Role: not MemberRole.ReadOnly } && m.Samples >= minSamples).ToArray();
-    if (eligible.Length < 2)
-      return null;
-
-    var fastest = eligible.OrderBy(m => m.AverageLatencyMs).First();
-    var landing = eligible.FirstOrDefault(m => m.Role == MemberRole.Landing);
-
-    if (landing == null) {
-      // auto-detect: promote only when one member is decisively faster than the median of the rest
-      var others = eligible.Where(m => m != fastest).Select(m => m.AverageLatencyMs).OrderBy(x => x).ToArray();
-      var median = others[others.Length / 2];
-      if (fastest.AverageLatencyMs * requiredSpeedAdvantage > median)
-        return null;
-
-      this._lastChangeUtc = this._clock();
-      return new(fastest.MemberId, null,
-        $"auto landing-zone: '{fastest.DisplayName}' ({fastest.AverageLatencyMs:F1} ms) is ≥{requiredSpeedAdvantage:F0}× faster than the median ({median:F1} ms)");
-    }
-
-    // swap only when the current landing zone is decisively slower than the best alternative
-    if (fastest.MemberId == landing.MemberId || landing.AverageLatencyMs < fastest.AverageLatencyMs * requiredSpeedAdvantage)
-      return null;
-
-    this._lastChangeUtc = this._clock();
-    return new(fastest.MemberId, landing.MemberId,
-      $"landing zone '{landing.DisplayName}' has become slow/busy ({landing.AverageLatencyMs:F1} ms vs '{fastest.DisplayName}' {fastest.AverageLatencyMs:F1} ms) — swapping");
   }
 
 }

@@ -53,12 +53,16 @@ internal static class PoolOpsCommand {
     return (pool, online, Math.Max(1, config.Duplication ?? 1), config.Placement?.ShadowNeverSamePhysical == false, _Limiter(config, online));
   }
 
+  /// <summary>Each online member's role, so the moving service knows which members are idle (fill first) and read-only (never).</summary>
+  private static IReadOnlyDictionary<Guid, MemberRole> _RolesOf(IReadOnlyList<(PoolMemberDefinition def, IVolumeIO io)> online)
+    => online.ToDictionary(m => m.io.MemberId, m => m.def.Role);
+
   /// <summary>Runs the health scan (optionally deep / correcting) and returns the structured report — shared by the CLI verb and the daemon's API.</summary>
   public static HealthReport RunHealth(IHostEnvironment host, IPoolProvider provider, BackendMemberResolver remoteResolver, string poolNameOrId, bool fix, bool deep = false) {
     var (_, online, duplication, allowSamePhysical, admit) = _Open(host, provider, remoteResolver, poolNameOrId);
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
-    var service = new HealthService(ios, new SmartctlMonitor(), new IntegrityService(ios, admit: admit), new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit));
+    var service = new HealthService(ios, new SmartctlMonitor(), new IntegrityService(ios, admit: admit), new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online)));
     return fix ? service.CheckAndCorrect() : service.Check(deep);
   }
 
@@ -220,7 +224,7 @@ internal static class PoolOpsCommand {
 
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
-    var report = new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit).RestorePool();
+    var report = new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online)).RestorePool();
     if (options.Json) {
       Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new { ok = true, copiesCreated = report.CopiesCreated }));
       return 0;
@@ -413,7 +417,7 @@ internal static class PoolOpsCommand {
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
 
-    new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit).ScatterAndRemove(member.MemberId);
+    new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online)).ScatterAndRemove(member.MemberId);
     lifecycle.RemoveMember(pool.Manifest, member.MemberId); // drop from the manifest once its data is scattered
     Console.WriteLine($"Removed media '{member.Label ?? member.Path}' from pool '{pool.Name}'; data scattered over the remaining members.");
     return 0;
@@ -451,7 +455,7 @@ internal static class PoolOpsCommand {
     IVolumeIO replacement = new LocalVolumeIO(joined.MemberId, newPath, newPath, host.GetVolumeIdentity(newPath).PhysicalVolumeId);
     var ios = online.Select(m => m.io).Where(io => io.MemberId != joined.MemberId).Append(replacement).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
-    new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit).Replace(oldMember.MemberId, replacement);
+    new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online)).Replace(oldMember.MemberId, replacement);
 
     lifecycle.RemoveMember(manifest, oldMember.MemberId);
     Console.WriteLine($"Replaced media '{oldMember.Label ?? oldMember.Path}' with '{options.New}' in pool '{pool.Name}'.");

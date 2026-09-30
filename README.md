@@ -224,9 +224,8 @@ cache-occupancy meters, a hit-rate history, and a **live flow map** — pool I/O
 RAM cache → fast tier → capacity storage — where **data blocks fly along curves**
 as reads, writes, drains and duplications actually happen, with each storage's
 measured latency shown in its node; updated once a second while pools are
-mounted. With `placement.autoLandingZone` enabled, the **landing zone follows
-the measured-fastest drive automatically** (hysteresis + cooldown prevent
-flapping; a slow or busy drive gets demoted live). From the same page you can run the
+mounted. A landing zone is always a role you give a disk; the pool never
+promotes one by itself. From the same page you can run the
 **entire lifecycle**: create a pool (pick local folders with a built-in **folder
 browser**, or add remote members whose **credentials are collected by a
 scheme-aware dialog** — user/password for FTP·WebDAV, password *or* private key
@@ -442,6 +441,23 @@ flowchart LR
     class Buf warn
     class Members store
 ```
+
+### Swapping a disk: join the new one as idle
+
+A member can join with the role `idle`. An idle disk takes no new files and no
+copies of them, and the landing-zone drainer and the healer never put anything on
+it. The one thing that fills it is retiring another disk: `pool remove-media`
+moves the leaving disk's files onto idle members first, and only then onto the
+others.
+
+```bash
+dbmount pool add-member MyPool -m "K:\" --role idle     # the new disk waits, untouched
+dbmount pool remove-media MyPool --member "D:\"         # the old disk's files move onto K:\
+```
+
+Its files are ordinary pool files, read and written like any other. Once the
+old disk is gone, give the new one the `capacity` role (the dashboard's member
+dialog) so it takes new files too.
 
 ### Tiering: land fast, drain later
 

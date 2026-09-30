@@ -253,8 +253,9 @@ public sealed record PlacementConfig {
   [JsonPropertyName("strategy")] public PlacementStrategy? Strategy { get; init; }
   [JsonPropertyName("shadowNeverSamePhysical")] public bool? ShadowNeverSamePhysical { get; init; }
 
-  /// <summary>FR-AUTO-TIER: measure member latency and re-tier the landing zone live when a drive gets slow/busy.</summary>
-  [JsonPropertyName("autoLandingZone")] public bool? AutoLandingZone { get; init; }
+  // "autoLandingZone" is gone: a landing zone is a role the operator gives a disk, never one the
+  // pool hands out by itself. An old manifest that still sets it loads fine — the key lands in
+  // ExtensionData and does nothing.
 
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
 }

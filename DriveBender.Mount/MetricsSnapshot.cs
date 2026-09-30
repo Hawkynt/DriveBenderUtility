@@ -7,7 +7,7 @@ namespace DivisonM.Mount;
 /// <summary>One activity row for the live feed (mirrors OPS-EVENTS for cross-process transport).</summary>
 public sealed record ActivityRow(string Kind, string Path, long Bytes, string? From, string? To, string Reason, string Stamp);
 
-/// <summary>One member's measured latency for the dashboard (FR-AUTO-TIER visibility).</summary>
+/// <summary>One member's measured latency for the dashboard (placement and read routing weigh it).</summary>
 public sealed record MemberLatencyRow(Guid MemberId, double AvgMs, long Samples);
 
 /// <summary>
