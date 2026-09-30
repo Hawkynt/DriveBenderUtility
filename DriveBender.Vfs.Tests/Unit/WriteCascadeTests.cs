@@ -57,7 +57,8 @@ public class WriteCascadeTests {
   [Test]
   [Category("HappyPath")]
   public void WriteBack_GivenTripleDuplication_WhenWritten_ThenAckAfterTwoCopiesAndThirdOwedToBackground() {
-    var fs = this._CreateFs("""{ "duplication": 3, "write": { "policy": "write-back", "minCopiesBeforeAck": 2 } }""");
+    // pinned to the unstriped path: this tests the RAM owed-copy buffer, which new files only reach with striping off
+    var fs = this._CreateFs("""{ "duplication": 3, "write": { "striping": false, "policy": "write-back", "minCopiesBeforeAck": 2 } }""");
     var handle = fs.Create("f.bin", NodeKind.File, CreateFlags.None);
 
     fs.Write(handle, [1, 2, 3], 0, WriteMode.Normal); // ack ⇒ 2 durable copies exist
@@ -101,7 +102,8 @@ public class WriteCascadeTests {
   [Test]
   [Category("HappyPath")]
   public void Deferred_GivenCoalescingWindow_WhenClockAdvances_ThenOwedCopiesApplyOnlyAfterWindow() {
-    var fs = this._CreateFs("""{ "duplication": 3, "write": { "policy": "deferred", "minCopiesBeforeAck": 2, "deferWindow": "5s", "maxDeferSeconds": 30 } }""");
+    // pinned to the unstriped path: this tests the RAM owed-copy buffer, which new files only reach with striping off
+    var fs = this._CreateFs("""{ "duplication": 3, "write": { "striping": false, "policy": "deferred", "minCopiesBeforeAck": 2, "deferWindow": "5s", "maxDeferSeconds": 30 } }""");
     var scheduler = fs.CreateScheduler();
     scheduler.Quiesce(); // drain the mount-time heal scan so only the deferred write is observed
     var handle = fs.Create("f.bin", NodeKind.File, CreateFlags.None);
@@ -235,7 +237,8 @@ public class WriteCascadeTests {
   [Test]
   [Category("HappyPath")]
   public void StateMachine_GivenWritePolicyStages_WhenObserved_ThenStatesProgress() {
-    var fs = this._CreateFs("""{ "duplication": 3, "write": { "policy": "write-back", "minCopiesBeforeAck": 2 } }""");
+    // pinned to the unstriped path: this tests the RAM owed-copy buffer, which new files only reach with striping off
+    var fs = this._CreateFs("""{ "duplication": 3, "write": { "striping": false, "policy": "write-back", "minCopiesBeforeAck": 2 } }""");
     var handle = fs.Create("f.bin", NodeKind.File, CreateFlags.None);
 
     fs.WriteBuffer.StateOf("f.bin").Should().Be(DirtyState.Clean);

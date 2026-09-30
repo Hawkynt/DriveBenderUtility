@@ -33,6 +33,29 @@ public class MeasuredVolumeIOTests {
   }
 
   [Test]
+  [Category("EdgeCase")]
+  public void MeasuredVolumeIO_GivenADiskSlowAtMovingDataButQuickAtMetadata_ThenItStillReadsSlowHoweverManyQuickOperationsFollow() {
+    // placement's floor is 1 ms: a disk taking 3 ms per write must stay well above it even when
+    // most of its recent operations were instant renames and truncates
+    var measured = new MeasuredVolumeIO(new FakeVolumeIO(Guid.NewGuid(), "slow", "PHYS-1"));
+    for (var i = 0; i < 3; ++i)
+      measured.RecordLatency(3);
+    for (var i = 0; i < 50; ++i)
+      measured.RecordMetadataLatency(0.01);
+
+    measured.AverageLatencyMs.Should().BeGreaterThan(1.4, "a disk slow at moving data does not become fast by renaming quickly");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void MeasuredVolumeIO_GivenOnlyOneKindMeasured_ThenThatKindIsTheReading() {
+    var measured = new MeasuredVolumeIO(new FakeVolumeIO(Guid.NewGuid(), "one", "PHYS-1"));
+    measured.RecordLatency(80);
+
+    measured.AverageLatencyMs.Should().Be(80, "an unmeasured kind does not dilute the one that was measured");
+  }
+
+  [Test]
   [Category("Exception")]
   public void Config_GivenAnOldManifestStillAskingForAnAutomaticLandingZone_ThenItLoadsAndTheKeyIsIgnored() {
     // pools created while the feature existed carry the key; they must keep mounting

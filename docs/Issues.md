@@ -2153,3 +2153,129 @@ too). It now never gives a read-only member a copy, and restoring duplication ne
 it later, by rewriting the manifest. A landing zone is a role the operator gives a disk; the pool no
 longer assigns one by itself. The latency measurement stays, because placement and read routing weigh
 it. An old manifest that still sets the key keeps loading; the key is ignored.
+
+### Added: stripe sessions: a new file is written across its whole group
+
+How an incoming file travels is now written down, with a diagram, in `docs/IncomingFiles.md`. In
+short: where a new file goes (landing zone if one is configured and the file fits, storage
+otherwise) is decided once, before its first block. While it is written, its blocks go to whichever
+disks of that group can take them first, into temps, tracked by a block map. At close the disks that
+keep the file are filled to whole copies (in parallel, one per disk), made durable, and only then
+renamed. A disk never holds a correctly named file with missing blocks, and a power cut at any step
+leaves the file whole or absent.
+
+- **Ack floor kept.** Each block goes to as many disks as the folder's ack count, so striping never
+  weakens it (2 for duplicated folders).
+- **Refusal is not loss.** A disk that refuses a write (full, above all) gets no new blocks, but
+  what it already holds stays valid. An early version forgot those blocks and could lose the first
+  bytes of a file on a full disk.
+- **Close fills every copy.** In the safe default, close fills every copy the folder asks for, not
+  just the ack count's worth. The fills run in parallel, so this costs about what one would, and a
+  published file is fully duplicated from the moment it has its name. Leaving the extra copies to
+  the healer left a window with too few copies, which a clean unmount did not close.
+- **Landing zone overflow.** A file whose announced size does not fit the landing zone goes straight
+  to storage. One that outgrows it while being written moves to storage and continues there; its
+  blocks on the landing zone are copied across by the same fill. A landing-zone file always gets a
+  session for this, even on a single landing disk or with `write.striping: false`.
+- **Measured and fixed along the way.** Dispatch first scored every queued block as a whole
+  operation, which sent blocks to a disk measured at 500 ms once a few hundred small blocks were
+  queued elsewhere. Filling copied block by block, which was six seconds per small file on a slow
+  final. Blocks now cost transfer time, and filling copies contiguous runs.
+
+Coverage: a power-cut matrix at every step of a striped write and close (30 steps single-copy,
+38 duplicated; the measured lengths), the same across a move out of the landing zone, and controls.
+Publishing without filling fails all of them. With striping on, the engine suite runs at the same
+speed as without, and the real-driver battery passed 211/211.
+
+### Resolved: a file replaced while its previous version's publish was still pending came back
+
+Under the performance policy a closed file's publish is deferred. Saving a new version by writing a
+temp and renaming it over the name, while the old version was still pending, let the old version's
+publish land afterwards and put it back over the new one. Found by the save-shape crash matrix once
+striping made deferral common. A pending publish now always happens before anything else replaces
+that name: a rename over it, or a new create of it.
+
+### Resolved: `tiers.fast.drainConcurrency` was validated and never used
+
+The setting (default 2) existed, was checked for being at least 1, and the drainer ignored it,
+moving one file at a time. A drain pass now moves up to that many files at once, each to a
+different storage disk; claimed files and claimed target disks keep two drains from colliding.
+Removing the target claim sends both moves to the same disk, and the test catches it.
+
+### Resolved: the drainer could delete a storage copy it had already published under the real name
+
+Moving a file off the landing zone copied it to storage, published that copy under the file's real
+name, and only then checked whether the file had been opened or changed in the meantime. If it had,
+the drainer deleted the copy it had just published: sometimes without the file's lease, and always
+without dropping the cached list of the file's copies. So an application that had been told about
+that copy could be sent to a file that no longer existed.
+
+CI showed the symptom once on Linux: a file being written while the mover relocated it reported
+"Could not find file". An engine-level test that opens, writes and reads the file the moment its
+storage copy appears passes both before and after this change (the engine's write path fails over
+around a missing copy), so that CI failure is not proven to be this; the FUSE adapter's own open
+path is the next place to look if it recurs.
+
+What changed regardless: the check now comes first, under the lease, through the same commit gate
+the healer uses. The rename and the freeing of the landing copy happen under that one lease, and the
+copy list is refreshed before the lease is released. A copy that must not be kept is only ever a
+temp, and a visible copy is never deleted by the drainer. The drain is still 21 storage steps, and
+its power-cut matrix still covers every one.
+
+### Resolved: healing a missing copy while the file was rewritten could roll back an acknowledged write
+
+Two faults, both in how the healer publishes the copy it made without holding the file. Found by
+healing a file whose second copy was missing while four writers rewrote it: acknowledged writes read
+back old (2 of 5 runs).
+
+- **The copy list was refreshed after the lease was released.** The healer renamed its new copy into
+  place under the file's lease, released the lease, and only then dropped the cached list of the
+  file's copies. A write landing in between went by the old list, updated the old copy only, and
+  never reached the new one. Reads split across copies then returned the new copy's old bytes.
+  Now the list is refreshed before the lease goes. Removing that ordering fails 6 of 10 runs.
+- **"Unchanged" was judged by size and modification time.** A rewrite that keeps the length and
+  lands within one step of the disk's clock changes neither. FAT32 keeps modification times in
+  two-second steps and exFAT in ten-millisecond ones, and SD cards and USB sticks are pool members
+  too. The healer and the drainer now watch the path from before they read it: every write,
+  truncate, rename, unlink or publish reports itself once its bytes have landed, and a counter that
+  moved blocks the commit. Only watched paths are counted, so a write pays one read when nothing is
+  being copied. Simulated by pausing a heal after its copy and putting the source's time back after
+  a same-length rewrite: without the watch the stale copy is published.
+
+### Resolved (found by CI on Linux): striped publishes touched every disk of the group, and `cp -p` lost its times
+
+- **Deletes of temps that never existed.** Publishing a striped file deleted the temp of every helper
+  disk, including helpers that never took a block and had none: one pointless operation per disk per
+  file. Being quick, those deletes also taught placement that an idle slow disk was fast (its average
+  sank to the 1 ms floor), so it won ties again. Seen only on Linux, where `Thread.Sleep(3)` really
+  sleeps 3 ms rather than Windows' 15 ms: half of twenty files went to the slow disk, and the test
+  took 8 s. Only temps that exist are deleted now (200 ms), and the test spends an exact 3 ms per
+  operation on both platforms.
+- **`cp -p` times lost.** GNU `cp -p` stamps the file's times while it is still open, then closes it.
+  Filling the finals at close wrote to them after the stamp, so the published file carried the time
+  of the fill. The session now keeps what was stamped (times and mode) and puts it back on every
+  finished copy before the rename. A write after the stamp clears the stamped time, because then the
+  write's time is the right one.
+- **Blocks handed out one at a time.** With two disks costing the same, blocks alternated between
+  them, so nothing coalesced: a 3 MiB striped write took about 2,400 storage operations. Measuring
+  per kind (below) exposed it. Blocks now go out in contiguous units of at least 1 MiB, and a write
+  that starts inside a unit already begun joins that unit's disk; unaligned writes had kept the old
+  behaviour. The same write now takes 17 operations, and the striped power-cut matrices cover the
+  whole operation at 19 and 27 steps.
+- **Latency measured per kind.** One average blended every operation, so a disk slow at moving data
+  but quick at renames and truncates could sink under placement's 1 ms floor when its recent work was
+  mostly metadata, and win ties. Striping shifted exactly that mix (a final does a few long fill
+  writes and a tail of quick metadata), and a CI runner split twenty files 10 / 10 with a disk three
+  times slower. Latency is now averaged per kind (data, flush, metadata) and reported as their mean.
+  The test's slow disk also turned out to be slow only at opening files, because the fake's
+  operation hook never sees stream writes. It now slows through a new `Delay` knob that every
+  operation passes.
+
+### Resolved (found by CI on Windows): a burst of new files was kept on one of two identical disks
+
+With striping, a new file's blocks go to whichever disk is free first, so while a burst is written
+both disks carry the same in-flight load, and placement's load term could no longer tell them apart. On two members sharing one device (same free
+space) the tie-break then kept all 21 files of a burst on the first disk, 0 / 21. The disks that keep
+a file must still receive every block of it, so placement now counts each open file a disk will keep
+as work queued there. Block routing does not count it, which would only make the fill copy more. A
+burst of four open files now splits 2 / 2; without the change it was 4 / 0.

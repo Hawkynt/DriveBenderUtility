@@ -64,7 +64,8 @@ public class WriteResilienceTests {
     var v1 = new FakeVolumeIO(Guid.NewGuid(), "v1", "PHYS-1", capacity: 1L << 20);
     var v2 = new FakeVolumeIO(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 20);
     var fs = new PoolFileSystem(_pool, [new(v1), new(v2)], _Cache(),
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "write": { "policy": "write-back", "minCopiesBeforeAck": 1 } }"""));
+    // pinned to the unstriped path: this tests the RAM owed-copy buffer, which new files only reach with striping off
+      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "write": { "striping": false, "policy": "write-back", "minCopiesBeforeAck": 1 } }"""));
     fs.Mount(new(@"X:\"));
 
     var handle = fs.Create("solo.bin", NodeKind.File, CreateFlags.None);
@@ -91,7 +92,8 @@ public class WriteResilienceTests {
     var v1 = new FakeVolumeIO(Guid.NewGuid(), "v1", "PHYS-1", capacity: 1L << 20);
     var v2 = new FakeVolumeIO(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 20);
     var fs = new PoolFileSystem(_pool, [new(v1), new(v2)], _Cache(writeBufferMax: "8"),
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "write": { "policy": "write-back", "minCopiesBeforeAck": 1 } }"""));
+    // pinned to the unstriped path: this tests the RAM owed-copy buffer, which new files only reach with striping off
+      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "write": { "striping": false, "policy": "write-back", "minCopiesBeforeAck": 1 } }"""));
     fs.Mount(new(@"X:\"));
 
     // first file stages its owed copy: the 8-byte budget is now exhausted

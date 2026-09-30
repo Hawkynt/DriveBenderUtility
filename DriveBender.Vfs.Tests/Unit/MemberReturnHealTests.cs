@@ -60,9 +60,10 @@ public class MemberReturnHealTests {
     var volume3 = new FakeVolumeIO(Guid.NewGuid(), "v3", "PHYS-3", capacity: 1L << 20);
     var cache = new CacheInstance("od" + Guid.NewGuid().ToString("N"),
       new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
+    // pinned to the unstriped path: this tests the RAM owed-copy buffer, which new files only reach with striping off
     var fs = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2), new(volume3)], cache,
       ConfigResolver.ResolveEffective(null,
-        """{ "duplication": 3, "placement": { "shadowNeverSamePhysical": false }, "trash": { "enabled": false } }"""));
+        """{ "duplication": 3, "placement": { "shadowNeverSamePhysical": false }, "trash": { "enabled": false }, "write": { "striping": false } }"""));
     fs.Mount(new(@"X:\"));
 
     // the handle stays OPEN: closing it flushes, and the question here is what happens to owed ops

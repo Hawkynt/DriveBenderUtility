@@ -15,6 +15,7 @@ public enum VolumeOp {
   AtomicReplace,
   Stat,
   List,
+  SetTimestamps,
 }
 
 /// <summary>
@@ -139,7 +140,15 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   private void _After(VolumeOp op, string relativePath) => this.AfterOperation?.Invoke(op, relativePath);
 
   /// <summary>Fault gate; the caller holds <see cref="_lock"/>.</summary>
+  /// <summary>
+  /// Runs for EVERY operation, stream reads, writes and flushes included — a slow disk. Unlike
+  /// <see cref="BeforeOperation"/> (which only sees the volume-level calls, and which the crash
+  /// matrices count steps with), this is not a step: it only costs time.
+  /// </summary>
+  public Action<VolumeOp>? Delay { get; set; }
+
   private void _Check(VolumeOp op) {
+    this.Delay?.Invoke(op);
     if (!this._online)
       throw new PoolFsException(PoolFsError.Offline, $"Member '{this.DisplayName}' is offline");
 
@@ -320,6 +329,8 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       this._EnsureParents(finalPhysical);
       this._files[finalPhysical] = staged;
     }
+
+    this._After(VolumeOp.AtomicReplace, finalRelative); // the name is visible from here on
   }
 
   public FileMeta? Stat(string relativePath, bool shadow) {
@@ -392,6 +403,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public void SetTimestamps(string relativePath, bool shadow, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) {
+    this._Before(VolumeOp.SetTimestamps, relativePath);
     lock (this._lock) {
       var file = this._files.GetValueOrDefault(PoolPaths.ToPhysical(relativePath, shadow))
                  ?? throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");

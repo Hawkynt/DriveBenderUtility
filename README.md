@@ -461,6 +461,9 @@ dialog) so it takes new files too.
 
 ### Tiering: land fast, drain later
 
+How a new file travels, step by step, from arrival through the stripe session to its final disks:
+[docs/IncomingFiles.md](docs/IncomingFiles.md).
+
 With a **landing zone** member, new files go to the fast tier and a background drainer moves settled
 files down to capacity. Placement declines the fast tier once it is past its low watermark, so a full
 SSD stops absorbing rather than wedging the pool.
@@ -784,7 +787,10 @@ common knobs:
   "duplication": 2,                       // total copies kept of each file
   "write": {
     "policy": "write-back",               // write-through | write-back | deferred | performance
-    "minCopiesBeforeAck": 2               // durable copies required before a write is acknowledged
+    "minCopiesBeforeAck": 2,              // durable copies required before a write is acknowledged
+    "striping": true                      // a new file's blocks go to whichever disks of its group are
+                                          //   free first; filled into whole copies before the file is
+                                          //   published (docs/IncomingFiles.md)
   },
   "resilience": {
     "onMemberLoss": "retain-metadata",    // keep showing metadata when a drive is pulled,

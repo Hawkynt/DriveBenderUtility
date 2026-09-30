@@ -115,10 +115,12 @@ public class PoolFileSystemWriteTests {
     this._fs.Read(handle, buffer, 0).Should().Be(6);
     buffer.Should().Equal(new byte[] { 1, 2, 0, 0, 0, 0 }, "growth zero-fills (FR-TRUNC)");
 
-    var staged = "t.bin." + DivisonM.DriveBender.DriveBenderConstants.TEMP_EXTENSION; // still open — physically a temp (FR-STAGED-WRITE)
-    var holders = new[] { this._volume1, this._volume2 };
-    holders.Single(v => v.FileExists(staged, true)).GetContent(staged, true)!.Length.Should().Be(6, "truncate applies to all copies");
+    // every copy follows — checked on the published copies, which is the promise; while the file is
+    // open its bytes may still be spread over a stripe session rather than sitting in each temp
     this._fs.Close(handle);
+    foreach (var shadow in new[] { false, true })
+      new[] { this._volume1, this._volume2 }.Single(v => v.FileExists("t.bin", shadow)).GetContent("t.bin", shadow)
+        .Should().Equal(new byte[] { 1, 2, 0, 0, 0, 0 }, $"truncate and growth apply to every copy (shadow: {shadow})");
   }
 
   [Test]

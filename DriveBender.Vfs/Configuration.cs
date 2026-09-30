@@ -197,6 +197,13 @@ public sealed record WriteConfig {
   [JsonPropertyName("maxDeferSeconds")] public double? MaxDeferSeconds { get; init; }
   [JsonPropertyName("acceptVolatileAck")] public bool? AcceptVolatileAck { get; init; }
   [JsonPropertyName("fsyncIsDurable")] public bool? FsyncIsDurable { get; init; }
+
+  /// <summary>
+  /// Stripe sessions for new files (docs/IncomingFiles.md): while a file is written its blocks go to
+  /// whichever disks of its group can take them first, and the final disks are filled before the
+  /// file is published. On unless set to false.
+  /// </summary>
+  [JsonPropertyName("striping")] public bool? Striping { get; init; }
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
 }
 

@@ -122,12 +122,13 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
   /// <c>placement.shadowNeverSamePhysical</c>, in which case it falls back to another member on an
   /// already-used disk — that copy guards against bit-rot/corruption but not disk failure.
   /// </summary>
-  public IVolumeIO? ChooseShadowTarget(long size, IEnumerable<IVolumeIO> existingCopyHolders) {
+  /// <param name="role">Only members of this role — a file re-homed to the storage group keeps every copy there.</param>
+  public IVolumeIO? ChooseShadowTarget(long size, IEnumerable<IVolumeIO> existingCopyHolders, MemberRole? role = null) {
     var holders = existingCopyHolders.ToArray();
     var occupiedDomains = new HashSet<string>(holders.Select(m => m.PhysicalVolumeId), StringComparer.OrdinalIgnoreCase);
 
     var independent = this._PreferHealthy([.. this._Online
-        .Where(m => this._IsEligible(m, size, null) && !occupiedDomains.Contains(m.PhysicalVolumeId))])
+        .Where(m => this._IsEligible(m, size, role) && !occupiedDomains.Contains(m.PhysicalVolumeId))])
       .OrderByDescending(this._UsableFree)
       .FirstOrDefault();
     if (independent != null)
@@ -138,7 +139,7 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
     if (config.Placement?.ShadowNeverSamePhysical == false) {
       var holderIds = new HashSet<Guid>(holders.Select(m => m.MemberId));
       return this._PreferHealthy([.. this._Online
-          .Where(m => this._IsEligible(m, size, null) && !holderIds.Contains(m.MemberId))])
+          .Where(m => this._IsEligible(m, size, role) && !holderIds.Contains(m.MemberId))])
         .OrderByDescending(this._UsableFree)
         .FirstOrDefault();
     }
@@ -161,6 +162,14 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
 
     return this._PickByStrategy(candidates);
   }
+
+  /// <summary>
+  /// Whether a landing-zone member can take <paramref name="additionalBytes"/> more and stay within
+  /// the fast tier's low watermark — the rule a new file lands by, applied to a file that keeps
+  /// growing (docs/IncomingFiles.md): a file that no longer fits moves to the storage group.
+  /// </summary>
+  public bool LandingCanTake(IVolumeIO member, long additionalBytes)
+    => this._IsEligible(member, additionalBytes, MemberRole.Landing) && this._UsedFractionAfter(member, additionalBytes) <= this._LowWatermarkFraction("fast");
 
   private double _LowWatermarkFraction(string tier) {
     var text = config.Tiers?.GetValueOrDefault(tier)?.LowWatermark;
