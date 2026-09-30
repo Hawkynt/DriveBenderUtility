@@ -106,6 +106,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   private static string _StagedNameOf(string normalized) => normalized + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
 
+  /// <summary>What the healer and the drainer check before publishing a copy they made without holding the file.</summary>
+  private readonly WriteWatch _writeWatch = new();
+
   /// <summary>Files being written through a stripe session (docs/IncomingFiles.md), by pool path.</summary>
   private readonly System.Collections.Concurrent.ConcurrentDictionary<string, StripeSession> _stripes = new(PoolPaths.PathComparer);
 
@@ -1669,6 +1672,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     this._journal.Complete(sequence, JournalOp.Rename);
+    this._writeWatch.Changed(fromNormalized);
+    this._writeWatch.Changed(toNormalized);
     this._integrity.RenameFile(fromNormalized, toNormalized);
     this._handles.RenamePath(fromNormalized, toNormalized);
     this._shadow.Rename(fromNormalized, toNormalized);
@@ -1998,6 +2003,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // exclusive for the whole delete: a background flush/heal must not be mid-way through
     // rewriting copies we are about to remove, and a reader must not observe a half-deleted set
     using var lease = this._handles.AcquireWrite(normalized);
+    this._writeWatch.Changed(normalized); // under the lease: a copy committing after this sees it
     this._CloseWriteSession(normalized); // nothing left to reconcile once the file is gone
 
     // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
@@ -2869,6 +2875,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._cache.Pages.InvalidatePath(this._poolId, dataPath);
         this._cache.Metadata.InvalidatePath(this._poolId, path);
         this._activity.Publish(ActivityKind.Write, path, bytes.Length, reason: "striped");
+        this._writeWatch.Changed(path);
         return bytes.Length;
       }
 
@@ -2888,6 +2895,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (volatileAck && this._writeBuffer.StageWrite(path, offset, bytes, 0, 0)) {
         this._cache.Pages.InvalidatePath(this._poolId, path);
         this._cache.Metadata.InvalidatePath(this._poolId, path);
+        this._writeWatch.Changed(path);
         return bytes.Length;
       }
 
@@ -3037,6 +3045,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._InvalidateChecksums(dataPath);
       this._cache.Pages.InvalidatePath(this._poolId, dataPath);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
+      this._writeWatch.Changed(path); // after the bytes landed: a copy racing this write sees it at its commit
       return bytes.Length;
     } finally {
       // the lease's own dispose releases the lock
@@ -3209,6 +3218,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         stripe.SetLength(length, _TruncateMember);
         this._cache.Pages.InvalidatePath(this._poolId, this._DataName(path));
         this._cache.Metadata.InvalidatePath(this._poolId, path);
+        this._writeWatch.Changed(path);
         return;
       }
 
@@ -3231,6 +3241,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._InvalidateChecksums(dataPath);
       this._cache.Pages.InvalidatePath(this._poolId, dataPath);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
+      this._writeWatch.Changed(path);
     } finally {
       // the lease's own dispose releases the lock
     }
@@ -3429,6 +3440,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     IVolumeIO? target;
     FileMeta? before;
     long size;
+    long watch;
     using (var probe = this._handles.TryAcquireWrite(path, TimeSpan.Zero)) {
       if (probe == null)
         return false;
@@ -3442,27 +3454,32 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (before == null)
         return false; // moved or deleted since the walk listed it: nothing to drain, and nothing to create
       size = before.Value.Length;
+      watch = this._writeWatch.Begin(path); // under the probe lease: no write is in flight as it starts
       // the storage disks other drains are writing to right now count as taken: concurrent moves go
       // to different disks, which is the point of running them concurrently
       var busy = this._members.Where(m => this._drainTargets.ContainsKey(m.Io.MemberId)).Select(m => m.Io);
       target = this._placement.ChooseDrainTarget(size, holders.Where(h => h.MemberId != landing.MemberId).Concat(busy));
     }
 
-    if (target == null)
-      return false;
-
-    if (!this._drainTargets.TryAdd(target.MemberId, 0))
-      return false; // another drain took that disk a moment ago: this file waits for the next pass
-
     try {
-      return this._DrainTo(landing, path, target, before, size);
+      if (target == null)
+        return false;
+
+      if (!this._drainTargets.TryAdd(target.MemberId, 0))
+        return false; // another drain took that disk a moment ago: this file waits for the next pass
+
+      try {
+        return this._DrainTo(landing, path, target, before, size, watch);
+      } finally {
+        this._drainTargets.TryRemove(target.MemberId, out _);
+      }
     } finally {
-      this._drainTargets.TryRemove(target.MemberId, out _);
+      this._writeWatch.End(path);
     }
   }
 
   /// <summary>The move itself, to a target this drain has claimed; the caller holds the namespace gate.</summary>
-  private bool _DrainTo(IVolumeIO landing, string path, IVolumeIO target, FileMeta? before, long size) {
+  private bool _DrainTo(IVolumeIO landing, string path, IVolumeIO target, FileMeta? before, long size, long watch) {
     var sequence = this._journal.LogIntent(JournalOp.Drain, path, memberId: target.MemberId);
 
     var parent = PoolPaths.GetParent(path);
@@ -3490,7 +3507,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         published = WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
           admit: this._AbandonForFolderRename(this._AdmitBulkBetween(landing, target)),
           commit: () => {
-            held = this._CommitDrainedCopy(landing, path, before);
+            held = this._CommitDrainedCopy(landing, path, before, watch);
             return held == null ? null : _NoRelease; // kept past the rename: the landing copy goes under it too
           });
       } catch (OperationCanceledException) {
@@ -3735,12 +3752,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var sequence = this._journal.LogIntent(JournalOp.ShadowCreate, normalized, memberId: target.MemberId);
       target.EnsureFolder(PoolPaths.GetParent(normalized), true);
       var from = source!;
+      var watch = this._writeWatch.Begin(normalized); // before the source is read: any write from here on is seen
       var before = from.Volume.Stat(normalized, from.Shadow);
       bool published;
       try {
         published = WholeFilePublisher.CopyBetween(from.Volume, normalized, from.Shadow, target, normalized, true,
           admit: this._AbandonForFolderRename(this._AdmitBulkBetween(from.Volume, target)),
-          commit: () => this._CommitHealedCopy(normalized, from, before));
+          commit: () => this._CommitHealedCopy(normalized, from, before, watch));
       } catch (OperationCanceledException) {
         // a folder rename is waiting: give way at once. The file is about to live under another
         // name, so re-queueing THIS path would find nothing — ask for a rescan instead.
@@ -3753,6 +3771,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         this._journal.Complete(sequence, JournalOp.ShadowCreate);
         Interlocked.Exchange(ref this._healScanRequested, 1);
         return true;
+      } finally {
+        this._writeWatch.End(normalized);
       }
 
       this._journal.Complete(sequence, JournalOp.ShadowCreate);
@@ -3788,7 +3808,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// Declining costs one wasted copy and nothing else — the file is still at its old duplication
   /// level, and the next heal pass picks it up.
   /// </summary>
-  private IDisposable? _CommitHealedCopy(string normalized, PhysicalCopy source, FileMeta? before) {
+  private IDisposable? _CommitHealedCopy(string normalized, PhysicalCopy source, FileMeta? before, long watch) {
     if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized))
       return null;
 
@@ -3796,16 +3816,32 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (lease == null)
       return null;
 
-    // re-checked under the lease, then the source itself
+    // re-checked under the lease, then the source itself — and whether anything wrote to the file
+    // while it was copied, which its size and time cannot be trusted to show
     var after = source.Volume.Stat(normalized, source.Shadow);
     if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpen(normalized)
+        || this._writeWatch.Changed(normalized, watch)
         || after is not { } now || before is not { } was
         || now.Length != was.Length || now.LastWriteTimeUtc != was.LastWriteTimeUtc) {
       lease.Dispose();
       return null;
     }
 
-    return lease;
+    // The copy list is refreshed BEFORE the lease goes. Released first, a write landing in between
+    // still went by the cached list — the old copies only — and never reached the copy just made,
+    // which then read back its old bytes: an acknowledged write, rolled back on every read served
+    // from the new copy. Found by healing a missing copy while the file was rewritten.
+    return new _InvalidateThenRelease(this, normalized, lease);
+  }
+
+  private sealed class _InvalidateThenRelease(PoolFileSystem fs, string path, IDisposable lease) : IDisposable {
+    public void Dispose() {
+      try {
+        fs._Invalidate(path);
+      } finally {
+        lease.Dispose();
+      }
+    }
   }
 
   /// <summary>
@@ -3813,13 +3849,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// the drainer across the rename AND the freeing of the landing copy. Null, and no lease, when the
   /// file is open, dirty or no longer what was copied: the temp is then discarded.
   /// </summary>
-  private HandleTable.PathLease? _CommitDrainedCopy(IVolumeIO landing, string path, FileMeta? before) {
+  private HandleTable.PathLease? _CommitDrainedCopy(IVolumeIO landing, string path, FileMeta? before, long watch) {
     var lease = this._handles.TryAcquireWrite(path, _DRAIN_SWAP_WAIT);
     if (lease == null)
       return null;
 
     var after = landing.Stat(path, false);
-    if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path)
+    if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path) || this._writeWatch.Changed(path, watch)
         || after is not { } now || before is not { } was
         || now.Length != was.Length || now.LastWriteTimeUtc != was.LastWriteTimeUtc) {
       lease.Dispose();
@@ -4056,6 +4092,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._Invalidate(normalized);
     this._cache.Pages.InvalidatePath(this._poolId, stagedName);
     this._activity.Publish(ActivityKind.Write, normalized, 0, reason: "staged file published (temp → final)");
+    this._writeWatch.Changed(normalized);
     if (healAfter)
       this._healQueue.Enqueue(normalized); // the copies beyond the ack count, made from the published file
   }

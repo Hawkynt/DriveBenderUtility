@@ -2221,3 +2221,23 @@ the healer uses. The rename and the freeing of the landing copy happen under tha
 copy list is refreshed before the lease is released. A copy that must not be kept is only ever a
 temp, and a visible copy is never deleted by the drainer. The drain is still 21 storage steps, and
 its power-cut matrix still covers every one.
+
+### Resolved: healing a missing copy while the file was rewritten could roll back an acknowledged write
+
+Two faults, both in how the healer publishes the copy it made without holding the file. Found by
+healing a file whose second copy was missing while four writers rewrote it: acknowledged writes read
+back old (2 of 5 runs).
+
+- **The copy list was refreshed after the lease was released.** The healer renamed its new copy into
+  place under the file's lease, released the lease, and only then dropped the cached list of the
+  file's copies. A write landing in between went by the old list, updated the old copy only, and
+  never reached the new one. Reads split across copies then returned the new copy's old bytes.
+  Now the list is refreshed before the lease goes. Removing that ordering fails 6 of 10 runs.
+- **"Unchanged" was judged by size and modification time.** A rewrite that keeps the length and
+  lands within one step of the disk's clock changes neither. FAT32 keeps modification times in
+  two-second steps and exFAT in ten-millisecond ones, and SD cards and USB sticks are pool members
+  too. The healer and the drainer now watch the path from before they read it: every write,
+  truncate, rename, unlink or publish reports itself once its bytes have landed, and a counter that
+  moved blocks the commit. Only watched paths are counted, so a write pays one read when nothing is
+  being copied. Simulated by pausing a heal after its copy and putting the source's time back after
+  a same-length rewrite: without the watch the stale copy is published.

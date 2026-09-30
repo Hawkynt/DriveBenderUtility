@@ -15,6 +15,7 @@ public enum VolumeOp {
   AtomicReplace,
   Stat,
   List,
+  SetTimestamps,
 }
 
 /// <summary>
@@ -394,6 +395,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
   }
 
   public void SetTimestamps(string relativePath, bool shadow, DateTime? creationTimeUtc, DateTime? lastWriteTimeUtc) {
+    this._Before(VolumeOp.SetTimestamps, relativePath);
     lock (this._lock) {
       var file = this._files.GetValueOrDefault(PoolPaths.ToPhysical(relativePath, shadow))
                  ?? throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");

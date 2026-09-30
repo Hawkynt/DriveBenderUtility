@@ -274,6 +274,118 @@ public class ConcurrencyFuzzTests {
         .Should().BeEmpty($"'{volume.DisplayName}' must hold no residue of deleted files");
   }
 
+  [Test]
+  [Category("EdgeCase")]
+  public void Concurrency_GivenTheHealerRebuildsAMissingCopyWhileTheFileIsRewritten_ThenNoAcknowledgedWriteIsRolledBack() {
+    // The same race as above, with the healer given real work: each file starts with its second copy
+    // missing, so every heal is a genuine cross-disk copy racing the writers — not a no-op on a file
+    // that is already whole.
+    const int files = 4;
+    const int rounds = 30;
+    const int length = 1536;
+
+    var paths = Enumerable.Range(0, files).Select(f => $"m{f}.bin").ToArray();
+    foreach (var path in paths) {
+      var handle = this._fs.Create(path, NodeKind.File, CreateFlags.None);
+      this._fs.Write(handle, _Content(99, 0, length), 0, WriteMode.Normal);
+      this._fs.Close(handle);
+    }
+
+    this._fs.CreateScheduler().Quiesce();
+    foreach (var path in paths)
+    foreach (var volume in new[] { this._v1, this._v2 })
+      if (volume.FileExists(path, true))
+        volume.Delete(path, true); // the second copy is gone: the healer has to make it again
+    this._fs.Placement.InvalidateAll();
+
+    var failures = new System.Collections.Concurrent.ConcurrentBag<string>();
+    this._WithBackgroundPump(() => {
+      var healer = new Thread(() => {
+        for (var i = 0; i < rounds * files; ++i) {
+          this._fs.RequestHeal();
+          Thread.Yield();
+        }
+      }) { IsBackground = true, Name = "heal-requester" };
+
+      var workers = paths.Select((path, file) => new Thread(() => {
+        for (var version = 1; version <= rounds; ++version) {
+          var expected = _Content(file, version, length);
+          var handle = this._fs.Open(path, AccessMode.ReadWrite, ShareMode.Read | ShareMode.Write);
+          try {
+            this._fs.Write(handle, expected, 0, WriteMode.Normal);
+          } finally {
+            this._fs.Close(handle);
+          }
+
+          var got = this._ReadAll(path);
+          if (!got.AsSpan().SequenceEqual(expected))
+            failures.Add($"'{path}' v{version}: heal rolled back an acknowledged write (first mismatch at {_FirstDiff(got, expected)})");
+        }
+      }) { IsBackground = true, Name = $"heal-writer-{file}" }).ToArray();
+
+      healer.Start();
+      foreach (var worker in workers)
+        worker.Start();
+      foreach (var worker in workers)
+        worker.Join(TimeSpan.FromMinutes(2)).Should().BeTrue("a writer thread must not hang");
+      healer.Join(TimeSpan.FromSeconds(30));
+    });
+
+    failures.Should().BeEmpty("the heal job must never publish a stale copy over acknowledged data");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Heal_GivenTheFileIsRewrittenAtTheSameLengthWithinOneTimestampTick_ThenTheStaleCopyIsNotPublished() {
+    // FAT32 keeps modification times in two-second steps (exFAT in ten-millisecond ones), and SD
+    // cards and USB sticks are pool members too. A rewrite of the same length inside one step leaves
+    // size AND time exactly as they were — which is all the healer used to check before publishing
+    // the copy it had been making. Simulated here by putting the source's time back after the write.
+    const int length = 1536;
+    var handle = this._fs.Create("tick.bin", NodeKind.File, CreateFlags.None);
+    this._fs.Write(handle, _Content(7, 1, length), 0, WriteMode.Normal);
+    this._fs.Close(handle);
+    this._fs.CreateScheduler().Quiesce();
+
+    FakeVolumeIO? source = null;
+    foreach (var volume in new[] { this._v1, this._v2 })
+      if (volume.FileExists("tick.bin", true))
+        volume.Delete("tick.bin", true);
+      else if (volume.FileExists("tick.bin", false))
+        source = volume;
+    this._fs.Placement.InvalidateAll();
+    var sourceTime = source!.Stat("tick.bin", false)!.Value.LastWriteTimeUtc;
+
+    // pause the heal once it has copied every byte (as it stamps its temp, just before the commit),
+    // rewrite the file, and leave the time as a FAT disk would
+    var target = source == this._v1 ? this._v2 : this._v1;
+    var rewritten = _Content(7, 2, length);
+    var fired = 0;
+    target.BeforeOperation = (op, path) => {
+      if (op != VolumeOp.SetTimestamps || !path.StartsWith("tick.bin.", StringComparison.Ordinal) || Interlocked.Exchange(ref fired, 1) == 1)
+        return;
+
+      var writer = new Thread(() => {
+        var h = this._fs.Open("tick.bin", AccessMode.ReadWrite, ShareMode.Read | ShareMode.Write);
+        this._fs.Write(h, rewritten, 0, WriteMode.Normal);
+        this._fs.Close(h);
+        source.SetTimestamps("tick.bin", false, null, sourceTime);
+      });
+      writer.Start();
+      writer.Join();
+    };
+
+    this._fs.RequestHeal();
+    this._fs.CreateScheduler().Quiesce();
+    target.BeforeOperation = null;
+
+    fired.Should().Be(1, "the rewrite has to land inside the heal's copy, or this proves nothing");
+    foreach (var volume in new[] { this._v1, this._v2 })
+    foreach (var shadow in new[] { false, true })
+      if (volume.GetContent("tick.bin", shadow) is { } copy)
+        copy.Should().Equal(rewritten, $"the copy on '{volume.DisplayName}' (shadow: {shadow}) must be the rewritten file, not the one the heal began copying");
+  }
+
   private static string _FirstDiff(byte[] got, byte[] expected) {
     if (got.Length != expected.Length)
       return $"length {got.Length} != {expected.Length}";
