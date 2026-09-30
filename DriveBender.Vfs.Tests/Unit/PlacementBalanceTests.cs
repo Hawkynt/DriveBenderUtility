@@ -76,7 +76,25 @@ public class PlacementBalanceTests {
       $"two identical disks must both take new files; the split was {split[0]} / {split[1]}");
   }
 
-  [TestCase(500, false, TestName = "Placement_GivenAMemberLastMeasuredSlowHalfASecondAgo_WhenTheNextFileIsPlaced_ThenItIsStillAvoided")]
+  [Test]
+  [Category("EdgeCase")]
+  public void Placement_GivenFilesStillBeingWrittenStripedOverBothMembers_WhenMoreArrive_ThenTheyAreKeptOnBoth() {
+    // Striping spreads each file's blocks over both disks, so the load in flight is level and the
+    // free space identical. The disk that keeps a file still owes it every block, and that is what
+    // tells the disks apart: without it, a burst was kept on one disk alone (0 / 21 on CI).
+    var fs = _Engine(this._v1, this._v2);
+    const int files = 4;
+    var handles = Enumerable.Range(0, files).Select(i => fs.Create($"burst{i}.bin", NodeKind.File, CreateFlags.None)).ToList();
+    foreach (var handle in handles)
+      fs.Write(handle, new byte[4096], 0, WriteMode.Normal);
+    foreach (var handle in handles)
+      fs.Close(handle);
+
+    var split = new[] { _FilesOn(this._v1, "burst", files), _FilesOn(this._v2, "burst", files) };
+    split.Should().Equal([files / 2, files / 2], $"files written at the same time are kept on both disks; the split was {split[0]} / {split[1]}");
+  }
+
+  [TestCase(500, false, TestName ="Placement_GivenAMemberLastMeasuredSlowHalfASecondAgo_WhenTheNextFileIsPlaced_ThenItIsStillAvoided")]
   [TestCase(1500, true, TestName = "Placement_GivenAMemberLastMeasuredSlowOneAndAHalfSecondsAgo_WhenTheNextFileIsPlaced_ThenItIsTriedAgain")]
   [Category("EdgeCase")]
   public void Placement_GivenAMemberWhoseOnlyMeasurementIsOldAndSlow_ThenItIsTriedAgainOnceThatMeasurementIsStale(int millisecondsAgo, bool expectTriedAgain) {

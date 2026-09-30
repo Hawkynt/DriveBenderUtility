@@ -86,6 +86,16 @@ public sealed class StripeSession {
   public IReadOnlyList<Member> Members => this._members;
   public IEnumerable<Member> Finals => this._members.Where(m => m.IsFinal);
 
+  /// <summary>Whether this file will be kept on the member: one of its finals is there. Safe to ask from any thread.</summary>
+  public bool KeepsOn(Guid memberId) {
+    lock (this._lock)
+      foreach (var member in this._members)
+        if (member.IsFinal && member.Volume.MemberId == memberId)
+          return true;
+
+    return false;
+  }
+
   /// <summary>How many blocks a final still lacks — what <see cref="Fill"/> would copy onto it.</summary>
   public int MissingOn(Member final) {
     var bit = 1UL << this._members.IndexOf(final);

@@ -2270,3 +2270,12 @@ back old (2 of 5 runs).
   The test's slow disk also turned out to be slow only at opening files, because the fake's
   operation hook never sees stream writes. It now slows through a new `Delay` knob that every
   operation passes.
+
+### Resolved (found by CI on Windows): a burst of new files was kept on one of two identical disks
+
+With striping, a new file's blocks go to whichever disk is free first, so while a burst is written
+both disks carry the same in-flight load, and placement's load term could no longer tell them apart. On two members sharing one device (same free
+space) the tie-break then kept all 21 files of a burst on the first disk, 0 / 21. The disks that keep
+a file must still receive every block of it, so placement now counts each open file a disk will keep
+as work queued there. Block routing does not count it, which would only make the fill copy more. A
+burst of four open files now splits 2 / 2; without the change it was 4 / 0.

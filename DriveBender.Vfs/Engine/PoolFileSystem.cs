@@ -247,11 +247,36 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private Action<long>? _AdmitBulkBetween(IVolumeIO source, IVolumeIO target)
     => WholeFilePublisher.Pace(this.AdmitBulk, source, target);
 
-  private double _LoadScore(IVolumeIO volume) {
+  /// <summary>
+  /// Where a NEW file goes: <see cref="_LoadScore"/>, counting each file still being written that
+  /// this member will keep as one more operation already queued here.
+  ///
+  /// A stripe session sends a file's blocks to whichever disk of the group is free first, so while a
+  /// burst is written every disk carries about the same in-flight load, and that load stops telling
+  /// the disks apart. The disks that keep a file must still end up holding all of it (the fill at
+  /// close), so an open file is work owed to them. Found by a burst of 21 files on two identical
+  /// members, every one kept by the first (0 / 21): with the in-flight load level, the free-space
+  /// tie-break decided, and two members on one device report the same free space.
+  ///
+  /// Only placement counts this. Block routing must not: steering blocks away from the disks that
+  /// keep the file would only make the fill copy more.
+  /// </summary>
+  private double _PlacementLoad(IVolumeIO volume) {
+    var keeping = 0;
+    foreach (var session in this._stripes.Values)
+      if (session.KeepsOn(volume.MemberId))
+        ++keeping;
+
+    return this._LoadScore(volume, keeping);
+  }
+
+  private double _LoadScore(IVolumeIO volume) => this._LoadScore(volume, 0);
+
+  private double _LoadScore(IVolumeIO volume, int owed) {
     if (this._IsCoolingDown(volume.MemberId))
       return 1_000_000.0;
 
-    var inflight = this._memberLoad.TryGetValue(volume.MemberId, out var queued) ? queued : 0;
+    var inflight = (this._memberLoad.TryGetValue(volume.MemberId, out var queued) ? queued : 0) + owed;
 
     // What one more operation here is expected to cost: everything already queued, plus this one,
     // each taking what an operation on this member currently takes.
@@ -384,7 +409,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       effectiveConfig,
       members.ToDictionary(m => m.Io.MemberId, m => m.Role),
       members.ToDictionary(m => m.Io.MemberId, m => m.ReserveBytes),
-      this._LoadScore, // new files go where the least work is already queued
+      this._PlacementLoad, // new files go where the least work is already queued, or owed
       member => this._IsCoolingDown(member.MemberId)); // and never at one that just refused a write
 
     this._queues = new(effectiveConfig, members.ToDictionary(m => m.Io.MemberId, m => m.Role));
