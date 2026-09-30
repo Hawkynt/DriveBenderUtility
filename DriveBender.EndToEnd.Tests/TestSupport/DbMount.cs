@@ -156,6 +156,10 @@ public static class DbMount {
   /// </summary>
   public static string PoolRegistryDirectory {
     get {
+      // a fixture that isolated its daemon with DBMOUNT_CONFIG_ROOT cleans up in that registry, not the machine's
+      if (Environment.GetEnvironmentVariable("DBMOUNT_CONFIG_ROOT") is { Length: > 0 } isolated)
+        return Path.Combine(isolated, "pools");
+
       if (OperatingSystem.IsWindows())
         return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DriveBenderUtility", "pools");
 

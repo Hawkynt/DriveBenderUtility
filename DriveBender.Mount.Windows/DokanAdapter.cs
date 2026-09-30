@@ -409,7 +409,21 @@ public sealed class DokanMountHost : IDisposable {
   private Dokan? _dokan;
   private DokanInstance? _instance;
 
+  /// <summary>
+  /// Whether the Dokan driver is installed — asked without building a <see cref="Dokan"/> unless it is.
+  ///
+  /// Building one IS what failed on a machine without Dokan: the constructor throws for the missing
+  /// DLL, which was caught — but .NET still finalizes an object whose constructor threw, and the
+  /// <c>using</c> never had it to dispose. Its finalizer calls into the same missing DLL, and an
+  /// exception on the finalizer thread ends the process. The dashboard asks this every 15 seconds, so
+  /// the management daemon of every WinFsp user collected these until a garbage collection ran one
+  /// and it died: the page's "lost connection", minutes into ordinary use.
+  /// </summary>
   public static bool IsDokanAvailable() {
+    if (!System.Runtime.InteropServices.NativeLibrary.TryLoad("dokan2.dll", typeof(Dokan).Assembly, null, out var library))
+      return false;
+
+    System.Runtime.InteropServices.NativeLibrary.Free(library);
     try {
       using var dokan = new Dokan(new NullLogger());
       return dokan.Version > 0;

@@ -187,8 +187,16 @@ public sealed class RealHostEnvironment : IHostEnvironment {
     }
   }
 
+  /// <summary>
+  /// Where pool registrations, mount records and settings live. <c>DBMOUNT_CONFIG_ROOT</c> moves it —
+  /// for a portable or side-by-side install, and so a test daemon can run against a registry of its
+  /// own instead of the machine's real pools.
+  /// </summary>
   public string ConfigRoot {
     get {
+      if (Environment.GetEnvironmentVariable(ConfigRootVariable) is { Length: > 0 } overridden)
+        return overridden;
+
       if (OperatingSystem.IsWindows())
         return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DriveBenderUtility");
 
@@ -204,6 +212,9 @@ public sealed class RealHostEnvironment : IHostEnvironment {
       return Path.Combine(baseDir, "drivebenderutility");
     }
   }
+
+  /// <summary>The environment variable that overrides <see cref="ConfigRoot"/>.</summary>
+  public const string ConfigRootVariable = "DBMOUNT_CONFIG_ROOT";
 
   public IEnumerable<string> EnumerateVolumeRoots() {
     foreach (var drive in DriveInfo.GetDrives()) {
