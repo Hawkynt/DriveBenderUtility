@@ -73,8 +73,10 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   /// destination is unique per deletion, so an earlier trashed version of the same path is
   /// never destroyed by this one.
   /// </summary>
-  public void MoveToTrash(string normalizedPath, IReadOnlyList<PhysicalCopy> copies, bool dropDuplicates) {
-    var trashPath = _NewTrashPathFor(normalizedPath);
+  /// <param name="recordedAs">The path the entry is listed and restored under, when it is not the path deleted (a file the kernel set aside under a hidden name first).</param>
+  public void MoveToTrash(string normalizedPath, IReadOnlyList<PhysicalCopy> copies, bool dropDuplicates, string? recordedAs = null) {
+    var originalPath = recordedAs ?? normalizedPath;
+    var trashPath = _NewTrashPathFor(originalPath);
     var sequence = journal.LogIntent(JournalOp.TrashMove, normalizedPath, trashPath);
 
     var kept = 0;
@@ -94,7 +96,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
       else
         copy.Volume.AtomicReplace(normalizedPath, trashPath, false);
 
-      this._WriteInfo(copy.Volume, trashPath, normalizedPath);
+      this._WriteInfo(copy.Volume, trashPath, originalPath);
       ++kept;
     }
 

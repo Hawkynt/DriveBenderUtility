@@ -95,6 +95,42 @@ public class TrashInteractionTests {
     _ReadLive(fs, "saved.doc").Should().Equal(new byte[] { 3, 1, 4 });
   }
 
+  [TestCase(".fuse_hidden0000000200000001", TestName = "Delete_GivenFuseHidTheOpenFileBeforeDeletingIt_ThenTheBinKeepsItUnderTheNameTheUserDeleted")]
+  [TestCase("docs/.fuse_hidden00000a3c00000007", TestName = "Delete_GivenFuseHidAnOpenFileInASubfolder_ThenTheBinKeepsItUnderItsOwnName")]
+  [Category("EdgeCase")]
+  public void Delete_GivenTheKernelRenamedTheFileAsideFirst_ThenTheBinKeepsTheNameTheUserDeleted(string hidden) {
+    // Linux: deleting a file that is still open (a read whose release the kernel has not sent yet)
+    // is not an unlink. FUSE renames the file to .fuse_hiddenNNNN in the same folder and unlinks
+    // THAT when the last handle closes. The bin recorded the hidden name, so the file the user
+    // deleted was in the bin under a name nobody would recognise, restore or clear by hand.
+    var folder = PoolPaths.GetParent(hidden);
+    var original = folder.Length == 0 ? "report.bin" : $"{folder}/report.bin";
+    using var fs = this._Mounted("""{ "duplication": 1, "trash": { "enabled": true } }""");
+    if (folder.Length > 0)
+      fs.MakeDir(folder);
+    _Write(fs, original, [2, 7, 1, 8]);
+
+    fs.Rename(original, hidden, RenameFlags.None);
+    fs.Unlink(hidden);
+
+    fs.Trash.List().Should().ContainSingle(e => e.OriginalPath == original, "the entry is named as the user knew the file");
+    fs.RestoreFromTrash(original);
+    _ReadLive(fs, original).Should().Equal(new byte[] { 2, 7, 1, 8 });
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Delete_GivenAFileRenamedToAnOrdinaryName_ThenTheBinKeepsTheNameItHadWhenDeleted() {
+    // only the kernel's own aside-rename is undone: a user's rename is what the user meant
+    using var fs = this._Mounted("""{ "duplication": 1, "trash": { "enabled": true } }""");
+    _Write(fs, "draft.bin", [1]);
+
+    fs.Rename("draft.bin", "final.bin", RenameFlags.None);
+    fs.Unlink("final.bin");
+
+    fs.Trash.List().Should().ContainSingle(e => e.OriginalPath == "final.bin");
+  }
+
   [Test]
   [Category("HappyPath")]
   public void Delete_GivenAFileStillOpenForItsFirstWrite_ThenItNeverExistedAndTheBinStaysEmpty() {

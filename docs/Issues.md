@@ -1019,6 +1019,20 @@ path-addressed one, block sharing with per-snapshot reference counts, a reserve 
 understands and that the drainer and healer respect, and recovery semantics for each of those. That
 is a design, then an engine, then a screen — in that order.
 
+### Resolved (found by CI on Linux): a file deleted while still open went to the bin as `.fuse_hidden…`
+
+On Linux, deleting a file that is still open is not an unlink. FUSE renames the file to
+`.fuse_hiddenNNNN` in the same folder and unlinks that name when the last handle closes. A read handle
+counts: `File.ReadAllBytes` followed at once by `File.Delete` is enough, because the kernel sends the
+read's `release` asynchronously. The recycle bin recorded the hidden name, so the deleted file was in
+the bin under a name nobody deleted, would recognise, or could restore by.
+`TamperEndToEndTests.Trash_GivenASidecarIsDatedInTheFuture_…` listed exactly that, one entry named
+`.fuse_hidden0000000200000001`, and failed.
+
+The engine now remembers what a file was called when it is renamed to a `.fuse_hidden` name, and a
+delete of that name bins the file under its earlier name. A user's own rename is left alone: only the
+kernel's set-aside name is undone. The memory is dropped on every delete, binned or not.
+
 ### The recycle bin was built and unreachable
 
 `PoolTrash` has been there since deletes were first journalled: a delete moves the file aside instead

@@ -1880,6 +1880,28 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._shadow.Rename(fromNormalized, toNormalized);
     this._Invalidate(fromNormalized);
     this._Invalidate(toNormalized);
+    this._RememberAsideName(fromNormalized, toNormalized);
+  }
+
+  /// <summary>
+  /// What a file set aside by the kernel was called before (docs/Issues.md): hidden name, original.
+  ///
+  /// On Linux, deleting a file that is still open is not an unlink. FUSE renames it to
+  /// <c>.fuse_hiddenNNNN</c> in the same folder and unlinks that name once the last handle closes.
+  /// The recycle bin then kept the file under the hidden name, one nobody deleted, recognises or can
+  /// restore by. A delete of such a name bins the file as what it was called before.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _asideNames = new(PoolPaths.PathComparer);
+
+  private static bool _IsKernelAsideName(string path) => PoolPaths.GetName(path).StartsWith(".fuse_hidden", StringComparison.Ordinal);
+
+  private void _RememberAsideName(string from, string to) {
+    // a name moved on keeps the name it was set aside from, if any; a user's own rename is what the user meant
+    var original = this._asideNames.TryRemove(from, out var earlier) ? earlier : from;
+    if (_IsKernelAsideName(to) && !_IsKernelAsideName(original))
+      this._asideNames[to] = original;
+    else
+      this._asideNames.TryRemove(to, out _);
   }
 
   /// <summary>
@@ -2371,6 +2393,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var lease = this._handles.AcquireWrite(normalized);
     this._writeWatch.Changed(normalized); // under the lease: a copy committing after this sees it
     this._CloseWriteSession(normalized); // nothing left to reconcile once the file is gone
+    var recordedAs = this._asideNames.TryRemove(normalized, out var original) ? original : null; // taken on every path out, binned or not
 
     // A file its writer has CLOSED but whose publish is still pending (the performance policy
     // publishes striped files in the background) was saved as far as anybody could tell. With the
@@ -2440,7 +2463,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     if (binned) {
       // recoverable delete: all copies move to the hidden pool trash instead of dying (FR-TRASH)
-      this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true);
+      this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true,
+        recordedAs);
       this._InvalidateChecksums(normalized);
       if (discarded != null)
         foreach (var staleSequence in discarded.Value.journalSequences)
