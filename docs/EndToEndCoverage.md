@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36686086596](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36686086596).
+Generated from run: [36704205189](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36704205189).
 
-247 scenarios — 226 passing on at least one target, 0 failing.
+249 scenarios — 228 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -46,6 +46,7 @@ Generated from run: [36686086596](https://github.com/Hawkynt/DriveBenderUtility/
 | CredentialLeak | `Secret_GivenItIsAtRest_ThenItIsInTheCredentialStoreAloneAndThatStoreIsNotWorldReadable` | The credential store's own files are the only place the secret may rest, and the fallback file is owner-only. | pass | pass |
 | CredentialLeak | `Secret_GivenItIsPassedWhereTheReferenceNameBelongs_ThenItIsNotCommittedToTheManifest` | A raw secret passed where a reference NAME belongs must not be written verbatim into the manifest. | pass | pass |
 | CredentialLeak | `Secret_GivenItIsStoredAndReferencedByAMember_ThenOnlyTheReferenceIsEverPersisted` | A stored secret appears in no manifest, no export, no on-disk mirror and no console output — only its reference does. | pass | pass |
+| DaemonLifetime | `Daemon_GivenTheDashboardKeepsPollingThePrerequisites_ThenItStaysUp` | Given The Dashboard Keeps Polling The Prerequisites , then It Stays Up | pass | pass |
 | DrainCrash | `Crash_GivenADrainWasInFlight_ThenNoStagingFileIsExposed` | A crash mid-drain leaves no half-written staging file visible to the user after the pool comes back. | pass | pass |
 | DrainCrash | `Crash_GivenADrainWasInFlight_ThenTheFileSurvivesWholeOnOneTier` | The power goes off while the drainer is copying a file down to capacity: the file comes back whole, on one tier or the other. | pass | pass |
 | DrainCrash | `Recovery_GivenOnePathOnTwoMembers_ThenThePoolServesItOnceAndWhole` | The same file left on two members, as a crash between a relocation's copy and its delete leaves it: the pool serves one entry, not two. | pass | pass |
@@ -252,6 +253,7 @@ Generated from run: [36686086596](https://github.com/Hawkynt/DriveBenderUtility/
 | Trash | `Trash_GivenAFileWasTrashed_ThenItsNameCanBeUsedAgainAtOnce` | A trashed file's name is free again immediately: creating a new file at the same path is not confused by the deleted one. | pass | pass |
 | Trash | `Trash_GivenItIsEnabled_ThenADeletedFilesBytesAreKeptIntact` | With the trash on, a deleted file leaves the pool but its bytes are kept, whole, on a member. | pass | pass |
 | Trash | `Trash_GivenItIsOff_ThenADeleteIsPermanent` | With the trash off — the default — a delete really is permanent and leaves nothing behind. | pass | pass |
+| UiFuzz | `Fuzz_GivenRandomClicksAndInputThroughTheSettings_ThenTheConnectionIsNeverLost` | Given Random Clicks And Input Through The Settings , then The Connection Is Never Lost | pass | pass |
 | WebUi | `Api_GivenTheDashboardFrame_ThenEveryMemberCarriesAResolvedState` | Given The Dashboard Frame , then Every Member Carries AResolved State | pass | pass |
 | WebUi | `Assets_GivenEveryStateTheDaemonCanReport_ThenTheShippedStylesheetPaintsIt` | Given Every State The Daemon Can Report , then The Shipped Stylesheet Paints It | pass | pass |
 | WebUi | `Dashboard_GivenSmartCannotBeRead_ThenStorageIsMarkedUnknownRatherThanFailing` | Given Smart Cannot Be Read , then Storage Is Marked Unknown Rather Than Failing | pass | pass |
