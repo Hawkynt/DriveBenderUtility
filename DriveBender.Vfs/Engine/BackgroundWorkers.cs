@@ -168,7 +168,7 @@ public sealed class DrainJob(PoolFileSystem fs) : IBackgroundJob {
 
   public string Name => "drainer";
 
-  public bool RunOnce() => fs.DrainOneLandingFile();
+  public bool RunOnce() => fs.DrainLandingFiles(); // up to the fast tier's drainConcurrency at once, to different disks
 
 }
 
@@ -217,6 +217,15 @@ public sealed class MemberWatchJob(PoolFileSystem fs) : IBackgroundJob {
 /// primaries promoted, missing shadow copies recreated — incrementally, so foreground I/O
 /// is never starved, and as fast as the pump allows.
 /// </summary>
+/// <summary>Publishes striped files that were closed under the performance policy (docs/IncomingFiles.md).</summary>
+public sealed class DeferredPublishJob(PoolFileSystem fs) : IBackgroundJob {
+
+  public string Name => "deferred-publish";
+
+  public bool RunOnce() => fs.PublishOneDeferredStripe();
+
+}
+
 public sealed class HealJob(PoolFileSystem fs) : IBackgroundJob {
 
   public string Name => "heal";

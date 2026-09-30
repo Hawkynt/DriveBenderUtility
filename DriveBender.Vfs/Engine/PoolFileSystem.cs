@@ -106,6 +106,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   private static string _StagedNameOf(string normalized) => normalized + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
 
+  /// <summary>Files being written through a stripe session (docs/IncomingFiles.md), by pool path.</summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, StripeSession> _stripes = new(PoolPaths.PathComparer);
+
+  /// <summary>Striped files closed under the performance policy, published in the background.</summary>
+  private readonly System.Collections.Concurrent.ConcurrentQueue<string> _deferredPublishes = new();
+
   private static bool _IsStagedName(string physical)
     => physical.EndsWith("." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, StringComparison.OrdinalIgnoreCase);
 
@@ -531,7 +537,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       : TimeSpan.Zero;
     var maxDefer = TimeSpan.FromSeconds(write?.MaxDeferSeconds ?? 30);
     var jobs = new List<IBackgroundJob> {
-      new OwedSyncJob(this, deferWindow, maxDefer), new DrainJob(this), new MemberWatchJob(this), new HealJob(this),
+      new OwedSyncJob(this, deferWindow, maxDefer), new DeferredPublishJob(this), new DrainJob(this), new MemberWatchJob(this), new HealJob(this),
       new TrimIdleResourcesJob([.. this._members.Select(m => m.Io)]),
     };
 
@@ -907,7 +913,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var dataName = this._DataName(normalized);
     var copies = this._placement.ResolveCopies(dataName);
     if (copies.Count > 0)
-      return _StatAnyCopy(copies, dataName);
+      return this._stripes.TryGetValue(normalized, out var stripe) && _StatAnyCopy(copies, dataName) is { } temp
+        ? temp with { Length = stripe.Length } // the blocks are spread over the group; no temp alone has the length
+        : _StatAnyCopy(copies, dataName);
 
     foreach (var member in this._Online)
       if (member.FolderExists(normalized, false))
@@ -1117,6 +1125,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // may release it before calling back into a lock-taking public method
     using var lease = this._handles.AcquireWrite(normalized);
 
+    // A closed file whose publish is still pending (the performance policy defers it) IS the file at
+    // this name. It is published first, so this create meets it as the existing file it is — rather
+    // than staging a second temp under the same name, after which the older publish would land last.
+    if (this._staging.ContainsKey(normalized) && !this._handles.IsOpen(normalized))
+      this._PublishStagedLocked(normalized);
+
     var existing = this._placement.ResolveCopies(normalized);
     if (existing.Count > 0) {
       if ((flags & CreateFlags.Exclusive) != 0)
@@ -1214,9 +1228,254 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._Invalidate(normalized);
     this._Invalidate(physical);
+    if (staged)
+      this._StartStripe(normalized, target);
+
     this._shadow.Record(normalized, new(NodeKind.File, 0, this._clock()));
     return this._handles.Open(normalized, AccessMode.ReadWrite).Handle;
   }
+
+  #region stripe sessions
+
+  /// <summary>
+  /// Opens a stripe session for a new file (docs/IncomingFiles.md): its FINALS are the staged temps
+  /// just created (primary and shadows), its HELPERS every other disk of the same group — the
+  /// landing zone's or the storage's, whichever the file was placed in. Idle and read-only disks are
+  /// never in a group. A group of one disk has nothing to stripe over, and the RAM-ack opt-in keeps
+  /// its own path.
+  /// </summary>
+  private void _StartStripe(string normalized, IVolumeIO primaryTarget) {
+    var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(normalized));
+    if (effective.Write?.Policy == WritePolicy.Performance && (effective.Write?.AcceptVolatileAck ?? false))
+      return;
+
+    // A file that lands in the landing zone always gets a session — even a landing zone of one disk,
+    // even with striping off — because the session is also what moves it to the storage group when
+    // it does not fit or outgrows the zone. Without striping it simply has no helpers.
+    var group = this._RoleOf(primaryTarget);
+    var striping = effective.Write?.Striping != false;
+    if (!striping && group != MemberRole.Landing)
+      return;
+
+    var stagedName = _StagedNameOf(normalized);
+    var finals = this._placement.ResolveCopies(stagedName)
+      .OrderBy(c => c.Shadow) // the primary first: it is filled first when fewer copies are required
+      .Select(c => new StripeSession.Member(c.Volume, stagedName, c.Shadow, IsFinal: true))
+      .ToList();
+    if (finals.Count == 0)
+      return;
+
+    var token = Guid.NewGuid().ToString("N")[..8];
+    var helperName = $"{normalized}.{token}.STRIPE.{DriveBender.DriveBenderConstants.TEMP_EXTENSION}";
+    var helpers = this._members
+      .Where(m => m.Role == group && m.Io.IsOnline && (m.Io.Caps & BackendCaps.AtomicRename) != 0)
+      .Where(m => finals.All(f => f.Volume.MemberId != m.Io.MemberId) && !this._IsCoolingDown(m.Io.MemberId))
+      .Select(m => new StripeSession.Member(m.Io, helperName, false, IsFinal: false))
+      .Take(striping ? StripeSession.MaxMembers - finals.Count : 0)
+      .ToList();
+    if (finals.Count + helpers.Count < 2 && group != MemberRole.Landing)
+      return;
+
+    var copiesPerBlock = Math.Min(finals.Count, ConfigValidator.EffectiveMinCopiesBeforeAck(effective.Write, effective.Duplication));
+    this._stripes[normalized] = new([.. finals, .. helpers], this._cache.Pages.BlockSize, copiesPerBlock, this._LoadScore,
+      this._StripeWrite, this._StripeRead, allowDegraded: this._config.Resilience?.AcceptDegradedWrites ?? true);
+  }
+
+  /// <summary>One run of a stripe session onto one disk: through its queue, visible to readiness, no barrier (it is a temp).</summary>
+  private void _StripeWrite(StripeSession.Member member, long offset, ReadOnlySpan<byte> data, bool create) {
+    this._BeginIo(member.Volume.MemberId);
+    try {
+      using var admission = this._queues.Enter(member.Volume, IoKind.Write, data.Length);
+      if (create && PoolPaths.GetParent(member.Path) is { Length: > 0 } parent)
+        member.Volume.EnsureFolder(parent, member.Shadow); // a helper may never have held this folder
+      using var stream = member.Volume.OpenWrite(member.Path, member.Shadow, create);
+      stream.Seek(offset, SeekOrigin.Begin);
+      stream.Write(data);
+    } catch (Exception) {
+      this._NoteMemberFault(member.Volume.MemberId);
+      throw;
+    } finally {
+      this._EndIo(member.Volume.MemberId);
+    }
+  }
+
+  private int _StripeRead(StripeSession.Member member, long offset, Span<byte> buffer) {
+    this._BeginIo(member.Volume.MemberId);
+    try {
+      using var admission = this._queues.Enter(member.Volume, IoKind.Read, buffer.Length);
+      using var stream = member.Volume.OpenRead(member.Path, member.Shadow);
+      if (offset >= stream.Length)
+        return 0;
+
+      stream.Seek(offset, SeekOrigin.Begin);
+      return stream.Read(buffer);
+    } finally {
+      this._EndIo(member.Volume.MemberId);
+    }
+  }
+
+  private static void _TruncateMember(StripeSession.Member member, long length) => member.Volume.Truncate(member.Path, member.Shadow, length);
+
+  /// <summary>
+  /// Ends a stripe session before its file is published: fills every final that can be completed
+  /// and deletes the helpers' temps (and any final that could not be). Afterwards the remaining
+  /// staged temps are whole files, and the ordinary publish makes them durable and renames them.
+  /// Put back on failure, so a later close or the unmount tries again.
+  /// </summary>
+  /// <returns>
+  /// The copies to publish — exactly the finals now whole, never "every temp with the staged name",
+  /// so a final that failed part-way can never be renamed into place — and whether the file is left
+  /// short of its duplication level and needs healing once published.
+  /// </returns>
+  private (IReadOnlyList<PhysicalCopy> Publish, bool HealAfter) _CompleteStripe(string normalized, StripeSession stripe) {
+    try {
+      var stagedName = _StagedNameOf(normalized);
+      var finals = stripe.Finals.ToArray();
+
+      // Every final that is still reachable is filled — in parallel, one per disk, so waiting for
+      // all of them costs about what waiting for one does, and a published file is fully duplicated
+      // from the moment it has its name. A final that cannot be completed (its disk refused, or
+      // failed) is dropped; the copies that are whole are published, and the healer makes up the rest.
+      var candidates = finals.Where(f => f.Volume.IsOnline).ToArray();
+      var whole = new System.Collections.Concurrent.ConcurrentBag<StripeSession.Member>();
+      var refusals = new System.Collections.Concurrent.ConcurrentBag<Exception>();
+      Parallel.ForEach(candidates, final => {
+        try {
+          stripe.Fill(final, _TruncateMember);
+          whole.Add(final);
+        } catch (Exception e) when (e is PoolFsException or IOException) {
+          refusals.Add(e);
+        }
+      });
+
+      // No final could be completed, so the acknowledged blocks live on helpers only: the helper
+      // missing the fewest takes the staged name and becomes the primary.
+      if (whole.IsEmpty)
+        foreach (var heir in stripe.CreatedHelpers().Where(h => h.Volume.IsOnline).OrderBy(stripe.MissingOn).ToArray())
+          try {
+            heir.Volume.AtomicReplace(heir.Path, stagedName, false);
+            var promoted = stripe.Promote(heir, stagedName);
+            stripe.Fill(promoted, _TruncateMember);
+            whole.Add(promoted);
+            break;
+          } catch (Exception e) when (e is PoolFsException or IOException) {
+            refusals.Add(e);
+          }
+
+      if (whole.IsEmpty)
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(
+          refusals.FirstOrDefault() ?? new PoolFsException(PoolFsError.IoError, $"No disk could complete '{normalized}'")).Throw();
+
+      var fill = whole.OrderBy(f => f.Shadow).ToArray();
+      foreach (var member in stripe.Members.Except(fill))
+        try {
+          member.Volume.Delete(member.Path, member.Shadow);
+        } catch (PoolFsException) {
+          // an orphaned temp is swept on the next mount
+        }
+
+      this._Invalidate(stagedName);
+      var duplication = this._placement.DuplicationLevelFor(PoolPaths.GetParent(normalized));
+      return ([.. fill.Select(f => new PhysicalCopy(f.Volume, f.Shadow))], fill.Length < duplication);
+    } catch {
+      this._stripes[normalized] = stripe;
+      throw;
+    }
+  }
+
+  private MemberRole _RoleOf(IVolumeIO volume) => this._members.FirstOrDefault(m => m.Io.MemberId == volume.MemberId)?.Role ?? MemberRole.Capacity;
+
+  /// <summary>
+  /// Keeps a landing-zone file inside the landing zone only while it fits there (docs/IncomingFiles.md):
+  /// when <paramref name="newLength"/> would take the landing final past the fast tier's low watermark,
+  /// the session moves to the storage group before the bytes are written — which, before the first
+  /// block, is a file that never landed at all. False when it stays where it is.
+  /// </summary>
+  private bool _RehomeIfOutgrown(string normalized, StripeSession stripe, long newLength) {
+    var growth = newLength - stripe.Length;
+    if (growth <= 0)
+      return false;
+
+    var landingFinals = stripe.Finals.Where(f => this._RoleOf(f.Volume) == MemberRole.Landing).ToArray();
+    if (landingFinals.Length == 0 || landingFinals.All(f => this._placement.LandingCanTake(f.Volume, growth)))
+      return false;
+
+    return this._RehomeStripe(normalized, stripe, newLength);
+  }
+
+  /// <summary>Gives the session storage-group finals (with fresh staged temps) and storage helpers; false when the storage group cannot take the file.</summary>
+  private bool _RehomeStripe(string normalized, StripeSession stripe, long size) {
+    var stagedName = _StagedNameOf(normalized);
+    var parent = PoolPaths.GetParent(normalized);
+    var duplication = this._placement.DuplicationLevelFor(parent);
+
+    var primary = this._placement.ChooseDrainTarget(size, []);
+    if (primary == null) {
+      DriveBender.Logger($"[Warning]'{normalized}' outgrew the landing zone, but no storage disk can take {size:N0} bytes — it stays where it is");
+      return false;
+    }
+
+    var finals = new List<StripeSession.Member> { new(primary, stagedName, false, IsFinal: true) };
+    var holders = new List<IVolumeIO> { primary };
+    while (finals.Count < duplication && this._placement.ChooseShadowTarget(size, holders, MemberRole.Capacity) is { } shadow) {
+      finals.Add(new(shadow, stagedName, true, IsFinal: true));
+      holders.Add(shadow);
+    }
+
+    foreach (var final in finals) {
+      if (parent.Length > 0)
+        final.Volume.EnsureFolder(parent, final.Shadow);
+      using (final.Volume.OpenWrite(stagedName, final.Shadow, true)) { }
+    }
+
+    var helperName = $"{normalized}.{Guid.NewGuid().ToString("N")[..8]}.STRIPE.{DriveBender.DriveBenderConstants.TEMP_EXTENSION}";
+    var striping = ConfigResolver.ResolveForFolder(this._config, parent).Write?.Striping != false;
+    var helpers = this._members
+      .Where(m => m.Role == MemberRole.Capacity && m.Io.IsOnline && (m.Io.Caps & BackendCaps.AtomicRename) != 0)
+      .Where(m => holders.All(h => h.MemberId != m.Io.MemberId) && stripe.Members.All(s => s.Volume.MemberId != m.Io.MemberId))
+      .Where(m => !this._IsCoolingDown(m.Io.MemberId))
+      .Select(m => new StripeSession.Member(m.Io, helperName, false, IsFinal: false))
+      .Take(striping ? Math.Max(0, StripeSession.MaxMembers - stripe.Members.Count - finals.Count) : 0)
+      .ToList();
+
+    stripe.Rehome(finals, helpers);
+    this._Invalidate(stagedName);
+    this._activity.Publish(ActivityKind.Rebalance, normalized, size, toMember: primary.DisplayName,
+      reason: stripe.Length == 0 ? "does not fit the landing zone — written to storage" : "outgrew the landing zone — continues in storage");
+    return true;
+  }
+
+  /// <summary>Publishes one striped file closed under the performance policy; false when there was none to do.</summary>
+  public bool PublishOneDeferredStripe() {
+    while (this._deferredPublishes.TryDequeue(out var path)) {
+      if (!this._staging.ContainsKey(path) || this._handles.IsOpen(path))
+        continue; // published or deleted since, or reopened: its next close decides again
+
+      using var namespaceHold = this._EnterNamespaceShared();
+      this._PublishStaged(path);
+      return true;
+    }
+
+    return false;
+  }
+
+  /// <summary>
+  /// Publishing a striped file waits for its finals to be filled — unless the folder's policy is
+  /// performance, where the close returns at once and the publish runs in the background.
+  /// </summary>
+  private bool _DefersPublish(string path) {
+    if (!this._stripes.ContainsKey(path))
+      return false;
+
+    var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(path));
+    if (effective.Write?.Policy != WritePolicy.Performance)
+      return false;
+
+    this._deferredPublishes.Enqueue(path);
+    return true;
+  }
+
+  #endregion
 
   /// <summary>
   /// Brings a file up to its folder's duplication level D by creating missing shadow copies
@@ -1326,6 +1585,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // renaming a file that is still being written publishes it first (temp → final), then renames
       if (this._staging.ContainsKey(fromNormalized))
         this._PublishStagedLocked(fromNormalized);
+
+      // and a TARGET whose publish is still pending is published before it is replaced: left
+      // pending, its publish would land after the rename and put the older file back over the newer
+      if (!sameFile && this._staging.ContainsKey(toNormalized) && !this._handles.IsOpen(toNormalized))
+        this._PublishStagedLocked(toNormalized);
 
       var copies = this._placement.ResolveCopies(fromNormalized);
       if (copies.Count == 0) {
@@ -1738,6 +2002,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
     if (this._staging.TryRemove(normalized, out var createSequence)) {
+      if (this._stripes.TryRemove(normalized, out var stripe))
+        foreach (var helper in stripe.CreatedHelpers())
+          try {
+            helper.Volume.Delete(helper.Path, helper.Shadow);
+          } catch (PoolFsException) {
+            // swept on the next mount
+          }
+
       var stagedName = _StagedNameOf(normalized);
       var discardedStaged = this._writeBuffer.Drain(normalized); // buffered blocks are moot
       foreach (var member in this._Online)
@@ -2007,6 +2279,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var lease = this._handles.AcquireRead(open.File.Path);
     try {
       var path = lease.File.Path;
+      if (this._stripes.TryGetValue(path, out var stripe)) {
+        // being written through a stripe session: each block from a disk that holds it
+        var read = stripe.Read(offset, buffer);
+        this._activity.Publish(ActivityKind.Read, path, read, reason: "user I/O (striped, still being written)");
+        return read;
+      }
+
       var dataPath = this._DataName(path); // a staging file reads from its temp physical
       var copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
@@ -2579,6 +2858,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     try {
       var path = lease.File.Path;
       var dataPath = this._DataName(path); // a staging file writes into its temp physical
+      if (this._stripes.TryGetValue(path, out var stripe)) {
+        // a stripe session: each block to the disks of the group that can take it first
+        if (mode == WriteMode.Append)
+          offset = stripe.Length;
+
+        this._RehomeIfOutgrown(path, stripe, offset + bytes.Length);
+        stripe.Write(offset, bytes); // the private array made above: the session takes it as it is
+        this._InvalidateChecksums(dataPath);
+        this._cache.Pages.InvalidatePath(this._poolId, dataPath);
+        this._cache.Metadata.InvalidatePath(this._poolId, path);
+        this._activity.Publish(ActivityKind.Write, path, bytes.Length, reason: "striped");
+        return bytes.Length;
+      }
+
       IReadOnlyList<PhysicalCopy> copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
@@ -2909,6 +3202,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var lease = this._handles.AcquireWrite(open.File.Path); // by PATH — see Read
     try {
       var path = lease.File.Path;
+      if (this._stripes.TryGetValue(path, out var stripe)) {
+        // copy tools announce the size before the first block: a stripe session only moves its end —
+        // after moving to the storage group first, if the landing zone cannot hold that much
+        this._RehomeIfOutgrown(path, stripe, length);
+        stripe.SetLength(length, _TruncateMember);
+        this._cache.Pages.InvalidatePath(this._poolId, this._DataName(path));
+        this._cache.Metadata.InvalidatePath(this._poolId, path);
+        return;
+      }
+
       // already holding this file's lock through the handle — the locked core, never the
       // lease-taking shell, which would recurse on a NoRecursion lock
       this._FlushPathLocked(path); // pending buffered writes apply before the truncate so ordering stays linear
@@ -3051,122 +3354,173 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._mountOptions == null)
       return false;
 
-    foreach (var landing in this._members.Where(m => m is { Role: MemberRole.Landing, Io.IsOnline: true }).Select(m => m.Io)) {
+    foreach (var landing in this._members.Where(m => m is { Role: MemberRole.Landing, Io.IsOnline: true }).Select(m => m.Io))
       foreach (var path in this._WalkFiles(landing)) {
-        if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
-          continue; // only clean, closed files move (the balancer rule of §6.10 applies here too)
-
-        // The pre-image is taken under the lease; the COPY is not.
-        //
-        // Holding the path exclusively across the whole copy-and-free sequence is the obvious
-        // reading of SAFE-NOLOSS, and it was what this did — but a read lease is what serves a
-        // foreground read, so every read of a file blocked for as long as the pool took to relocate
-        // it. That is invisible while a drain is milliseconds and ruinous the moment it is not: a
-        // member held to 64 KiB/s made an eight-megabyte file unreadable through the mount for over
-        // two minutes, and a large file onto a slow disk does the same with no limit in sight.
-        // Tiering is supposed to be transparent, and a file that cannot be read while the pool
-        // moves it is not transparent, it is an outage on a timer.
-        //
-        // Safety does not rest on that lease and never did — it rests on the TOCTOU guard below,
-        // which re-validates under a FRESH lease and throws the copy away if anything moved. The
-        // lease across the copy only made that guard look like belt-and-braces. What must stay
-        // exclusive is the window between re-validating and deleting the landing original, which
-        // is now exactly what is held.
-        //
-        // A file a foreground op owns right now is skipped rather than waited on: the drainer must
-        // never stall the pump.
-        //
-        // The whole move holds the namespace gate SHARED, so a folder rename cannot move this file's
-        // folder mid-copy. It did, and the copy then recreated the OLD folder on the target — the
-        // re-validation below threw the stale copy away but left the folder, so a renamed folder's
-        // old name came back, empty, beside the new one. Cleaning such a folder up afterwards is not
-        // safe: a user who renames "New folder" and makes another "New folder" gets exactly that
-        // shape on purpose. A waiting rename abandons the copy at its next chunk instead.
-        using var namespaceHold = this._EnterNamespaceShared();
-        IVolumeIO? target;
-        FileMeta? before;
-        long size;
-        using (var probe = this._handles.TryAcquireWrite(path, TimeSpan.Zero)) {
-          if (probe == null)
-            continue;
-
-          if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
-            continue; // re-checked under the lease
-
-          var copies = this._placement.ResolveCopies(path);
-          var holders = copies.Select(c => c.Volume).ToArray();
-          before = landing.Stat(path, false);
-          if (before == null)
-            continue; // moved or deleted since the walk listed it: nothing to drain, and nothing to create
-          size = before.Value.Length;
-          target = this._placement.ChooseDrainTarget(size, holders.Where(h => h.MemberId != landing.MemberId));
-        }
-
-        if (target == null)
+        // claimed for the length of the move: concurrent drainers take different files
+        if (!this._drainingPaths.TryAdd(path, 0))
           continue;
 
-        var sequence = this._journal.LogIntent(JournalOp.Drain, path, memberId: target.MemberId);
-
-        var parent = PoolPaths.GetParent(path);
-        if (parent.Length > 0)
-          target.EnsureFolder(parent, false);
-
-        // streamed drain — the file is copied through a fixed buffer, never held in RAM
-        // (SAFE-BIGFILE), and with no lease held, so reads of it are served throughout
         try {
-          WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
-            admit: this._AbandonForFolderRename(this._AdmitBulkBetween(landing, target)));
-        } catch (OperationCanceledException) {
-          try {
-            target.Delete(path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, false);
-          } catch (PoolFsException) {
-            // an orphaned temp is swept on the next mount
-          }
-
-          this._journal.Complete(sequence, JournalOp.Drain);
-          return true; // the pump comes straight back, after the rename, and finds the file by its new name
+          if (this._DrainFile(landing, path))
+            return true;
+        } finally {
+          this._drainingPaths.TryRemove(path, out _);
         }
-
-        // TOCTOU guard (SAFE-NOLOSS): between the pre-image and here, a foreground write could have
-        // opened, rewritten and closed this file. If it is now open/dirty, or its size/mtime
-        // changed, the copy we just made is stale — remove it and leave the landing original (the
-        // authoritative new version) in place rather than deleting the only copy of fresh data.
-        // Taken under a fresh exclusive lease, which also covers the delete that follows: failing to
-        // get one means a foreground op owns the path, which is itself a reason to discard.
-        using (var lease = this._handles.TryAcquireWrite(path, _DRAIN_SWAP_WAIT)) {
-          var after = landing.Stat(path, false);
-          if (lease == null
-              || this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path)
-              || after is not { } stillThere || before is not { } was
-              || stillThere.Length != was.Length || stillThere.LastWriteTimeUtc != was.LastWriteTimeUtc) {
-            if (target.FileExists(path, false))
-              target.Delete(path, false);
-            this._journal.Complete(sequence, JournalOp.Drain);
-            continue; // try again on a later pump once the file settles
-          }
-
-          landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
-          this._journal.Complete(sequence, JournalOp.Drain);
-
-          // STILL UNDER THE LEASE. The copy set changed the moment the landing original went away,
-          // and a reader resolving between that delete and the invalidation gets a list naming a
-          // file that is no longer there. The same ordering fault as the promote's, with a window
-          // of a few statements rather than minutes — which is a reason to think it harmless, not
-          // a reason to leave it: the read that lands in it fails just as completely.
-          this._InvalidateChecksums(path);
-          this._Invalidate(path);
-        }
-
-        this._activity.Publish(ActivityKind.Drain, path, size, landing.DisplayName, target.DisplayName, "landing-zone drain");
-
-        this._EnsureShadows(path, this._placement.ResolveCopies(path));
-        this._Invalidate(path);
-        DriveBender.Logger($" - Drained '{path}' from '{landing.DisplayName}' to '{target.DisplayName}' ({size} bytes)");
-        return true;
       }
-    }
 
     return false;
+  }
+
+  /// <summary>Files being moved off the landing zone right now, and the storage disks they are going to.</summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _drainingPaths = new(PoolPaths.PathComparer);
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, byte> _drainTargets = new();
+
+  /// <summary>
+  /// Drains up to the fast tier's <c>drainConcurrency</c> files at once (default 2), each to a
+  /// different storage disk: the configured value existed, was validated, and was never used — the
+  /// drainer moved one file at a time whatever it said. Returns whether anything moved.
+  /// </summary>
+  public bool DrainLandingFiles() {
+    var concurrency = Math.Max(1, this._config.Tiers?.GetValueOrDefault("fast")?.DrainConcurrency ?? 2);
+    if (concurrency == 1)
+      return this.DrainOneLandingFile();
+
+    var moved = 0;
+    Parallel.For(0, concurrency, _ => {
+      if (this.DrainOneLandingFile())
+        Interlocked.Increment(ref moved);
+    });
+
+    return moved > 0;
+  }
+
+  /// <summary>Moves one landing-zone file to storage; false when it was skipped (busy, gone, or nowhere to go).</summary>
+  private bool _DrainFile(IVolumeIO landing, string path) {
+    if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
+      return false; // only clean, closed files move (the balancer rule of §6.10 applies here too)
+
+    // The pre-image is taken under the lease; the COPY is not.
+    //
+    // Holding the path exclusively across the whole copy-and-free sequence is the obvious
+    // reading of SAFE-NOLOSS, and it was what this did — but a read lease is what serves a
+    // foreground read, so every read of a file blocked for as long as the pool took to relocate
+    // it. That is invisible while a drain is milliseconds and ruinous the moment it is not: a
+    // member held to 64 KiB/s made an eight-megabyte file unreadable through the mount for over
+    // two minutes, and a large file onto a slow disk does the same with no limit in sight.
+    // Tiering is supposed to be transparent, and a file that cannot be read while the pool
+    // moves it is not transparent, it is an outage on a timer.
+    //
+    // Safety does not rest on that lease and never did — it rests on the TOCTOU guard below,
+    // which re-validates under a FRESH lease and throws the copy away if anything moved. The
+    // lease across the copy only made that guard look like belt-and-braces. What must stay
+    // exclusive is the window between re-validating and deleting the landing original, which
+    // is now exactly what is held.
+    //
+    // A file a foreground op owns right now is skipped rather than waited on: the drainer must
+    // never stall the pump.
+    //
+    // The whole move holds the namespace gate SHARED, so a folder rename cannot move this file's
+    // folder mid-copy. It did, and the copy then recreated the OLD folder on the target — the
+    // re-validation below threw the stale copy away but left the folder, so a renamed folder's
+    // old name came back, empty, beside the new one. Cleaning such a folder up afterwards is not
+    // safe: a user who renames "New folder" and makes another "New folder" gets exactly that
+    // shape on purpose. A waiting rename abandons the copy at its next chunk instead.
+    using var namespaceHold = this._EnterNamespaceShared();
+    IVolumeIO? target;
+    FileMeta? before;
+    long size;
+    using (var probe = this._handles.TryAcquireWrite(path, TimeSpan.Zero)) {
+      if (probe == null)
+        return false;
+
+      if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path))
+        return false; // re-checked under the lease
+
+      var copies = this._placement.ResolveCopies(path);
+      var holders = copies.Select(c => c.Volume).ToArray();
+      before = landing.Stat(path, false);
+      if (before == null)
+        return false; // moved or deleted since the walk listed it: nothing to drain, and nothing to create
+      size = before.Value.Length;
+      // the storage disks other drains are writing to right now count as taken: concurrent moves go
+      // to different disks, which is the point of running them concurrently
+      var busy = this._members.Where(m => this._drainTargets.ContainsKey(m.Io.MemberId)).Select(m => m.Io);
+      target = this._placement.ChooseDrainTarget(size, holders.Where(h => h.MemberId != landing.MemberId).Concat(busy));
+    }
+
+    if (target == null)
+      return false;
+
+    if (!this._drainTargets.TryAdd(target.MemberId, 0))
+      return false; // another drain took that disk a moment ago: this file waits for the next pass
+
+    try {
+      return this._DrainTo(landing, path, target, before, size);
+    } finally {
+      this._drainTargets.TryRemove(target.MemberId, out _);
+    }
+  }
+
+  /// <summary>The move itself, to a target this drain has claimed; the caller holds the namespace gate.</summary>
+  private bool _DrainTo(IVolumeIO landing, string path, IVolumeIO target, FileMeta? before, long size) {
+    var sequence = this._journal.LogIntent(JournalOp.Drain, path, memberId: target.MemberId);
+
+    var parent = PoolPaths.GetParent(path);
+    if (parent.Length > 0)
+      target.EnsureFolder(parent, false);
+
+    // streamed drain — the file is copied through a fixed buffer, never held in RAM
+    // (SAFE-BIGFILE), and with no lease held, so reads of it are served throughout
+    try {
+      WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
+        admit: this._AbandonForFolderRename(this._AdmitBulkBetween(landing, target)));
+    } catch (OperationCanceledException) {
+      try {
+        target.Delete(path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, false);
+      } catch (PoolFsException) {
+        // an orphaned temp is swept on the next mount
+      }
+
+      this._journal.Complete(sequence, JournalOp.Drain);
+      return true; // the pump comes straight back, after the rename, and finds the file by its new name
+    }
+
+    // TOCTOU guard (SAFE-NOLOSS): between the pre-image and here, a foreground write could have
+    // opened, rewritten and closed this file. If it is now open/dirty, or its size/mtime
+    // changed, the copy we just made is stale — remove it and leave the landing original (the
+    // authoritative new version) in place rather than deleting the only copy of fresh data.
+    // Taken under a fresh exclusive lease, which also covers the delete that follows: failing to
+    // get one means a foreground op owns the path, which is itself a reason to discard.
+    using (var lease = this._handles.TryAcquireWrite(path, _DRAIN_SWAP_WAIT)) {
+      var after = landing.Stat(path, false);
+      if (lease == null
+          || this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path)
+          || after is not { } stillThere || before is not { } was
+          || stillThere.Length != was.Length || stillThere.LastWriteTimeUtc != was.LastWriteTimeUtc) {
+        if (target.FileExists(path, false))
+          target.Delete(path, false);
+        this._journal.Complete(sequence, JournalOp.Drain);
+        return false; // try again on a later pump once the file settles
+      }
+
+      landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
+      this._journal.Complete(sequence, JournalOp.Drain);
+
+      // STILL UNDER THE LEASE. The copy set changed the moment the landing original went away,
+      // and a reader resolving between that delete and the invalidation gets a list naming a
+      // file that is no longer there. The same ordering fault as the promote's, with a window
+      // of a few statements rather than minutes — which is a reason to think it harmless, not
+      // a reason to leave it: the read that lands in it fails just as completely.
+      this._InvalidateChecksums(path);
+      this._Invalidate(path);
+    }
+
+    this._activity.Publish(ActivityKind.Drain, path, size, landing.DisplayName, target.DisplayName, "landing-zone drain");
+
+    this._EnsureShadows(path, this._placement.ResolveCopies(path));
+    this._Invalidate(path);
+    DriveBender.Logger($" - Drained '{path}' from '{landing.DisplayName}' to '{target.DisplayName}' ({size} bytes)");
+    return true;
   }
 
   /// <summary>All primary files on one member, walked raw (shadow containers and sidecars skipped).</summary>
@@ -3529,7 +3883,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (path == null)
       return;
 
-    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path))
+    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path) && !this._DefersPublish(path))
       this._PublishStaged(path);
 
     if (wrote)
@@ -3558,7 +3912,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     // last handle gone: publish the staged temp to its final name — the atomic rename is the
     // LAST action before the Create journal intent completes (FR-STAGED-WRITE)
-    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path))
+    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path) && !this._DefersPublish(path))
       this._PublishStaged(path);
 
     if (wrote)
@@ -3608,6 +3962,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (!this._staging.ContainsKey(normalized))
       return;
 
+    // a striped file's finals are filled before anything is made durable or renamed, and only
+    // those it vouches for are published
+    IReadOnlyList<PhysicalCopy>? striped = null;
+    var healAfter = false;
+    if (this._stripes.TryRemove(normalized, out var stripe))
+      (striped, healAfter) = this._CompleteStripe(normalized, stripe);
+
     this._FlushPathLocked(normalized); // owed blocks land in the temp physical first (mapping still active)
     if (!this._staging.TryRemove(normalized, out var createSequence))
       return; // another thread published concurrently
@@ -3623,7 +3984,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       createSequence = this._journal.LogIntent(JournalOp.Create, stagedName);
 
     try {
-      var copies = this._placement.ResolveCopies(stagedName);
+      var copies = striped ?? this._placement.ResolveCopies(stagedName);
 
       // Content first, name second: writes into the temp skipped their barriers, so each copy is
       // made durable here, BEFORE the rename can make it visible. Renaming first would let a power
@@ -3665,6 +4026,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._Invalidate(normalized);
     this._cache.Pages.InvalidatePath(this._poolId, stagedName);
     this._activity.Publish(ActivityKind.Write, normalized, 0, reason: "staged file published (temp → final)");
+    if (healAfter)
+      this._healQueue.Enqueue(normalized); // the copies beyond the ack count, made from the published file
   }
 
   #endregion

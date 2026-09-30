@@ -57,7 +57,8 @@ Two decisions are made, at two different times:
   |          +-----------+ +-----------+ +-----------+   the real name yet |
   |                                                                        |
   |   A block map records which disk holds the current bytes of each       |
-  |   block. The client's write returns once its blocks are on a disk.     |
+  |   block. The client's write returns once each of its blocks is on as   |
+  |   many disks as the folder's ack count (2 for duplicated folders).     |
   +------------------------------------------------------------------------+
                                         |
                                         v
@@ -74,13 +75,12 @@ Two decisions are made, at two different times:
   +------------------------------------------------------------------------+
   |  4. CLOSE                                                              |
   |                                                                        |
-  |   safe (default):  close waits until the required copies are           |
-  |                    COMPLETE -> flushed to disk -> renamed               |
+  |   safe (default):  close waits until every copy the folder asks for    |
+  |                    is COMPLETE -> flushed to disk -> renamed            |
   |                    img.TEMP -> img.raw                                  |
-  |                    (required = the folder's ack count: 1 for a         |
-  |                     single copy, 2 for duplicated folders unless       |
-  |                     minCopiesBeforeAck says 1)                         |
-  |                    Any further copy is made in the background.         |
+  |                    The copies fill in parallel, one per disk, so       |
+  |                    waiting for all of them costs about what waiting    |
+  |                    for one would.                                      |
   |                                                                        |
   |   performance:     close returns at once; filling, flushing and        |
   |                    renaming finish in the background.                  |
@@ -119,6 +119,12 @@ Two decisions are made, at two different times:
   This needs disks that can rename atomically, which every local disk can. A pool with a
   whole-file remote member (FTP, WebDAV, cloud storage) writes the real name directly and
   verifies it afterwards, and does not stripe.
+- **Every acknowledged block is on as many disks as the ack count asks.** Striping never weakens
+  that: with duplication, each block goes to the two readiest disks, on different physical disks.
+- **A disk that refuses a write is not a disk that lost data.** It gets no new blocks, but what it
+  already holds stays valid. At close every reachable copy is filled; one that cannot be completed
+  is dropped and the healer makes it again from the published file. If no copy can be completed,
+  the helper holding the most blocks becomes the copy.
 - **Idle and read-only disks never take part.** An idle disk only receives files from a disk being
   retired; a read-only disk takes nothing.
 
@@ -130,8 +136,8 @@ Two decisions are made, at two different times:
 | Placement strategy picks the final disks at arrival | implemented |
 | Temp names first; only a complete, flushed temp is renamed | implemented |
 | Idle and read-only disks excluded | implemented |
-| Stripe session: per-block choice across the whole group, helpers, block map, filling | in progress |
-| Safe vs. performance close for striped files | in progress |
-| File doesn't fit the landing zone at arrival goes to storage (using the announced size) | in progress |
-| File outgrowing the landing zone mid-write is re-homed to storage | in progress |
-| Drainer moves several files at once, to different storage disks | in progress |
+| Stripe session: per-block choice across the whole group, helpers, block map, filling | implemented |
+| Safe vs. performance close for striped files | implemented |
+| File doesn't fit the landing zone at arrival goes to storage (using the announced size) | implemented |
+| File outgrowing the landing zone mid-write is re-homed to storage | implemented |
+| Drainer moves several files at once, to different storage disks (`tiers.fast.drainConcurrency`, default 2) | implemented |

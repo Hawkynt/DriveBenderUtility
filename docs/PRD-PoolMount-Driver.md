@@ -42,10 +42,14 @@ file granularity:
 
 **Key architectural fact that shapes this whole PRD:** DriveBender stores every
 file *whole* on a single volume, optionally mirrored whole onto other volumes as
-shadow copies. Files are **not** block-striped across drives. Therefore
+shadow copies. Files are **not** block-striped across drives *at rest*. Therefore
 "accelerated I/O using multiple physical drives" means **request-level and
 mirror-level parallelism** (§6.4), *not* single-file RAID-0 striping — that would
-require a new on-disk format and is an explicit non-goal (§3.3).
+require a new on-disk format and is an explicit non-goal (§3.3). What *is* striped
+is a file **while it is being written**: its blocks go to whichever disks of its
+group can take them first, into temps, and the disks that keep the file are filled
+to whole copies before it is published under its name (FR-STRIPE-WRITE,
+docs/IncomingFiles.md). The format on disk stays whole files.
 
 ### 1.2 Why a driver
 Today the tool operates on a pool the OS cannot see as a filesystem. Users want
@@ -201,7 +205,8 @@ macFUSE — same FUSE adapter); OS-native Recycle Bin integration on Windows
 periodic idle **deep scrub** (strong-hash re-verification of the whole pool).
 
 ### 3.4 Won't (this version) / explicit non-goals
-Single-file block striping / RAID-0 across drives (would change on-disk format);
+Single-file block striping / RAID-0 across drives *at rest* (would change on-disk
+format; transient striping while a file is written keeps the format — FR-STRIPE-WRITE);
 kernel-mode drivers (user-mode FUSE/WinFsp only); network/SMB re-export (out of
 scope — mount locally and share via OS); encryption at rest; changing
 DriveBender's fundamental whole-file-copy model; treating **RAM as a durable

@@ -2153,3 +2153,51 @@ too). It now never gives a read-only member a copy, and restoring duplication ne
 it later, by rewriting the manifest. A landing zone is a role the operator gives a disk; the pool no
 longer assigns one by itself. The latency measurement stays, because placement and read routing weigh
 it. An old manifest that still sets the key keeps loading; the key is ignored.
+
+### Added: stripe sessions: a new file is written across its whole group
+
+How an incoming file travels is now written down, with a diagram, in `docs/IncomingFiles.md`. In
+short: where a new file goes (landing zone if one is configured and the file fits, storage
+otherwise) is decided once, before its first block. While it is written, its blocks go to whichever
+disks of that group can take them first, into temps, tracked by a block map. At close the disks that
+keep the file are filled to whole copies (in parallel, one per disk), made durable, and only then
+renamed. A disk never holds a correctly named file with missing blocks, and a power cut at any step
+leaves the file whole or absent.
+
+- **Ack floor kept.** Each block goes to as many disks as the folder's ack count, so striping never
+  weakens it (2 for duplicated folders).
+- **Refusal is not loss.** A disk that refuses a write (full, above all) gets no new blocks, but
+  what it already holds stays valid. An early version forgot those blocks and could lose the first
+  bytes of a file on a full disk.
+- **Close fills every copy.** In the safe default, close fills every copy the folder asks for, not
+  just the ack count's worth. The fills run in parallel, so this costs about what one would, and a
+  published file is fully duplicated from the moment it has its name. Leaving the extra copies to
+  the healer left a window with too few copies, which a clean unmount did not close.
+- **Landing zone overflow.** A file whose announced size does not fit the landing zone goes straight
+  to storage. One that outgrows it while being written moves to storage and continues there; its
+  blocks on the landing zone are copied across by the same fill. A landing-zone file always gets a
+  session for this, even on a single landing disk or with `write.striping: false`.
+- **Measured and fixed along the way.** Dispatch first scored every queued block as a whole
+  operation, which sent blocks to a disk measured at 500 ms once a few hundred small blocks were
+  queued elsewhere. Filling copied block by block, which was six seconds per small file on a slow
+  final. Blocks now cost transfer time, and filling copies contiguous runs.
+
+Coverage: a power-cut matrix at every step of a striped write and close (30 steps single-copy,
+38 duplicated; the measured lengths), the same across a move out of the landing zone, and controls.
+Publishing without filling fails all of them. With striping on, the engine suite runs at the same
+speed as without, and the real-driver battery passed 211/211.
+
+### Resolved: a file replaced while its previous version's publish was still pending came back
+
+Under the performance policy a closed file's publish is deferred. Saving a new version by writing a
+temp and renaming it over the name, while the old version was still pending, let the old version's
+publish land afterwards and put it back over the new one. Found by the save-shape crash matrix once
+striping made deferral common. A pending publish now always happens before anything else replaces
+that name: a rename over it, or a new create of it.
+
+### Resolved: `tiers.fast.drainConcurrency` was validated and never used
+
+The setting (default 2) existed, was checked for being at least 1, and the drainer ignored it,
+moving one file at a time. A drain pass now moves up to that many files at once, each to a
+different storage disk; claimed files and claimed target disks keep two drains from colliding.
+Removing the target claim sends both moves to the same disk, and the test catches it.

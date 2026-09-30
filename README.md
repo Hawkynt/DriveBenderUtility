@@ -787,7 +787,10 @@ common knobs:
   "duplication": 2,                       // total copies kept of each file
   "write": {
     "policy": "write-back",               // write-through | write-back | deferred | performance
-    "minCopiesBeforeAck": 2               // durable copies required before a write is acknowledged
+    "minCopiesBeforeAck": 2,              // durable copies required before a write is acknowledged
+    "striping": true                      // a new file's blocks go to whichever disks of its group are
+                                          //   free first; filled into whole copies before the file is
+                                          //   published (docs/IncomingFiles.md)
   },
   "resilience": {
     "onMemberLoss": "retain-metadata",    // keep showing metadata when a drive is pulled,
