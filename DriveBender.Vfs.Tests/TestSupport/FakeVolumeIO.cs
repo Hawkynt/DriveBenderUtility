@@ -320,6 +320,8 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       this._EnsureParents(finalPhysical);
       this._files[finalPhysical] = staged;
     }
+
+    this._After(VolumeOp.AtomicReplace, finalRelative); // the name is visible from here on
   }
 
   public FileMeta? Stat(string relativePath, bool shadow) {

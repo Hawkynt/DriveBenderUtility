@@ -2201,3 +2201,23 @@ The setting (default 2) existed, was checked for being at least 1, and the drain
 moving one file at a time. A drain pass now moves up to that many files at once, each to a
 different storage disk; claimed files and claimed target disks keep two drains from colliding.
 Removing the target claim sends both moves to the same disk, and the test catches it.
+
+### Resolved: the drainer could delete a storage copy it had already published under the real name
+
+Moving a file off the landing zone copied it to storage, published that copy under the file's real
+name, and only then checked whether the file had been opened or changed in the meantime. If it had,
+the drainer deleted the copy it had just published: sometimes without the file's lease, and always
+without dropping the cached list of the file's copies. So an application that had been told about
+that copy could be sent to a file that no longer existed.
+
+CI showed the symptom once on Linux: a file being written while the mover relocated it reported
+"Could not find file". An engine-level test that opens, writes and reads the file the moment its
+storage copy appears passes both before and after this change (the engine's write path fails over
+around a missing copy), so that CI failure is not proven to be this; the FUSE adapter's own open
+path is the next place to look if it recurs.
+
+What changed regardless: the check now comes first, under the lease, through the same commit gate
+the healer uses. The rename and the freeing of the landing copy happen under that one lease, and the
+copy list is refreshed before the lease is released. A copy that must not be kept is only ever a
+temp, and a visible copy is never deleted by the drainer. The drain is still 21 storage steps, and
+its power-cut matrix still covers every one.

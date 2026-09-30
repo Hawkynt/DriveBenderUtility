@@ -3469,50 +3469,52 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (parent.Length > 0)
       target.EnsureFolder(parent, false);
 
-    // streamed drain — the file is copied through a fixed buffer, never held in RAM
-    // (SAFE-BIGFILE), and with no lease held, so reads of it are served throughout
+    // Streamed through a fixed buffer, never held in RAM (SAFE-BIGFILE), and with no lease held,
+    // so reads of the file are served throughout. The copy lands in a TEMP and only becomes the
+    // storage copy through the commit below.
+    //
+    // It used to be published under the real name first and checked afterwards: if the file had
+    // been opened or changed meanwhile, the drainer deleted the copy it had just published — without
+    // the file's lease, and without dropping the cached copy list. An application that opened the
+    // file in between had already been told about that copy, and its next write went to a file that
+    // no longer existed: "file not found", mid-write, on a file nobody had deleted. Seen on CI while
+    // the mover relocated files under a writer.
+    //
+    // Now the check comes FIRST, under the lease, and the rename and the freeing of the landing copy
+    // happen under that same lease: a copy that must not be kept is only ever a temp, and nothing
+    // can see the storage copy until the landing copy is gone and the copy list is fresh.
+    HandleTable.PathLease? held = null;
     try {
-      WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
-        admit: this._AbandonForFolderRename(this._AdmitBulkBetween(landing, target)));
-    } catch (OperationCanceledException) {
+      bool published;
       try {
-        target.Delete(path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, false);
-      } catch (PoolFsException) {
-        // an orphaned temp is swept on the next mount
+        published = WholeFilePublisher.CopyBetween(landing, path, false, target, path, false,
+          admit: this._AbandonForFolderRename(this._AdmitBulkBetween(landing, target)),
+          commit: () => {
+            held = this._CommitDrainedCopy(landing, path, before);
+            return held == null ? null : _NoRelease; // kept past the rename: the landing copy goes under it too
+          });
+      } catch (OperationCanceledException) {
+        try {
+          target.Delete(path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, false);
+        } catch (PoolFsException) {
+          // an orphaned temp is swept on the next mount
+        }
+
+        this._journal.Complete(sequence, JournalOp.Drain);
+        return true; // the pump comes straight back, after the rename, and finds the file by its new name
       }
 
-      this._journal.Complete(sequence, JournalOp.Drain);
-      return true; // the pump comes straight back, after the rename, and finds the file by its new name
-    }
-
-    // TOCTOU guard (SAFE-NOLOSS): between the pre-image and here, a foreground write could have
-    // opened, rewritten and closed this file. If it is now open/dirty, or its size/mtime
-    // changed, the copy we just made is stale — remove it and leave the landing original (the
-    // authoritative new version) in place rather than deleting the only copy of fresh data.
-    // Taken under a fresh exclusive lease, which also covers the delete that follows: failing to
-    // get one means a foreground op owns the path, which is itself a reason to discard.
-    using (var lease = this._handles.TryAcquireWrite(path, _DRAIN_SWAP_WAIT)) {
-      var after = landing.Stat(path, false);
-      if (lease == null
-          || this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path)
-          || after is not { } stillThere || before is not { } was
-          || stillThere.Length != was.Length || stillThere.LastWriteTimeUtc != was.LastWriteTimeUtc) {
-        if (target.FileExists(path, false))
-          target.Delete(path, false);
+      if (!published) {
         this._journal.Complete(sequence, JournalOp.Drain);
-        return false; // try again on a later pump once the file settles
+        return false; // opened, written or busy: try again on a later pump once the file settles
       }
 
       landing.Delete(path, false); // free the fast tier only after the durable capacity copy exists
       this._journal.Complete(sequence, JournalOp.Drain);
-
-      // STILL UNDER THE LEASE. The copy set changed the moment the landing original went away,
-      // and a reader resolving between that delete and the invalidation gets a list naming a
-      // file that is no longer there. The same ordering fault as the promote's, with a window
-      // of a few statements rather than minutes — which is a reason to think it harmless, not
-      // a reason to leave it: the read that lands in it fails just as completely.
       this._InvalidateChecksums(path);
       this._Invalidate(path);
+    } finally {
+      held?.Dispose();
     }
 
     this._activity.Publish(ActivityKind.Drain, path, size, landing.DisplayName, target.DisplayName, "landing-zone drain");
@@ -3804,6 +3806,34 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     return lease;
+  }
+
+  /// <summary>
+  /// Decides whether a drained copy may be published, and takes the path's lease for it — held by
+  /// the drainer across the rename AND the freeing of the landing copy. Null, and no lease, when the
+  /// file is open, dirty or no longer what was copied: the temp is then discarded.
+  /// </summary>
+  private HandleTable.PathLease? _CommitDrainedCopy(IVolumeIO landing, string path, FileMeta? before) {
+    var lease = this._handles.TryAcquireWrite(path, _DRAIN_SWAP_WAIT);
+    if (lease == null)
+      return null;
+
+    var after = landing.Stat(path, false);
+    if (this._writeBuffer.IsDirty(path) || this._handles.IsOpen(path)
+        || after is not { } now || before is not { } was
+        || now.Length != was.Length || now.LastWriteTimeUtc != was.LastWriteTimeUtc) {
+      lease.Dispose();
+      return null;
+    }
+
+    return lease;
+  }
+
+  /// <summary>Handed to the publisher in place of a lease the caller keeps for longer.</summary>
+  private static readonly IDisposable _NoRelease = new NoRelease();
+
+  private sealed class NoRelease : IDisposable {
+    public void Dispose() { }
   }
 
   /// <summary>True when a copy is currently readable (member online and the file present) — a cheap failover probe.</summary>
