@@ -203,11 +203,96 @@ to resolve the path, then the file's `ReaderWriterLockSlim`. At tens of thousand
 second across twenty threads, one global monitor per read is enough to explain this. Not yet
 isolated with a profiler, which is what the next pass should do rather than guessing again.
 
+*Profiled since:* it was five locks, not one. See "The engine's read path: cached reads now scale
+with threads" below. The engine now scales; the mount row has not been re-measured.
+
 The benchmark itself was wrong first time round and is worth remembering: it opened a `FileStream`
 per operation, so it measured open+read+close and reported it as read IOPS — the read path looked
 four times slower than it is (15,000 rather than 69,000). Each worker now takes its handle before
 the clock starts.
 
+
+### The engine's read path: cached reads now scale with threads, and writes stop making garbage
+
+Measured without a driver: `EngineHotPathBenchmarks` (explicit, never asserts a timing) and a
+scratch harness, both building the pool the way `dbmount` does — `PoolFileSystem` over
+`MeasuredVolumeIO(LocalVolumeIO)` members in temp folders. Before and after were run alternately,
+three times each, on a shared 20-CPU machine with other work running. The single-thread rows swing
+by nearly 2x between runs, so only differences well outside that are claimed.
+
+| Cached random 4 KiB reads, one file, one handle per thread | before | after |
+| --- | ---: | ---: |
+| 1 thread | 0.6–1.1M/s | 0.6–1.1M/s (no change) |
+| 4 threads | 1.3–1.8M/s | 2.1–2.8M/s |
+| 20 threads | 0.7–1.4M/s | 2.2–3.1M/s |
+| allocated per read | 416 B (552 B two folders deep) | 240 B |
+
+**The engine reproduced the mount's symptom**: twenty threads were slower than four, and sometimes
+slower than one. The earlier note in this file ("`HandleTable`'s single global lock is NOT the
+limiter") measured the table on its own. Profiled on the real read path, it was one of five monitors
+every read went through, and each profile showed the next one once the previous was gone:
+
+1. **Metadata cache**: ~80% of the read at twenty threads. Every read looks up the placement and
+   the stat under one lock, which a hit also takes to move an LRU node.
+2. **Page cache**: the pool's shard lock, taken by every hit to bump counters and the eviction order.
+3. **Handle table**: four acquisitions per read (resolve the handle, pin, re-check, unpin).
+4. **Write buffer**: "is anything owed on this path?", asked two or three times per read.
+5. **The per-file `ReaderWriterLockSlim`**: its internal spin lock, taken on every enter and exit,
+   serialised readers of one file. That was ~60% of the path once the global locks were gone.
+
+What changed. Every guarantee is kept by construction, not by timing:
+- **Caches**: hits read a concurrent map and take no lock. Every change to a map still pairs with
+  its policy change under the lock. A hit records recency only while the lock is free, and only for
+  the entry still under that key (SLRU/ARC re-admit on access). A single caller always records it,
+  so uncontended eviction is exactly as before. Hit counters are per-CPU.
+- **Handle table**: both maps are concurrent and are written only under the lock. A lease on a
+  path that is already pinned adds its pin with a CAS that never goes up from zero, so it cannot
+  land on a state being retired. Reaching zero and unkeying still happen together under the lock.
+  The canonical-state re-check (the replacing-rename guard) and the `ReferenceEquals` removal guards
+  are unchanged.
+- **`FileLock`** replaces `ReaderWriterLockSlim` for the per-file lock. It keeps the same contract
+  and the same exceptions: shared readers, one writer, writers preferred, no recursion, released
+  only by its holder. An uncontended enter or exit is one atomic operation. Its tests were each
+  shown to fail when the rule they guard was removed: writer preference, waking readers when a
+  waiting writer gives up, and the reader-exit wake-up (the stress test hangs without it).
+- **Write buffer**: the clean-path checks read a concurrent map; buffered contents are still
+  touched only under its lock.
+- **Allocation**: the prefetch closure in `Read` was allocated at the top of the method on every
+  read, whether or not a prefetch started. `PoolPaths.Normalize` split every path into an array
+  plus one string per folder level.
+
+**Not verified: whether the mount's 69k → 53k row moves.** At 53k reads/s the engine is far below
+the ~1M/s one thread of it sustains, so the mount's limit may be the driver path rather than the
+engine. The performance matrix was not run in this pass, so that row is unchanged.
+
+**Writes: `data.ToArray()` is now taken only where the bytes are kept.** Those places are the RAM
+ack and a copy that can be owed. The write buffer keeps its array as it is, and the caller reuses
+its own buffer the moment `Write` returns. When no copy can be owed, the ack quorum is every copy:
+the write lands on all of them or throws. A stripe session writes every block to its disks before
+returning and keeps only the block map. So in both cases the bytes now go through a pooled buffer
+that is returned on the way out. The disks are written from a span of it, so no stream can hold on
+to the pooled array. `Write_GivenACopyIsOwed_…` fails if the owed path ever gets the pooled buffer.
+It fails, together with a concurrency fuzz case, when that guard is removed.
+
+| Sequential 8 MiB writes, 6 s, default config (striped new file, then in place) | before | after |
+| --- | ---: | ---: |
+| allocated per MiB written | 1,051 KiB | 3–9 KiB |
+| gen-2 collections | 140–279 | 1 |
+| throughput | 58–935 MiB/s | 278–1,013 MiB/s |
+
+The throughput row is the machine's disk under other tenants, not a result. It is included only so
+nobody reads a claim into it.
+
+**Looked at, not changed:**
+- **Small-file create**: ~200 files/s on one thread and ~500 on twenty, before and after. It is
+  fsync- and journal-barrier-bound, as the section above describes.
+- **Uncached listing** of a 2,000-entry folder: ~300–400/s. Two thirds of it is the OS directory
+  enumeration on each member. At twenty threads, a third of the time queued on `ShadowNamespace`'s
+  lock, which each listing took once per entry. Recording a listing under one acquisition was built
+  and measured: 449–535 → 489–624/s at twenty threads, inside the noise. It was reverted. Cached
+  listings did move with the metadata cache: ~1.4M → 3.5–4.5M/s at twenty threads.
+- **Still allocated per read (240 B)**: the path lease and three cache keys. The keys are classes
+  because `ICacheEvictionPolicy<TKey>` requires `class`.
 
 ### Why writes look slow, and how much of it is deliberate
 
@@ -247,6 +332,9 @@ large object heap and a 512 MiB transfer produces 512 MiB of garbage. The copy e
 buffer can take ownership when copies are owed; when nothing is owed it is pure waste. Making it
 conditional touches the ack-quorum and journalling path, which is the most safety-critical code in
 the product, so it is written down rather than attempted in passing.
+
+*Done since*, with guard tests on the owed path: see "The engine's read path…" below. The copy is
+now taken only where the bytes are kept. The throughput effect through a mount is not yet measured.
 
 ### The storages behind a tier were taking turns instead of working together
 
