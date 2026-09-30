@@ -1981,6 +1981,37 @@ WinFsp now reports every close. A handle that was never writable skips the flush
 extra callback stays cheap. `Heal_GivenTheFileWasOnlyReadThroughTheMount_…` covers it directly, and
 fails with the old setting. Linux was never affected: FUSE always sends `release`.
 
+### Resolved: the management daemon died minutes into ordinary use: the dashboard's "lost connection"
+
+Reported as: "I opened pool settings, randomly clicked buttons and entered stuff until I lost the
+connection." Reproduced the same way: a UI fuzzer drives the real dashboard in a headless browser,
+clicking and typing at random through the pool card and its dialogs (pool settings above all). It
+lost the daemon within 45 seconds, and the daemon's last words were:
+
+    Unhandled exception. System.DllNotFoundException: Unable to load DLL 'dokan2.dll'
+       at DokanNet.Dokan.Dispose(Boolean disposing)
+       at DokanNet.Dokan.Finalize()
+
+Nothing about the settings. The dashboard checks the prerequisites every 15 seconds, and asking
+"is the Dokan driver installed?" constructed a `Dokan` object to find out. On a machine without
+Dokan (every WinFsp user) the constructor threw for the missing DLL, which was caught. But .NET still
+finalizes an object whose constructor threw, and the `using` never held it to dispose it. When the
+garbage collector later ran its finalizer, that finalizer called into the same missing DLL, and an
+exception on the finalizer thread ends the process. The more the page was used, the sooner a
+collection came, so it looked random, and like the clicking caused it.
+
+The check now asks whether the native library can be loaded at all before constructing anything. A
+daemon polled for its prerequisites died after 71 checks (under a second) before, and now answers
+23,000 in 40 seconds.
+
+The fuzzer stays as a test. It runs against a daemon with a registry of its own (the new
+`DBMOUNT_CONFIG_ROOT`), so it can never touch the machine's real pools. It never types a drive letter
+or a slash, and never presses buttons that reach outside its sandbox (folder pickers, adding members,
+creating or deleting pools, installing prerequisites). It fails on a lost live connection, a request
+that never finishes, the daemon not answering, or any uncaught script error, and prints its seed
+(`DBE2E_FUZZ_SEED` replays it; `DBE2E_FUZZ_SECONDS` sets how long it runs). After the fix, the seed
+that crashed it and three more ran two minutes each (about 3,100 actions) clean.
+
 ### Resolved: with one required copy, a power cut could lose an acknowledged write
 
 `write.minCopiesBeforeAck` below the number of copies (the Settings dialog offers it) acknowledges a

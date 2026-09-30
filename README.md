@@ -774,6 +774,8 @@ without a real pool.
 Tuning lives in the manifest's `defaults` block (per pool) or a machine-wide
 `config.json` under the config root (`%ProgramData%\DriveBenderUtility` on
 Windows, `/etc/drivebenderutility` or `~/.config/drivebenderutility` on Linux).
+Set `DBMOUNT_CONFIG_ROOT` to move it: for a portable or side-by-side install, or
+to run a daemon against a pool registry of its own.
 Values resolve built-in defaults → global file → pool → per-folder glob. A few
 common knobs:
 
