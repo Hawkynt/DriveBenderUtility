@@ -981,6 +981,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     foreach (var copy in copies) {
+      if (!_IsStagedName(dataName))
+        WholeFilePublisher.SeparateIfLinked(copy.Volume, dataName, copy.Shadow); // linked names share times and mode as well
       copy.Volume.SetTimestamps(dataName, copy.Shadow, patch.CreationTimeUtc, patch.LastWriteTimeUtc);
 
       // EVERY copy, not just the primary: a file that is private on one member and readable on
@@ -2928,6 +2930,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
 
+      // copy-on-write: a copy sharing its data with another file (a hard link the optimizer made)
+      // gets data of its own before it is written in place — checked once per open file
+      if (!lease.File.LinksSeparated && !_IsStagedName(dataPath)) {
+        foreach (var copy in copies)
+          if (WholeFilePublisher.SeparateIfLinked(copy.Volume, dataPath, copy.Shadow))
+            this._activity.Publish(ActivityKind.Write, path, reason: $"separated from a shared (hard-linked) file on {copy.Volume.DisplayName} before writing");
+
+        lease.File.LinksSeparated = true;
+      }
+
       if (mode == WriteMode.Append)
         offset = this._writeBuffer.OverlayLength(path, copies[0].Volume.Stat(dataPath, copies[0].Shadow)?.Length ?? 0);
 
@@ -3279,8 +3291,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // while still a staging temp — where an intent recovers nothing (the temp is swept after a
       // crash) and the publish's flush commits the size along with the content.
       var sequence = _IsStagedName(dataPath) ? 0 : this._journal.LogIntent(JournalOp.Truncate, dataPath, length: length);
-      foreach (var copy in copies)
+      foreach (var copy in copies) {
+        WholeFilePublisher.SeparateIfLinked(copy.Volume, dataPath, copy.Shadow); // copy-on-write
         copy.Volume.Truncate(dataPath, copy.Shadow, length); // grows zero-filled or shrinks on all copies (FR-TRUNC)
+      }
 
       this._journal.Complete(sequence, JournalOp.Truncate);
       this._InvalidateChecksums(dataPath);
@@ -3348,6 +3362,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       try {
         foreach (var copy in copies) {
+          if (!intoStaging)
+            WholeFilePublisher.SeparateIfLinked(copy.Volume, dataName, copy.Shadow); // copy-on-write: a copy that was away may still share
           using var stream = copy.Volume.OpenWrite(dataName, copy.Shadow, false);
           foreach (var op in ops) {
             if (op.TruncateLength is { } truncateLength) {

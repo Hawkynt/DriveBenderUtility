@@ -305,7 +305,48 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     | BackendCaps.Timestamps
     // only where the host filesystem actually has a mode to keep; claiming it on Windows would make
     // the engine carry a permission it cannot store and report one it never set
-    | (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() ? BackendCaps.Permissions : BackendCaps.None);
+    | (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() ? BackendCaps.Permissions : BackendCaps.None)
+    | this._spaceCaps.Value;
+
+  /// <summary>Hard links, block cloning and sparse ranges — what the filesystem here supports, found once (docs/SpaceSavings.md).</summary>
+  private readonly Lazy<BackendCaps> _spaceCaps = new(() => SpaceNative.CapabilitiesOf(rootPath, Path.Combine(rootPath, PoolPaths.UtilityFolderName, "probe")));
+
+  public int LinkCount(string relativePath, bool shadow)
+    => (this.Caps & BackendCaps.HardLinks) == 0 ? 1 : this._Guard(() => SpaceNative.LinkCount(this._Resolve(relativePath, shadow)));
+
+  public bool TryHardLink(string existingRelative, bool existingShadow, string newRelative, bool newShadow) {
+    if ((this.Caps & BackendCaps.HardLinks) == 0)
+      return false;
+
+    return this._Guard(() => {
+      var existing = this._Resolve(existingRelative, existingShadow);
+      var target = this._Resolve(newRelative, newShadow);
+      Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+
+      // The new name IS the existing file. A handle this member keeps pooled on the existing name
+      // lacks delete sharing, and on Windows renaming ANY name of a file needs delete access to the
+      // file — so renaming the link into place failed "being used by another process". A rename
+      // retires handles on the names it touches; the other name of the same file is this one.
+      this._pool.Invalidate(existing);
+      return SpaceNative.TryHardLink(existing, target);
+    });
+  }
+
+  public bool TryClone(string sourceRelative, bool sourceShadow, string targetRelative, bool targetShadow) {
+    if ((this.Caps & BackendCaps.BlockClone) == 0)
+      return false;
+
+    return this._Guard(() => {
+      var target = this._Resolve(targetRelative, targetShadow);
+      Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+      return SpaceNative.TryClone(this._Resolve(sourceRelative, sourceShadow), target);
+    });
+  }
+
+  public bool TryPunchHole(string relativePath, bool shadow, long offset, long length)
+    => (this.Caps & BackendCaps.Sparse) != 0 && this._Guard(() => SpaceNative.TryPunchHole(this._Resolve(relativePath, shadow), offset, length));
+
+  public long AllocatedBytes(string relativePath, bool shadow) => this._Guard(() => SpaceNative.AllocatedBytes(this._Resolve(relativePath, shadow)));
 
   /// <summary>
   /// Capacity of the volume behind this member, or ZERO when it cannot be interrogated — the
