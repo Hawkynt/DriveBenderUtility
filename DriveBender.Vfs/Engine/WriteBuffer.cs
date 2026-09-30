@@ -34,7 +34,14 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
     public DateTime FirstStagedUtc { get; internal set; }
   }
 
-  private readonly Dictionary<string, FileBuffer> _files = new(PoolPaths.PathComparer);
+  /// <summary>
+  /// READ without the lock, written only under it — and a <see cref="FileBuffer"/>'s contents are
+  /// touched only under it. Every read of every file asks "is anything owed here?" two or three
+  /// times, and the answer is nearly always no; asking through this one monitor made clean reads of
+  /// unrelated files queue behind each other (measured: the largest remaining share of a cached read
+  /// under twenty threads once the caches and the handle table stopped locking).
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, FileBuffer> _files = new(PoolPaths.PathComparer);
   private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
   private readonly Lock _lock = new();
 
@@ -45,10 +52,7 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
     }
   }
 
-  public bool IsDirty(string path) {
-    lock (this._lock)
-      return this._files.ContainsKey(path);
-  }
+  public bool IsDirty(string path) => this._files.ContainsKey(path);
 
   public DirtyState StateOf(string path) {
     lock (this._lock)
@@ -89,7 +93,7 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
 
   private FileBuffer _Buffer(string path, int durableCopies) {
     if (!this._files.TryGetValue(path, out var buffer)) {
-      this._files.Add(path, buffer = new() { FirstStagedUtc = this._clock() });
+      this._files[path] = buffer = new() { FirstStagedUtc = this._clock() };
       buffer.State = durableCopies == 0 ? DirtyState.RamBuffered : DirtyState.Landed;
       buffer.DurableCopies = durableCopies;
     }
@@ -99,6 +103,9 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
 
   /// <summary>Applies the pending image over a block read from disk — the buffer is authoritative (SAFE-COHERE).</summary>
   public byte[] OverlayBlock(string path, long blockIndex, int blockSize, byte[] block) {
+    if (!this._files.ContainsKey(path))
+      return block; // the common case, answered without the lock
+
     lock (this._lock) {
       if (!this._files.TryGetValue(path, out var buffer) || buffer.Ops.Count == 0)
         return block;
@@ -135,6 +142,9 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
 
   /// <summary>The logical length including staged appends/truncates.</summary>
   public long OverlayLength(string path, long durableLength) {
+    if (!this._files.ContainsKey(path))
+      return durableLength;
+
     lock (this._lock) {
       if (!this._files.TryGetValue(path, out var buffer))
         return durableLength;
@@ -206,14 +216,14 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
       buffer.Ops.AddRange(kept);
 
       if (buffer.Ops.Count == 0)
-        this._files.Remove(path);
+        this._files.TryRemove(path, out _);
     }
   }
 
   /// <summary>Removes and returns the pending image for application; the caller must complete the returned journal sequences.</summary>
   public (IReadOnlyList<PendingOp> ops, IReadOnlyList<long> journalSequences, int durableCopies, DateTime firstStagedUtc)? Drain(string path) {
     lock (this._lock) {
-      if (!this._files.Remove(path, out var buffer))
+      if (!this._files.TryRemove(path, out var buffer))
         return null;
 
       cache.ReleaseWrite(buffer.ReservedBytes);
@@ -274,7 +284,7 @@ public sealed class WriteBufferManager(CacheInstance cache, Func<DateTime>? cloc
   /// <summary>Follows a rename so pending mutations land on the new name.</summary>
   public void RenamePath(string from, string to) {
     lock (this._lock) {
-      if (!this._files.Remove(from, out var buffer))
+      if (!this._files.TryRemove(from, out var buffer))
         return;
 
       this._files[to] = buffer;

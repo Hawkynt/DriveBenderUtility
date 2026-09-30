@@ -57,6 +57,46 @@ public class EnginePerformanceTests {
 
   [Test]
   [Category("HappyPath")]
+  public void Read_GivenWarmCacheAndDefaultReadAhead_WhenReadAtRandom_ThenEachReadAllocatesAlmostNothing() {
+    // Measured: 416 bytes per cached 4 KiB read. At the two million reads a second twenty threads
+    // reach, that is close to a gigabyte of garbage a second, and every gen-0 collection it causes
+    // stops all twenty readers — the largest cost left on the path once the locks were gone. Most
+    // of it was invisible in the source: the prefetch closure is created at the top of the method,
+    // on every read, whether a prefetch is started or not.
+    var v1 = new FakeVolumeIO(Guid.NewGuid(), "v1", "P1", capacity: 1L << 28);
+    var v2 = new FakeVolumeIO(Guid.NewGuid(), "v2", "P2", capacity: 1L << 28);
+    using var fs = new PoolFileSystem(_pool, [new(v1), new(v2)],
+      new("alloc" + Guid.NewGuid().ToString("N"), new() { Size = "8388608", BlockSize = "65536", MetadataEntries = 1000, MetadataTtl = "1h" }),
+      ConfigResolver.ResolveEffective(null, """{ "duplication": 2 }"""));
+    fs.Mount(new(@"X:\"));
+
+    const int size = 1 << 20;
+    fs.Create("deep", NodeKind.Directory, CreateFlags.None);
+    fs.Create("deep/folder", NodeKind.Directory, CreateFlags.None);
+    var write = fs.Create("deep/folder/random.bin", NodeKind.File, CreateFlags.None);
+    fs.Write(write, new byte[size], 0, WriteMode.Normal);
+    fs.Close(write);
+
+    var handle = fs.Open("deep/folder/random.bin", AccessMode.Read, ShareMode.Read);
+    var buffer = new byte[4096];
+    var random = new Random(11);
+    for (var i = 0; i < 2000; ++i) // warm: every block cached, read-ahead state created
+      fs.Read(handle, buffer, random.Next(size / 4096) * 4096L);
+
+    const int reads = 5000;
+    var before = GC.GetAllocatedBytesForCurrentThread();
+    for (var i = 0; i < reads; ++i)
+      fs.Read(handle, buffer, random.Next(size / 4096) * 4096L);
+    var perRead = (GC.GetAllocatedBytesForCurrentThread() - before) / reads;
+    fs.Close(handle);
+
+    // ~240 now: the lease and three cache keys, which are classes because the eviction policies
+    // require it. The bound leaves room for platform differences, not for the closure to come back.
+    perRead.Should().BeLessThan(320, $"a cached random read allocated {perRead} bytes");
+  }
+
+  [Test]
+  [Category("HappyPath")]
   public void InvalidatePath_GivenALargeCache_WhenOneFileMutates_ThenCostDoesNotScaleWithOccupancy() {
     // the regression this pins: invalidation used to scan EVERY cached block of the pool to find
     // the handful belonging to one path, so a write got slower as the cache filled with other

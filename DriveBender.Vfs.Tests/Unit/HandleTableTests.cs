@@ -156,6 +156,97 @@ public class HandleTableTests {
     violations.Should().BeEmpty();
   }
 
+  [Test]
+  [Category("EdgeCase")]
+  public void Table_GivenSharedLeasesRacingOpensClosesWritersAndRenames_ThenExclusionHoldsAndNothingLeaks() {
+    // A shared lease on a path that is already pinned is taken WITHOUT the table's lock (a cached
+    // read does this on every call, from every thread). That pin must never land on a state that is
+    // being retired, or the path ends up with two states — two locks that exclude nothing — and it
+    // must never be lost, or a state lingers in the table for good.
+    var table = new HandleTable();
+    var violations = new System.Collections.Concurrent.ConcurrentBag<string>();
+    var readers = 0;
+    var writers = 0;
+    const int rounds = 3000;
+
+    var workers = Enumerable.Range(0, 10).Select(worker => new Thread(() => {
+      for (var round = 0; round < rounds; ++round)
+        switch (worker % 5) {
+          case 0 or 1: {
+            using var lease = table.AcquireRead("shared.bin");
+            Interlocked.Increment(ref readers);
+            if (Volatile.Read(ref writers) != 0)
+              violations.Add("a shared lease was held while an exclusive one was");
+
+            Interlocked.Decrement(ref readers);
+            break;
+          }
+
+          case 2: {
+            using var lease = table.AcquireWrite("shared.bin");
+            if (Interlocked.Increment(ref writers) != 1)
+              violations.Add("two threads held the exclusive lease on 'shared.bin' at once");
+            if (Volatile.Read(ref readers) != 0)
+              violations.Add("an exclusive lease was held while a shared one was");
+
+            Thread.Yield();
+            Interlocked.Decrement(ref writers);
+            break;
+          }
+
+          case 3: {
+            // the pin a handle holds comes and goes, so the lock-free pin races the last release
+            var open = table.Open("shared.bin", AccessMode.Read);
+            table.Close(open.Handle);
+            break;
+          }
+
+          default:
+            if (round % 10 == 0) {
+              _Rename(table, "shared.bin", "moved.bin");
+              _Rename(table, "moved.bin", "shared.bin");
+            }
+
+            break;
+        }
+    }) { IsBackground = true, Name = $"leases-{worker}" }).ToArray();
+
+    foreach (var thread in workers)
+      thread.Start();
+    foreach (var thread in workers)
+      thread.Join(TimeSpan.FromMinutes(1)).Should().BeTrue("handle-table operations must never deadlock");
+
+    violations.Should().BeEmpty();
+    table.TrackedPathCount.Should().Be(0, "with every handle closed and every lease released, no state may linger");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Lease_GivenAPathPinnedByAnOpenHandle_WhenLeasedAndReleasedRepeatedly_ThenTheHandlesStateIsKept() {
+    var table = new HandleTable();
+    var open = table.Open("pinned.bin", AccessMode.Read);
+
+    for (var i = 0; i < 3; ++i)
+      using (var lease = table.AcquireRead("pinned.bin"))
+        lease.File.Should().BeSameAs(open.File);
+
+    table.TrackedPathCount.Should().Be(1, "the handle still pins the state");
+    table.Close(open.Handle);
+    table.TrackedPathCount.Should().Be(0, "the last pin retires it");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void Get_GivenAClosedHandle_ThenItIsStale() {
+    var table = new HandleTable();
+    var open = table.Open("gone.bin", AccessMode.Read);
+    table.Close(open.Handle);
+
+    table.Invoking(t => t.Get(open.Handle)).Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.StaleHandle);
+    table.TryGet(open.Handle).Should().BeNull();
+    table.TryGetPath(open.Handle).Should().BeNull();
+  }
+
   /// <summary>Renames the way the engine does: both endpoints leased exclusively, in a fixed order.</summary>
   private static void _Rename(HandleTable table, string from, string to) {
     var first = string.CompareOrdinal(from, to) <= 0 ? from : to;

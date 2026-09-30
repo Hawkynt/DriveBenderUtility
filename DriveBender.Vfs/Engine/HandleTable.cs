@@ -7,9 +7,13 @@
 /// </summary>
 public sealed class FileState(string normalizedPath) {
   public string Path { get; internal set; } = normalizedPath;
-  public ReaderWriterLockSlim Lock { get; } = new(LockRecursionPolicy.NoRecursion);
+  public FileLock Lock { get; } = new();
 
-  /// <summary>Total pins keeping this state alive: open handles PLUS outstanding path leases.</summary>
+  /// <summary>
+  /// Total pins keeping this state alive: open handles PLUS outstanding path leases. Changed only
+  /// atomically: a lease on a path that is already pinned adds its pin WITHOUT the table's lock (see
+  /// <see cref="HandleTable.TryPinLive"/>); every transition to or from zero still happens under it.
+  /// </summary>
   internal int RefCount;
 
   /// <summary>
@@ -103,8 +107,11 @@ public sealed class HandleTable {
     }
   }
 
-  private readonly Dictionary<long, OpenHandle> _handles = [];
-  private readonly Dictionary<string, FileState> _files = new(PoolPaths.PathComparer);
+  // Both maps are READ without the lock and WRITTEN only under it. Every read of a file resolves its
+  // handle and leases its path, which was four trips through this one monitor per read; measured,
+  // twenty threads of cached reads then spent more than half the read path queueing here.
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<long, OpenHandle> _handles = new();
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, FileState> _files = new(PoolPaths.PathComparer);
   private readonly Lock _lock = new();
   private long _nextHandle;
 
@@ -137,14 +144,15 @@ public sealed class HandleTable {
   private PathLease? _Acquire(string normalizedPath, bool write, TimeSpan timeout) {
     var deadline = timeout == Timeout.InfiniteTimeSpan ? DateTime.MaxValue : DateTime.UtcNow + timeout;
     while (true) {
-      FileState file;
-      lock (this._lock) {
-        if (!this._files.TryGetValue(normalizedPath, out var existing))
-          this._files.Add(normalizedPath, existing = new(normalizedPath));
+      // pin the state so it survives until the lease is released — without the lock when the path
+      // is already pinned by somebody else, which is every read through an open handle
+      if (!this._files.TryGetValue(normalizedPath, out var file) || !TryPinLive(file))
+        lock (this._lock) {
+          if (!this._files.TryGetValue(normalizedPath, out file))
+            this._files[normalizedPath] = file = new(normalizedPath);
 
-        file = existing;
-        ++file.RefCount; // pin the state so it survives until the lease is released
-      }
+          Interlocked.Increment(ref file.RefCount);
+        }
 
       // NEVER block on the file lock while holding the table lock — Open/Close would stall.
       // A zero timeout is a legitimate "try once, do not wait" (the drainer and heal use it to
@@ -166,9 +174,10 @@ public sealed class HandleTable {
         return null;
       }
 
-      lock (this._lock)
-        if (this._files.TryGetValue(normalizedPath, out var current) && ReferenceEquals(current, file))
-          return new(this, file, write); // still the path's state — the lease is meaningful
+      // No lock needed for the check: the map changes only under the table's lock, a rename that
+      // repoints this path needs the lock we now hold, and our pin keeps the state from retiring.
+      if (this._files.TryGetValue(normalizedPath, out var current) && ReferenceEquals(current, file))
+        return new(this, file, write); // still the path's state — the lease is meaningful
 
       // superseded while we waited: release and resolve again
       if (write)
@@ -189,38 +198,68 @@ public sealed class HandleTable {
   /// same path — the mutual exclusion is only as good as the one-state-per-path invariant.
   /// </summary>
   internal void _ReleaseState(FileState file) {
+    // not the last pin: dropped without the lock, since the state cannot retire here
+    for (var pins = Volatile.Read(ref file.RefCount); pins > 1; pins = Volatile.Read(ref file.RefCount))
+      if (Interlocked.CompareExchange(ref file.RefCount, pins - 1, pins) == pins)
+        return;
+
     lock (this._lock)
-      if (--file.RefCount == 0 && this._files.TryGetValue(file.Path, out var current) && ReferenceEquals(current, file))
-        this._files.Remove(file.Path);
+      this._UnpinLocked(file);
+  }
+
+  /// <summary>
+  /// Adds a pin to a state that is ALREADY pinned, without the table's lock; false when it has no
+  /// pins left. A state reaches zero only under the lock, and is unkeyed in the same locked step, so
+  /// refusing to go up from zero is what keeps a lock-free pin off a state that is being retired —
+  /// the caller then takes the lock and resolves the path again.
+  /// </summary>
+  internal static bool TryPinLive(FileState file) {
+    for (var pins = Volatile.Read(ref file.RefCount); pins > 0; pins = Volatile.Read(ref file.RefCount))
+      if (Interlocked.CompareExchange(ref file.RefCount, pins + 1, pins) == pins)
+        return true;
+
+    return false;
+  }
+
+  /// <summary>Drops one pin, unkeying the state when it was the last; the caller holds the table's lock.</summary>
+  private void _UnpinLocked(FileState file) {
+    if (Interlocked.Decrement(ref file.RefCount) == 0 && this._files.TryGetValue(file.Path, out var current) && ReferenceEquals(current, file))
+      this._files.TryRemove(file.Path, out _);
+  }
+
+  /// <summary>Paths the table currently holds a state for — handles and leases alike. Diagnostics.</summary>
+  public int TrackedPathCount {
+    get {
+      lock (this._lock)
+        return this._files.Count;
+    }
   }
 
   public OpenHandle Open(string normalizedPath, AccessMode access) {
     lock (this._lock) {
       if (!this._files.TryGetValue(normalizedPath, out var file))
-        this._files.Add(normalizedPath, file = new(normalizedPath));
+        this._files[normalizedPath] = file = new(normalizedPath);
 
-      ++file.RefCount;
+      Interlocked.Increment(ref file.RefCount);
       ++file.HandleCount;
       ++file.AppHandleCount;
       if ((access & AccessMode.Write) != 0)
         ++file.WriteHandleCount;
       var handle = new NodeHandle(++this._nextHandle);
       var open = new OpenHandle(handle, file, access);
-      this._handles.Add(handle.Value, open);
+      this._handles[handle.Value] = open;
       return open;
     }
   }
 
-  public OpenHandle Get(NodeHandle handle) {
-    lock (this._lock)
-      return this._handles.TryGetValue(handle.Value, out var open)
-        ? open
-        : throw new PoolFsException(PoolFsError.StaleHandle, $"Handle {handle.Value} is not open");
-  }
+  public OpenHandle Get(NodeHandle handle)
+    => this._handles.TryGetValue(handle.Value, out var open)
+      ? open
+      : throw new PoolFsException(PoolFsError.StaleHandle, $"Handle {handle.Value} is not open");
 
   public void Close(NodeHandle handle) {
     lock (this._lock) {
-      if (!this._handles.Remove(handle.Value, out var open))
+      if (!this._handles.TryRemove(handle.Value, out var open))
         throw new PoolFsException(PoolFsError.StaleHandle, $"Handle {handle.Value} is not open");
 
       // the map is concurrent, so a Read racing this Close cannot corrupt it; the worst case is a
@@ -235,8 +274,7 @@ public sealed class HandleTable {
         --open.File.AppHandleCount;
       }
 
-      if (--open.File.RefCount == 0 && this._files.TryGetValue(open.File.Path, out var current) && ReferenceEquals(current, open.File))
-        this._files.Remove(open.File.Path); // only ever unkey OUR OWN entry (see _ReleaseState)
+      this._UnpinLocked(open.File); // only ever unkeys OUR OWN entry (see _ReleaseState)
     }
   }
 
@@ -261,16 +299,12 @@ public sealed class HandleTable {
   /// adapter may legitimately send twice (a cleanup after a close), where a stale handle is an
   /// ordinary answer rather than an error.
   /// </summary>
-  public OpenHandle? TryGet(NodeHandle handle) {
-    lock (this._lock)
-      return this._handles.TryGetValue(handle.Value, out var open) ? open : null;
-  }
+  public OpenHandle? TryGet(NodeHandle handle)
+    => this._handles.TryGetValue(handle.Value, out var open) ? open : null;
 
   /// <summary>The path a handle refers to, or null when it is already gone.</summary>
-  public string? TryGetPath(NodeHandle handle) {
-    lock (this._lock)
-      return this._handles.TryGetValue(handle.Value, out var open) ? open.File.Path : null;
-  }
+  public string? TryGetPath(NodeHandle handle)
+    => this._handles.TryGetValue(handle.Value, out var open) ? open.File.Path : null;
 
   /// <summary>
   /// Records that the APPLICATION has closed this handle, even though the handle itself stays
@@ -300,7 +334,7 @@ public sealed class HandleTable {
   /// </summary>
   public void RenamePath(string fromNormalized, string toNormalized) {
     lock (this._lock) {
-      if (!this._files.Remove(fromNormalized, out var file))
+      if (!this._files.TryRemove(fromNormalized, out var file))
         return;
 
       file.Path = toNormalized;
@@ -313,8 +347,9 @@ public sealed class HandleTable {
     lock (this._lock) {
       var fromPrefix = fromNormalized + "/";
       foreach (var key in this._files.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray()) {
-        var file = this._files[key];
-        this._files.Remove(key);
+        if (!this._files.TryRemove(key, out var file))
+          continue;
+
         file.Path = toNormalized + "/" + key[fromPrefix.Length..];
         this._files[file.Path] = file;
       }

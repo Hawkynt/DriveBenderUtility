@@ -83,11 +83,19 @@ public static class PoolPaths {
     if (result.Contains("//"))
       result = string.Join('/', result.Split('/', StringSplitOptions.RemoveEmptyEntries));
 
-    foreach (var segment in result.Split('/'))
+    // walked as spans, not Split: every read, write and stat normalises its path, and splitting
+    // allocated an array plus one string per folder level each time only to look at them
+    for (var rest = result.AsSpan(); ;) {
+      var slash = rest.IndexOf('/');
+      var segment = slash < 0 ? rest : rest[..slash];
       if (segment is ".." or ".")
         throw new PoolFsException(PoolFsError.InvalidArgument, $"Path must not contain relative segments: {relativePath}");
 
-    return result;
+      if (slash < 0)
+        return result;
+
+      rest = rest[(slash + 1)..];
+    }
   }
 
   /// <summary>

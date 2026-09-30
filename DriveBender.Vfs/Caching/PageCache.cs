@@ -31,16 +31,29 @@ public sealed record CacheStatistics(long Hits, long Misses, long Bytes, int Ent
 /// never contend with each other and no lock ordering exists to get wrong. A single global lock
 /// meant every cached read in the process — including the parallel mirror-split and prefetch
 /// loads that exist precisely to use several disks at once — queued behind one another.
+///
+/// A HIT takes no lock at all. Every change to a pool's block map still happens under its lock,
+/// paired with the matching change to the eviction policy and the per-path index, so the three
+/// never disagree; a hit only reads the (concurrent) map, and records its recency only when the lock
+/// happens to be free. Measured: twenty threads of cached 4 KiB reads on one pool spent most of the
+/// read path queueing on this lock just to bump a counter and an LRU list.
 /// </summary>
-public sealed class PageCache(EvictionPolicy policy, int blockSize) {
+public sealed class PageCache(Func<ICacheEvictionPolicy<PageKey>> newPolicy, int blockSize) {
 
-  private sealed class PoolShard(EvictionPolicy policy) {
+  public PageCache(EvictionPolicy policy, int blockSize)
+    : this(() => EvictionPolicyFactory.Create<PageKey>(policy), blockSize) { }
+
+  private sealed class PoolShard(ICacheEvictionPolicy<PageKey> policy) {
 
     /// <summary>Guards everything below. Taken alone, never while holding another shard's lock.</summary>
     public readonly Lock Lock = new();
 
-    public readonly ICacheEvictionPolicy<PageKey> Policy = EvictionPolicyFactory.Create<PageKey>(policy);
-    public readonly Dictionary<PageKey, byte[]> Blocks = [];
+    public readonly ICacheEvictionPolicy<PageKey> Policy = policy;
+    /// <summary>Read without <see cref="Lock"/> by a hit; every write to it happens under the lock.</summary>
+    public readonly System.Collections.Concurrent.ConcurrentDictionary<PageKey, byte[]> Blocks = new();
+
+    /// <summary>The map's size, kept under the lock: a concurrent map's own Count takes all its internal locks.</summary>
+    public int Count;
 
     /// <summary>
     /// path → its cached block indices. InvalidatePath runs on EVERY mutation, and without
@@ -53,11 +66,11 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
     /// <summary>Occupancy. Read WITHOUT the shard lock during victim selection, so it moves atomically.</summary>
     public long Bytes;
 
-    public long Hits;
-    public long Misses;
+    public readonly StripedCounter Hits = new();
+    public readonly StripedCounter Misses = new();
     public double Weight = 1.0;
 
-    /// <summary>Bumped on every invalidation — lets a lock-free prefetch reject a stale late Put.</summary>
+    /// <summary>Bumped (under <see cref="Lock"/>) on every invalidation — lets a lock-free prefetch reject a stale late Put.</summary>
     public long Epoch;
 
     public void Track(PageKey key) {
@@ -75,11 +88,12 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
     /// <summary>Drops every block; the caller holds <see cref="Lock"/>. The epoch deliberately SURVIVES.</summary>
     public void Clear() {
       this.Blocks.Clear();
+      this.Count = 0;
       this.ByPath.Clear();
       this.Policy.Clear();
       Interlocked.Exchange(ref this.Bytes, 0);
-      this.Hits = 0;
-      this.Misses = 0;
+      this.Hits.Reset();
+      this.Misses.Reset();
     }
   }
 
@@ -108,22 +122,31 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
       shard.Weight = Math.Max(double.Epsilon, weight);
   }
 
-  private PoolShard _Shard(Guid poolId) => this._shards.GetOrAdd(poolId, static (_, p) => new(p), policy);
+  private PoolShard _Shard(Guid poolId) => this._shards.GetOrAdd(poolId, static (_, factory) => new(factory()), newPolicy);
 
   public bool TryGet(PageKey key, out byte[] block) {
     var shard = this._Shard(key.PoolId);
-    lock (shard.Lock) {
-      if (shard.Blocks.TryGetValue(key, out var found)) {
-        ++shard.Hits;
-        shard.Policy.OnAccess(key);
-        block = found;
-        return true;
-      }
-
-      ++shard.Misses;
+    if (!shard.Blocks.TryGetValue(key, out var found)) {
+      shard.Misses.Increment();
       block = [];
       return false;
     }
+
+    shard.Hits.Increment();
+
+    // Recency is a hint to eviction, so a hit never WAITS to record it. It is recorded only while
+    // this exact block is still the key's: a policy told about a key it no longer tracks may re-admit
+    // it (ARC and SLRU promote on access), and then map and policy would disagree about what exists.
+    if (shard.Lock.TryEnter())
+      try {
+        if (shard.Blocks.TryGetValue(key, out var current) && ReferenceEquals(current, found))
+          shard.Policy.OnAccess(key);
+      } finally {
+        shard.Lock.Exit();
+      }
+
+    block = found;
+    return true;
   }
 
   public void Put(PageKey key, byte[] block) {
@@ -138,11 +161,7 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
   }
 
   /// <summary>The current invalidation epoch of a pool — captured before a lock-free background load.</summary>
-  public long EpochOf(Guid poolId) {
-    var shard = this._Shard(poolId);
-    lock (shard.Lock)
-      return shard.Epoch;
-  }
+  public long EpochOf(Guid poolId) => Interlocked.Read(ref this._Shard(poolId).Epoch);
 
   /// <summary>
   /// Inserts a block only if the pool has not been invalidated since <paramref name="expectedEpoch"/>
@@ -171,7 +190,8 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
       return;
     }
 
-    shard.Blocks.Add(key, block);
+    shard.Blocks[key] = block;
+    ++shard.Count;
     shard.Track(key);
     Interlocked.Add(ref shard.Bytes, block.Length);
     Interlocked.Add(ref totalBytes, block.Length);
@@ -184,15 +204,16 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
       return;
 
     lock (shard.Lock) {
-      ++shard.Epoch; // any in-flight background load's Put for this pool is now rejected
+      Interlocked.Increment(ref shard.Epoch); // any in-flight background load's Put for this pool is now rejected
       if (!shard.ByPath.Remove(path, out var blocks))
         return; // nothing of this path is cached — O(1), not a scan of the whole shard
 
       foreach (var blockIndex in blocks) {
         var key = new PageKey(poolId, path, blockIndex);
-        if (!shard.Blocks.Remove(key, out var block))
+        if (!shard.Blocks.TryRemove(key, out var block))
           continue;
 
+        --shard.Count;
         Interlocked.Add(ref shard.Bytes, -block.Length);
         Interlocked.Add(ref this._totalBytes, -block.Length);
         shard.Policy.Remove(key);
@@ -211,7 +232,7 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
       return;
 
     lock (shard.Lock) {
-      ++shard.Epoch;
+      Interlocked.Increment(ref shard.Epoch);
       Interlocked.Add(ref this._totalBytes, -Interlocked.Read(ref shard.Bytes));
       shard.Clear();
     }
@@ -222,7 +243,7 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
       return new(0, 0, 0, 0);
 
     lock (shard.Lock)
-      return new(shard.Hits, shard.Misses, Interlocked.Read(ref shard.Bytes), shard.Blocks.Count);
+      return new(shard.Hits.Value, shard.Misses.Value, Interlocked.Read(ref shard.Bytes), shard.Count);
   }
 
   private void _EvictUntilWithinBudget() {
@@ -268,9 +289,10 @@ public sealed class PageCache(EvictionPolicy policy, int blockSize) {
         if (victim == null)
           return false;
 
-        if (!shard.Blocks.Remove(victim, out var block))
+        if (!shard.Blocks.TryRemove(victim, out var block))
           continue; // the policy named a key the shard no longer holds — drop it and keep going
 
+        --shard.Count;
         shard.Untrack(victim);
         Interlocked.Add(ref shard.Bytes, -block.Length);
         Interlocked.Add(ref this._totalBytes, -block.Length);

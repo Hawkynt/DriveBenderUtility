@@ -2484,28 +2484,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         // all of its readers behind a single monitor on the hottest path there is. The state itself
         // is per HANDLE, so the lock below contends only with the same caller's own reads.
         var state = lease.File.ReadAhead.GetOrAdd(handle.Value,
-          _ => new ReadAheadState(this._readAheadMin, this._readAheadMax, this._readAheadAdaptive));
+          static (_, fs) => new ReadAheadState(fs._readAheadMin, fs._readAheadMax, fs._readAheadAdaptive), this);
 
         long prefetchBytes;
         lock (state)
           prefetchBytes = state.OnRead(offset, count);
 
-        // background prefetch (FR-RA): the window loads on the thread pool so the foreground read
-        // returns at once. Up to _MAX_PREFETCH_CHAINS run at a time, so window N+1 is already on
-        // its way while N is being consumed; a second chain that overlaps the first costs nothing
-        // extra because _LoadBlock single-flights and _Prefetch skips blocks already in flight.
-        if (prefetchBytes > 0 && this._TryBeginPrefetch(path)) {
-          var from = offset + count;
-          ThreadPool.QueueUserWorkItem(_ => {
-            try {
-              this._Prefetch(dataPath, copies, from, prefetchBytes, length, durableExpected ? length : 0);
-            } catch (Exception) {
-              // prefetch is strictly best-effort — the foreground read surfaces real errors
-            } finally {
-              this._EndPrefetch(path);
-            }
-          });
-        }
+        if (prefetchBytes > 0 && this._TryBeginPrefetch(path))
+          this._StartPrefetch(path, dataPath, copies, offset + count, prefetchBytes, length, durableExpected ? length : 0);
       }
 
       return count;
@@ -2513,6 +2499,27 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // the lease's own dispose releases the lock
     }
   }
+
+  /// <summary>
+  /// Background prefetch (FR-RA): the window loads on the thread pool so the foreground read
+  /// returns at once. Up to _MAX_PREFETCH_CHAINS run at a time, so window N+1 is already on its way
+  /// while N is being consumed; a second chain that overlaps the first costs nothing extra because
+  /// _LoadBlock single-flights and _Prefetch skips blocks already in flight.
+  ///
+  /// A method of its own for the sake of the READ, not the prefetch: a lambda inside Read captures
+  /// Read's locals, and C# allocates that closure where those locals are declared — at the top of
+  /// the method, on every read, whether a prefetch is started or not.
+  /// </summary>
+  private void _StartPrefetch(string path, string dataPath, IReadOnlyList<PhysicalCopy> copies, long from, long prefetchBytes, long length, long fileLength)
+    => ThreadPool.QueueUserWorkItem(_ => {
+      try {
+        this._Prefetch(dataPath, copies, from, prefetchBytes, length, fileLength);
+      } catch (Exception) {
+        // prefetch is strictly best-effort — the foreground read surfaces real errors
+      } finally {
+        this._EndPrefetch(path);
+      }
+    });
 
   /// <summary>
   /// The order in which a block's copies are tried (FR-MIRROR, FR-STRIPE-READY): readiest first,
@@ -3008,9 +3015,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (offset < 0)
       throw new PoolFsException(PoolFsError.InvalidArgument, "Negative offset");
 
-    // a private array the driver's span is copied into ONCE: it is handed to the copies, then
-    // (if owed) to the write buffer, which takes ownership of it rather than cloning again
-    var bytes = data.ToArray();
+    // The driver's span is copied ONCE, into one of two kinds of array. Where the pool may KEEP the
+    // bytes — the RAM ack, a copy that can be owed — it is a private array the write buffer takes
+    // over as it is. Where every copy (or, striped, every disk of the block) takes the write before
+    // it returns, nothing keeps it, so it is a pooled buffer given back on the way out: this used to
+    // be a fresh array on every write, and an 8 MiB write put 8 MiB of garbage on the large object
+    // heap. The disks are written from a SPAN of it, so no stream can hold on to the pooled array.
+    var length = data.Length;
+    byte[]? owned = null;
+    byte[]? rented = null;
     using var gate = this._EnterNamespaceShared(); // before the lease: a folder rename must not move the file mid-write
     using var lease = this._handles.AcquireWrite(open.File.Path); // by PATH — see Read
     try {
@@ -3021,14 +3034,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         if (mode == WriteMode.Append)
           offset = stripe.Length;
 
-        this._RehomeIfOutgrown(path, stripe, offset + bytes.Length);
-        stripe.Write(offset, bytes); // the private array made above: the session takes it as it is
+        this._RehomeIfOutgrown(path, stripe, offset + length);
+        rented = System.Buffers.ArrayPool<byte>.Shared.Rent(length);
+        data.CopyTo(rented);
+        stripe.Write(offset, rented, length); // on every disk it needs before this returns; the session keeps none of it
         this._InvalidateChecksums(dataPath);
         this._cache.Pages.InvalidatePath(this._poolId, dataPath);
         this._cache.Metadata.InvalidatePath(this._poolId, path);
-        this._activity.Publish(ActivityKind.Write, path, bytes.Length, reason: "striped");
+        this._activity.Publish(ActivityKind.Write, path, length, reason: "striped");
         this._writeWatch.Changed(path);
-        return bytes.Length;
+        return length;
       }
 
       IReadOnlyList<PhysicalCopy> copies = this._placement.ResolveCopies(dataPath);
@@ -3054,11 +3069,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       // performance + acceptVolatileAck: the ack may come from RAM alone — an explicit,
       // per-folder opt-in (SAFE-RAM); fsync still forces durability (SAFE-FSYNC)
-      if (volatileAck && this._writeBuffer.StageWrite(path, offset, bytes, 0, 0)) {
+      if (volatileAck && this._writeBuffer.StageWrite(path, offset, owned = data.ToArray(), 0, 0)) {
         this._cache.Pages.InvalidatePath(this._poolId, path);
         this._cache.Metadata.InvalidatePath(this._poolId, path);
         this._writeWatch.Changed(path);
-        return bytes.Length;
+        return length;
       }
 
       // copies on members without a durable flush can never satisfy the ack quorum and
@@ -3117,6 +3132,20 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var mayOwe = requiredCopies < copies.Count;
       var ackCopy = copies[0];
 
+      // Where no copy can be owed, the ack quorum IS every copy: the write either lands on all of
+      // them or throws, so the buffer never outlives this call and a pooled one will do.
+      byte[] bytes;
+      if (owned != null || mayOwe)
+        bytes = owned ??= data.ToArray();
+      else {
+        bytes = rented = System.Buffers.ArrayPool<byte>.Shared.Rent(length);
+        data.CopyTo(rented);
+      }
+
+      // the array the write buffer may keep — the one above, unless that is the pooled one (which a
+      // quorum of every copy means is never needed; this is the guard, not a path taken)
+      byte[] Kept() => owned ??= bytes.AsSpan(0, length).ToArray();
+
       // Where every copy takes every write before it returns (the default: as many required copies as
       // there are copies), the per-write intent only guards the moment copies could disagree — a
       // power cut DURING a write. One intent can guard a whole edit session just as well: logged,
@@ -3131,7 +3160,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       var sequence = staged || !mayOwe
         ? 0L
-        : this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length,
+        : this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: length,
           memberId: ackCopy.Volume.MemberId, shadow: ackCopy.Shadow);
 
       // Nor does a copy OWED into a staging temp: the same reasoning, one step later. The temp is
@@ -3141,7 +3170,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       long OwedIntent() => staged ? 0
         : sequence != 0
           ? sequence
-          : sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length,
+          : sequence = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: length,
             memberId: ackCopy.Volume.MemberId, shadow: ackCopy.Shadow);
 
       void CompleteIfLogged() {
@@ -3156,7 +3185,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // member's copy stays owed, served later from the write-back cache, never re-read from the
       // broken storage
       var appliedFlags = new bool[copies.Count];
-      this._WriteAckQuorum(copies, requiredCopies, dataPath, bytes, offset, appliedFlags);
+      this._WriteAckQuorum(copies, requiredCopies, dataPath, bytes, length, offset, appliedFlags);
       var appliedCount = appliedFlags.Count(f => f);
 
       // The named copy failed and another took the write (mid-write failover): name the copy that
@@ -3165,7 +3194,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (!appliedFlags[0] && Array.IndexOf(appliedFlags, true) is var holder and >= 0) {
         ackCopy = copies[holder]; // any intent logged from here on names the copy that really has it
         if (mayOwe && sequence != 0) {
-          var corrected = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: bytes.Length,
+          var corrected = this._journal.LogIntent(JournalOp.Write, dataPath, offset: offset, length: length,
             memberId: ackCopy.Volume.MemberId, shadow: ackCopy.Shadow);
           this._journal.Complete(sequence, JournalOp.Write);
           sequence = corrected;
@@ -3175,52 +3204,56 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (appliedCount >= copies.Count) {
         // every copy now durably holds these bytes: any older buffered write of this range is
         // obsolete and must not later flush over them (SAFE-NOLOSS)
-        this._writeBuffer.Supersede(path, offset, bytes.Length);
+        this._writeBuffer.Supersede(path, offset, length);
         CompleteIfLogged();
       }
       else if (policy == WritePolicy.WriteThrough) {
         // write-through: apply the remaining copies now (best effort); a copy that fails stays
         // owed under the open intent so recovery reconciles it (SAFE-REMOTE)
         mirroredNow = true;
-        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset)) {
-          this._writeBuffer.Supersede(path, offset, bytes.Length);
+        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, length, offset)) {
+          this._writeBuffer.Supersede(path, offset, length);
           CompleteIfLogged();
         } else
-          this._StageWithThrottle(path, offset, bytes, OwedIntent(), appliedCount); // hold the block for the lagging copy
+          this._StageWithThrottle(path, offset, Kept(), OwedIntent(), appliedCount); // hold the block for the lagging copy
       }
-      else if (!this._StageWithThrottle(path, offset, bytes, OwedIntent(), appliedCount)) {
+      else if (!this._StageWithThrottle(path, offset, Kept(), OwedIntent(), appliedCount)) {
         // buffer full even after throttling: degrade to synchronous catch-up (FR-BACKP)
         mirroredNow = true;
-        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, offset)) {
-          this._writeBuffer.Supersede(path, offset, bytes.Length);
+        if (this._TryWriteRemaining(copies, appliedFlags, dataPath, bytes, length, offset)) {
+          this._writeBuffer.Supersede(path, offset, length);
           CompleteIfLogged(); // OwedIntent ran in the condition above, so there is always one here
         }
         // else: the intent stays open — recovery reconciles the copies that never took the block
       }
 
-      this._activity.Publish(ActivityKind.Write, path, bytes.Length, toMember: copies.Count > 0 ? copies[0].Volume.DisplayName : null, reason: policy.ToString());
+      this._activity.Publish(ActivityKind.Write, path, length, toMember: copies.Count > 0 ? copies[0].Volume.DisplayName : null, reason: policy.ToString());
       // the mirrored copy is its own visible movement (FR-UI-MAP: the duplicate leg to the second member)
       if (mirroredNow && copies.Count > 1)
-        this._activity.Publish(ActivityKind.Duplicate, path, bytes.Length, fromMember: copies[0].Volume.DisplayName, toMember: copies[1].Volume.DisplayName, reason: "mirrored write");
+        this._activity.Publish(ActivityKind.Duplicate, path, length, fromMember: copies[0].Volume.DisplayName, toMember: copies[1].Volume.DisplayName, reason: "mirrored write");
 
       // coherency: a read after this write must return the new bytes (SAFE-COHERE)
       this._InvalidateChecksums(dataPath);
       this._cache.Pages.InvalidatePath(this._poolId, dataPath);
       this._cache.Metadata.InvalidatePath(this._poolId, path);
       this._writeWatch.Changed(path); // after the bytes landed: a copy racing this write sees it at its commit
-      return bytes.Length;
+      return length;
     } finally {
-      // the lease's own dispose releases the lock
+      // the lease's own dispose releases the lock; every copy has finished with the pooled buffer —
+      // the quorum and catch-up writes are joined before they return
+      if (rented != null)
+        System.Buffers.ArrayPool<byte>.Shared.Return(rented);
     }
   }
 
-  private void _WriteOneCopy(PhysicalCopy copy, string path, byte[] bytes, long offset) {
+  /// <param name="length">How many of <paramref name="bytes"/> to write — a pooled array is longer than its content.</param>
+  private void _WriteOneCopy(PhysicalCopy copy, string path, byte[] bytes, int length, long offset) {
     this._BeginIo(copy.Volume.MemberId); // visible to the readiness selector while queued
     try {
-      using var admission = this._queues.Enter(copy.Volume, IoKind.Write, bytes.Length); // the device's queue, not the member's
+      using var admission = this._queues.Enter(copy.Volume, IoKind.Write, length); // the device's queue, not the member's
       using var stream = copy.Volume.OpenWrite(path, copy.Shadow, false);
       stream.Seek(offset, SeekOrigin.Begin);
-      stream.Write(bytes, 0, bytes.Length);
+      stream.Write(bytes.AsSpan(0, length)); // a span: a stream that keeps what it is given has to copy it
 
       // Durability barrier per copy (SAFE-FSYNC) — except into a staging temp. A barrier there
       // makes nothing durable that a crash could keep: recovery deletes unpublished temps outright.
@@ -3242,12 +3275,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// so the driver's write still succeeds — its owed copy converges from the write cache later.
   /// Throws only when the quorum itself is unreachable.
   /// </summary>
-  private void _WriteAckQuorum(IReadOnlyList<PhysicalCopy> copies, int requiredCopies, string path, byte[] bytes, long offset, bool[] appliedFlags) {
+  private void _WriteAckQuorum(IReadOnlyList<PhysicalCopy> copies, int requiredCopies, string path, byte[] bytes, int length, long offset, bool[] appliedFlags) {
     var target = Math.Min(requiredCopies, copies.Count);
     var errors = new Exception?[copies.Count];
     _ForEachIndex(target, _ParallelOver(copies, target), i => {
       try {
-        this._WriteOneCopy(copies[i], path, bytes, offset);
+        this._WriteOneCopy(copies[i], path, bytes, length, offset);
         appliedFlags[i] = true;
       } catch (Exception e) {
         errors[i] = e;
@@ -3264,10 +3297,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var succeeded = appliedFlags.Count(f => f);
     for (var i = target; i < copies.Count && succeeded < target; ++i)
       try {
-        this._WriteOneCopy(copies[i], path, bytes, offset);
+        this._WriteOneCopy(copies[i], path, bytes, length, offset);
         appliedFlags[i] = true;
         ++succeeded;
-        this._activity.Publish(ActivityKind.Recovery, path, bytes.Length, toMember: copies[i].Volume.DisplayName,
+        this._activity.Publish(ActivityKind.Recovery, path, length, toMember: copies[i].Volume.DisplayName,
           reason: "block redirected — a storage failed mid-write; its copy stays owed from the write cache");
       } catch (PoolFsException e) {
         lastError = e;
@@ -3278,7 +3311,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   /// <summary>Best-effort application to every copy not yet holding the block; true = all copies have it now.</summary>
-  private bool _TryWriteRemaining(IReadOnlyList<PhysicalCopy> copies, bool[] appliedFlags, string path, byte[] bytes, long offset) {
+  private bool _TryWriteRemaining(IReadOnlyList<PhysicalCopy> copies, bool[] appliedFlags, string path, byte[] bytes, int length, long offset) {
     // count the copies that actually still owe the block: parallelising over the whole copy list
     // scheduled a task per copy even when all but one were already applied
     var pending = 0;
@@ -3291,7 +3324,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         return;
 
       try {
-        this._WriteOneCopy(copies[i], path, bytes, offset);
+        this._WriteOneCopy(copies[i], path, bytes, length, offset);
         appliedFlags[i] = true;
       } catch (Exception) {
         // stays owed — the open journal intent covers it

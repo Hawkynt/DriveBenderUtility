@@ -129,26 +129,33 @@ public sealed class StripeSession {
       this.Write(offset, data.ToArray()); // copied once: the dispatch runs on several threads, which a span cannot cross
   }
 
-  /// <summary>As <see cref="Write(long, ReadOnlySpan{byte})"/>, taking an array the caller no longer changes — no copy.</summary>
-  public void Write(long offset, byte[] bytes) {
-    if (bytes.Length == 0)
+  /// <summary>As <see cref="Write(long, ReadOnlySpan{byte})"/>, taking an array the caller does not change during the call — no copy.</summary>
+  public void Write(long offset, byte[] bytes) => this.Write(offset, bytes, bytes.Length);
+
+  /// <summary>
+  /// Writes the first <paramref name="count"/> bytes of <paramref name="bytes"/> — a pooled buffer is
+  /// longer than its content. Every disk has its share before this returns, and the session keeps
+  /// nothing of the array, so the caller may reuse it at once.
+  /// </summary>
+  public void Write(long offset, byte[] bytes, int count) {
+    if (count <= 0)
       return;
 
     this.PendingLastWriteTimeUtc = null; // written after it was stamped: the write's time is the file's
 
     var first = offset / this.BlockSize;
-    var last = (offset + bytes.Length - 1) / this.BlockSize;
+    var last = (offset + count - 1) / this.BlockSize;
 
     PoolFsException? lastError = null;
     for (var attempt = 0; ; ++attempt) {
       var plan = this._Plan(first, last, this._CopiesNow(lastError));
-      var failures = this._Dispatch(plan, offset, bytes);
+      var failures = this._Dispatch(plan, offset, bytes, count);
       if (failures.Count == 0) {
         lock (this._lock) {
           foreach (var (block, mask) in plan.Assignments)
             this._holders[block] = mask;
 
-          this.Length = Math.Max(this.Length, offset + bytes.Length);
+          this.Length = Math.Max(this.Length, offset + count);
         }
 
         return;
@@ -392,9 +399,9 @@ public sealed class StripeSession {
   }
 
   /// <summary>Writes each disk's share of the call — contiguous runs, disks in parallel; returns the disks that failed, and why.</summary>
-  private List<(int Index, PoolFsException Error)> _Dispatch(Plan plan, long offset, byte[] bytes) {
+  private List<(int Index, PoolFsException Error)> _Dispatch(Plan plan, long offset, byte[] bytes, int count) {
     var perMember = new List<(long From, int Start, int Length)>[this._members.Count];
-    var end = offset + bytes.Length;
+    var end = offset + count;
     foreach (var (block, mask) in plan.Assignments) {
       var from = Math.Max(offset, block * this.BlockSize);
       var to = Math.Min(end, (block + 1) * this.BlockSize);

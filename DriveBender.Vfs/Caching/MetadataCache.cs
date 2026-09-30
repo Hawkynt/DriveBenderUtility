@@ -25,41 +25,63 @@ public sealed record MetadataKey(Guid PoolId, string Path, MetadataKind Kind) {
 /// Metadata cache (§6.5): dir listings, stat results and path→placement resolutions,
 /// bounded by entry count, expired by TTL, and invalidated on mutation (a write to a
 /// path drops the path's entries and its parent's listing).
+///
+/// LOCKING: a hit takes no lock. Every read of a file looks up its placement AND its stat here,
+/// and when both went through one monitor, twenty threads of cached reads spent ~80% of the read
+/// path queueing on it (measured: the engine's read rate went from ~500k to ~1M/s across twenty
+/// threads, and to several million once hits stopped waiting). The map is concurrent; every
+/// CHANGE to it still happens under the lock, together with the matching change to the policy,
+/// so the two never disagree about which keys exist. A hit records its recency only when the lock
+/// is free at that instant — recency is a hint to eviction, and a single caller always records it,
+/// so an uncontended cache evicts exactly as before.
 /// </summary>
-public sealed class MetadataCache(EvictionPolicy policy, int maxEntries, TimeSpan ttl, Func<DateTime>? clock = null) {
+public sealed class MetadataCache(ICacheEvictionPolicy<MetadataKey> policy, int maxEntries, TimeSpan ttl, Func<DateTime>? clock = null) {
+
+  public MetadataCache(EvictionPolicy policy, int maxEntries, TimeSpan ttl, Func<DateTime>? clock = null)
+    : this(EvictionPolicyFactory.Create<MetadataKey>(policy, maxEntries), maxEntries, ttl, clock) { }
 
   private sealed record Entry(object Value, DateTime ExpiresUtc);
 
-  private readonly ICacheEvictionPolicy<MetadataKey> _policy = EvictionPolicyFactory.Create<MetadataKey>(policy, maxEntries);
-  private readonly Dictionary<MetadataKey, Entry> _entries = [];
+  private readonly ICacheEvictionPolicy<MetadataKey> _policy = policy;
+  /// <summary>Read without the lock; written only under it (see the class remarks).</summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<MetadataKey, Entry> _entries = new();
   private readonly Func<DateTime> _clock = clock ?? (static () => DateTime.UtcNow);
   private readonly Lock _lock = new();
 
-  public long Hits { get; private set; }
-  public long Misses { get; private set; }
-  public int Count {
-    get {
-      lock (this._lock)
-        return this._entries.Count;
-    }
-  }
+  /// <summary>The map's size, kept under the lock: a concurrent map's own Count takes every one of its internal locks.</summary>
+  private int _count;
+
+  public int Count => Volatile.Read(ref this._count);
 
   public bool TryGet<T>(MetadataKey key, out T value) where T : notnull {
-    lock (this._lock) {
-      if (this._entries.TryGetValue(key, out var entry) && entry.ExpiresUtc > this._clock() && entry.Value is T typed) {
-        ++this.Hits;
-        this._policy.OnAccess(key);
-        value = typed;
-        return true;
-      }
-
-      if (this._entries.Remove(key))
-        this._policy.Remove(key); // expired
-
-      ++this.Misses;
+    if (!this._entries.TryGetValue(key, out var entry)) {
       value = default!;
       return false;
     }
+
+    if (entry.ExpiresUtc > this._clock() && entry.Value is T typed) {
+      // Recency is a hint, so a hit never WAITS to record it. It is recorded only while this exact
+      // entry is still the key's — a policy told about a key it no longer tracks may re-admit it
+      // (SLRU promotes on access), and the map and the policy must never disagree.
+      if (this._lock.TryEnter())
+        try {
+          if (this._entries.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
+            this._policy.OnAccess(key);
+        } finally {
+          this._lock.Exit();
+        }
+
+      value = typed;
+      return true;
+    }
+
+    // expired, or unable to answer as T: dropped — unless a Put has replaced it meanwhile
+    lock (this._lock)
+      if (this._entries.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
+        this._RemoveLocked(key);
+
+    value = default!;
+    return false;
   }
 
   public void Put(MetadataKey key, object value) {
@@ -69,16 +91,18 @@ public sealed class MetadataCache(EvictionPolicy policy, int maxEntries, TimeSpa
         this._entries[key] = entry;
         this._policy.OnAccess(key);
       } else {
-        this._entries.Add(key, entry);
+        this._entries[key] = entry;
+        ++this._count;
         this._policy.OnInsert(key);
       }
 
-      while (this._entries.Count > maxEntries) {
+      while (this._count > maxEntries) {
         var victim = this._policy.SelectVictim();
         if (victim == null)
           break;
 
-        this._entries.Remove(victim);
+        if (this._entries.TryRemove(victim, out _))
+          --this._count;
       }
     }
   }
@@ -89,21 +113,24 @@ public sealed class MetadataCache(EvictionPolicy policy, int maxEntries, TimeSpa
     var parent = PoolPaths.GetParent(normalized);
     lock (this._lock) {
       foreach (var kind in Enum.GetValues<MetadataKind>())
-        this._Remove(new(poolId, normalized, kind));
+        this._RemoveLocked(new(poolId, normalized, kind));
 
-      this._Remove(new(poolId, parent, MetadataKind.DirectoryListing));
+      this._RemoveLocked(new(poolId, parent, MetadataKind.DirectoryListing));
     }
   }
 
   public void InvalidatePool(Guid poolId) {
     lock (this._lock)
       foreach (var key in this._entries.Keys.Where(k => k.PoolId == poolId).ToArray())
-        this._Remove(key);
+        this._RemoveLocked(key);
   }
 
-  private void _Remove(MetadataKey key) {
-    if (this._entries.Remove(key))
-      this._policy.Remove(key);
+  private void _RemoveLocked(MetadataKey key) {
+    if (!this._entries.TryRemove(key, out _))
+      return;
+
+    --this._count;
+    this._policy.Remove(key);
   }
 
 }
