@@ -191,11 +191,18 @@ public class MemberLossEndToEndTests {
 
     problems.Should().BeEmpty();
 
-    // everything settles: each file readable, and its copies agree
+    // everything settles: each file readable, and its copies agree.
+    //
+    // Waiting for the copies to AGREE, not merely to exist. The returned member's copy of a file
+    // last written while it was away still exists — it is simply stale until the member's resync
+    // reaches it — so "two copies" was true the instant it came back, and on a slow CI runner the
+    // check ran before the resync did (m0 matched the pool's read; m1 still held the old bytes).
+    // A copy that never converges still fails, with the copies it found.
     for (var file = 0; file < 4; ++file) {
       var settled = File.ReadAllBytes(pool.PathTo($"churn{file}.bin"));
       settled.Should().NotBeEmpty();
-      MountedPool.WaitUntil(() => pool.PhysicalCopies($"churn{file}.bin").Count >= 2, TimeSpan.FromMinutes(2));
+      MountedPool.WaitUntil(() => pool.PhysicalCopies($"churn{file}.bin") is { Count: >= 2 } copies
+                                  && copies.All(c => c.content.AsSpan().SequenceEqual(settled)), TimeSpan.FromMinutes(2));
       foreach (var (where, bytes) in pool.PhysicalCopies($"churn{file}.bin"))
         bytes.Should().Equal(settled, $"copy {where} must converge on the settled content");
     }

@@ -262,6 +262,10 @@ dbmount pool remove-media MyPool --member "E:\"                 # scatter its da
 dbmount pool replace-media MyPool --old "D:\" --new "K:\newdisk"  # migrate to a replacement disk
 ```
 
+`replace-media` adds the new disk to the pool before it moves anything, so if it
+stops part-way (a read error, a disk that's too small, a power cut) every file
+stays in the pool. Run the same command again to finish the swap.
+
 A mounted pool also **heals itself**: losing a member degrades redundancy, not
 availability — reads fail over to surviving copies and writes keep flowing (ack
 on what is reachable; opt out with `resilience.acceptDegradedWrites: false`).

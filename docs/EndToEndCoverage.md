@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36582138761](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36582138761).
+Generated from run: [36674545650](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36674545650).
 
-245 scenarios — 224 passing on at least one target, 0 failing.
+246 scenarios — 225 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -96,6 +96,7 @@ Generated from run: [36582138761](https://github.com/Hawkynt/DriveBenderUtility/
 | MediaReplace | `Replace_GivenAMemberHoldsFiles_ThenTheyAreServedFromTheReplacement` | Replacing a disk carries the ordinary files across and the pool serves them from the new one. | pass | pass |
 | MediaReplace | `Replace_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable` | Replacing the disk that holds a snapshot's preserved versions: the snapshot is still restorable afterwards. | pass | pass |
 | MediaReplace | `Replace_GivenTheMemberHoldsTheRecycleBin_ThenDeletedFilesAreStillRecoverable` | Replacing the disk that holds the recycle bin: deleted files are still listed and still restorable. | pass | pass |
+| MediaReplace | `Replace_GivenTheMigrationFailsPartWay_ThenEveryFileIsStillInThePoolAndARerunFinishesIt` | A replace that fails part-way leaves every file in the pool, and running it again finishes the job. | pass | pass |
 | MediaReplace | `Replace_GivenTheOldMemberIsOffline_ThenItIsRefusedRatherThanAbandoningItsData` | Replacing a member that is not there is refused: its data would be abandoned rather than migrated. | pass | pass |
 | MemberFailureLatency | `Cripple_GivenAMemberFailsEveryOperationWithoutGoingOffline_ThenReadsStillCompletePromptly` | A member that is still present but fails every operation is routed around: reads keep completing promptly from the healthy copy. | skipped | pass |
 | MemberFailureLatency | `Eject_GivenEveryMemberGoesAndOneComesBack_ThenItsContentIsServedAgain` | Every member goes away and one comes back: its content is served again rather than the pool staying dark. | pass | pass |
