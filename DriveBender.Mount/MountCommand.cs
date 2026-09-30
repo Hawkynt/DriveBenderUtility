@@ -54,7 +54,7 @@ internal static class MountCommand {
         IVolumeIO io = MemberSchemes.IsRemoteMember(definition)
           ? remoteResolver.OpenVolume(definition)
           : new LocalVolumeIO(m.MemberId, m.Label ?? m.ResolvedPath, m.ResolvedPath, m.PhysicalVolumeId);
-        // measured so the auto-tier advisor and the dashboard see real per-member latency (FR-AUTO-TIER)
+        // measured so placement, read routing and the dashboard see real per-member latency
         return new EngineMember(new MeasuredVolumeIO(io), m.Role, m.ReserveBytes, m.MaxIops, m.MaxThroughput) {
           Limits = m.Limits,
         };
@@ -157,39 +157,6 @@ internal static class MountCommand {
     } catch (Exception e) {
       DriveBender.Logger($"[Warning]Live config reload failed: {e.Message}");
       return null;
-    }
-  }
-
-  /// <summary>
-  /// Auto landing-zone pass (FR-AUTO-TIER, placement.autoLandingZone): feeds measured member
-  /// latencies to the advisor; on advice it re-tiers the manifest, applies the roles live and
-  /// logs why — the landing zone follows the actually-fastest drive as load shifts.
-  /// </summary>
-  private static void _AutoTier(IHostEnvironment host, ManifestStore store, PoolFileSystem fs, PoolRef pool, IVolumeIO[] ios, AutoTierAdvisor advisor) {
-    try {
-      var manifest = store.TryLoadRegistry(pool.PoolId);
-      if (manifest == null || manifest.IsVirtual)
-        return;
-
-      var speeds = ios.OfType<MeasuredVolumeIO>().Select(m => {
-        var definition = manifest.FindMember(m.MemberId);
-        return definition == null ? null : new MemberSpeed(m.MemberId, m.DisplayName, m.AverageLatencyMs, m.Samples, definition.Network, definition.Role);
-      }).Where(s => s != null).Select(s => s!).ToArray();
-
-      var advice = advisor.Advise(speeds);
-      if (advice == null)
-        return;
-
-      var lifecycle = new PoolLifecycle(host, store);
-      var updated = lifecycle.SetMemberRole(manifest, advice.PromoteToLanding, MemberRole.Landing);
-      if (advice.DemoteToCapacity is { } demoted)
-        updated = lifecycle.SetMemberRole(updated, demoted, MemberRole.Capacity);
-
-      fs.UpdateMemberRoles(updated.Members.ToDictionary(m => m.MemberId, m => m.Role));
-      fs.Activity.Publish(ActivityKind.Rebalance, "", reason: advice.Reason);
-      DriveBender.Logger($"[AutoTier]{advice.Reason}");
-    } catch (Exception e) {
-      DriveBender.Logger($"[Warning]auto-tier pass failed: {e.Message}");
     }
   }
 
@@ -369,8 +336,6 @@ internal static class MountCommand {
       var scheduler = fs.CreateScheduler();
       using var stop = new ManualResetEventSlim();
       var currentConfig = config;
-      var advisor = new AutoTierAdvisor();
-      var tick = 0L;
       // NON-REENTRANT: the timer is armed for a single shot and re-armed at the END of each tick,
       // so a slow tick (a live reload, a big metrics publish) can never overlap the next one —
       // System.Threading.Timer's periodic mode fires on a new thread-pool thread regardless, which
@@ -391,8 +356,6 @@ internal static class MountCommand {
             var cfg = currentConfig;
             new Thread(() => _RunPoolOp(fs, pool, ios, cfg, registry, opId, op)) { IsBackground = true }.Start();
           }
-          if (++tick % 30 == 0 && currentConfig.Placement?.AutoLandingZone == true)
-            _AutoTier(host, store, fs, pool, ios, advisor);
         } catch (Exception e) {
           DriveBender.Logger($"[Warning]background pump tick failed: {e.Message}");
         } finally {
@@ -466,8 +429,6 @@ internal static class MountCommand {
     var fuseMetrics = new MetricsPublisher(host);
     var fuseSmart = new MemberSmartCache(new SmartctlMonitor());
     var fuseConfig = config;
-    var fuseAdvisor = new AutoTierAdvisor();
-    var fuseTick = 0L;
     return Linux.LinuxFuseMountHost.Run(fs, target, options.ReadOnly,
       onMounted: () => registry.Register(fuseEntry),
       stopRequested: () => registry.StopRequested(pool.PoolId),
@@ -481,8 +442,6 @@ internal static class MountCommand {
           var cfg = fuseConfig;
           new Thread(() => _RunPoolOp(fs, pool, ios, cfg, registry, opId, op)) { IsBackground = true }.Start();
         }
-        if (++fuseTick % 30 == 0 && fuseConfig.Placement?.AutoLandingZone == true)
-          _AutoTier(host, store, fs, pool, ios, fuseAdvisor);
       });
 #endif
   }

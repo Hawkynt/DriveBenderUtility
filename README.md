@@ -224,9 +224,8 @@ cache-occupancy meters, a hit-rate history, and a **live flow map** — pool I/O
 RAM cache → fast tier → capacity storage — where **data blocks fly along curves**
 as reads, writes, drains and duplications actually happen, with each storage's
 measured latency shown in its node; updated once a second while pools are
-mounted. With `placement.autoLandingZone` enabled, the **landing zone follows
-the measured-fastest drive automatically** (hysteresis + cooldown prevent
-flapping; a slow or busy drive gets demoted live). From the same page you can run the
+mounted. A landing zone is always a role you give a disk; the pool never
+promotes one by itself. From the same page you can run the
 **entire lifecycle**: create a pool (pick local folders with a built-in **folder
 browser**, or add remote members whose **credentials are collected by a
 scheme-aware dialog** — user/password for FTP·WebDAV, password *or* private key

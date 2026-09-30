@@ -2115,3 +2115,10 @@ the others. So a new disk can be joined ahead of time and receive exactly the ol
 While wiring this in, the moving service turned out to ignore roles entirely: it chose targets by
 free space alone, so retiring a disk could fill a READ-ONLY member (and restoring duplication could
 too). It now never gives a read-only member a copy, and restoring duplication never uses an idle one.
+
+### Removed: the automatic landing zone
+
+`placement.autoLandingZone` let the mount promote the measured-fastest disk to landing zone, and swap
+it later, by rewriting the manifest. A landing zone is a role the operator gives a disk; the pool no
+longer assigns one by itself. The latency measurement stays, because placement and read routing weigh
+it. An old manifest that still sets the key keeps loading; the key is ignored.
