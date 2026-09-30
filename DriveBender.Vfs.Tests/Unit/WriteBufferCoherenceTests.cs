@@ -119,3 +119,56 @@ public class WriteBufferCoherenceTests {
     remote.GetContent(MemberJournalStore.JournalPath, false).Should().BeNull("the whole-file remote is never journalled to");
   }
 }
+
+/// <summary>
+/// The write buffer answers "is anything owed on this path?" without its lock, because every read
+/// asks it. What must survive that: a reader of a CLEAN path gets the disk block back untouched, a
+/// reader of a DIRTY path always gets the overlay, and the map never tears under concurrent
+/// staging, draining and renaming of other paths.
+/// </summary>
+[TestFixture]
+[Category("Unit")]
+public class WriteBufferConcurrencyTests {
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Overlay_GivenOtherPathsStagedDrainedAndRenamedConcurrently_ThenEachPathReadsItsOwnTruth() {
+    var cache = new CacheInstance("wbc" + Guid.NewGuid().ToString("N"), new() { Size = "16777216", BlockSize = "16" });
+    var buffer = new WriteBufferManager(cache);
+    buffer.StageWrite("dirty.bin", 0, [7, 7, 7, 7], 0, 1).Should().BeTrue();
+    var disk = new byte[] { 1, 2, 3, 4 };
+    var failures = new System.Collections.Concurrent.ConcurrentQueue<string>();
+    using var stop = new CancellationTokenSource();
+
+    var churn = Enumerable.Range(0, 4).Select(worker => Task.Run(() => {
+      for (var i = 0; !stop.IsCancellationRequested; ++i) {
+        var path = $"churn{worker}-{i % 16}.bin";
+        buffer.StageWrite(path, 0, [1], 0, 1);
+        if (i % 3 == 0)
+          buffer.RenamePath(path, path + ".moved");
+        buffer.Drain(path);
+        buffer.Drain(path + ".moved");
+      }
+    })).ToArray();
+
+    var readers = Enumerable.Range(0, 4).Select(reader => Task.Run(() => {
+      for (var i = 0; i < 50_000; ++i) {
+        if (!ReferenceEquals(buffer.OverlayBlock("clean.bin", 0, 16, disk), disk))
+          failures.Enqueue("a clean path's disk block was not handed back as it is");
+        if (buffer.IsDirty("clean.bin") || buffer.OverlayLength("clean.bin", 4) != 4)
+          failures.Enqueue("a clean path looked dirty");
+        if (!buffer.IsDirty("dirty.bin") || buffer.OverlayBlock("dirty.bin", 0, 16, disk)[0] != 7 || buffer.OverlayLength("dirty.bin", 0) != 4)
+          failures.Enqueue("a dirty path's owed bytes were not overlaid");
+      }
+    })).ToArray();
+
+    Task.WaitAll(readers, TimeSpan.FromSeconds(60)).Should().BeTrue("no reader may block for good");
+    stop.Cancel();
+    Task.WaitAll(churn, TimeSpan.FromSeconds(60)).Should().BeTrue();
+
+    failures.Should().BeEmpty();
+    buffer.DirtyPaths.Should().Equal("dirty.bin");
+    disk.Should().Equal(1, 2, 3, 4);
+  }
+
+}
