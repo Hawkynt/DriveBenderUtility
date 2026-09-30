@@ -175,6 +175,134 @@ public class PageCacheTests {
     cache.TryGet(new(_poolB, "b.bin", 0), out _).Should().BeTrue("the other pool is untouched");
   }
 
+  [Test]
+  [Category("HappyPath")]
+  public void TryGet_GivenAnotherThreadHoldsThePoolsLock_WhenACachedBlockIsFetched_ThenTheHitDoesNotWait() {
+    // Measured: with the metadata lookups out of the way, twenty threads of cached reads spent most
+    // of the read path queueing on the pool's cache lock — every hit took it to bump the counters
+    // and the eviction order. A hit now reads a concurrent map and never waits for a writer.
+    using var gate = new ManualResetEventSlim();
+    var policy = new BlockingInsertPolicy<PageKey>(gate);
+    var cache = new PageCache(() => policy, 4);
+    cache.SetBudget(1024);
+    cache.Put(new(_poolA, "cached.bin", 0), [1, 2, 3, 4]);
+    policy.BlockInserts = true;
+
+    var writer = Task.Run(() => cache.Put(new(_poolA, "slow.bin", 0), [5, 6, 7, 8])); // parks INSIDE the lock
+    policy.InsertEntered.Wait(TimeSpan.FromSeconds(10)).Should().BeTrue("the writer must be holding the lock for this to test anything");
+    try {
+      var reader = Task.Run(() => cache.TryGet(new(_poolA, "cached.bin", 0), out var block) ? block : null);
+      reader.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue("a hit must not queue behind a writer holding the pool's lock");
+      reader.Result.Should().Equal(1, 2, 3, 4);
+    } finally {
+      gate.Set();
+      writer.Wait(TimeSpan.FromSeconds(10)).Should().BeTrue();
+    }
+
+    cache.GetStatistics(_poolA).Hits.Should().Be(1, "a lock-free hit is still counted");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void TryGet_GivenAPathWasInvalidated_WhenReadAfterTheInvalidationReturned_ThenTheOldBlockIsNeverServed() {
+    // the coherence contract a lock-free hit must keep: once InvalidatePath has returned, no reader
+    // can be handed the dropped bytes (SAFE-COHERE) — however many readers are racing it
+    var cache = new PageCache(EvictionPolicy.Arc, 4);
+    cache.SetBudget(1 << 20);
+    var key = new PageKey(_poolA, "hot.bin", 0);
+    var stale = new byte[] { 1, 1, 1, 1 };
+    for (var round = 0; round < 200; ++round) {
+      cache.Put(key, stale);
+      using var stop = new CancellationTokenSource();
+      var readers = Enumerable.Range(0, 4).Select(reader => Task.Run(() => {
+        while (!stop.IsCancellationRequested)
+          cache.TryGet(key, out _);
+      })).ToArray();
+
+      cache.InvalidatePath(_poolA, "hot.bin");
+      var served = cache.TryGet(key, out var after);
+      stop.Cancel();
+      Task.WaitAll(readers);
+
+      served.Should().BeFalse($"round {round}: an invalidated block was served after the invalidation returned");
+      after.Should().NotBeSameAs(stale);
+    }
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void PageCache_GivenOnePoolHammeredByHitsPutsAndInvalidations_WhenQuiescent_ThenTheMapAndThePolicyAgree() {
+    // Every change to the block map still pairs with its change to the policy under the pool's lock;
+    // a hit's lock-free recency must never re-admit a key the map no longer holds. If the two drifted,
+    // eviction could not reach every block and the cache would sit above its budget.
+    const int block = 64;
+    var cache = new PageCache(EvictionPolicy.Arc, block);
+    cache.SetBudget(block * 100);
+    var failures = new System.Collections.Concurrent.ConcurrentQueue<Exception>();
+    var workers = Enumerable.Range(0, 8).Select(worker => Task.Run(() => {
+      var random = new Random(worker);
+      try {
+        for (var i = 0; i < 20_000; ++i) {
+          var file = random.Next(20);
+          var key = new PageKey(_poolA, $"f{file}.bin", random.Next(20));
+          switch (random.Next(10)) {
+            case < 6:
+              if (cache.TryGet(key, out var found) && found[0] != (byte)file)
+                throw new InvalidOperationException($"{key.Path} served another file's block");
+              break;
+            case < 9:
+              var bytes = new byte[block];
+              bytes[0] = (byte)file;
+              cache.Put(key, bytes);
+              break;
+            default:
+              cache.InvalidatePath(_poolA, key.Path);
+              break;
+          }
+        }
+      } catch (Exception e) {
+        failures.Enqueue(e);
+      }
+    })).ToArray();
+
+    Task.WaitAll(workers, TimeSpan.FromSeconds(60)).Should().BeTrue("no deadlock");
+    failures.Should().BeEmpty();
+    cache.TotalBytes.Should().Be(cache.GetStatistics(_poolA).Bytes);
+    cache.TotalBytes.Should().BeLessThanOrEqualTo(cache.BudgetBytes);
+
+    for (var i = 0; i < 300; ++i)
+      cache.Put(new(_poolA, "fresh.bin", i), new byte[block]);
+
+    cache.TotalBytes.Should().BeLessThanOrEqualTo(cache.BudgetBytes, "every block the map holds is still known to the policy");
+    for (var file = 0; file < 20; ++file)
+      cache.InvalidatePath(_poolA, $"f{file}.bin");
+    cache.InvalidatePath(_poolA, "fresh.bin");
+    cache.GetStatistics(_poolA).Entries.Should().Be(0, "the per-path index reaches every block the map holds");
+    cache.TotalBytes.Should().Be(0);
+  }
+
+}
+
+/// <summary>An LRU whose inserts can be held open — a writer parked inside the owning cache's lock.</summary>
+internal sealed class BlockingInsertPolicy<TKey>(ManualResetEventSlim gate) : ICacheEvictionPolicy<TKey> where TKey : class {
+  private readonly ICacheEvictionPolicy<TKey> _inner = EvictionPolicyFactory.Create<TKey>(EvictionPolicy.Lru);
+  public volatile bool BlockInserts;
+  public readonly ManualResetEventSlim InsertEntered = new();
+
+  public void OnAccess(TKey key) => this._inner.OnAccess(key);
+
+  public void OnInsert(TKey key) {
+    if (this.BlockInserts) {
+      this.InsertEntered.Set();
+      gate.Wait();
+    }
+
+    this._inner.OnInsert(key);
+  }
+
+  public TKey? SelectVictim() => this._inner.SelectVictim();
+  public void Remove(TKey key) => this._inner.Remove(key);
+  public int Count => this._inner.Count;
 }
 
 [TestFixture]
@@ -231,6 +359,99 @@ public class MetadataCacheTests {
       cache.Put(new(_pool, $"p{i}", MetadataKind.Stat), i);
 
     cache.Count.Should().BeLessThanOrEqualTo(3);
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void TryGet_GivenAnLruCacheUsedFromOneThread_WhenAnEntryIsReadBeforeTheCacheOverflows_ThenTheReadEntrySurvives() {
+    // a hit's recency is recorded only when the lock is free — which, with a single caller, is always
+    var cache = this._Create(maxEntries: 2);
+    cache.Put(new(_pool, "old", MetadataKind.Stat), 1);
+    cache.Put(new(_pool, "newer", MetadataKind.Stat), 2);
+
+    cache.TryGet<int>(new(_pool, "old", MetadataKind.Stat), out _).Should().BeTrue();
+    cache.Put(new(_pool, "newest", MetadataKind.Stat), 3);
+
+    cache.TryGet<int>(new(_pool, "old", MetadataKind.Stat), out _).Should().BeTrue("it was used last, so LRU keeps it");
+    cache.TryGet<int>(new(_pool, "newer", MetadataKind.Stat), out _).Should().BeFalse("the least recently used entry is the one evicted");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void TryGet_GivenAnEntryOfAnotherType_WhenFetched_ThenMissAndTheEntryIsDropped() {
+    var cache = this._Create();
+    cache.Put(new(_pool, "a", MetadataKind.Stat), "not a FileMeta");
+
+    cache.TryGet<FileMeta>(new(_pool, "a", MetadataKind.Stat), out _).Should().BeFalse();
+    cache.Count.Should().Be(0, "an entry that cannot answer for its key is removed, as an expired one is");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void TryGet_GivenAnotherThreadHoldsTheCacheLock_WhenACachedEntryIsFetched_ThenTheHitDoesNotWait() {
+    // Measured: every read looks up the placement AND the stat here, and under twenty threads of
+    // cached reads 80% of the read path was queueing on this one lock. A hit reads a concurrent map
+    // and records its recency only when the lock is free, so it never waits for a writer.
+    using var gate = new ManualResetEventSlim();
+    var policy = new BlockingInsertPolicy<MetadataKey>(gate);
+    var cache = new MetadataCache(policy, 100, TimeSpan.FromMinutes(1), () => this._now);
+    cache.Put(new(_pool, "cached", MetadataKind.Stat), 7);
+    policy.BlockInserts = true;
+
+    var writer = Task.Run(() => cache.Put(new(_pool, "slow", MetadataKind.Stat), 8)); // parks INSIDE the lock
+    policy.InsertEntered.Wait(TimeSpan.FromSeconds(10)).Should().BeTrue("the writer must be holding the lock for this to test anything");
+    try {
+      var reader = Task.Run(() => cache.TryGet<int>(new(_pool, "cached", MetadataKind.Stat), out var value) ? value : -1);
+      reader.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue("a hit must not queue behind a writer holding the lock");
+      reader.Result.Should().Be(7);
+    } finally {
+      gate.Set();
+      writer.Wait(TimeSpan.FromSeconds(10)).Should().BeTrue();
+    }
+
+    cache.TryGet<int>(new(_pool, "slow", MetadataKind.Stat), out var slow).Should().BeTrue();
+    slow.Should().Be(8);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Cache_GivenConcurrentHitsPutsInvalidationsAndEvictions_WhenQuiescent_ThenTheBoundStillHolds() {
+    // The map and the policy must stay in exact step whatever interleaving the lock-free hit sees:
+    // a key the policy forgot can never be chosen as a victim, so the cache would outgrow its bound.
+    const int maxEntries = 64;
+    var cache = new MetadataCache(EvictionPolicy.Slru, maxEntries, TimeSpan.FromMinutes(1));
+    var failures = new System.Collections.Concurrent.ConcurrentQueue<Exception>();
+    var workers = Enumerable.Range(0, 8).Select(worker => Task.Run(() => {
+      var random = new Random(worker);
+      try {
+        for (var i = 0; i < 20_000; ++i) {
+          var key = new MetadataKey(_pool, $"p{random.Next(200)}", MetadataKind.Stat);
+          switch (random.Next(10)) {
+            case < 6:
+              if (cache.TryGet<int>(key, out var value) && value != int.Parse(key.Path[1..]))
+                throw new InvalidOperationException($"{key.Path} answered {value}");
+              break;
+            case < 9:
+              cache.Put(key, int.Parse(key.Path[1..]));
+              break;
+            default:
+              cache.InvalidatePath(_pool, key.Path);
+              break;
+          }
+        }
+      } catch (Exception e) {
+        failures.Enqueue(e);
+      }
+    })).ToArray();
+
+    Task.WaitAll(workers, TimeSpan.FromSeconds(60)).Should().BeTrue("no deadlock");
+    failures.Should().BeEmpty();
+    cache.Count.Should().BeLessThanOrEqualTo(maxEntries);
+
+    for (var i = 0; i < maxEntries * 2; ++i)
+      cache.Put(new(_pool, $"fresh{i}", MetadataKind.Stat), i);
+
+    cache.Count.Should().Be(maxEntries, "every entry the map holds is still known to the policy, so eviction reaches all of them");
   }
 
 }
