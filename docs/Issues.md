@@ -1957,23 +1957,38 @@ These now fail the build rather than needing to be re-found:
   `5b67a05`, in which mounting any local pool was impossible. `DBE2E_REQUIRE_DRIVER=1` makes a
   missing driver a failure, so the suite cannot report green by skipping everything.
 
-### Open: `RemoveMedia…ThenTheyAreStillRecoverable` fails intermittently under battery load
+### Resolved (Linux cause): `RemoveMedia…ThenTheyAreStillRecoverable` failed intermittently under battery load
 
 `RemoveMedia_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable`
-(`SwapMediaEndToEndTests`), added with the disk-swap fix in `d8bfa25`, failed twice while three
-unrelated pull requests were being validated: once on the Linux runner (run `35323450800`, on a
-branch whose only change was inert for that path) and once in a local Windows battery. It passed in
-isolation on both platforms, passed on `main`'s own run for the commit that introduced it, and
-passed on every later run of the same branches.
+(`SnapshotEndToEndTests`) failed twice: once on the Linux runner (run `35323450800`) and once in a
+local Windows battery.
 
-So the evidence says intermittent-under-load rather than broken, but nobody has actually looked at
-why, and "it passed when I ran it again" is how a real fault gets written off. The assertion that
-fails is the restored snapshot version's content, which is the one thing in that scenario worth
-being sure about — a retired disk must not take a snapshot's only copy with it.
+**The Linux failure was the harness, and the log says so.** The note above guessed that the restored
+content was wrong. The run's own log shows otherwise: `pool-snapshot-restore` exited 1 with "Pool …
+is not mounted", straight after the scenario remounted the pool to retire a disk. The FUSE mount
+registers itself on a pump tick *after* the kernel mount appears, because libfuse has no "mounted"
+callback. The harness counted the pool as ready as soon as the mountpoint answered, and every verb
+that relays into the mount process (the snapshot verbs, `health --fix`) says "not mounted" until
+the registration lands. The harness now waits for both. Under load (six writers churning the temp
+disk) the fixture passed 3 of 3 afterwards; it also passed before, which is expected for a race this
+narrow, so this is not proof of the fix.
 
-Worth a deliberate reproduction under load before it is dismissed: run the full battery in a loop
-and capture the member dumps the failure already prints, rather than waiting to notice it again in
-somebody's unrelated pull request.
+The product-side gap remains, and is small: on Linux a script that waits for the mountpoint and then
+calls a snapshot verb can hit the same window, at most one 50 ms pump tick wide. On Windows the mount
+registers after the driver returns. A test trying to catch that window there did not fail even with
+the gap artificially widened to 500 ms, so nothing was changed on that path.
+
+**The local Windows failure is not explained.** Its output was not kept, and it did not recur here.
+
+**Found on the way: retiring a disk could separate a snapshot version from its sidecar.** The store
+only sees a version whose `.snapinfo` sits beside it on the same member. `_ScatterHiddenTree` sent
+each file to whichever member had the most free space at that moment, and moving the version lowered
+its target's free space, so the sidecar could go elsewhere. The version stayed on disk and the
+snapshot could no longer find it (the restore failed with "that copy is not available"). The recycle
+bin's `.trashinfo` had the same exposure. An item and its sidecar now move together, the sidecar
+deleted first from the leaving disk. This cannot have caused the E2E failures, because the E2E members
+share one disk and always tie on free space. `DataMovementCrashTests.RemoveMedia_GivenTheDiskHoldsASnapshotVersion_…`
+uses three disks, and fails without the change.
 
 ### Resolved: copying a folder tree failed with "directory does not exist"
 

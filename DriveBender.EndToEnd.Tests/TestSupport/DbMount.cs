@@ -295,6 +295,14 @@ public static class DbMount {
   /// same reason the manifest itself is edited directly here: standing up the whole management
   /// stack to flip one setting would drag it into a driver test.
   /// </summary>
+  /// <summary>
+  /// Whether the mount process has REGISTERED the pool — what every verb that relays into it (the
+  /// snapshot verbs, <c>health --fix</c>) looks for. A drive that answers is not enough: until the
+  /// entry exists, those verbs say "not mounted".
+  /// </summary>
+  public static bool IsMountRegistered(string poolName)
+    => File.Exists(Path.Combine(Path.GetDirectoryName(PoolRegistryDirectory)!, "mounts", $"{PoolIdOf(poolName):D}.json"));
+
   public static void RequestLiveReload(string poolName) {
     var mounts = Path.Combine(Path.GetDirectoryName(PoolRegistryDirectory)!, "mounts");
     Directory.CreateDirectory(mounts);

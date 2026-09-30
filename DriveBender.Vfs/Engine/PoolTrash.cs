@@ -34,7 +34,10 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
   private static string _BaseTrashPathFor(string normalizedPath) => $"{TrashPrefix}/{normalizedPath}";
-  private static string _InfoPathFor(string trashPath) => trashPath + ".trashinfo";
+  /// <summary>The sidecar that describes a trashed file sits beside it under the file's name plus this.</summary>
+  public const string InfoSuffix = ".trashinfo";
+
+  private static string _InfoPathFor(string trashPath) => trashPath + InfoSuffix;
 
   /// <summary>
   /// The original path a trashed file was deleted from, read back out of its trash name
@@ -165,7 +168,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
           continue;
         }
 
-        if (!item.Name.EndsWith(".trashinfo", StringComparison.OrdinalIgnoreCase))
+        if (!item.Name.EndsWith(InfoSuffix, StringComparison.OrdinalIgnoreCase))
           continue;
 
         TrashInfo? info = null;
@@ -179,8 +182,8 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
         }
 
         if (info != null) {
-          described.Add(childPath[..^".trashinfo".Length]);
-          yield return (childPath[..^".trashinfo".Length], info);
+          described.Add(childPath[..^InfoSuffix.Length]);
+          yield return (childPath[..^InfoSuffix.Length], info);
         }
       }
 

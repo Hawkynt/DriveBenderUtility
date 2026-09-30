@@ -228,7 +228,11 @@ public sealed class MountedPool : IDisposable {
           $"The mount process exited with code {this._mountProcess.ExitCode} before the mount became usable "
           + $"on {DbMount.Platform}.{Environment.NewLine}{this.MountLog}");
 
-      if (this._IsUsable())
+      // Usable AND registered. The FUSE mount registers on a pump tick after the kernel mount
+      // appears, and every verb that relays into the mount (the snapshot verbs, health --fix)
+      // answers "not mounted" until it has: the disk-swap snapshot scenario failed on the Linux
+      // runner exactly there, at the restore straight after a remount.
+      if (this._IsUsable() && DbMount.IsMountRegistered(this.PoolName))
         return;
 
       Thread.Sleep(250);
