@@ -353,6 +353,7 @@ public sealed class VolumeQueues {
   private static string _RoleKey(MemberRole role) => role switch {
     MemberRole.Landing => "landing",
     MemberRole.ReadOnly => "readonly",
+    MemberRole.Idle => "idle",
     _ => "capacity",
   };
 

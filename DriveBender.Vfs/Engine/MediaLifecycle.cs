@@ -19,7 +19,7 @@ public sealed record MediaLifecycleReport(int FilesMoved, int CopiesCreated, int
 /// disk end to end and writes another flat out, for hours, while the pool stays mounted and in use.
 /// </param>
 public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal journal, int duplicationLevel, bool allowSamePhysical = false,
-  Action<IVolumeIO, long>? admit = null) {
+  Action<IVolumeIO, long>? admit = null, IReadOnlyDictionary<Guid, MemberRole>? roles = null) {
 
   private sealed record Copy(IVolumeIO Member, string Path, bool Shadow);
 
@@ -31,8 +31,12 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
     : copies.Select(c => c.Member.PhysicalVolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count();
 
   /// <summary>The coverage the members staying behind can give a file: the duplication level, or every independent disk left.</summary>
+  private MemberRole _RoleOf(IVolumeIO member)
+    => roles != null && roles.TryGetValue(member.MemberId, out var role) ? role : MemberRole.Capacity;
+
   private int _ReachableCoverage(IVolumeIO leaving) {
-    var staying = this._Online.Where(m => m != leaving).ToArray();
+    // a read-only member can keep a copy it already has, but cannot be given one
+    var staying = this._Online.Where(m => m != leaving && this._RoleOf(m) != MemberRole.ReadOnly).ToArray();
     var reachable = allowSamePhysical
       ? staying.Length
       : staying.Select(m => m.PhysicalVolumeId).Distinct(StringComparer.OrdinalIgnoreCase).Count();
@@ -106,23 +110,34 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
 
   private static long _Size(Copy copy) => copy.Member.Stat(copy.Path, copy.Shadow)?.Length ?? 0;
 
-  private IVolumeIO? _ChooseTarget(IEnumerable<Copy> existing, long size, IVolumeIO? exclude) {
+  /// <summary>
+  /// Where a copy goes. A read-only member never receives one. When a disk is being RETIRED an idle
+  /// member is filled first — that is what it joined the pool for — and only then the rest, by free
+  /// space; for the pool's own housekeeping (restoring duplication) an idle member is not a target
+  /// at all. This used to choose by free space alone, so retiring a disk could fill a read-only one.
+  /// </summary>
+  private IVolumeIO? _ChooseTarget(IEnumerable<Copy> existing, long size, IVolumeIO? exclude, bool retiring) {
     var list = existing.ToArray();
+    var candidates = this._Online
+      .Where(m => m != exclude && m.BytesFree >= size)
+      .Where(m => this._RoleOf(m) switch {
+        MemberRole.ReadOnly => false,
+        MemberRole.Idle => retiring,
+        _ => true,
+      })
+      .OrderByDescending(m => retiring && this._RoleOf(m) == MemberRole.Idle)
+      .ThenByDescending(m => m.BytesFree)
+      .ToArray();
+
     var occupiedDomains = new HashSet<string>(list.Select(c => c.Member.PhysicalVolumeId), StringComparer.OrdinalIgnoreCase);
-    var independent = this._Online
-      .Where(m => m != exclude && m.BytesFree >= size && !occupiedDomains.Contains(m.PhysicalVolumeId))
-      .OrderByDescending(m => m.BytesFree)
-      .FirstOrDefault();
+    var independent = candidates.FirstOrDefault(m => !occupiedDomains.Contains(m.PhysicalVolumeId));
     if (independent != null || !allowSamePhysical)
       return independent;
 
     // opted in: no independent disk left — use another member on an occupied disk, but never
     // one that already holds a copy of this file (that would duplicate onto itself)
     var holders = new HashSet<Guid>(list.Select(c => c.Member.MemberId));
-    return this._Online
-      .Where(m => m != exclude && m.BytesFree >= size && !holders.Contains(m.MemberId))
-      .OrderByDescending(m => m.BytesFree)
-      .FirstOrDefault();
+    return candidates.FirstOrDefault(m => !holders.Contains(m.MemberId));
   }
 
   /// <summary>
@@ -152,7 +167,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
         // up, so protection quietly halved at the very moment somebody was changing hardware.
         while (this._Coverage(elsewhere) < this._ReachableCoverage(leaving) || !this._SurvivesOffDomain(elsewhere, leaving)) {
           var size = _Size(copy);
-          var target = this._ChooseTarget(elsewhere, size, leaving);
+          var target = this._ChooseTarget(elsewhere, size, leaving, retiring: true);
           if (target == null) {
             if (this._SurvivesOffDomain(elsewhere, leaving)) {
               DriveBender.Logger($"[Warning]'{path}' is below its duplication level after removing '{leaving.DisplayName}' — no room for another copy; the healer will retry");
@@ -211,7 +226,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
     var moved = 0;
     foreach (var path in this._WalkFolder(leaving, root)) {
       var size = leaving.Stat(path, false)?.Length ?? 0;
-      var target = this._ChooseTarget([], size, leaving);
+      var target = this._ChooseTarget([], size, leaving, retiring: true);
       if (target == null) {
         // Said out loud rather than swallowed: the bin is the one thing here that has no second
         // copy anywhere, so failing to place it is the difference between "moved" and "gone".
@@ -367,7 +382,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
       // create missing shadow copies up to the duplication level (FixMissingShadowCopies) — streamed
       while (distinctDomains < duplicationLevel) {
         var size = _Size(copies[0]);
-        var target = this._ChooseTarget(copies, size, null);
+        var target = this._ChooseTarget(copies, size, null, retiring: false);
         if (target == null)
           break; // not placeable without co-locating (SAFE-PHYS) — leave for later
 

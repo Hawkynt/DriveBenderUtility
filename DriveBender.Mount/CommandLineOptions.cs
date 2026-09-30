@@ -55,7 +55,7 @@ public sealed class PoolAddMemberOptions {
   [Option('m', "member", Required = true, HelpText = "Path of the new member.")]
   public string Member { get; set; } = "";
 
-  [Option("role", Default = "capacity", HelpText = "capacity | landing | readonly.")]
+  [Option("role", Default = "capacity", HelpText = "capacity | landing | readonly | idle (idle: joins to receive a retiring disk's files, and takes nothing else).")]
   public string Role { get; set; } = "capacity";
 
   [Option("reserve", HelpText = "Bytes the pool must not consume on the member's volume (e.g. 20GiB).")]

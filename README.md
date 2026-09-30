@@ -443,6 +443,23 @@ flowchart LR
     class Members store
 ```
 
+### Swapping a disk: join the new one as idle
+
+A member can join with the role `idle`. An idle disk takes no new files and no
+copies of them, and the landing-zone drainer and the healer never put anything on
+it. The one thing that fills it is retiring another disk: `pool remove-media`
+moves the leaving disk's files onto idle members first, and only then onto the
+others.
+
+```bash
+dbmount pool add-member MyPool -m "K:\" --role idle     # the new disk waits, untouched
+dbmount pool remove-media MyPool --member "D:\"         # the old disk's files move onto K:\
+```
+
+Its files are ordinary pool files, read and written like any other. Once the
+old disk is gone, give the new one the `capacity` role (the dashboard's member
+dialog) so it takes new files too.
+
 ### Tiering: land fast, drain later
 
 With a **landing zone** member, new files go to the fast tier and a background drainer moves settled

@@ -2104,3 +2104,14 @@ The drainer and the healer hold the gate for a whole file, which on a throttled 
 minutes, so a waiting folder rename makes them abandon their copy at the next 1 MiB chunk. That is
 always safe, because the original is untouched until the copy is complete. They delete their temp,
 and retry after the rename under the new name.
+
+### Added: idle members, for swapping a disk without the pool filling the new one first
+
+A disk can join the pool with the role `idle`. It takes no new files or copies of them, and neither
+the landing-zone drainer nor the healer puts anything on it. Retiring another disk
+(`pool-remove-media`) fills idle members FIRST, preferring them by role rather than free space, then
+the others. So a new disk can be joined ahead of time and receive exactly the old disk's files.
+
+While wiring this in, the moving service turned out to ignore roles entirely: it chose targets by
+free space alone, so retiring a disk could fill a READ-ONLY member (and restoring duplication could
+too). It now never gives a read-only member a copy, and restoring duplication never uses an idle one.

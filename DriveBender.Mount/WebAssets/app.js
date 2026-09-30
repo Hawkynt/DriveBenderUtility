@@ -244,7 +244,8 @@ const KINDS = [
   ["azblob", "Azure Blob"], ["azfile", "Azure File"], ["dropbox", "Dropbox"], ["onedrive", "OneDrive"],
   ["gdrive", "Google Drive"], ["gcs", "Google Cloud Storage"]
 ];
-const ROLES = ["capacity", "landing", "readonly"];
+// idle: joined to receive a retiring disk's files — takes no new files, nothing is balanced onto it
+const ROLES = ["capacity", "landing", "readonly", "idle"];
 
 // local kinds are picked with the folder browser and need no credentials; every other kind is
 // a remote service with a scheme-specific credential form (mapped to the daemon's user/secret).

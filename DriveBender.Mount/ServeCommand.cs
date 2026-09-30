@@ -1172,6 +1172,7 @@ internal sealed class ServeCommand(
   private static MemberRole _ParseRole(string? role) => role?.ToLowerInvariant() switch {
     "landing" => MemberRole.Landing,
     "readonly" => MemberRole.ReadOnly,
+    "idle" => MemberRole.Idle,
     _ => MemberRole.Capacity,
   };
 

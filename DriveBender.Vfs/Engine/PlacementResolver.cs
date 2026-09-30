@@ -84,8 +84,9 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
     if (!member.IsOnline || this._UsableFree(member) < size)
       return false;
 
+    // read-only takes nothing; idle takes only what the moving service puts there itself
     var role = this._RoleOf(member);
-    if (role == MemberRole.ReadOnly)
+    if (role is MemberRole.ReadOnly or MemberRole.Idle)
       return false;
 
     return roleFilter == null || role == roleFilter;
