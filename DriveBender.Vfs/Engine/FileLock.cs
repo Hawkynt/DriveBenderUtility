@@ -19,7 +19,10 @@ namespace DivisonM.Vfs.Engine;
 /// before it sleeps, and a releaser changes the state and then, seeing any waiter, pulses under
 /// that same gate. Both sides use full fences, so at least one of them sees the other.
 /// </summary>
-public sealed class FileLock {
+/// <param name="clock">Milliseconds since some fixed point, for the timeouts; <see cref="Environment.TickCount64"/> unless a test drives it.</param>
+public sealed class FileLock(Func<long>? clock = null) {
+
+  private readonly Func<long> _now = clock ?? (static () => Environment.TickCount64);
 
   private const int _WRITER = -1;
 
@@ -81,7 +84,7 @@ public sealed class FileLock {
   }
 
   private bool _Wait(bool write, TimeSpan timeout) {
-    var deadline = timeout == Timeout.InfiniteTimeSpan ? long.MaxValue : Environment.TickCount64 + (long)Math.Max(0, timeout.TotalMilliseconds);
+    var deadline = timeout == Timeout.InfiniteTimeSpan ? long.MaxValue : this._now() + (long)Math.Max(0, timeout.TotalMilliseconds);
     lock (this._gate) {
       Interlocked.Increment(ref this._waiters);
       if (write)
@@ -92,11 +95,18 @@ public sealed class FileLock {
           if (write ? Interlocked.CompareExchange(ref this._state, _WRITER, 0) == 0 : this._TryEnterReadFast())
             return true;
 
-          var remaining = deadline == long.MaxValue ? Timeout.Infinite : deadline - Environment.TickCount64;
-          if (remaining != Timeout.Infinite && remaining <= 0)
+          // an infinite wait is decided by the deadline, never by the number: a remaining of exactly
+          // -1 IS Timeout.Infinite, so a wait that overran its deadline by one millisecond slept for ever
+          if (deadline == long.MaxValue) {
+            Monitor.Wait(this._gate, Timeout.Infinite);
+            continue;
+          }
+
+          var remaining = deadline - this._now();
+          if (remaining <= 0)
             return false;
 
-          Monitor.Wait(this._gate, remaining == Timeout.Infinite ? Timeout.Infinite : (int)Math.Min(remaining, int.MaxValue));
+          Monitor.Wait(this._gate, (int)Math.Min(remaining, int.MaxValue));
         }
       } finally {
         Interlocked.Decrement(ref this._waiters);

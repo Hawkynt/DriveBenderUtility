@@ -294,6 +294,18 @@ nobody reads a claim into it.
 - **Still allocated per read (240 B)**: the path lease and three cache keys. The keys are classes
   because `ICacheEvictionPolicy<TKey>` requires `class`.
 
+### Resolved (found by CI on Linux): a timed wait for a file's lock could become a wait for ever
+
+`FileLock` computed a waiter's remaining time as `deadline - now` and passed it to `Monitor.Wait`,
+treating `-1` as "no deadline". But `-1` is also what a wait that overran its deadline by exactly one
+millisecond computes. A coarse timer or a busy runner makes that overrun ordinary, and the waiter then
+slept until something else released the lock. On the Linux runner a reader asked to wait 100 ms slept
+through the waiting writer's whole 10-second timeout, then got in ahead of the writer it was meant to
+yield to. In the engine, a lease with a timeout (the drainer's swap window, the heal's commit) could
+have hung the same way. An infinite wait is now decided by the deadline itself, never by the number.
+`FileLock` takes an optional clock, so the test places the wake-up exactly one millisecond late; it
+hung for the test's full 30 seconds before the change.
+
 ### Why writes look slow, and how much of it is deliberate
 
 The write rows in `docs/Performance.md` were all within a few percent of each other — around
