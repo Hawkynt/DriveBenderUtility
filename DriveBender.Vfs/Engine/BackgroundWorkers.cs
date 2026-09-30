@@ -188,6 +188,15 @@ public sealed class TrashMaintenanceJob(PoolFileSystem fs) : IBackgroundJob {
 
 }
 
+/// <summary>Takes scheduled snapshots and drops the scheduled ones beyond the kept count (snapshots.schedule).</summary>
+public sealed class SnapshotScheduleJob(PoolFileSystem fs) : IBackgroundJob {
+
+  public string Name => "snapshot-schedule";
+
+  public bool RunOnce() => fs.RunSnapshotSchedule();
+
+}
+
 /// <summary>
 /// Hands back cached OS resources the members are no longer using (CMP-BG). Pooled file handles
 /// are otherwise only reclaimed when the next request arrives, so a pool nobody is using keeps

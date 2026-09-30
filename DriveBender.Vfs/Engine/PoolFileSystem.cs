@@ -579,6 +579,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._config.Trash?.Enabled == true)
       jobs.Add(new TrashMaintenanceJob(this));
 
+    // always present and idle unless snapshots.schedule is set: it reads the setting on every pump,
+    // so a schedule turned on by a live reload runs without a remount
+    jobs.Add(new SnapshotScheduleJob(this));
+
     return new(jobs);
   }
 
@@ -1936,6 +1940,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public SnapshotEntry TakeSnapshot(string name) {
     this._RequireWritable();
 
+    // The name is a folder in the snapshot view (.snapshots/<name>), found case-insensitively. A
+    // second snapshot of the same name was taken and then unreachable there, shadowed by the first;
+    // a name with a separator in it named a folder that cannot exist.
+    name = name?.Trim() ?? "";
+    if (name.Length == 0 || name is "." or ".." || name.IndexOfAny(['/', '\\']) >= 0 || name.Any(char.IsControl))
+      throw new PoolFsException(PoolFsError.InvalidArgument, $"'{name}' cannot name a snapshot: it becomes the folder .snapshots/<name>");
+    if (this._SnapshotNamed(name) != null)
+      throw new PoolFsException(PoolFsError.Exists, $"A snapshot named '{name}' already exists");
+
     var configured = this._config.Snapshots;
     if ((configured?.OnReserveFull ?? SnapshotReservePolicy.DropOldest) == SnapshotReservePolicy.Refuse) {
       var reserve = SizeSpec.Parse(configured?.Reserve ?? "10%").ResolveBytes(this.StatFs().BytesTotal);
@@ -1980,6 +1993,99 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   public IReadOnlyList<SnapshotEntry> ListSnapshots() => this._snapshots.List();
+
+  /// <summary>What every scheduled snapshot's name starts with; the rest is the moment it was due, in UTC.</summary>
+  public const string ScheduledSnapshotPrefix = "auto-";
+
+  /// <summary>The name a scheduled snapshot taken at <paramref name="utc"/> gets: <c>auto-20260930-060000</c> — sortable, and a valid folder name everywhere.</summary>
+  public static string ScheduledSnapshotName(DateTime utc) => ScheduledSnapshotPrefix + utc.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture);
+
+  /// <summary>When the schedule looks again; MinValue = at the next pump. Only the background pump touches it.</summary>
+  private DateTime _snapshotScheduleCheckUtc = DateTime.MinValue;
+
+  /// <summary>The interval the check above was computed for, so a reloaded schedule is honoured at once.</summary>
+  private TimeSpan _snapshotScheduleInterval;
+
+  /// <summary>How long a refused scheduled snapshot waits before it is tried again, at most.</summary>
+  private static readonly TimeSpan _SCHEDULE_RETRY = TimeSpan.FromHours(1);
+
+  /// <summary>
+  /// Takes the scheduled snapshot when one is due (<c>snapshots.schedule</c>), and drops the oldest
+  /// scheduled snapshots beyond the kept count. True when a snapshot was taken. Driven by the
+  /// background pump, so it answers "not due" from memory and looks at the store only when it is.
+  ///
+  /// Due is measured from the newest SCHEDULED snapshot the store holds that is not dated in the
+  /// future — so a remount does not take an extra one, and a clock stepped backwards does not stop the
+  /// schedule until it catches up. A snapshot the reserve policy refuses is logged and tried again
+  /// after the interval or an hour, whichever is sooner; it never fails the pump.
+  /// </summary>
+  public bool RunSnapshotSchedule() {
+    if (this._mountOptions == null || this.IsReadOnly)
+      return false;
+
+    var interval = this._ScheduleInterval();
+    if (interval != this._snapshotScheduleInterval) {
+      this._snapshotScheduleInterval = interval;
+      this._snapshotScheduleCheckUtc = DateTime.MinValue; // a changed schedule is looked at now
+    }
+
+    if (interval <= TimeSpan.Zero)
+      return false;
+
+    var now = this._clock();
+    if (now < this._snapshotScheduleCheckUtc)
+      return false;
+
+    var last = this._snapshots.List()
+      .Where(s => s.Name.StartsWith(ScheduledSnapshotPrefix, StringComparison.OrdinalIgnoreCase) && s.CreatedUtc <= now)
+      .Select(s => (DateTime?)s.CreatedUtc)
+      .Max();
+    if (last is { } previous && now - previous < interval) {
+      this._snapshotScheduleCheckUtc = previous + interval;
+      return false;
+    }
+
+    try {
+      var taken = this.TakeSnapshot(ScheduledSnapshotName(now));
+      DriveBender.Logger($" - Scheduled snapshot '{taken.Name}' taken");
+    } catch (PoolFsException e) {
+      DriveBender.Logger($"[Warning]The scheduled snapshot was not taken: {e.Message}");
+      this._snapshotScheduleCheckUtc = now + (interval < _SCHEDULE_RETRY ? interval : _SCHEDULE_RETRY);
+      return false;
+    }
+
+    this._snapshotScheduleCheckUtc = now + interval;
+    this._PruneScheduledSnapshots();
+    return true;
+  }
+
+  private TimeSpan _ScheduleInterval() {
+    try {
+      var interval = this._config.Snapshots?.Schedule?.Interval ?? TimeSpan.Zero;
+      return interval <= TimeSpan.Zero ? TimeSpan.Zero
+        : interval < SnapshotScheduleConfig.MinimumInterval ? SnapshotScheduleConfig.MinimumInterval
+        : interval;
+    } catch (ManifestException) {
+      return TimeSpan.Zero; // a mount validates its config; an unvalidated one with a bad interval schedules nothing
+    }
+  }
+
+  /// <summary>Deletes the oldest scheduled snapshots beyond <c>snapshots.schedule.keep</c>; hand-taken ones are never touched.</summary>
+  private void _PruneScheduledSnapshots() {
+    var keep = Math.Max(1, this._config.Snapshots?.Schedule?.Keep ?? 7);
+    var scheduled = this._snapshots.List()
+      .Where(s => s.Name.StartsWith(ScheduledSnapshotPrefix, StringComparison.OrdinalIgnoreCase))
+      .OrderBy(s => s.CreatedUtc)
+      .ToList();
+
+    foreach (var expired in scheduled.Take(Math.Max(0, scheduled.Count - keep))) {
+      DriveBender.Logger($" - Scheduled snapshot '{expired.Name}' dropped: {keep} are kept");
+      this._snapshots.Delete(expired.Id);
+    }
+
+    if (scheduled.Count > keep)
+      this._RebuildPinned();
+  }
 
   /// <summary>Forgets a snapshot and releases whatever only it was holding.</summary>
   public int DeleteSnapshot(Guid id) {
