@@ -168,7 +168,8 @@ public class BinKeepsReplacedTests {
     var copied = Written(linking: false);
     var linked = Written(linking: true);
 
-    (copied - linked).Should().BeGreaterThanOrEqualTo(_OLD.Length, $"the link saves the copy ({copied:N0} bytes written copying, {linked:N0} linking)");
+    // less a few bytes: the two runs' sidecars carry timestamps whose JSON length differs by a digit or two
+    (copied - linked).Should().BeGreaterThanOrEqualTo(_OLD.Length - 64, $"the link saves the copy ({copied:N0} bytes written copying, {linked:N0} linking)");
   }
 
   [TestCase(false, true, TestName = "Overwrite_GivenTheBinIsOnAndThePowerIsCutAtEveryStep_ThenNoVersionIsLost")]

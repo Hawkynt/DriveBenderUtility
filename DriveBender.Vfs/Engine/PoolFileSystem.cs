@@ -2040,6 +2040,44 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     return true;
   }
 
+  /// <summary>
+  /// Whether the bin takes this version, beyond being on: why not, or null when it does. A file larger
+  /// than <c>trash.maxFileSize</c> skips it; while the member that would keep it has less usable room
+  /// than <c>trash.minFreeSpace</c>, nothing new goes to it; and a REPLACED version is kept only when
+  /// the bin has none of that file from within <c>trash.replacedInterval</c>, so a log or a database
+  /// rewritten all the time does not fill the bin one save at a time. Deletes ignore the interval.
+  /// </summary>
+  private string? _BinRefuses(string normalized, IReadOnlyList<PhysicalCopy> copies, bool replaced) {
+    var trash = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(normalized)).Trash;
+    if (trash == null || copies.Count == 0)
+      return null;
+
+    var keeper = copies.OrderBy(c => c.Shadow).First();
+    var volume = keeper.Volume;
+    var total = volume.BytesTotal;
+    if (trash.MaxFileSize is { } maxFileSize && (volume.Stat(normalized, keeper.Shadow)?.Length ?? 0) is var length
+        && length > SizeSpec.Parse(maxFileSize).ResolveBytes(total))
+      return $"it is larger than trash.maxFileSize ({length:N0} bytes)";
+
+    if (total > 0 && volume.BytesFree - this._ReserveOf(volume.MemberId) < SizeSpec.Parse(trash.MinFreeSpace ?? "10%").ResolveBytes(total))
+      return $"{volume.DisplayName} has less room than trash.minFreeSpace";
+
+    if (replaced && trash.ResolvedReplacedInterval is var interval && interval > TimeSpan.Zero
+        && this._trash.LastKeptUtc(normalized) is { } last && this._clock() - last < interval)
+      return "a version of it was kept within trash.replacedInterval";
+
+    return null;
+  }
+
+  private void _NoteSkippedBin(string normalized, string why, bool replaced) {
+    var what = replaced ? "the version replaced" : "the deleted file";
+    if (replaced)
+      DriveBender.Logger($" - Not keeping {what} of '{normalized}' in the recycle bin: {why}");
+    else
+      DriveBender.Logger($"[Warning]Not keeping {what} '{normalized}' in the recycle bin: {why}; it is removed for good");
+    this._activity.Publish(ActivityKind.Write, normalized, reason: $"{what} skipped the recycle bin: {why}");
+  }
+
   /// <summary>Whether the recycle bin is on where this path lives, and whether it keeps a single copy.</summary>
   private (bool Keeps, bool DropDuplicates) _BinFor(string normalized) {
     var trash = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(normalized)).Trash;
@@ -2056,6 +2094,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var (keeps, dropDuplicates) = this._BinFor(normalized);
     if (!keeps || copies.Count == 0)
       return;
+
+    if (this._BinRefuses(normalized, copies, replaced: true) is { } why) {
+      this._NoteSkippedBin(normalized, why, replaced: true);
+      return;
+    }
 
     this._FlushBeforeKeeping(normalized);
     this._trash.KeepReplaced(normalized, this._placement.ResolveCopies(normalized), dropDuplicates);
@@ -2729,6 +2772,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._shadow.Remove(normalized);
       this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
       return;
+    }
+
+    // too large for the bin, or the disk too short of room for it: the delete is final (logged)
+    if (binned && this._BinRefuses(normalized, copies, replaced: false) is { } why) {
+      this._NoteSkippedBin(normalized, why, replaced: false);
+      binned = false;
     }
 
     // The bin keeps ONE copy (dropDuplicatesInTrash), and a copy can be behind an acknowledged write

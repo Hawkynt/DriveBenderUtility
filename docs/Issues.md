@@ -2192,6 +2192,28 @@ that still wait for their rename. Found by reading the publish path. Covered by
 `StripeCrashTests.Stripe_GivenAFinalCouldNotBeFilledNorRemovedAndThePublishIsRetried_…`, which
 fails without the change: three injected faults (the fill, the delete, one rename).
 
+### Added: limits on what the bin takes: per-file interval for replaced versions, file size, free room
+
+Keeping replaced versions made the bin's intake depend on how often files are saved. A log appended by
+rewriting, or a database saved every few seconds, would fill the bin with near-identical versions;
+one large file would fill it at once; and a disk running out of room keeps spending it on an undo.
+
+- `trash.replacedInterval` (default 15m): a REPLACED version is kept only when the bin has none of
+  that file from within the interval. Ten saves in five minutes are one version. `0` or `off` keeps
+  every version. Deletes ignore it, being deliberate. The check is a dictionary lookup per save: the
+  bin's last version of each path is remembered, and a path not yet asked about is looked up once in
+  the single bin folder that holds all of its versions, by its sidecars, so a remount does not reset
+  the interval.
+- `trash.maxFileSize` (a size or a percentage of the member; no limit by default): larger files skip
+  the bin, deleted or replaced.
+- `trash.minFreeSpace` (default 10%): while the member that would keep the version has less usable
+  room than this (free space less its reserve), nothing new goes to its bin.
+
+A file that skips the bin is logged (as a warning for a delete, since that delete is final) and
+published to the activity feed. All three are validated with the setting's name in the message.
+`BinPolicyTests` covers each limit with its boundaries, a remount, files sharing a folder, and
+rejected values; without the policy, the limiting cases fail.
+
 ### Added: the recycle bin keeps replaced versions; and a rename over a file could lose the renamed content
 
 With the bin on, a version that is REPLACED goes to the bin, as a deleted one does: an overwrite's

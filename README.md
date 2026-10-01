@@ -526,6 +526,13 @@ it, are the everyday mistakes the bin is for. Where the disk can hard-link, the 
 name for the old data and nothing is copied; the new version then takes the name by an atomic rename,
 so neither the name nor the old version is ever missing, power cut or not.
 
+What the bin takes is bounded three ways. A file rewritten all the time (a log, a database) would
+leave a version per save, so a **replaced** version is kept only when the bin has none of that file
+from within `trash.replacedInterval` (15 minutes by default; `0` keeps every one); deletes are
+always kept. Files larger than `trash.maxFileSize` skip the bin. And while a member has less room
+than `trash.minFreeSpace` (10% by default), nothing new goes to its bin: the room is needed more
+than an undo. A file that skips the bin is logged and shown in the activity feed.
+
 Restoring from a pool that is mounted goes through the process that owns it, and re-establishes the
 file's duplication level on the way back — a recovered file that is one bad sector from being lost again is
 only half recovered. A restore over a file that holds the name now is a **swap**: that file goes to
@@ -849,7 +856,12 @@ common knobs:
     "acceptDegradedWrites": true          // keep writing on the reachable copies when a member is
                                           //   missing (owed copies heal on return); false = refuse
   },
-  "trash": { "enabled": true, "retention": "7d" },   // recoverable deletes
+  "trash": {                              // recoverable deletes and replaced versions
+    "enabled": true, "retention": "7d", "maxSize": "5%",
+    "replacedInterval": "15m",            // a log or database saved every second leaves one version per 15 min
+    "maxFileSize": "2GiB",                // larger files skip the bin (default: no limit)
+    "minFreeSpace": "10%"                 // below this much room, nothing new goes to the bin
+  },
   "snapshots": { "reserve": "10%", "schedule": { "every": "1d", "keep": 7 } },  // off unless "every" is set
   "space": { "deduplicate": true, "sparsify": true },  // saved with the health scan (docs/SpaceSavings.md)
   "folders": {

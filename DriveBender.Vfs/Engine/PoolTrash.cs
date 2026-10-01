@@ -31,6 +31,57 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
 
   private long _uniquifier;
 
+  /// <summary>
+  /// When the bin last took a version of each path (deleted or replaced), as far as this mount has
+  /// seen; a path it has not asked about yet is looked up in the bin once (<see cref="LastKeptUtc"/>).
+  /// What lets a file rewritten every second be checked against the replaced-version interval at the
+  /// cost of a dictionary lookup.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _lastKept = new(PoolPaths.PathComparer);
+
+  /// <summary>When the bin last took a version of <paramref name="originalPath"/>; null when it holds none.</summary>
+  public DateTime? LastKeptUtc(string originalPath) {
+    var normalized = PoolPaths.Normalize(originalPath);
+    var last = this._lastKept.GetOrAdd(normalized, path => {
+      // one folder of one member's bin holds every version of a path: listed, and only this path's sidecars read
+      var newest = DateTime.MinValue;
+      var folder = PoolPaths.GetParent(_BaseTrashPathFor(path));
+      var prefix = PoolPaths.GetName(path) + ".";
+      foreach (var member in this._Online)
+        try {
+          if (!member.FolderExists(folder, false))
+            continue;
+
+          foreach (var entry in member.List(folder, false).Where(e => !e.IsDirectory && e.Name.StartsWith(prefix, PoolPaths.PathComparison)
+                                                                      && e.Name.EndsWith(".trashver", StringComparison.OrdinalIgnoreCase)
+                                                                      && _TryOriginalPathOf($"{folder}/{e.Name}", out var original)
+                                                                      && original.Equals(path, PoolPaths.PathComparison))) {
+            var kept = this._ReadInfo(member, $"{folder}/{entry.Name}")?.DeletedUtc ?? entry.LastWriteTimeUtc;
+            if (kept > newest)
+              newest = kept;
+          }
+        } catch (PoolFsException) {
+          // a member that cannot be listed right now: the others answer
+        }
+
+      return newest;
+    });
+
+    return last == DateTime.MinValue ? null : last;
+  }
+
+  private void _Kept(string originalPath, DateTime when) => this._lastKept[originalPath] = when;
+
+  private TrashInfo? _ReadInfo(IVolumeIO member, string trashPath) {
+    try {
+      using var stream = member.OpenRead(_InfoPathFor(trashPath), false);
+      using var reader = new StreamReader(stream, Encoding.UTF8);
+      return JsonSerializer.Deserialize<TrashInfo>(reader.ReadToEnd());
+    } catch (Exception e) when (e is PoolFsException or JsonException) {
+      return null;
+    }
+  }
+
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
   private static string _BaseTrashPathFor(string normalizedPath) => $"{TrashPrefix}/{normalizedPath}";
@@ -105,6 +156,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
     }
 
     journal.Complete(sequence, JournalOp.TrashMove);
+    this._Kept(originalPath, clock());
     return kept > 0 ? trashPath : null;
   }
 
@@ -132,6 +184,8 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
 
       this._WriteInfo(copy.Volume, trashPath, normalizedPath);
     }
+
+    this._Kept(normalizedPath, clock());
   }
 
   /// <summary>The bin entry a restore of <paramref name="originalPath"/> would bring back now, or null.</summary>

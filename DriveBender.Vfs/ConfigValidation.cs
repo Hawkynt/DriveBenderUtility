@@ -211,6 +211,20 @@ public static class ConfigValidator {
       DurationSpec.Parse(retention);
     if (trash.MaxSize is { } maxSize)
       SizeSpec.Parse(maxSize);
+
+    try {
+      _ = trash.ResolvedReplacedInterval;
+    } catch (ManifestException e) {
+      throw new ConfigValidationException($"'trash.replacedInterval' must be an interval (\"15m\", \"1h\") or \"0\"/\"off\", got '{trash.ReplacedInterval}': {e.Message}");
+    }
+
+    foreach (var (key, value) in new[] { ("maxFileSize", trash.MaxFileSize), ("minFreeSpace", trash.MinFreeSpace) })
+      if (value != null)
+        try {
+          SizeSpec.Parse(value);
+        } catch (ManifestException e) {
+          throw new ConfigValidationException($"'trash.{key}' must be a size or a percentage, got '{value}': {e.Message}");
+        }
   }
 
   private static void _ValidateSnapshots(SnapshotsConfig? snapshots) {

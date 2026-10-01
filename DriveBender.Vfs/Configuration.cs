@@ -333,6 +333,29 @@ public sealed record TrashConfig {
   [JsonPropertyName("retention")] public string? Retention { get; init; }
   [JsonPropertyName("maxSize")] public string? MaxSize { get; init; }
   [JsonPropertyName("dropDuplicatesInTrash")] public bool? DropDuplicatesInTrash { get; init; }
+
+  /// <summary>
+  /// A REPLACED version (an overwrite, a rename over a file) is kept only when the bin holds no
+  /// version of that file from within this interval, so a log or a database rewritten all the time
+  /// leaves one version per interval rather than one per save. "0" or "off" keeps every version.
+  /// Deletes are always kept: they are deliberate. Default 15m.
+  /// </summary>
+  [JsonPropertyName("replacedInterval")] public string? ReplacedInterval { get; init; }
+
+  /// <summary>Files larger than this (a size, or a percentage of the member) skip the bin. Default: no limit.</summary>
+  [JsonPropertyName("maxFileSize")] public string? MaxFileSize { get; init; }
+
+  /// <summary>
+  /// While a member's usable free space (after its reserve) is below this (a size, or a percentage
+  /// of the member), nothing new goes to its bin: a deleted or replaced file is removed for good.
+  /// Default 10%.
+  /// </summary>
+  [JsonPropertyName("minFreeSpace")] public string? MinFreeSpace { get; init; }
+
+  /// <summary>The replaced-version interval this setting means; zero keeps every version.</summary>
+  public TimeSpan ResolvedReplacedInterval
+    => this.ReplacedInterval?.Trim().ToLowerInvariant() is "0" or "off" ? TimeSpan.Zero : DurationSpec.Parse(this.ReplacedInterval ?? "15m");
+
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
 }
 
@@ -492,7 +515,8 @@ public static class ConfigResolver {
       "scrubberSchedule": "idle-weekly",
       "deepScrubSchedule": null
     },
-    "trash": { "enabled": false, "retention": "7d", "maxSize": "5%", "dropDuplicatesInTrash": true },
+    "trash": { "enabled": false, "retention": "7d", "maxSize": "5%", "dropDuplicatesInTrash": true,
+               "replacedInterval": "15m", "minFreeSpace": "10%" },
     "snapshots": { "reserve": "10%", "onReserveFull": "drop-oldest", "schedule": { "every": "off", "keep": 7 } },
     "locale": "auto",
     "duplication": 1,
