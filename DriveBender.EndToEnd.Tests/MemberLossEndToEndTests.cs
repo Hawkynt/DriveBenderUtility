@@ -231,12 +231,24 @@ public class MemberLossEndToEndTests {
     drive.AvailableFreeSpace.Should().BeLessThanOrEqualTo(backing.TotalSize,
       "the pool must not report more free space than the storage behind it could possibly hold");
 
-    var before = new DriveInfo(pool.MountPath).AvailableFreeSpace;
+    // The pool reports the free space of the disk behind it, and that disk is shared: anything else
+    // writing or deleting there moves the figure too, and a test run beside this one once freed 16 MiB
+    // during the write and made the pool look as though it had gained room. So the drop is looked for
+    // in up to three attempts, and must show in one; a figure that never moves fails all three.
     const int written = 24 * 1024 * 1024;
-    File.WriteAllBytes(pool.PathTo("capacity.bin"), _Payload(written, 7));
-    MountedPool.WaitUntil(() => pool.PhysicalCopies("capacity.bin").Count >= 2);
+    long before = 0, after = 0;
+    for (var attempt = 1; attempt <= 3; ++attempt) {
+      before = new DriveInfo(pool.MountPath).AvailableFreeSpace;
+      File.WriteAllBytes(pool.PathTo("capacity.bin"), _Payload(written, 7));
+      MountedPool.WaitUntil(() => pool.PhysicalCopies("capacity.bin").Count >= 2);
+      after = new DriveInfo(pool.MountPath).AvailableFreeSpace;
+      if (after < before || attempt == 3)
+        break;
 
-    var after = new DriveInfo(pool.MountPath).AvailableFreeSpace;
+      File.Delete(pool.PathTo("capacity.bin"));
+      MountedPool.WaitUntil(() => pool.PhysicalCopies("capacity.bin").Count == 0);
+    }
+
     after.Should().BeLessThan(before,
       $"writing {written / 1024 / 1024} MiB must reduce the reported free space — a figure that never moves is not a measurement");
 
