@@ -108,6 +108,36 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
     return kept > 0 ? trashPath : null;
   }
 
+  /// <summary>
+  /// Keeps the version of a file that is about to be REPLACED (an overwrite's publish, a rename over
+  /// it, a restore swapping it out) in the bin, while the file itself stays where it is: the caller
+  /// then replaces it. Where the disk can hard-link, the bin entry is a second name for the same data
+  /// and nothing is copied; the replacement's atomic rename then leaves the old data to the bin alone.
+  /// Elsewhere it is copied (a clone where the disk can).
+  ///
+  /// Not journaled, and safe without it: the live file is untouched, so a power cut leaves at worst a
+  /// bin entry of a version that is still live, and a sidecar lost with it is reconstructed from the
+  /// entry's name. One copy is kept, as a deleted file keeps one with <paramref name="dropDuplicates"/>;
+  /// otherwise every copy is, each on its own member.
+  /// </summary>
+  public void KeepReplaced(string normalizedPath, IReadOnlyList<PhysicalCopy> copies, bool dropDuplicates) {
+    var kept = copies.OrderBy(c => c.Shadow).Take(dropDuplicates ? 1 : copies.Count);
+    foreach (var copy in kept) {
+      var trashPath = _NewTrashPathFor(normalizedPath);
+      copy.Volume.EnsureFolder(PoolPaths.GetParent(trashPath), false);
+      var linked = (copy.Volume.Caps & BackendCaps.HardLinks) != 0 && copy.Volume.TryHardLink(normalizedPath, copy.Shadow, trashPath, false);
+      if (!linked)
+        WholeFilePublisher.CloneOrCopyWithin(copy.Volume, normalizedPath, copy.Shadow, trashPath, false,
+          admit: WholeFilePublisher.Pace(admit, copy.Volume, copy.Volume));
+
+      this._WriteInfo(copy.Volume, trashPath, normalizedPath);
+    }
+  }
+
+  /// <summary>The bin entry a restore of <paramref name="originalPath"/> would bring back now, or null.</summary>
+  public string? NewestVersionOf(string originalPath)
+    => this._VersionsOf(PoolPaths.Normalize(originalPath)).OrderByDescending(v => v.info.DeletedUtc).Select(v => v.trashPath).FirstOrDefault();
+
   private void _MoveShadowIntoTrash(IVolumeIO member, string normalizedPath, string trashPath) {
     // a shadow copy cannot be renamed across the shadow/primary namespace in one step: cloned where
     // the member can (nothing copied), else staged + published, STREAMED so a multi-GB shadow copy
@@ -218,10 +248,13 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   /// <paramref name="chooseTarget"/> names for a file of its size, and it is restored there.
   /// </param>
   /// <exception cref="PoolFsException">NoSpace when the entry has to move and no member can take it; nothing is moved then.</exception>
+  /// <param name="version">The bin entry to restore, as <see cref="NewestVersionOf"/> named it; the newest when null.</param>
   public (IVolumeIO member, string restoredPath)? Restore(string originalPath, Func<IVolumeIO, bool>? takesFiles = null,
-    Func<long, IVolumeIO?>? chooseTarget = null) {
+    Func<long, IVolumeIO?>? chooseTarget = null, string? version = null) {
     var normalized = PoolPaths.Normalize(originalPath);
-    var newest = this._VersionsOf(normalized).OrderByDescending(v => v.info.DeletedUtc).FirstOrDefault();
+    var newest = this._VersionsOf(normalized)
+      .Where(v => version == null || string.Equals(v.trashPath, version, PoolPaths.PathComparison))
+      .OrderByDescending(v => v.info.DeletedUtc).FirstOrDefault();
     if (newest.member == null)
       return null;
 

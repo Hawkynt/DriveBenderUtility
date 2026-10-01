@@ -521,16 +521,22 @@ the other copies are dropped (`dropDuplicatesInTrash`, on by default — the bin
 recoverable, not redundant). Nothing is copied, so deleting stays as cheap as it was. A
 retention/size policy purges oldest-first in the background.
 
+A version that is **replaced** goes to the bin too: saving over a file, and renaming another file over
+it, are the everyday mistakes the bin is for. Where the disk can hard-link, the bin entry is a second
+name for the old data and nothing is copied; the new version then takes the name by an atomic rename,
+so neither the name nor the old version is ever missing, power cut or not.
+
 Restoring from a pool that is mounted goes through the process that owns it, and re-establishes the
 file's duplication level on the way back — a recovered file that is one bad sector from being lost again is
-only half recovered. A restore never lands over a file that has taken the name since (it is refused;
-rename or delete that file first), and never onto a disk that takes no new files: an entry kept on an
-idle or read-only member is moved to where a new file would go and restored there.
+only half recovered. A restore over a file that holds the name now is a **swap**: that file goes to
+the bin in its place, so restoring again swaps back and neither is lost (a file still being written
+is not swapped out; the restore is refused). It never lands on a disk that takes no new files: an
+entry kept on an idle or read-only member is moved to where a new file would go and restored there.
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontSize":"15px","lineColor":"#90A4AE","textColor":"#37474F","clusterBkg":"#FAFAFA","clusterBorder":"#E0E0E0","edgeLabelBackground":"#FFFFFF"}}}%%
 flowchart TD
-    Del["delete file"] --> On{"trash<br/>enabled?"}
+    Del["delete, overwrite,<br/>or rename over a file"] --> On{"trash<br/>enabled?"}
     On -- no --> Gone["every copy removed<br/>permanently"]
     On -- yes --> Move["rename ONE copy into the hidden<br/>trash tree with a .trashinfo sidecar<br/>and drop the others"]
     Move --> Bin["Recycle bin<br/>listed by CLI, API and the dashboard"]
