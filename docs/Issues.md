@@ -1990,6 +1990,13 @@ deleted first from the leaving disk. This cannot have caused the E2E failures, b
 share one disk and always tie on free space. `DataMovementCrashTests.RemoveMedia_GivenTheDiskHoldsASnapshotVersion_…`
 uses three disks, and fails without the change.
 
+**The product-side gap is closed too, and it was wider than one pump tick.** The FUSE mount
+registered itself on its background tick AFTER `scheduler.Pump()`, so the registration waited for the
+pool's background work. With a member throttled to a crawl one pump call takes minutes: the
+starved-unmount scenario's remount stayed unregistered past the harness's 90 s on the Linux runner
+(found once the harness started waiting for registration). A pump that threw skipped registration
+for that tick as well. Registration now comes first, and the pump's failures are its own.
+
 ### Resolved: copying a folder tree failed with "directory does not exist"
 
 Reported from real use: copying many files into the pool with Explorer failed over and over with
