@@ -132,101 +132,78 @@ public class TamperPhysicalEndToEndTests {
   }
 
   [Test]
-  [Description("Every member is reserved to the brim: a write is refused cleanly and the file it would have replaced is intact.")]
+  [Description("Every member is reserved to the brim: an overwrite is refused cleanly and the file it would have replaced is intact.")]
   public void Space_GivenEveryMemberIsReservedToTheBrim_ThenAWriteIsRefusedAndTheOldFileSurvives() {
     // The classic way a filesystem loses a file it was asked to UPDATE: truncate, then fail, and now
     // neither version exists. Reserving the members rather than filling a real disk is what makes
-    // this testable at all — the machine has 100+ GiB free and filling it is not a reasonable thing
-    // to do to somebody's workstation.
+    // this testable at all; filling the disk of somebody's workstation is not a reasonable thing to do.
+    //
+    // The reserve is the WHOLE volume, not "what is free now plus a margin". The volume is shared
+    // with everything else on the machine, which was seen to free a gigabyte within a second; a
+    // margin can be overtaken, the whole volume cannot. And the contract is asserted, not "either
+    // answer": a reserve is room the pool must never take, so the write is refused, and the old
+    // version is what remains.
     var original = _Payload(32 * 1024, 44);
     using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
 
     File.WriteAllBytes(pool.PathTo("precious.bin"), original);
     pool.WaitForPhysicalCopies("precious.bin", atLeast: 2, TimeSpan.FromMinutes(2));
 
-    var free = new DriveInfo(Path.GetPathRoot(pool.Root)!).AvailableFreeSpace;
-    pool.WhileUnmounted(() => DbMount.SetMemberReserves(pool.PoolName, free + (1L << 30)));
+    var everything = new DriveInfo(Path.GetPathRoot(pool.Root)!).TotalSize;
+    pool.WhileUnmounted(() => DbMount.SetMemberReserves(pool.PoolName, everything));
 
-    // updating the existing file: the dangerous shape, because a naive implementation has already
-    // thrown the old content away by the time it discovers there is nowhere to put the new
-    var replacement = _Payload(64 * 1024, 45);
-    string? refusal = null;
-    try {
-      File.WriteAllBytes(pool.PathTo("precious.bin"), replacement);
-    } catch (Exception e) {
-      refusal = $"{e.GetType().Name}: {e.Message.ReplaceLineEndings(" ")}";
-    }
+    var update = () => File.WriteAllBytes(pool.PathTo("precious.bin"), _Payload(64 * 1024, 45));
+    update.Should().Throw<IOException>("there is no room the pool may use, so the update cannot be stored");
 
-    TestContext.Out.WriteLine($"write with every member reserved: {refusal ?? "accepted"}");
+    File.ReadAllBytes(pool.PathTo("precious.bin")).Should().Equal(original,
+      $"a refused update leaves the previous version whole, never neither version.{Environment.NewLine}{pool.DescribeMembers()}");
 
-    var survived = File.Exists(pool.PathTo("precious.bin"))
-      ? File.ReadAllBytes(pool.PathTo("precious.bin"))
-      : [];
-
-    // Either answer is defensible — the write may be refused, or the reserve may be treated as
-    // advisory and the write allowed. What is NOT defensible is the file ending up as neither
-    // version: that is the update that ate the data it was updating.
-    var isOld = survived.AsSpan().SequenceEqual(original);
-    var isNew = survived.AsSpan().SequenceEqual(replacement);
-    (isOld || isNew).Should().BeTrue(
-      $"with no room left the file is neither its old content nor its new one — it is "
-      + $"{survived.Length} bytes of something else. A failed update must leave the old version "
-      + $"behind.{Environment.NewLine}refusal: {refusal ?? "none"}{Environment.NewLine}{pool.DescribeMembers()}");
-
-    // and a brand new file must not appear half-written either
-    string? createRefusal = null;
-    try {
-      File.WriteAllBytes(pool.PathTo("brand-new.bin"), _Payload(16 * 1024, 46));
-    } catch (Exception e) {
-      createRefusal = e.GetType().Name;
-    }
-
-    if (createRefusal == null)
-      new FileInfo(pool.PathTo("brand-new.bin")).Length.Should().Be(16 * 1024,
-        "a create that was ACCEPTED with no room left must still have stored every byte");
+    var create = () => File.WriteAllBytes(pool.PathTo("brand-new.bin"), _Payload(16 * 1024, 46));
+    create.Should().Throw<IOException>();
+    File.Exists(pool.PathTo("brand-new.bin")).Should().BeFalse("a file that could not be written whole never appears half-written");
   }
 
   [Test]
-  [Description("The pool runs out of room mid-write: the partially written file is not left claiming a length it does not have.")]
+  [Description("The pool runs out of room mid-write: the write is refused there, nothing half-written is published, and other files are untouched.")]
   public void Space_GivenItRunsOutMidStream_ThenTheFileDoesNotClaimBytesItNeverStored() {
+    // The reserve lands while a stream is open and part-written, which is the awkward moment. It is
+    // applied to the MOUNTED pool by a live reload, and the scenario waits until the pool reports no
+    // room before writing on: editing the manifest alone never reached a mounted pool, so this
+    // scenario used to write all 40 chunks and test nothing.
     var original = _Payload(16 * 1024, 47);
     using var pool = MountedPool.Create(members: 2, poolDefaults: MountedPool.DuplicatedOnOneDisk);
 
     File.WriteAllBytes(pool.PathTo("steady.bin"), original);
     pool.WaitForPhysicalCopies("steady.bin", atLeast: 2, TimeSpan.FromMinutes(2));
 
-    // the reserve lands while a stream is open and part-written, which is the awkward moment
-    var free = new DriveInfo(Path.GetPathRoot(pool.Root)!).AvailableFreeSpace;
+    var everything = new DriveInfo(Path.GetPathRoot(pool.Root)!).TotalSize;
     var chunk = _Payload(64 * 1024, 48);
     var written = 0L;
-    string? failure = null;
+    Exception? failure = null;
 
     try {
       using var stream = new FileStream(pool.PathTo("growing.bin"), FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16);
       for (var i = 0; i < 40; ++i) {
+        if (i == 5) {
+          DbMount.SetMemberReserves(pool.PoolName, everything); // no room from here on
+          DbMount.RequestLiveReload(pool.PoolName);
+          MountedPool.WaitUntil(() => new DriveInfo(pool.MountPath).AvailableFreeSpace == 0, TimeSpan.FromSeconds(30))
+            .Should().BeTrue("the mounted pool takes the new reserve without a remount");
+        }
+
         stream.Write(chunk, 0, chunk.Length);
-        written += chunk.Length;
         stream.Flush();
-        if (i == 4)
-          DbMount.SetMemberReserves(pool.PoolName, free + (1L << 30)); // no room from here on
+        written += chunk.Length;
       }
-    } catch (Exception e) {
-      failure = $"{e.GetType().Name} after {written} bytes";
+    } catch (IOException e) {
+      failure = e;
     }
 
-    TestContext.Out.WriteLine($"mid-stream exhaustion: {failure ?? $"completed {written} bytes"}");
-
-    // whatever it reports as its length, that many bytes must be readable — a file claiming more
-    // than it holds is the shape that makes a later read fail or return padding
-    if (File.Exists(pool.PathTo("growing.bin"))) {
-      var claimed = new FileInfo(pool.PathTo("growing.bin")).Length;
-      var readable = File.ReadAllBytes(pool.PathTo("growing.bin")).LongLength;
-      readable.Should().Be(claimed,
-        $"the file says it is {claimed} bytes and {readable} came back. A length that outruns the "
-        + $"stored bytes turns running out of space into silent corruption."
-        + $"{Environment.NewLine}{failure ?? "no failure was reported"}");
-    }
-
+    TestContext.Out.WriteLine($"mid-stream exhaustion: {(failure == null ? $"completed {written} bytes" : $"refused after {written} bytes: {failure.Message}")}");
+    failure.Should().NotBeNull("a write past the reserve must be refused, not stored in room the pool promised to leave");
+    written.Should().Be(5 * chunk.Length, "everything before the reserve was accepted, nothing after it");
+    File.Exists(pool.PathTo("growing.bin")).Should().BeFalse(
+      "a file whose writer was refused part-way is not published with the bytes it never stored");
     File.ReadAllBytes(pool.PathTo("steady.bin")).Should().Equal(original,
       "a file that was already safely stored must not be harmed by another file running out of room");
   }

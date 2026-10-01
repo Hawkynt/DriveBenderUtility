@@ -332,7 +332,7 @@ public class DataMovementCrashTests {
 
   [Test]
   [Category("EdgeCase")]
-  public void RestoreFromSnapshot_GivenItIsInterruptedAtEveryStep_ThenTheFileIsOneWholeVersion([Range(1, 32)] int abortAfter) {
+  public void RestoreFromSnapshot_GivenItIsInterruptedAtEveryStep_ThenTheFileIsOneWholeVersion([Range(1, 30)] int abortAfter) { // 30: the whole restore, measured (it writes a replacement beside the live file instead of truncating it)
     var then = _Content();
     var now = _Content().Select(x => (byte)~x).ToArray();
     Guid snapshot;

@@ -2192,6 +2192,50 @@ that still wait for their rename. Found by reading the publish path. Covered by
 `StripeCrashTests.Stripe_GivenAFinalCouldNotBeFilledNorRemovedAndThePublishIsRetried_…`, which
 fails without the change: three injected faults (the fill, the delete, one rename).
 
+### Resolved: an overwrite that ran out of room lost the file it was updating, and a reserve was only half kept
+
+Found by questioning a test rather than the code. `TamperPhysicalEndToEndTests` had two "out of
+space" scenarios, and neither could fail in the way that mattered:
+
+- **"Every member reserved to the brim"** accepted either answer: the write refused, or "the reserve
+  treated as advisory and the write allowed". It printed `accepted` on every run. A reserve is room
+  the pool must NEVER consume (the manifest says so), and the pool kept it only when placing a new
+  file: a write that grew an existing file went straight through it.
+- **"Runs out mid-stream"** set the reserve by editing the manifest under a mounted pool. A live
+  reload updated member roles and rate limits but not reserves, so the pool never saw it. The
+  scenario wrote all 40 chunks and asserted only that the result was self-consistent.
+
+Enforcing the reserve then exposed the textbook loss underneath. An overwrite truncated the file in
+place before writing the new content (`File.WriteAllBytes` over an existing file, `>` in a shell, an
+`O_TRUNC` open), so when the write was refused the file was neither version: an engine test found
+the 4 KiB original reduced to nothing. A real full disk does the same without any reserve.
+
+- **Overwrites are staged.** Truncating an existing file to nothing now begins a replacement: an
+  empty temp beside each copy, on the same disk and side, which the last close renames over exactly
+  the copy it replaces. Until then reads and writes go to the replacement, as they would to a
+  truncated file; the old copies are untouched. Files a snapshot pins keep their earlier path (the
+  store already keeps the old version), as do members that cannot rename atomically.
+- **A file that could not be written whole is not published.** The engine records the byte ranges
+  whose write failed and clears them when they are written successfully later; a truncate cuts away
+  what failed beyond the new end. At the last close a file with a range still missing is discarded:
+  an overwrite leaves the old file, a new file never appears. A first version discarded on ANY
+  failure, which would have thrown away the save of a writer that made room and retried; a test now
+  pins the retry.
+- **The reserve is kept for growth too**, refused with `NoSpace` before any byte lands, counting
+  members that share a volume together as the free-space report does; a member without a reserve
+  pays nothing. **A changed reserve applies live** (`UpdateMemberReserves`, called by the reload).
+- **Both scenarios assert the contract now**, with the whole volume reserved rather than "free space
+  plus 1 GiB" (the shared disk was seen to free a gigabyte within a second): the update is refused
+  and the old file is intact; a new file never appears; mid-stream, the reserve reaches the mounted
+  pool live, the write is refused after exactly the five chunks written before it, nothing
+  half-written is published, and the neighbouring file is untouched.
+
+Tests: `SafeOverwriteTests` (both platforms' overwrite shapes, retry, partial retry, delete and rename
+mid-overwrite, a reader, power cut at every step), `MemberReserveTests` (growth, truncate, rewrite
+within the file, overwrite, live raise and lower). Without the changes the overwrite and reserve
+tests fail; the snapshot-restore crash matrix is two steps shorter (30), since a restore no longer
+truncates in place.
+
 ### Resolved: a file renamed onto a name still being written was lost at the writer's close, and an old handle could write into a newer file
 
 A file being written has no copy under its name yet, only a temp, which its last close publishes.

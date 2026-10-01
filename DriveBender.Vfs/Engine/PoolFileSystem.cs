@@ -104,6 +104,22 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   // before that intent completes; a crash before it leaves only temps the recovery sweep removes.
   private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _staging = new(PoolPaths.PathComparer);
 
+  /// <summary>
+  /// Staged paths that REPLACE an existing file (an overwrite: truncated to nothing, then written
+  /// again). The old copies stay under the real name until the publish renames the replacement over
+  /// them, so a replacement that is not published leaves the old file where it was.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _overwrites = new(PoolPaths.PathComparer);
+
+  /// <summary>
+  /// Byte ranges of a file still being written (new, or an overwrite's replacement) whose write
+  /// FAILED and has not been written successfully since. A file with such a range inside its length
+  /// is not what its writer meant, so its last close does not publish it: a new file never appears
+  /// half-written, and an overwrite leaves the old file. A writer that recovers, making room and
+  /// writing the range again, clears it, and its file is published as any other.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, List<(long Start, long End)>> _failedRanges = new(PoolPaths.PathComparer);
+
   private static string _StagedNameOf(string normalized) => normalized + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
 
   /// <summary>What the healer and the drainer check before publishing a copy they made without holding the file.</summary>
@@ -400,6 +416,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public PoolFileSystem(Guid poolId, IReadOnlyList<EngineMember> members, CacheInstance cache, PoolConfig effectiveConfig, Journal? journal = null, Func<DateTime>? clock = null) {
     this._poolId = poolId;
     this._members = members;
+    this._reserves = members.Where(m => m.ReserveBytes > 0).ToDictionary(m => m.Io.MemberId, m => m.ReserveBytes);
     this._cache = cache;
     this._config = effectiveConfig;
     this._journal = journal ?? new(new MemberJournalStore([.. members.Select(m => m.Io)]));
@@ -506,6 +523,53 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// setting exists precisely for the situation you cannot unmount for ("the pool is taking too much
   /// of that disk, ease off"), which made it the least useful thing to require a remount.
   /// </summary>
+  public void UpdateMemberReserves(IReadOnlyDictionary<Guid, long> reserves) {
+    this._reserves = reserves;
+    this._placement.UpdateReserves(reserves);
+    this._placement.InvalidateAll();
+    this._activity.Publish(ActivityKind.Recovery, "", reason: "member reserves reloaded");
+    DriveBender.Logger("Member reserves reloaded live");
+  }
+
+  /// <summary>
+  /// Bytes reserved on each member (<c>reserveBytes</c>): room the pool must never consume there.
+  /// Replaced whole by a live reload; read without a lock.
+  /// </summary>
+  private volatile IReadOnlyDictionary<Guid, long> _reserves;
+
+  private long _ReserveOf(Guid memberId) => this._reserves.TryGetValue(memberId, out var bytes) ? bytes : 0;
+
+  /// <summary>
+  /// Refuses growth that would reach into a member's reserve, before any byte lands. A reserve is a
+  /// promise to leave room, and placement keeping it for NEW files was only half of it: a write that
+  /// grew a file went straight through. Members sharing a physical volume are counted together, as
+  /// <see cref="StatFs"/> counts them: each of their copies needs the room, from one pool of free
+  /// space less all of their reserves. Without a reserve on any of them this costs nothing at all,
+  /// not even the growth, which is only worked out when it matters.
+  /// </summary>
+  private void _RefuseIntoReserve(string path, IEnumerable<IVolumeIO> holders, Func<long> growth) {
+    var reserves = this._reserves;
+    if (reserves.Count == 0)
+      return;
+
+    long? needed = null;
+    foreach (var volume in holders.GroupBy(h => h.PhysicalVolumeId, StringComparer.OrdinalIgnoreCase)) {
+      var members = volume.DistinctBy(h => h.MemberId).ToArray();
+      var reserved = members.Sum(m => reserves.TryGetValue(m.MemberId, out var bytes) ? bytes : 0);
+      if (reserved <= 0)
+        continue;
+
+      needed ??= growth();
+      if (needed <= 0)
+        return;
+
+      var free = members[0].BytesFree;
+      if (free - reserved < needed * volume.Count())
+        throw new PoolFsException(PoolFsError.NoSpace,
+          $"'{path}' would grow into the room reserved on {members[0].DisplayName} ({reserved:N0} bytes reserved, {Math.Max(0, free - reserved):N0} usable)");
+    }
+  }
+
   public void UpdateMemberLimits(IEnumerable<(Guid MemberId, MemberLimits Limits)> limits) {
     this._queues.SetThrottles(limits);
     this._activity.Publish(ActivityKind.Recovery, "", reason: "member rate limits reloaded");
@@ -1909,6 +1973,56 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._shadow.Remove(hidden); // reads through the open handles remembered it
   }
 
+  /// <summary>
+  /// Turns a truncate-to-nothing of an existing file into a staged replacement: an empty temp beside
+  /// each copy, on the same disk and on the same side (primary or shadow), so the publish at the last
+  /// close renames each one over exactly the copy it replaces. Until then every read and write of the
+  /// path goes to the replacement, as it would to a truncated file, while the old copies are still
+  /// on disk. The old content is never truncated in place, so an overwrite that fails part-way (no
+  /// room, a disk that drops, a power cut) leaves the old file, not neither version.
+  ///
+  /// Not for a file a snapshot pins (the store already keeps its old version, by rename) and not
+  /// where any copy's storage cannot rename atomically; those truncate in place as before. The
+  /// caller holds the path's write lease.
+  /// </summary>
+  private bool _TryBeginOverwriteLocked(string path) {
+    if (this._staging.ContainsKey(path) || this._pinned.ContainsKey(path))
+      return false;
+
+    var copies = this._placement.ResolveCopies(path);
+    if (copies.Count == 0 || copies.Any(c => (c.Volume.Caps & BackendCaps.AtomicRename) == 0))
+      return false;
+
+    this._FlushPathLocked(path); // owed blocks land on the old copies first: they are the version kept if this fails
+    this._CloseWriteSession(path); // the old file's edit session ends here; the replacement is a new file
+
+    var stagedName = _StagedNameOf(path);
+    var made = new List<PhysicalCopy>();
+    try {
+      foreach (var copy in copies) {
+        using (var stream = copy.Volume.OpenWrite(stagedName, copy.Shadow, true))
+          stream.SetLength(0); // never inherit a stale temp's tail
+        made.Add(copy);
+      }
+    } catch (PoolFsException) {
+      foreach (var copy in made)
+        try {
+          copy.Volume.Delete(stagedName, copy.Shadow);
+        } catch (PoolFsException) {
+          // swept on the next mount
+        }
+
+      throw;
+    }
+
+    this._staging[path] = 0; // a publish over an existing name journals for itself (see _PublishStagedLocked)
+    this._overwrites[path] = 0;
+    this._Invalidate(stagedName);
+    this._Invalidate(path);
+    this._shadow.Record(path, new(NodeKind.File, 0, this._clock()));
+    return true;
+  }
+
   /// <summary>A path that is a folder on some member and a file on none — what a folder rename moves.</summary>
   private bool _IsFolderOnly(string normalized)
     => this._placement.ResolveCopies(normalized).Count == 0 && this._Online.Any(m => m.FolderExists(normalized, false));
@@ -2540,8 +2654,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (binned && this._staging.ContainsKey(normalized) && !this._handles.IsOpen(normalized))
       this._PublishStagedLocked(normalized);
 
-    // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
-    if (this._DiscardStagedLocked(normalized)) {
+    // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE).
+    // An overwrite's replacement is dropped the same way, but the file it was replacing DID exist, and
+    // the delete goes on to remove that.
+    var replacing = this._overwrites.ContainsKey(normalized);
+    if (this._DiscardStagedLocked(normalized) && !replacing) {
       this._shadow.Remove(normalized);
       this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
       return;
@@ -2658,6 +2775,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (!this._staging.TryRemove(normalized, out var createSequence))
       return false;
 
+    this._overwrites.TryRemove(normalized, out _);
+    this._failedRanges.TryRemove(normalized, out _);
     this._completedStripes.TryRemove(normalized, out _);
     if (this._stripes.TryRemove(normalized, out var stripe))
       foreach (var helper in stripe.CreatedHelpers())
@@ -3447,6 +3566,90 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   public int Write(NodeHandle handle, ReadOnlySpan<byte> data, long offset, WriteMode mode) {
+    var staged = this._handles.TryGetPath(handle) is { } path && this._staging.ContainsKey(path) ? path : null;
+    var start = staged != null && mode == WriteMode.Append ? this._LogicalLength(staged) : offset;
+    try {
+      var written = this._Write(handle, data, offset, mode);
+      if (staged != null)
+        this._WrittenAgain(staged, start, start + written);
+
+      return written;
+    } catch (PoolFsException) {
+      if (staged != null)
+        this._WriteFailed(staged, start, start + data.Length);
+
+      throw;
+    }
+  }
+
+  /// <summary>The length a file has to its writers right now, or 0 when that cannot be told.</summary>
+  private long _LogicalLength(string path) {
+    try {
+      return this.GetAttributes(path).Length;
+    } catch (PoolFsException) {
+      return 0;
+    }
+  }
+
+  private void _WriteFailed(string path, long start, long end) {
+    if (end <= start)
+      return;
+
+    var ranges = this._failedRanges.GetOrAdd(path, static _ => []);
+    lock (ranges)
+      ranges.Add((start, end));
+  }
+
+  /// <summary>A range written successfully is no longer missing, whatever failed there before.</summary>
+  private void _WrittenAgain(string path, long start, long end) {
+    if (end <= start || !this._failedRanges.TryGetValue(path, out var ranges))
+      return;
+
+    lock (ranges) {
+      var left = new List<(long, long)>();
+      foreach (var (from, to) in ranges) {
+        if (to <= start || from >= end) {
+          left.Add((from, to));
+          continue;
+        }
+
+        if (from < start)
+          left.Add((from, start));
+        if (to > end)
+          left.Add((end, to));
+      }
+
+      ranges.Clear();
+      ranges.AddRange(left);
+    }
+  }
+
+  /// <summary>A truncate that succeeded cuts away whatever failed beyond the new end: those bytes were given up, not lost.</summary>
+  private void _TruncatedTo(string path, long length) {
+    if (!this._failedRanges.TryGetValue(path, out var ranges))
+      return;
+
+    lock (ranges) {
+      var left = ranges.Where(r => r.Start < length).Select(r => (r.Start, Math.Min(r.End, length))).ToList();
+      ranges.Clear();
+      ranges.AddRange(left);
+    }
+  }
+
+  /// <summary>
+  /// Whether bytes a writer meant to write are still missing: a failed range never written again
+  /// nor cut away by a later truncate. Even beyond the current end, because a write that failed
+  /// before it landed anything left the file SHORT of what was meant, not complete.
+  /// </summary>
+  private bool _HasMissingBytes(string path) {
+    if (!this._failedRanges.TryGetValue(path, out var ranges))
+      return false;
+
+    lock (ranges)
+      return ranges.Any(r => r.End > r.Start);
+  }
+
+  private int _Write(NodeHandle handle, ReadOnlySpan<byte> data, long offset, WriteMode mode) {
     _RefuseWriteToSnapshotHandle(handle);
     this._RequireWritable();
     var open = this._handles.Get(handle);
@@ -3475,7 +3678,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         if (mode == WriteMode.Append)
           offset = stripe.Length;
 
-        this._RehomeIfOutgrown(path, stripe, offset + length);
+        var stripeEnd = offset + length;
+        this._RefuseIntoReserve(path, stripe.Finals.Select(f => f.Volume), () => stripeEnd - stripe.Length);
+        this._RehomeIfOutgrown(path, stripe, stripeEnd);
         rented = System.Buffers.ArrayPool<byte>.Shared.Rent(length);
         data.CopyTo(rented);
         stripe.Write(offset, rented, length); // on every disk it needs before this returns; the session keeps none of it
@@ -3508,6 +3713,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       if (mode == WriteMode.Append)
         offset = this._writeBuffer.OverlayLength(path, copies[0].Volume.Stat(dataPath, copies[0].Shadow)?.Length ?? 0);
+
+      var end = offset + length;
+      this._RefuseIntoReserve(path, copies.Select(c => c.Volume),
+        () => end - this._writeBuffer.OverlayLength(path, copies[0].Volume.Stat(dataPath, copies[0].Shadow)?.Length ?? 0));
 
       var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(path));
       var policy = effective.Write?.Policy ?? WritePolicy.WriteBack;
@@ -3840,6 +4049,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   public void SetLength(NodeHandle handle, long length) {
+    var staged = this._handles.TryGetPath(handle) is { } path && this._staging.ContainsKey(path) ? path : null;
+    var before = staged != null ? this._LogicalLength(staged) : 0;
+    try {
+      this._SetLength(handle, length);
+      if (staged != null)
+        this._TruncatedTo(staged, length);
+    } catch (PoolFsException) {
+      if (staged != null)
+        this._WriteFailed(staged, before, length); // the room it was to have did not arrive
+
+      throw;
+    }
+  }
+
+  private void _SetLength(NodeHandle handle, long length) {
     this._RequireWritable();
     _RefuseWriteToSnapshotHandle(handle);
     var open = this._handles.Get(handle);
@@ -3856,9 +4080,19 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (this._stripes.TryGetValue(path, out var stripe)) {
         // copy tools announce the size before the first block: a stripe session only moves its end —
         // after moving to the storage group first, if the landing zone cannot hold that much
+        this._RefuseIntoReserve(path, stripe.Finals.Select(f => f.Volume), () => length - stripe.Length);
         this._RehomeIfOutgrown(path, stripe, length);
         stripe.SetLength(length, _TruncateMember);
         this._cache.Pages.InvalidatePath(this._poolId, this._DataName(path));
+        this._cache.Metadata.InvalidatePath(this._poolId, path);
+        this._writeWatch.Changed(path);
+        return;
+      }
+
+      // Truncating an existing file to nothing is how an overwrite begins, on every platform: the
+      // replacement is written beside the old file, which stays until the publish replaces it
+      if (length == 0 && this._TryBeginOverwriteLocked(path)) {
+        this._cache.Pages.InvalidatePath(this._poolId, path);
         this._cache.Metadata.InvalidatePath(this._poolId, path);
         this._writeWatch.Changed(path);
         return;
@@ -3873,6 +4107,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       var copies = this._placement.ResolveCopies(dataPath);
       if (copies.Count == 0)
         throw new PoolFsException(PoolFsError.NotFound, $"File vanished: {path}");
+
+      this._RefuseIntoReserve(path, copies.Select(c => c.Volume), () => length - (copies[0].Volume.Stat(dataPath, copies[0].Shadow)?.Length ?? 0));
 
       // Copy engines size a file before filling it, so every copied file passes through here once
       // while still a staging temp — where an intent recovers nothing (the temp is swept after a
@@ -4697,6 +4933,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (!this._staging.ContainsKey(normalized))
       return;
 
+    // a file that could not be written whole is not published: a new one never appears half-written,
+    // and an overwrite's replacement leaves the old file where it was
+    if (this._HasMissingBytes(normalized)) {
+      var replacing = this._overwrites.ContainsKey(normalized);
+      this._DiscardStagedLocked(normalized);
+      this._Invalidate(normalized);
+      if (!replacing)
+        this._shadow.Remove(normalized);
+
+      var outcome = replacing ? "the previous version is kept" : "it is not published";
+      DriveBender.Logger($"[Warning]'{normalized}' could not be written whole; {outcome}");
+      this._activity.Publish(ActivityKind.Write, normalized, reason: $"a write failed and was never repeated: {outcome}");
+      return;
+    }
+
     // a striped file's finals are filled before anything is made durable or renamed, and only
     // those it vouches for are published
     IReadOnlyList<PhysicalCopy>? striped = null;
@@ -4765,6 +5016,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     this._completedStripes.TryRemove(normalized, out _);
+    this._overwrites.TryRemove(normalized, out _);
+    this._failedRanges.TryRemove(normalized, out _);
     this._integrity.RenameFile(stagedName, normalized);
     this._journal.Complete(createSequence, JournalOp.Create);
     this._Invalidate(stagedName);
@@ -4792,7 +5045,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (io.BytesTotal == 0)
         continue; // capacity unknown (remote service) — excluded from the aggregate
 
-      var reserved = group.Sum(m => m.ReserveBytes);
+      var reserved = group.Sum(m => this._ReserveOf(m.Io.MemberId));
       free += Math.Max(0, io.BytesFree - reserved);
       total += io.BytesTotal;
     }

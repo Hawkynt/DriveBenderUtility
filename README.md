@@ -426,6 +426,13 @@ another file over it keeps it beside the new one as `<name> (displaced <when>)<e
 everything its writer wrote. Deleting it is the one deliberate end: handles still open on it are
 refused from then on, so they can never write into a new file that takes the name.
 
+Overwriting a file (truncate it, write it again: what `File.WriteAllBytes`, a shell
+redirect and most "save" commands do) never leaves it as neither version. The new
+content is written beside the old, on the same disks, and replaces it by an atomic
+rename at the last close. If a write failed and was never written again (no room,
+a disk that dropped), the old file is what remains; a new file in that state never
+appears. The cost: an overwrite briefly needs room for both versions.
+
 ### Memory: three caches with different jobs
 
 One configurable pool of RAM, split between reading and writing. The split can be automatic, fixed,
@@ -721,7 +728,9 @@ Platform-agnostic VFS/I/O engine towards live pool mounting
   into editable manifests in place
 - **Physical failure domains**: placement identity is the underlying volume
   (subfolder members on one disk are one domain), with de-duplicated free-space
-  accounting and `reserveBytes`
+  accounting and `reserveBytes`: room the pool never takes, neither for a new file
+  nor by growing an existing one, and a changed reserve applies to a mounted pool
+  at once
 - **Byte-range I/O abstraction** (`IVolumeIO`) with local backend and atomic
   temp-and-rename publication, plus whole-file remote backends
 - **Hierarchical configuration** (built-in defaults → global → pool → folder
