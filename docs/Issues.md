@@ -2185,7 +2185,7 @@ that still wait for their rename. Found by reading the publish path. Covered by
 `StripeCrashTests.Stripe_GivenAFinalCouldNotBeFilledNorRemovedAndThePublishIsRetried_…`, which
 fails without the change: three injected faults (the fill, the delete, one rename).
 
-### Resolved: a file renamed onto a name still being written was lost at the writer's close
+### Resolved: a file renamed onto a name still being written was lost at the writer's close, and an old handle could write into a newer file
 
 A file being written has no copy under its name yet, only a temp, which its last close publishes.
 A rename onto that name while it was open (`rename x t` on Linux; Windows refuses a rename over an
@@ -2194,17 +2194,31 @@ in. `x`'s bytes were gone, after the rename had been acknowledged. Until the clo
 also returned the writer's data rather than the renamed file's. The fix for the pending-publish case
 above covered closed files only, because an open file cannot be published.
 
-A replacing rename now discards the file being written, the way a delete of it already did (the
-shared code is `_DiscardStagedLocked`), so the close publishes nothing. A non-replacing rename onto
-the name is refused with `Exists`: the name is taken, even if only by a temp. This changes a
-deliberate earlier behaviour. `CrashConsistencyTests` had a matrix that expected the close to publish
-over the renamed file. It now cuts the power at each of the 15 steps of the rename and the close, and
-requires the renamed content to be whole under exactly one name, with every copy agreeing. Without
-the fix it fails 13 of 15, and the two new `StripeCrashTests` cases fail too.
+A replacing rename now moves the file being written aside first, to `t (displaced <when>).bin` in the
+same folder, and only then takes the freed name. The writer's handle follows the file as it follows any
+rename, so everything it writes afterwards and its close land in the displaced file. The renamed file
+is never touched. This applies whether the target is a new file still being written or an existing
+file being edited in place, and only to files open for WRITING: replacing a file that is merely open
+for reading is the atomic-save pattern, and nothing is displaced. A non-replacing rename onto the name
+is still refused with `Exists`, and a second displacement in the same second gets its own name.
 
-Still open: a handle stays bound to its path, not to its file. So the writer's handle, if used again
-after the rename, writes into the file now at that name. Deleting an open file has the same shape.
-Neither is new here, and neither is covered.
+An earlier version of this fix discarded the file being written instead, as a delete of it does. A
+delete is deliberate; a rename over a file is not a decision about the writer's data, so that version
+traded one loss for another and was replaced. `CrashConsistencyTests` now cuts the power at every one
+of the 26 steps of the move, the rename and the close (measured; the matrix was 15 steps before the
+move existed). It requires the renamed content to be whole under exactly one name, a kept-aside copy
+to be the writer's content whole, and every copy of each to agree. `RenameWhileWritingTests` covers
+the rest; without the move, 15 of the affected tests fail.
+
+**A handle outliving its file could write into the next file at that name.** That was still open
+here, and it was real. A deleted file's state stayed bound to the NAME while its handles were open,
+so the next file created at that name was given the same state, and the old writer's next byte landed
+in the new file (`05 06 05` where `05 05 05` was written). A rename over an edited file did the same
+before the move above. A delete now detaches the state from the name while handles are still open on
+it. Those handles are refused for anything but closing, with a stale-handle error, and the new file
+is its own. On Linux the kernel normally avoids reaching this by renaming an open file aside before
+deleting it (`.fuse_hidden`); on Windows, deleting one file while another handle keeps it open does
+reach it.
 
 Also audited this pass, with no defect found: the drainer's and the healer's commit paths
 (`_CommitDrainedCopy`, `_CommitHealedCopy`: check, rename and copy-list refresh all under one lease),

@@ -318,11 +318,12 @@ public class CrashConsistencyTests {
   // A rename onto the name of a file that is still being written. That file has no copy under its
   // name yet, only a temp, and its publish at the last close used to rename the temp over whatever
   // was renamed in — the renamed file's bytes were then gone, after the rename had been acknowledged.
-  // The rename now replaces the file being written, as a delete of it does, so the close publishes
-  // nothing. Interrupted at every step of the rename and the close, the renamed content must survive
-  // whole under exactly one of its two names, with every copy agreeing.
+  // The file being written is now moved aside to "race (displaced …).bin" first, and the rename takes
+  // the freed name. Interrupted at every step of the move, the rename and the close, the renamed
+  // content must survive whole under exactly one of its two names, a kept-aside copy must be whole,
+  // and every copy of each must agree. 26 steps: the whole operation, measured.
   public void Crash_GivenAFileIsRenamedOntoAFileStillBeingWritten_ThenTheRenamedContentSurvivesWhole(
-    [Range(1, 15)] int abortAfter) {
+    [Range(1, 26)] int abortAfter) {
     var renamed = _Version(31);
     var staged = _Version(32);
 
@@ -359,7 +360,12 @@ public class CrashConsistencyTests {
       (atNew.AsSpan().SequenceEqual(renamed) || (atOld != null && atNew.AsSpan().SequenceEqual(staged))).Should().BeTrue(
         $"after a crash at step {abortAfter}, race.bin is the renamed file, or the one being written while the rename had not happened");
 
-    foreach (var name in new[] { "race.bin", "other.bin" }) {
+    var displaced = recovered.ReadDirectory("").Where(e => e.Name.Contains("(displaced", StringComparison.Ordinal)).Select(e => e.Name).ToArray();
+    displaced.Should().HaveCountLessThanOrEqualTo(1, $"after a crash at step {abortAfter} the file being written is kept at most once");
+    foreach (var kept in displaced)
+      _ReadWhole(recovered, kept).Should().Equal(staged, $"after a crash at step {abortAfter} the file kept aside is the one being written, whole");
+
+    foreach (var name in new[] { "race.bin", "other.bin" }.Concat(displaced)) {
       var copies = new[] { this._v1, this._v2 }
         .SelectMany(v => new[] { false, true }.Select(shadow => v.GetContent(name, shadow)))
         .Where(c => c != null)

@@ -225,13 +225,13 @@ public class StripeCrashTests {
 
   [Test]
   [Category("EdgeCase")]
-  public void Rename_GivenItReplacesAFileStillBeingWritten_ThenTheRenamedFileWinsAndSurvivesTheWritersClose() {
+  public void Rename_GivenItReplacesAFileStillBeingWritten_ThenTheRenamedFileWinsAndTheWrittenOneIsKeptBesideIt() {
     // A file being written lives under a temp until its last close publishes it. A rename over it
     // replaced nothing (the name had no published copy), so the rename's own file sat under the name
     // only until that close, whose publish then renamed the temp over it: the renamed file's bytes
-    // were gone for good, after the rename had been acknowledged. The replaced file is discarded now,
-    // as a delete of a file still being written discards it. On Windows the OS refuses this rename
-    // while the file is open; on Linux it is an ordinary rename.
+    // were gone for good, after the rename had been acknowledged. The file being written is moved
+    // aside first now ("t (displaced …).bin") and keeps everything its writer wrote. On Windows the
+    // OS refuses this rename while the file is open; on Linux it is an ordinary rename.
     using var fs = this._Engine(2);
     var writing = fs.Create("t.bin", NodeKind.File, CreateFlags.None);
     fs.Write(writing, [1, 1, 1], 0, WriteMode.Normal);
@@ -244,9 +244,12 @@ public class StripeCrashTests {
     fs.Close(writing);
 
     _Read(fs, "t.bin").Should().Equal([2, 2, 2], "the replaced file's close must not bring it back over the rename");
+    var kept = fs.ReadDirectory("").Single(e => e.Name.StartsWith("t (displaced ", StringComparison.Ordinal)).Name;
+    _Read(fs, kept).Should().Equal([1, 1, 1], "and the file being written is not lost");
     fs.Unmount();
     using var remounted = this._Engine(2);
     _Read(remounted, "t.bin").Should().Equal([2, 2, 2], "and after a remount");
+    _Read(remounted, kept).Should().Equal([1, 1, 1]);
   }
 
   [Test]

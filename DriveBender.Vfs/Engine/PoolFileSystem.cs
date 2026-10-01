@@ -1820,6 +1820,56 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
+  /// <summary>
+  /// Moves a file that is open for writing aside to "&lt;name&gt; (displaced &lt;when&gt;)&lt;ext&gt;" in its folder,
+  /// so a rename can take its name without losing it. A file still being written for the first time
+  /// is published first, exactly as renaming such a file publishes it; its writer then carries on in
+  /// place under the new name. The caller holds the path's write lease and the namespace gate.
+  /// </summary>
+  private void _DisplaceLocked(string normalized) {
+    if (this._staging.ContainsKey(normalized))
+      this._PublishStagedLocked(normalized);
+
+    var copies = this._placement.ResolveCopies(normalized);
+    if (copies.Count == 0)
+      return; // nothing under the name to keep
+
+    for (var attempt = 1; ; ++attempt) {
+      var displaced = this._DisplacedNameFor(normalized, attempt);
+      if (this._placement.ResolveCopies(displaced).Count > 0 || this._staging.ContainsKey(displaced))
+        continue;
+
+      // a name nobody can be holding yet; should somebody be, the next one is taken rather than waited for
+      using var lease = this._handles.TryAcquireWrite(displaced, TimeSpan.Zero);
+      if (lease == null)
+        continue;
+
+      this._RenameFileLocked(normalized, displaced, RenameFlags.None, normalized, displaced, sameFile: false, caseOnly: false, copies);
+      DriveBender.Logger($"[Warning]'{normalized}' was still open for writing when another file was renamed over it; it is kept as '{displaced}'");
+      this._activity.Publish(ActivityKind.Write, displaced, reason: $"kept beside '{normalized}': still being written when another file took its name");
+      return;
+    }
+  }
+
+  private string _DisplacedNameFor(string normalized, int attempt) {
+    var name = PoolPaths.GetName(normalized);
+    var dot = name.LastIndexOf('.');
+    var (stem, extension) = dot > 0 ? (name[..dot], name[dot..]) : (name, "");
+    var when = this._clock().ToLocalTime().ToString("yyyy-MM-dd HH-mm-ss", System.Globalization.CultureInfo.InvariantCulture);
+    var displaced = attempt == 1 ? $"{stem} (displaced {when}){extension}" : $"{stem} (displaced {when}, {attempt}){extension}";
+    var parent = PoolPaths.GetParent(normalized);
+    return parent.Length == 0 ? displaced : $"{parent}/{displaced}";
+  }
+
+  /// <summary>
+  /// A handle whose file was deleted while it was open reaches nothing any more. It used to stay bound
+  /// to the NAME, so once a new file took the name, the old writer's next write went into the new file.
+  /// </summary>
+  private static void _RefuseDeleted(HandleTable.OpenHandle open) {
+    if (open.File.Deleted)
+      throw new PoolFsException(PoolFsError.StaleHandle, "The file was deleted while this handle was open");
+  }
+
   /// <summary>A path that is a folder on some member and a file on none — what a folder rename moves.</summary>
   private bool _IsFolderOnly(string normalized)
     => this._placement.ResolveCopies(normalized).Count == 0 && this._Online.Any(m => m.FolderExists(normalized, false));
@@ -1846,6 +1896,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // ARE the source; only a genuinely different path is a real target. And a rename that is refused
     // changes nothing, so the refusal comes before any preserving: a copy made first was store space
     // spent on nothing, with the target dropped from the pinned set on the way.
+    // A target somebody is still WRITING is never replaced out from under its writer: it is moved
+    // aside to a name beside it first, and the writer's handle goes with it, as any open file follows
+    // a rename. Its later writes and its close land there, and the rename takes the freed name.
+    // Replacing it instead lost data either way: discarded, the writer's work was gone; left bound to
+    // the name, the writer's next write went into the file that was renamed in.
+    if (!sameFile && (flags & RenameFlags.ReplaceExisting) != 0 && this._handles.IsOpenForWrite(toNormalized))
+      this._DisplaceLocked(toNormalized);
+
     var targetCopies = sameFile ? [] : this._placement.ResolveCopies(toNormalized);
 
     // A target still being written (open, so its publish could not be done above) has no copy under
@@ -2446,6 +2504,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
     if (this._DiscardStagedLocked(normalized)) {
       this._shadow.Remove(normalized);
+      this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
       return;
     }
 
@@ -2460,6 +2519,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (copies.Count == 0) {
       // the only copy was the one just preserved — the delete has nothing left to do
       this._shadow.Remove(normalized);
+      this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
       return;
     }
 
@@ -2486,6 +2546,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       this._Invalidate(normalized);
       this._shadow.Remove(normalized);
+      this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
       return;
     }
 
@@ -2528,6 +2589,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._Invalidate(normalized);
     this._shadow.Remove(normalized);
+    this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
   }
 
   /// <summary>
@@ -2738,6 +2800,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return this._ReadSnapshotHandle(handle, buffer, offset);
 
     var open = this._handles.Get(handle);
+    _RefuseDeleted(open);
     if (offset < 0)
       throw new PoolFsException(PoolFsError.InvalidArgument, "Negative offset");
 
@@ -3321,6 +3384,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     _RefuseWriteToSnapshotHandle(handle);
     this._RequireWritable();
     var open = this._handles.Get(handle);
+    _RefuseDeleted(open);
     if ((open.Access & AccessMode.Write) == 0)
       throw new PoolFsException(PoolFsError.AccessDenied, "Handle is not open for writing");
     if (offset < 0)
@@ -3713,6 +3777,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._RequireWritable();
     _RefuseWriteToSnapshotHandle(handle);
     var open = this._handles.Get(handle);
+    _RefuseDeleted(open);
     if ((open.Access & AccessMode.Write) == 0)
       throw new PoolFsException(PoolFsError.AccessDenied, "Handle is not open for writing");
     if (length < 0)
@@ -3767,6 +3832,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (handle.Value < 0)
       return; // nothing was ever owed on a read-only view of the past
     var open = this._handles.Get(handle);
+    _RefuseDeleted(open);
 
     // one lease covers both steps: a publish that raced the flush could otherwise rename the
     // temp away between them and strand the just-flushed blocks
@@ -4466,6 +4532,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var namespaceHold = this._EnterNamespaceShared();
     var wrote = this._handles.TryGet(handle) is { } open && (open.Access & AccessMode.Write) != 0;
     this._handles.MarkApplicationClosed(handle);
+    if (this._handles.TryGet(handle) is { File.Deleted: true })
+      return; // the file is gone
 
     // publication hangs off "no application still has it open", which is exactly what just changed
     var path = this._handles.TryGetPath(handle);
@@ -4488,6 +4556,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var namespaceHold = this._EnterNamespaceShared(); // a close can publish, and publishing writes under the path
 
     var open = this._handles.Get(handle);
+    if (open.File.Deleted) {
+      this._handles.Close(handle); // the file is gone: nothing to publish, nothing to settle
+      return;
+    }
+
     var path = open.File.Path;
     var wrote = (open.Access & AccessMode.Write) != 0;
     this._handles.Close(handle);
