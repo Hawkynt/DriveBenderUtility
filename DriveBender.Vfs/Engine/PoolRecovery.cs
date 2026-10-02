@@ -187,6 +187,29 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
     return any;
   }
 
+  /// <summary>Whether two files on one member hold the same bytes; false when either cannot be read.</summary>
+  private static bool _SameContent(IVolumeIO member, string a, string b, bool shadow) {
+    try {
+      if (member.Stat(a, shadow)?.Length != member.Stat(b, shadow)?.Length)
+        return false;
+
+      using var left = member.OpenRead(a, shadow);
+      using var right = member.OpenRead(b, shadow);
+      var bufferA = new byte[1 << 16];
+      var bufferB = new byte[1 << 16];
+      while (true) {
+        var readA = left.ReadAtLeast(bufferA, bufferA.Length, throwOnEndOfStream: false);
+        var readB = right.ReadAtLeast(bufferB, bufferB.Length, throwOnEndOfStream: false);
+        if (readA != readB || !bufferA.AsSpan(0, readA).SequenceEqual(bufferB.AsSpan(0, readB)))
+          return false;
+        if (readA == 0)
+          return true;
+      }
+    } catch (PoolFsException) {
+      return false;
+    }
+  }
+
   private bool _RollForwardRename(string from, string to) {
     // folder rename: some members may have flipped before the crash — finish the rest the same way
     if (this._Online.Any(m => m.FolderExists(to, false)) && !this._Online.Any(m => m.FileExists(to, false) || m.FileExists(to, true))) {
@@ -213,9 +236,14 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
       if (!member.FileExists(from, shadow))
         continue;
 
-      if (member.FileExists(to, shadow)) {
-        // both sides present on this member: the move happened elsewhere; the leftover source is stale
+      if (member.FileExists(to, shadow) && _SameContent(member, from, to, shadow)) {
+        // both sides present and alike: a copy-based move got as far as the copy; the source is the leftover
         member.Delete(from, shadow);
+      } else if (member.FileExists(to, shadow)) {
+        // both sides present and DIFFERENT: a rename over an existing file had not reached this member
+        // yet. Deleting the source here used to throw away the very content being renamed, and leave
+        // the old file under the name; the move is finished instead, as it was asked for.
+        member.AtomicReplace(from, to, shadow);
       } else {
         var parent = PoolPaths.GetParent(to);
         if (parent.Length > 0)

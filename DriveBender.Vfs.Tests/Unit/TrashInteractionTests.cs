@@ -146,22 +146,25 @@ public class TrashInteractionTests {
   }
 
   [Test]
-  [Category("Exception")]
-  public void Restore_GivenTheNameHasBeenUsedAgain_ThenItIsRefusedAndBothFilesSurvive() {
-    // Restoring renamed the binned file over whatever held the name now: on the same disk it replaced
-    // the new file outright, on another disk it made a second primary beside it. Either way a file
-    // was lost or the pool was left disagreeing with itself.
+  [Category("EdgeCase")]
+  public void Restore_GivenTheNameHasBeenUsedAgain_ThenTheTwoVersionsAreSwappedAndNeitherIsLost() {
+    // Restoring once renamed the binned file over whatever held the name: on the same disk it replaced
+    // the newer file outright, on another disk it made a second primary beside it. It was then
+    // refused instead, which made every version the bin keeps of a REPLACED file unrestorable, since
+    // its name is always taken. Now the file holding the name goes to the bin first: a swap.
     using var fs = this._Mounted("""{ "duplication": 1, "trash": { "enabled": true } }""");
     _Write(fs, "notes.txt", [1]);
     fs.Unlink("notes.txt");
     _Write(fs, "notes.txt", [2, 2]);
 
-    var restore = () => fs.RestoreFromTrash("notes.txt");
+    fs.RestoreFromTrash("notes.txt");
 
-    restore.Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.Exists);
-    _ReadLive(fs, "notes.txt").Should().Equal(new byte[] { 2, 2 }, "the file that holds the name now is untouched");
-    new[] { this._a, this._b }.Count(m => m.FileExists("notes.txt", false)).Should().Be(1, "and it is still the only primary");
-    fs.Trash.List().Should().ContainSingle(e => e.OriginalPath == "notes.txt", "and the binned one is still restorable");
+    _ReadLive(fs, "notes.txt").Should().Equal(new byte[] { 1 }, "the version asked for is back");
+    new[] { this._a, this._b }.Count(m => m.FileExists("notes.txt", false)).Should().Be(1, "as the only primary");
+    fs.Trash.List().Should().ContainSingle(e => e.OriginalPath == "notes.txt", "and the newer one is in the bin");
+
+    fs.RestoreFromTrash("notes.txt");
+    _ReadLive(fs, "notes.txt").Should().Equal(new byte[] { 2, 2 }, "restoring again swaps them back");
   }
 
   [Test]

@@ -2192,6 +2192,62 @@ that still wait for their rename. Found by reading the publish path. Covered by
 `StripeCrashTests.Stripe_GivenAFinalCouldNotBeFilledNorRemovedAndThePublishIsRetried_…`, which
 fails without the change: three injected faults (the fill, the delete, one rename).
 
+### Added: limits on what the bin takes: per-file interval for replaced versions, file size, free room
+
+Keeping replaced versions made the bin's intake depend on how often files are saved. A log appended by
+rewriting, or a database saved every few seconds, would fill the bin with near-identical versions;
+one large file would fill it at once; and a disk running out of room keeps spending it on an undo.
+
+- `trash.replacedInterval` (default 15m): a REPLACED version is kept only when the bin has none of
+  that file from within the interval. Ten saves in five minutes are one version. `0` or `off` keeps
+  every version. Deletes ignore it, being deliberate. The check is a dictionary lookup per save: the
+  bin's last version of each path is remembered, and a path not yet asked about is looked up once in
+  the single bin folder that holds all of its versions, by its sidecars, so a remount does not reset
+  the interval.
+- `trash.maxFileSize` (a size or a percentage of the member; no limit by default): larger files skip
+  the bin, deleted or replaced.
+- `trash.minFreeSpace` (default 10%): while the member that would keep the version has less usable
+  room than this (free space less its reserve), nothing new goes to its bin.
+
+A file that skips the bin is logged (as a warning for a delete, since that delete is final) and
+published to the activity feed. All three are validated with the setting's name in the message.
+`BinPolicyTests` covers each limit with its boundaries, a remount, files sharing a folder, and
+rejected values; without the policy, the limiting cases fail.
+
+### Added: the recycle bin keeps replaced versions; and a rename over a file could lose the renamed content
+
+With the bin on, a version that is REPLACED goes to the bin, as a deleted one does: an overwrite's
+old content at its publish, and the file a rename lands on. Saving over the wrong file and renaming
+over the wrong file are what a bin is for, and the bin used to see deletes only. On a disk that can
+hard-link the entry is a second name for the old data (no bytes copied); elsewhere it is a clone or
+a copy. The live name is untouched until the replacement's atomic rename, so a power cut leaves at
+worst a bin entry of a version that is still live. With the bin off nothing changes.
+
+Restoring had to change with it: it refused while the name was taken, and a replaced version's name
+is ALWAYS taken. A restore over a closed file is now a swap: that file goes to the bin in its place
+(by an ordinary binned delete), and the version chosen before the swap comes back, so restoring
+again swaps back. A name still being written, or one where the bin is off, is still refused.
+
+**Found by the crash matrix written for it, and older than the bin: a rename over an existing file
+could lose the renamed content.** The rename deleted every copy of the old target, then renamed the
+source onto the name on each member. Recovery decided whether to finish an interrupted rename by
+looking for the target name. A power cut after the journal intent but before anything moved left both
+names on every member; recovery read that as "moved elsewhere, this source is a leftover" and
+DELETED THE SOURCE, keeping the old file and throwing away the one being renamed (bin on or off, at
+step 2). A power cut after the deletes but before the renames left the name empty, read as "never
+started". Now only target copies with no source copy to replace them are deleted, and first; each
+remaining one is replaced by the atomic rename, so the name always holds a version. Recovery finishes
+the move where both names are still there and differ, and drops the source only where it holds the
+same bytes as the target (a copy-based move that got as far as the copy). The bin entry is made
+BEFORE the rename's intent: once the intent is durable, recovery finishes the rename, and a version
+not yet binned would be replaced without reaching the bin.
+
+Tests: `BinKeepsReplacedTests` (overwrite and rename-over, bin on and off, a failed overwrite adds
+nothing, hard link versus copy measured in bytes written, and power cut at every step of an
+overwrite and of a rename-over, bin on and off, requiring the renamed content under one of its two
+names and the replaced version in the bin). `TrashInteractionTests` restore-over-a-taken-name now
+asserts the swap.
+
 ### Resolved: an overwrite that ran out of room lost the file it was updating, and a reserve was only half kept
 
 Found by questioning a test rather than the code. `TamperPhysicalEndToEndTests` had two "out of

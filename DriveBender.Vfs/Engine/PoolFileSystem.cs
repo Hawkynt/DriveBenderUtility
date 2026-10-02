@@ -706,30 +706,47 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// <summary>Restores a trashed item to its original path and re-establishes its duplication level (FR-TRASH).</summary>
   public void RestoreFromTrash(string originalPath) {
     this._RequireWritable();
-    using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(originalPath);
     _RefuseWriteToSnapshotTree(normalized);
 
-    // Under the path's lease, and only onto a free name. The restore renames the binned file into
-    // place, and it used to do that over whatever held the name by then: on the same disk the newer
-    // file was replaced outright (not binned, not preserved for a snapshot), on another disk the pool
-    // was left with two primaries of one path. A name being written for the first time is taken too.
-    using var lease = this._handles.AcquireWrite(normalized);
-    if (this._staging.ContainsKey(normalized) || this._placement.ResolveCopies(normalized).Count > 0)
-      throw new PoolFsException(PoolFsError.Exists,
-        $"'{normalized}' exists again since it was deleted — rename or delete that file first, then restore");
+    // The version to bring back is chosen BEFORE anything else moves: when the name is taken, the file
+    // holding it goes to the bin first, and would otherwise be the newest entry, restored straight back.
+    string? version = null;
+    for (var swapped = false; ; swapped = true) {
+      using (this._EnterNamespaceShared()) // before any lease: a folder rename must not move the path mid-operation
+      using (this._handles.AcquireWrite(normalized)) {
+        version ??= this._trash.NewestVersionOf(normalized)
+                    ?? throw new PoolFsException(PoolFsError.NotFound, $"No trash entry for '{originalPath}'");
 
-    // The bin keeps a file on the disk it was deleted from. A disk that has since become idle (it is
-    // being retired) or read-only takes no new files, and a restored file is new to it: the entry is
-    // moved to where a new file of its size would be placed, and restored there.
-    var restored = this._trash.Restore(normalized, this._TakesNewFiles, this._placement.ChoosePrimaryTarget)
-                   ?? throw new PoolFsException(PoolFsError.NotFound, $"No trash entry for '{originalPath}'");
+        // Only onto a free name, under its lease. Renaming the binned file over whatever held the name
+        // replaced a newer file outright, or left two primaries on two disks. A name being written is
+        // refused; one held by a closed file is a SWAP, the file there going to the bin in its place —
+        // refusing that made every version the bin keeps of a replaced file unrestorable, since its
+        // name is always taken. Only where that file would really reach the bin, never by deleting it.
+        var taken = this._staging.ContainsKey(normalized) || this._placement.ResolveCopies(normalized).Count > 0;
+        if (!taken) {
+          // The bin keeps a file on the disk it was deleted from. A disk that has since become idle (it
+          // is being retired) or read-only takes no new files, and a restored file is new to it: the
+          // entry is moved to where a new file of its size would be placed, and restored there.
+          _ = this._trash.Restore(normalized, this._TakesNewFiles, this._placement.ChoosePrimaryTarget, version)
+              ?? throw new PoolFsException(PoolFsError.NotFound, $"No trash entry for '{originalPath}'");
 
-    this._Invalidate(normalized);
-    this._EnsureShadows(normalized, this._placement.ResolveCopies(normalized));
-    this._Invalidate(normalized);
-    DriveBender.Logger($" - Restored '{normalized}' from trash");
+          this._Invalidate(normalized);
+          this._EnsureShadows(normalized, this._placement.ResolveCopies(normalized));
+          this._Invalidate(normalized);
+          DriveBender.Logger($" - Restored '{normalized}' from trash");
+          return;
+        }
+
+        if (swapped || this._staging.ContainsKey(normalized) || this._handles.IsOpen(normalized) || !this._BinFor(normalized).Keeps)
+          throw new PoolFsException(PoolFsError.Exists,
+            $"'{normalized}' is in use, or exists again and the recycle bin is off here — rename or delete that file first, then restore");
+      }
+
+      this.Unlink(normalized); // into the bin: the restore is a swap
+    }
   }
+
   public bool IsMounted => this._mountOptions != null;
   public bool IsReadOnly => this._mountOptions?.ReadOnly ?? false;
 
@@ -2023,6 +2040,71 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     return true;
   }
 
+  /// <summary>
+  /// Whether the bin takes this version, beyond being on: why not, or null when it does. A file larger
+  /// than <c>trash.maxFileSize</c> skips it; while the member that would keep it has less usable room
+  /// than <c>trash.minFreeSpace</c>, nothing new goes to it; and a REPLACED version is kept only when
+  /// the bin has none of that file from within <c>trash.replacedInterval</c>, so a log or a database
+  /// rewritten all the time does not fill the bin one save at a time. Deletes ignore the interval.
+  /// </summary>
+  private string? _BinRefuses(string normalized, IReadOnlyList<PhysicalCopy> copies, bool replaced) {
+    var trash = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(normalized)).Trash;
+    if (trash == null || copies.Count == 0)
+      return null;
+
+    var keeper = copies.OrderBy(c => c.Shadow).First();
+    var volume = keeper.Volume;
+    var total = volume.BytesTotal;
+    if (trash.MaxFileSize is { } maxFileSize && (volume.Stat(normalized, keeper.Shadow)?.Length ?? 0) is var length
+        && length > SizeSpec.Parse(maxFileSize).ResolveBytes(total))
+      return $"it is larger than trash.maxFileSize ({length:N0} bytes)";
+
+    if (total > 0 && volume.BytesFree - this._ReserveOf(volume.MemberId) < SizeSpec.Parse(trash.MinFreeSpace ?? "10%").ResolveBytes(total))
+      return $"{volume.DisplayName} has less room than trash.minFreeSpace";
+
+    if (replaced && trash.ResolvedReplacedInterval is var interval && interval > TimeSpan.Zero
+        && this._trash.LastKeptUtc(normalized) is { } last && this._clock() - last < interval)
+      return "a version of it was kept within trash.replacedInterval";
+
+    return null;
+  }
+
+  private void _NoteSkippedBin(string normalized, string why, bool replaced) {
+    var what = replaced ? "the version replaced" : "the deleted file";
+    if (replaced)
+      DriveBender.Logger($" - Not keeping {what} of '{normalized}' in the recycle bin: {why}");
+    else
+      DriveBender.Logger($"[Warning]Not keeping {what} '{normalized}' in the recycle bin: {why}; it is removed for good");
+    this._activity.Publish(ActivityKind.Write, normalized, reason: $"{what} skipped the recycle bin: {why}");
+  }
+
+  /// <summary>Whether the recycle bin is on where this path lives, and whether it keeps a single copy.</summary>
+  private (bool Keeps, bool DropDuplicates) _BinFor(string normalized) {
+    var trash = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(normalized)).Trash;
+    return (trash?.Enabled == true, trash?.DropDuplicatesInTrash ?? true);
+  }
+
+  /// <summary>
+  /// With the recycle bin on, a version about to be REPLACED goes to the bin, as a deleted one does:
+  /// saving over the wrong file and renaming over the wrong file are what the bin is for. The owed
+  /// bytes of the version are applied first, so the bin keeps the file the pool acknowledged. The
+  /// caller holds the path's write lease and replaces the file afterwards.
+  /// </summary>
+  private void _KeepReplacedInBin(string normalized, IReadOnlyList<PhysicalCopy> copies) {
+    var (keeps, dropDuplicates) = this._BinFor(normalized);
+    if (!keeps || copies.Count == 0)
+      return;
+
+    if (this._BinRefuses(normalized, copies, replaced: true) is { } why) {
+      this._NoteSkippedBin(normalized, why, replaced: true);
+      return;
+    }
+
+    this._FlushBeforeKeeping(normalized);
+    this._trash.KeepReplaced(normalized, this._placement.ResolveCopies(normalized), dropDuplicates);
+    this._activity.Publish(ActivityKind.Write, normalized, reason: "the version replaced is kept in the recycle bin");
+  }
+
   /// <summary>A path that is a folder on some member and a file on none — what a folder rename moves.</summary>
   private bool _IsFolderOnly(string normalized)
     => this._placement.ResolveCopies(normalized).Count == 0 && this._Online.Any(m => m.FolderExists(normalized, false));
@@ -2076,16 +2158,29 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (stagedTarget)
       this._DiscardStagedLocked(toNormalized);
 
+    // a file renamed over is replaced: with the bin on, it is kept there first. BEFORE the intent: once
+    // the intent is durable, recovery finishes the rename, and a version not yet binned by then would
+    // be replaced without ever reaching the bin
+    if (!caseOnly)
+      this._KeepReplacedInBin(toNormalized, targetCopies);
+
     this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
 
-    // overwrite-on-rename removes every copy of the old target first (no orphans) — except where
-    // that copy is the SOURCE wearing the other spelling, which is what a case-only rename means on
-    // a member whose storage does not distinguish the two. Deleting it there destroys the file the
-    // rename was supposed to move, and the AtomicReplace below flips the name in place anyway.
+    // Overwrite-on-rename leaves no orphans, and never an empty name. A copy of the old target where
+    // the source has a copy of its own (same disk, same side) is REPLACED by the atomic rename below,
+    // so the name always holds one version or the other. Only target copies with no source copy to
+    // take their place are deleted, and they go first: until the renames, the name keeps its other
+    // copies. Deleting every target copy first left a window in which the name held nothing, and
+    // recovery read "no target" as "the rename never started", so a power cut there left the name
+    // empty. Never deleted either: the SOURCE wearing the other spelling, which is what a case-only
+    // rename means on a member whose storage does not distinguish the two.
     foreach (var stale in targetCopies) {
       if (caseOnly && !stale.Volume.IsCaseSensitive)
         continue;
+
+      if (copies.Any(c => c.Volume.MemberId == stale.Volume.MemberId && c.Shadow == stale.Shadow))
+        continue; // replaced in place by the rename below
 
       stale.Volume.Delete(toNormalized, stale.Shadow);
     }
@@ -2677,6 +2772,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._shadow.Remove(normalized);
       this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
       return;
+    }
+
+    // too large for the bin, or the disk too short of room for it: the delete is final (logged)
+    if (binned && this._BinRefuses(normalized, copies, replaced: false) is { } why) {
+      this._NoteSkippedBin(normalized, why, replaced: false);
+      binned = false;
     }
 
     // The bin keeps ONE copy (dropDuplicatesInTrash), and a copy can be behind an acknowledged write
@@ -4977,6 +5078,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // before the first rename: the same guarantee every staged create used to pay for up front.
     if (createSequence == 0 && this._placement.ResolveCopies(normalized).Count > 0)
       createSequence = this._journal.LogIntent(JournalOp.Create, stagedName);
+
+    // the version this publish replaces (an overwrite's original, or a file another client published
+    // at the name meanwhile) goes to the recycle bin first, where the bin is on
+    this._KeepReplacedInBin(normalized, this._placement.ResolveCopies(normalized));
 
     try {
       var copies = striped ?? this._placement.ResolveCopies(stagedName);
