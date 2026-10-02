@@ -246,6 +246,47 @@ public class RenameWhileWritingTests {
     _Read(fs, "log.txt").Should().Equal(new byte[] { 5, 5, 5 }, "the new file belongs to its own writer alone");
   }
 
+  [TestCase(false, TestName = "Delete_GivenAReaderStillHasTheFileOpen_ThenItGoesOnReadingTheDeletedContent")]
+  [TestCase(true, TestName = "Delete_GivenAReaderStillHasTheFileOpenAndTheBinIsOn_ThenItGoesOnReadingTheDeletedContent")]
+  [Category("EdgeCase")]
+  public void Delete_GivenAReaderStillHasTheFileOpen_ThenItGoesOnReadingTheDeletedContent(bool bin) {
+    // POSIX: a delete removes the NAME; a process that has the file open keeps it, reads and
+    // writes it, until it closes it. On Linux this is what replacing a file that someone is reading
+    // does all the time (the kernel deletes the old one once its readers let go, and the pool can
+    // hear that delete while a reader's close is still in flight). Refusing those reads reached the
+    // application as "access denied" in the middle of an ordinary replace.
+    using var fs = this._Engine();
+    if (bin)
+      fs.ReloadConfig(ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "trash": { "enabled": true }, "readAhead": { "enabled": false } }"""));
+    _WriteClosed(fs, "photo.jpg", [7, 7, 7, 7]);
+    var reader = fs.Open("photo.jpg", AccessMode.Read, ShareMode.Read | ShareMode.Delete);
+
+    fs.Unlink("photo.jpg");
+    _WriteClosed(fs, "photo.jpg", [8]);
+
+    var buffer = new byte[4];
+    fs.Read(reader, buffer, 0).Should().Be(4, "the open handle still has the file it opened");
+    buffer.Should().Equal(7, 7, 7, 7);
+    fs.Close(reader);
+
+    _Read(fs, "photo.jpg").Should().Equal(new byte[] { 8 }, "the name belongs to the new file");
+    this._Temps().Should().BeEmpty("the deleted file is gone once its last handle is");
+    fs.ReadDirectory("").Select(e => e.Name).Should().Equal(["photo.jpg"]);
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void Delete_GivenNoOtherHandleHasTheFileOpen_ThenItIsSimplyGone() {
+    // the common case pays nothing: the handle that asked for the delete is closed before it
+    using var fs = this._Engine();
+    _WriteClosed(fs, "tmp.bin", [1]);
+
+    fs.Unlink("tmp.bin");
+
+    this._Temps().Should().BeEmpty();
+    new[] { this._d1, this._d2, this._d3 }.SelectMany(d => d.FilePaths).Should().NotContain(p => p.Contains("tmp.bin"));
+  }
+
   #endregion
 
 }

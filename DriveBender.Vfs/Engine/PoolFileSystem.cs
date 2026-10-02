@@ -1133,7 +1133,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // retain-metadata: complete the listing with remembered entries whose members have dropped out (§10 SAFE-DEGRADE)
     if (this._memberLossPolicy == MemberLossPolicy.RetainMetadata && (folderSeen || this._shadow.Get(normalized)?.Kind == NodeKind.Directory))
       foreach (var remembered in this._shadow.Children(normalized))
-        if (!entries.ContainsKey(remembered.Name)) {
+        if (!PoolPaths.IsHiddenName(remembered.Name) && !entries.ContainsKey(remembered.Name)) {
           entries[remembered.Name] = remembered;
           folderSeen = true;
         }
@@ -1870,6 +1870,45 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       throw new PoolFsException(PoolFsError.StaleHandle, "The file was deleted while this handle was open");
   }
 
+  /// <summary>
+  /// A delete of a file the application still has open: every copy is renamed to a hidden name beside
+  /// it (journalled as the delete it is), the open state follows, and the last close removes it. A
+  /// power cut before then leaves temps the next mount sweeps, which is also what POSIX does with a
+  /// file deleted while open: it does not outlive the machine going down. The caller holds the lease.
+  /// </summary>
+  private void _RemoveNameKeepingOpenFile(string normalized, IReadOnlyList<PhysicalCopy> copies, IReadOnlyList<long>? staleIntents) {
+    var hidden = $"{normalized}.{Guid.NewGuid().ToString("N")[..8]}.OPEN.{DriveBender.DriveBenderConstants.TEMP_EXTENSION}";
+    var sequence = this._journal.LogIntent(JournalOp.Delete, normalized);
+    foreach (var copy in copies)
+      copy.Volume.AtomicReplace(normalized, hidden, copy.Shadow);
+
+    this._journal.Complete(sequence, JournalOp.Delete);
+    this._InvalidateChecksums(normalized);
+    foreach (var staleSequence in staleIntents ?? [])
+      this._journal.Complete(staleSequence, JournalOp.Write);
+
+    this._Invalidate(normalized);
+    this._Invalidate(hidden);
+    this._shadow.Remove(normalized);
+    this._handles.RenamePath(normalized, hidden);
+    this._handles.RemoveAtLastClose(hidden);
+  }
+
+  /// <summary>The last handle on a file deleted while open is gone: the hidden copies go with it.</summary>
+  private void _RemoveDeletedOpenFile(string hidden) {
+    using var lease = this._handles.AcquireWrite(hidden);
+    this._writeBuffer.Drain(hidden);
+    foreach (var copy in this._placement.ResolveCopies(hidden))
+      try {
+        copy.Volume.Delete(hidden, copy.Shadow);
+      } catch (PoolFsException) {
+        // swept as a temp on the next mount
+      }
+
+    this._Invalidate(hidden);
+    this._shadow.Remove(hidden); // reads through the open handles remembered it
+  }
+
   /// <summary>A path that is a folder on some member and a file on none — what a folder rename moves.</summary>
   private bool _IsFolderOnly(string normalized)
     => this._placement.ResolveCopies(normalized).Count == 0 && this._Online.Any(m => m.FolderExists(normalized, false));
@@ -2535,9 +2574,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // offline members keep their stale copies — record what they missed so no ghost resurrects
     this._RecordTombstoneForOffline(JournalOp.Delete, normalized);
 
+    // POSIX: a delete removes the NAME. A handle the application still holds keeps the file, and goes
+    // on reading and writing it until it closes; on Linux that is what replacing a file someone is
+    // reading does all the time. Refusing those handles reached the application as "access denied"
+    // in the middle of an ordinary replace. They follow the file instead: into the bin, or to a hidden
+    // name beside it that their last close removes. Either way the name is free for a new file that
+    // the old handles never reach.
+    var stillOpen = this._handles.IsOpen(normalized);
+
     if (binned) {
       // recoverable delete: all copies move to the hidden pool trash instead of dying (FR-TRASH)
-      this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true,
+      var kept = this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true,
         recordedAs);
       this._InvalidateChecksums(normalized);
       if (discarded != null)
@@ -2546,7 +2593,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       this._Invalidate(normalized);
       this._shadow.Remove(normalized);
-      this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
+      if (stillOpen && kept != null) {
+        this._handles.RenamePath(normalized, kept); // the open handles read on from the bin entry
+        this._Invalidate(kept);
+      } else
+        this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
+      return;
+    }
+
+    if (stillOpen) {
+      this._RemoveNameKeepingOpenFile(normalized, copies, discarded?.journalSequences);
       return;
     }
 
@@ -4564,6 +4620,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var path = open.File.Path;
     var wrote = (open.Access & AccessMode.Write) != 0;
     this._handles.Close(handle);
+
+    // a file deleted while open: its last handle takes it along
+    if (open.File.RemoveAtLastClose) {
+      if (HandleTable.IsLastHandleGone(open.File))
+        this._RemoveDeletedOpenFile(path);
+      return;
+    }
 
     // the last writer is done: complete the file's edit session. Under the file's write lease, so a
     // write still in flight on another handle finishes first and cannot end up outside any intent.

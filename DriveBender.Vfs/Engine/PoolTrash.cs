@@ -77,7 +77,8 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   /// never destroyed by this one.
   /// </summary>
   /// <param name="recordedAs">The path the entry is listed and restored under, when it is not the path deleted (a file the kernel set aside under a hidden name first).</param>
-  public void MoveToTrash(string normalizedPath, IReadOnlyList<PhysicalCopy> copies, bool dropDuplicates, string? recordedAs = null) {
+  /// <returns>Where the kept copy now lives in the bin (a primary-side path on its member), or null when none was kept.</returns>
+  public string? MoveToTrash(string normalizedPath, IReadOnlyList<PhysicalCopy> copies, bool dropDuplicates, string? recordedAs = null) {
     var originalPath = recordedAs ?? normalizedPath;
     var trashPath = _NewTrashPathFor(originalPath);
     var sequence = journal.LogIntent(JournalOp.TrashMove, normalizedPath, trashPath);
@@ -104,6 +105,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
     }
 
     journal.Complete(sequence, JournalOp.TrashMove);
+    return kept > 0 ? trashPath : null;
   }
 
   private void _MoveShadowIntoTrash(IVolumeIO member, string normalizedPath, string trashPath) {

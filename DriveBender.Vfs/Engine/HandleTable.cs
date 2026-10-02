@@ -13,6 +13,12 @@ public sealed class FileState(string normalizedPath) {
   public bool Deleted { get; internal set; }
 
   /// <summary>
+  /// The file was deleted while the application still had it open, and lives on under a hidden name
+  /// for those handles (POSIX: a delete removes the name, not the file); the last close removes it.
+  /// </summary>
+  public bool RemoveAtLastClose { get; internal set; }
+
+  /// <summary>
   /// Total pins keeping this state alive: open handles PLUS outstanding path leases. Changed only
   /// atomically: a lease on a path that is already pinned adds its pin WITHOUT the table's lock (see
   /// <see cref="HandleTable.TryPinLive"/>); every transition to or from zero still happens under it.
@@ -364,6 +370,16 @@ public sealed class HandleTable {
       this._files[file.Path] = file;
     }
   }
+
+  /// <summary>Marks a path's state to be removed at its last close (a file deleted while open); the caller holds its lease.</summary>
+  public void RemoveAtLastClose(string normalizedPath) {
+    lock (this._lock)
+      if (this._files.TryGetValue(normalizedPath, out var file))
+        file.RemoveAtLastClose = true;
+  }
+
+  /// <summary>Whether no handle at all is open on the state any more.</summary>
+  public static bool IsLastHandleGone(FileState file) => Volatile.Read(ref file.HandleCount) == 0;
 
   /// <summary>Follows every open file under a renamed folder so their handles stay valid (folder FR-RENAME).</summary>
   public void RenameSubtree(string fromNormalized, string toNormalized) {

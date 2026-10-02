@@ -2221,11 +2221,17 @@ the rest; without the move, 15 of the affected tests fail.
 here, and it was real. A deleted file's state stayed bound to the NAME while its handles were open,
 so the next file created at that name was given the same state, and the old writer's next byte landed
 in the new file (`05 06 05` where `05 05 05` was written). A rename over an edited file did the same
-before the move above. A delete now detaches the state from the name while handles are still open on
-it. Those handles are refused for anything but closing, with a stale-handle error, and the new file
-is its own. On Linux the kernel normally avoids reaching this by renaming an open file aside before
-deleting it (`.fuse_hidden`); on Windows, deleting one file while another handle keeps it open does
-reach it.
+before the move above. A delete now frees the NAME and leaves the file to the handles still open on it, which is what a
+POSIX delete means: the application that holds it goes on reading and writing it until it closes,
+and the next file at that name is its own. The copies move to a hidden name beside it (or, with the
+bin on, the open handles follow the file into the bin), and the last close removes them; a power cut
+first leaves temps the next mount sweeps. A first version refused those handles instead, with a
+stale-handle error. That stopped the corruption, but on Linux, replacing a file someone is reading
+makes the kernel delete the old one once its readers let go, and under load that delete reaches the
+pool while a reader's close is still in flight: its next read failed, and the application saw "access
+denied" in the middle of an ordinary replace (`SharedFile_GivenWritersReplacingItByRename_…`, 1 run
+in a few on a loaded runner; reproduced under load in WSL, with the pool logging the stale handle).
+A file still being written for the first time has no data worth keeping, and is still detached.
 
 Also audited this pass, with no defect found: the drainer's and the healer's commit paths
 (`_CommitDrainedCopy`, `_CommitHealedCopy`: check, rename and copy-list refresh all under one lease),
