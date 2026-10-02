@@ -7,14 +7,14 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [37004503153](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/37004503153).
+Generated from run: [37009935811](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/37009935811).
 
-251 scenarios — 231 passing on at least one target, 1 failing.
+251 scenarios — 231 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
 | BackgroundRace | `Delete_WhileACopyIsStillInFlight_ThenTheFileDoesNotComeBack` | A file deleted while the pool is still copying it stays deleted, rather than reappearing when the copy lands. | pass | pass |
-| BackgroundRace | `Overwrite_WhileTheHealerIsCopyingTheOldContent_ThenBothCopiesEndOnTheNewOne` | A file overwritten while the healer is copying the OLD content to a returning member ends with both copies on the NEW content. | pass | **FAIL** |
+| BackgroundRace | `Overwrite_WhileTheHealerIsCopyingTheOldContent_ThenBothCopiesEndOnTheNewOne` | A file overwritten while the healer is copying the OLD content to a returning member ends with both copies on the NEW content. | pass | pass |
 | BackgroundRace | `Read_GivenAReturnedMemberLostItsCopies_ThenEveryFileIsStillServedFromTheSurvivor` | A member returns having lost its copies: every file is still readable at once from the surviving copy, without waiting for the heal. | pass | pass |
 | BackgroundRace | `Read_WhileTheHealerIsCopying_ThenItIsServedAtOnceRatherThanAtTheCopysPace` | A file stays readable at full speed while the healer is copying it to another member. | pass | pass |
 | BackgroundRace | `Rename_WhileACopyIsStillInFlight_ThenItEndsUnderExactlyOneName` | A file renamed while the pool is still copying it ends under exactly one name, with its content intact. | pass | pass |
