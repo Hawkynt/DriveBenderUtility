@@ -7,14 +7,14 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36830391079](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36830391079).
+Generated from run: [37004503153](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/37004503153).
 
-251 scenarios — 231 passing on at least one target, 0 failing.
+251 scenarios — 231 passing on at least one target, 1 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
 | BackgroundRace | `Delete_WhileACopyIsStillInFlight_ThenTheFileDoesNotComeBack` | A file deleted while the pool is still copying it stays deleted, rather than reappearing when the copy lands. | pass | pass |
-| BackgroundRace | `Overwrite_WhileTheHealerIsCopyingTheOldContent_ThenBothCopiesEndOnTheNewOne` | A file overwritten while the healer is copying the OLD content to a returning member ends with both copies on the NEW content. | pass | pass |
+| BackgroundRace | `Overwrite_WhileTheHealerIsCopyingTheOldContent_ThenBothCopiesEndOnTheNewOne` | A file overwritten while the healer is copying the OLD content to a returning member ends with both copies on the NEW content. | pass | **FAIL** |
 | BackgroundRace | `Read_GivenAReturnedMemberLostItsCopies_ThenEveryFileIsStillServedFromTheSurvivor` | A member returns having lost its copies: every file is still readable at once from the surviving copy, without waiting for the heal. | pass | pass |
 | BackgroundRace | `Read_WhileTheHealerIsCopying_ThenItIsServedAtOnceRatherThanAtTheCopysPace` | A file stays readable at full speed while the healer is copying it to another member. | pass | pass |
 | BackgroundRace | `Rename_WhileACopyIsStillInFlight_ThenItEndsUnderExactlyOneName` | A file renamed while the pool is still copying it ends under exactly one name, with its content intact. | pass | pass |
@@ -237,8 +237,8 @@ Generated from run: [36830391079](https://github.com/Hawkynt/DriveBenderUtility/
 | TamperIdentity | `Mirror_GivenAForgedHigherVersionDropsAMember_ThenNoDataBecomesUnreachable` | A member's manifest mirror is given a huge version with one member REMOVED: the pool must not silently drop a disk holding data. | pass | pass |
 | TamperIdentity | `Mirror_GivenAForgedHigherVersionLowersDuplication_ThenRedundancyIsNotSilentlyDropped` | A mirror is given a huge version with duplication lowered to 1: redundancy must not be reduced by editing a file. | pass | pass |
 | TamperIdentity | `Mirror_GivenEveryCopyIsGarbage_ThenThePoolStillMountsFromTheRegistry` | Both mirrors are replaced with garbage: the pool still mounts from the registry and keeps its files. | pass | pass |
-| TamperPhysical | `Space_GivenEveryMemberIsReservedToTheBrim_ThenAWriteIsRefusedAndTheOldFileSurvives` | Every member is reserved to the brim: a write is refused cleanly and the file it would have replaced is intact. | pass | pass |
-| TamperPhysical | `Space_GivenItRunsOutMidStream_ThenTheFileDoesNotClaimBytesItNeverStored` | The pool runs out of room mid-write: the partially written file is not left claiming a length it does not have. | pass | pass |
+| TamperPhysical | `Space_GivenEveryMemberIsReservedToTheBrim_ThenAWriteIsRefusedAndTheOldFileSurvives` | Every member is reserved to the brim: an overwrite is refused cleanly and the file it would have replaced is intact. | pass | pass |
+| TamperPhysical | `Space_GivenItRunsOutMidStream_ThenTheFileDoesNotClaimBytesItNeverStored` | The pool runs out of room mid-write: the write is refused there, nothing half-written is published, and other files are untouched. | pass | pass |
 | TamperPhysical | `Stored_GivenACopyIsRelinkedOutsideThePool_ThenNeitherReadsNorWritesFollowIt` | A stored copy is replaced by a hard link to a file outside the pool: the pool reads and writes through it. _(held back: Measured, and recorded as a hardening gap rather than a broken promise. A hard link inside a member folder makes the stored copy BE the outside file - same MFT record - so every check the pool has says the file is where it belongs, and reads serve the outsider's bytes while writes overwrite them. Refusing it means comparing hard-link counts or file IDs on the read path, which costs a stat per open for a threat that already requires write access to a member folder. That is a design call, not a fix. See docs/Tampering.md.)_ | skipped | skipped |
 | TamperWeaponised | `Snapshot_GivenASidecarPointsOutsideThePool_ThenNothingEscapes` | A snapshot sidecar claims its stored version belongs outside the pool: nothing is written there. | pass | pass |
 | TamperWeaponised | `Tombstones_GivenAForgedRecordNamesALiveFile_ThenReplayDoesNotDeleteIt` | A forged tombstone claims a LIVE file was deleted: replay must not delete a file that is demonstrably there. | pass | pass |
