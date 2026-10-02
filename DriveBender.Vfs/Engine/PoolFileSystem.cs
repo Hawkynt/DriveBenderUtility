@@ -2847,7 +2847,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._PreserveIfPinned(normalized, wholeFileReplaced: false);
     }
 
-    return this._handles.Open(normalized, mode).Handle;
+    // The handle is registered under the path's read lease, after looking once more: a delete holds
+    // the write lease, so an open lands either before it (and the file lives on for the handle, as
+    // POSIX keeps a deleted file for whoever has it open) or after it (and finds nothing). Checked
+    // and registered without the lease, an open slipped in between the delete's "is anyone holding
+    // it" and the copies going, and held a handle on a file that no longer existed anywhere.
+    using (this._handles.AcquireRead(normalized)) {
+      if (this._placement.ResolveCopies(this._DataName(normalized)).Count == 0)
+        throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
+
+      return this._handles.Open(normalized, mode).Handle;
+    }
   }
 
   public int Read(NodeHandle handle, Span<byte> buffer, long offset) {
