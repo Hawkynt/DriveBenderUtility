@@ -4399,7 +4399,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
           });
       } catch (OperationCanceledException) {
         try {
-          target.Delete(path + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, false);
+          target.Delete(WholeFilePublisher.CopyTempOf(path), false);
         } catch (PoolFsException) {
           // an orphaned temp is swept on the next mount
         }
@@ -4650,7 +4650,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         // a folder rename is waiting: give way at once. The file is about to live under another
         // name, so re-queueing THIS path would find nothing — ask for a rescan instead.
         try {
-          target.Delete(normalized + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, true);
+          target.Delete(WholeFilePublisher.CopyTempOf(normalized), true);
         } catch (PoolFsException) {
           // an orphaned temp is swept on the next mount
         }
