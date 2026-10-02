@@ -2230,6 +2230,17 @@ the 4 KiB original reduced to nothing. A real full disk does the same without an
   pool live, the write is refused after exactly the five chunks written before it, nothing
   half-written is published, and the neighbouring file is untouched.
 
+**Found by CI on Linux while this was in review: the healer's half-copy published as a copy of the
+file.** The background copy jobs (healer, drainer, media moves, bin and snapshot clones) wrote their
+temp under `<name>.TEMP.$DRIVEBENDER`, the very name an overwrite now stages its replacement under, and
+the overwrite's publish renames whatever it finds under that name on every disk. An overwrite landing
+while the healer was copying onto a third disk therefore renamed the healer's half-written temp into
+place: a full-length copy holding neither version, on a pool that believed itself fully duplicated
+(`Overwrite_WhileTheHealerIsCopyingTheOldContent_…`, Linux runner; reproduced on its first loaded run
+in WSL). The copy jobs now write to `<name>.COPY.TEMP.$DRIVEBENDER`, still swept as a temp. Eight loaded
+runs in WSL pass since. An engine-level test was tried and dropped: on the simulated disks it passed
+with the old name too, and a test that cannot fail on the defect is not kept.
+
 Tests: `SafeOverwriteTests` (both platforms' overwrite shapes, retry, partial retry, delete and rename
 mid-overwrite, a reader, power cut at every step), `MemberReserveTests` (growth, truncate, rewrite
 within the file, overwrite, live raise and lower). Without the changes the overwrite and reserve
