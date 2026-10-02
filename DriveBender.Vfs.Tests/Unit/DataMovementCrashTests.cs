@@ -380,6 +380,44 @@ public class DataMovementCrashTests {
 
 
   [Test]
+  [Category("EdgeCase")]
+  public void RemoveMedia_GivenTheDiskHoldsASnapshotVersion_ThenTheSnapshotCanStillRestoreIt() {
+    // A preserved version is two files: its bytes and the sidecar that names it, and the store only
+    // sees a version whose sidecar sits beside it on the same member. Retiring the disk placed each
+    // file of the store on whichever member had the most room at that moment — so the bytes and the
+    // sidecar could land on different members, and the version, still on disk, was never found again.
+    // Members sharing one physical disk report the same free space and tie, so it takes members on
+    // different disks to see it.
+    const string single = """{ "duplication": 1, "write": { "policy": "write-through" }, "readAhead": { "enabled": false } }""";
+    var then = _Content();
+    var now = new byte[] { 1, 2, 3 }; // smaller than the version, so the store's two files get different targets
+    Guid snapshot;
+    using (var fs = this._Engine(withLandingZone: false, single)) {
+      this._Store(fs, "quarterly.bin", then);
+      snapshot = fs.TakeSnapshot("before-the-swap").Id;
+      var handle = fs.Open("quarterly.bin", AccessMode.ReadWrite, ShareMode.Read);
+      fs.SetLength(handle, 0);
+      fs.Write(handle, now, 0, WriteMode.Normal);
+      fs.Close(handle);
+      fs.Unmount();
+    }
+
+    var holder = this._All.Single(v => v.FilePaths.Any(p => p.EndsWith(".snapver", StringComparison.Ordinal)));
+    var staying = this._All.Where(v => v != holder).ToArray();
+    using (var fs = this._Engine(withLandingZone: false, single))
+      new MediaLifecycle(this._All, fs.Journal, duplicationLevel: 1).ScatterAndRemove(holder.MemberId);
+
+    var cache = new CacheInstance("rm" + Guid.NewGuid().ToString("N"),
+      new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
+    using var remaining = new PoolFileSystem(_pool, [.. staying.Select(v => new EngineMember(v))], cache, ConfigResolver.ResolveEffective(null, single));
+    remaining.Mount(new(@"X:\"));
+    remaining.RestoreFromSnapshot(snapshot, "quarterly.bin");
+
+    _Read(remaining, "quarterly.bin").Should().Equal(then,
+      "the version left the retired disk with its sidecar, so the snapshot still finds what it promised");
+  }
+
+  [Test]
   [Category("HappyPath")]
   public void RemoveMedia_GivenDuplicationTwoAndAThirdDiskToSpare_ThenEveryFileStillHasTwoCopiesAfterwards() {
     // Retiring a disk deleted each of its copies as soon as ONE copy survived elsewhere, and made

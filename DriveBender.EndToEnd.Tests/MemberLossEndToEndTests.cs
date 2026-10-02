@@ -211,38 +211,67 @@ public class MemberLossEndToEndTests {
   [Test]
   [Category("HappyPath")]
   public void Capacity_GivenTheMountedPool_ThenTheReportedSizeTracksTheStorageBehindIt() {
-    // FR-STAT through the OS: a pool that reports nothing (or a constant) breaks every copy
-    // dialog, installer and "is there room?" check the user's software makes. Both members sit on
-    // one physical volume here, so the assertions are about BEHAVIOUR — plausible totals, free
-    // space that actually moves when data is written — not about an exact arithmetic identity,
-    // which would need each member on its own disk.
+    // FR-STAT through the OS: a pool that reports nothing (or a constant) breaks every copy dialog,
+    // installer and "is there room?" check the user's software makes.
+    //
+    // Both members sit on one physical volume, which the pool counts ONCE, so its figures are exact:
+    // its total is the volume's total, and its free space is the volume's free space minus the
+    // members' reserves. The free space is therefore compared with the VOLUME at the same moment,
+    // never with itself a moment earlier. The volume is shared with everything else on the machine:
+    // a test run beside this one freed 16 MiB during a 24 MiB write, the pool truthfully reported
+    // more room afterwards than before, and the old before/after comparison failed 2 runs in 5.
     using var pool = _DuplicatedPool();
     if (!OperatingSystem.IsWindows())
       Assert.Ignore("DriveInfo on a FUSE mountpoint path reports the backing filesystem, not the pool");
 
-    var backing = new DriveInfo(Path.GetPathRoot(pool.Root)!);
-    var drive = new DriveInfo(pool.MountPath);
+    var backing = Path.GetPathRoot(pool.Root)!;
+    new DriveInfo(pool.MountPath).TotalSize.Should().Be(new DriveInfo(backing).TotalSize,
+      "two members on one volume are one volume's worth of room, not two, and not nothing");
+    _AssertFreeSpaceTracks(pool, backing, reserved: 0, "freshly mounted");
 
-    drive.TotalSize.Should().BeGreaterThan(0, "a mounted pool must report a total size");
-    drive.AvailableFreeSpace.Should().BeGreaterThan(0, "a mounted pool must report free space");
-    drive.AvailableFreeSpace.Should().BeLessThanOrEqualTo(drive.TotalSize, "free space cannot exceed the total");
-
-    // the pool is backed by this volume, so it cannot honestly claim more room than exists on it
-    drive.AvailableFreeSpace.Should().BeLessThanOrEqualTo(backing.TotalSize,
-      "the pool must not report more free space than the storage behind it could possibly hold");
-
-    var before = new DriveInfo(pool.MountPath).AvailableFreeSpace;
-    const int written = 24 * 1024 * 1024;
+    // a figure that never moves cannot go on matching a volume that just lost the 128 MiB written here
+    const int written = 64 * 1024 * 1024;
     File.WriteAllBytes(pool.PathTo("capacity.bin"), _Payload(written, 7));
     MountedPool.WaitUntil(() => pool.PhysicalCopies("capacity.bin").Count >= 2);
-
-    var after = new DriveInfo(pool.MountPath).AvailableFreeSpace;
-    after.Should().BeLessThan(before,
-      $"writing {written / 1024 / 1024} MiB must reduce the reported free space — a figure that never moves is not a measurement");
+    _AssertFreeSpaceTracks(pool, backing, reserved: 0, "after writing 64 MiB twice over");
 
     File.Delete(pool.PathTo("capacity.bin"));
-    MountedPool.WaitUntil(() => new DriveInfo(pool.MountPath).AvailableFreeSpace > after, TimeSpan.FromSeconds(30))
-      .Should().BeTrue("deleting the file must give the space back");
+    MountedPool.WaitUntil(() => pool.PhysicalCopies("capacity.bin").Count == 0);
+    _AssertFreeSpaceTracks(pool, backing, reserved: 0, "after deleting it");
+
+    // and the figure is the POOL's own: room reserved on each member comes off it exactly
+    const long reserve = 512L * 1024 * 1024;
+    pool.WhileUnmounted(() => DbMount.SetMemberReserves(pool.PoolName, reserve));
+    _AssertFreeSpaceTracks(pool, backing, reserved: 2 * reserve, "with 512 MiB reserved on each of the two members");
+  }
+
+  /// <summary>
+  /// The pool's free space must be the backing volume's minus <paramref name="reserved"/>. The OS may
+  /// answer from its volume-info cache, up to WinFsp's FileInfoTimeout (1 s) old, so the pool is held
+  /// to the range the volume's free space spanned over the 1.2 s before it was asked and just after,
+  /// with a little slack for what moved between two samples.
+  /// </summary>
+  private static void _AssertFreeSpaceTracks(MountedPool pool, string backing, long reserved, string when) {
+    const long slack = 8L * 1024 * 1024;
+    long low = long.MaxValue, high = long.MinValue;
+    void Sample() {
+      var free = new DriveInfo(backing).AvailableFreeSpace;
+      low = Math.Min(low, free);
+      high = Math.Max(high, free);
+    }
+
+    var until = DateTime.UtcNow + TimeSpan.FromMilliseconds(1200);
+    do {
+      Sample();
+      Thread.Sleep(50);
+    } while (DateTime.UtcNow < until);
+
+    var reported = new DriveInfo(pool.MountPath).AvailableFreeSpace;
+    Sample();
+
+    reported.Should().BeInRange(Math.Max(0, low - reserved - slack), Math.Max(0, high - reserved) + slack,
+      $"{when}, the pool must report its volume's free space ({low:N0}..{high:N0} bytes over the last moments) "
+      + $"less {reserved:N0} reserved");
   }
 
   [Test]

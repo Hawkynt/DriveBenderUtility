@@ -112,6 +112,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// <summary>Files being written through a stripe session (docs/IncomingFiles.md), by pool path.</summary>
   private readonly System.Collections.Concurrent.ConcurrentDictionary<string, StripeSession> _stripes = new(PoolPaths.PathComparer);
 
+  /// <summary>
+  /// Stripe sessions already completed whose publish has not yet succeeded: the finals that are
+  /// WHOLE, and whether the file is short of its duplication level. A retried publish must use this
+  /// list rather than "every temp with the staged name", which also names a final whose fill failed
+  /// and whose temp could not be removed — a torn copy, which the retry would rename into place.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (IReadOnlyList<PhysicalCopy> Whole, bool HealAfter)> _completedStripes = new(PoolPaths.PathComparer);
+
   /// <summary>Striped files closed under the performance policy, published in the background.</summary>
   private readonly System.Collections.Concurrent.ConcurrentQueue<string> _deferredPublishes = new();
 
@@ -1125,7 +1133,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // retain-metadata: complete the listing with remembered entries whose members have dropped out (§10 SAFE-DEGRADE)
     if (this._memberLossPolicy == MemberLossPolicy.RetainMetadata && (folderSeen || this._shadow.Get(normalized)?.Kind == NodeKind.Directory))
       foreach (var remembered in this._shadow.Children(normalized))
-        if (!entries.ContainsKey(remembered.Name)) {
+        if (!PoolPaths.IsHiddenName(remembered.Name) && !entries.ContainsKey(remembered.Name)) {
           entries[remembered.Name] = remembered;
           folderSeen = true;
         }
@@ -1303,9 +1311,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._integrity.RecordWholeFile(target, physical, false, []);
     this._EnsureShadows(physical, []);
-    if (staged)
+    if (staged) {
+      this._completedStripes.TryRemove(normalized, out _); // a new file: nothing of an earlier one's session applies
       this._staging[normalized] = sequence; // the Create intent stays open until the publish rename
-    else
+    } else
       this._journal.Complete(sequence, JournalOp.Create);
 
     this._Invalidate(normalized);
@@ -1811,6 +1820,95 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
   }
 
+  /// <summary>
+  /// Moves a file that is open for writing aside to "&lt;name&gt; (displaced &lt;when&gt;)&lt;ext&gt;" in its folder,
+  /// so a rename can take its name without losing it. A file still being written for the first time
+  /// is published first, exactly as renaming such a file publishes it; its writer then carries on in
+  /// place under the new name. The caller holds the path's write lease and the namespace gate.
+  /// </summary>
+  private void _DisplaceLocked(string normalized) {
+    if (this._staging.ContainsKey(normalized))
+      this._PublishStagedLocked(normalized);
+
+    var copies = this._placement.ResolveCopies(normalized);
+    if (copies.Count == 0)
+      return; // nothing under the name to keep
+
+    for (var attempt = 1; ; ++attempt) {
+      var displaced = this._DisplacedNameFor(normalized, attempt);
+      if (this._placement.ResolveCopies(displaced).Count > 0 || this._staging.ContainsKey(displaced))
+        continue;
+
+      // a name nobody can be holding yet; should somebody be, the next one is taken rather than waited for
+      using var lease = this._handles.TryAcquireWrite(displaced, TimeSpan.Zero);
+      if (lease == null)
+        continue;
+
+      this._RenameFileLocked(normalized, displaced, RenameFlags.None, normalized, displaced, sameFile: false, caseOnly: false, copies);
+      DriveBender.Logger($"[Warning]'{normalized}' was still open for writing when another file was renamed over it; it is kept as '{displaced}'");
+      this._activity.Publish(ActivityKind.Write, displaced, reason: $"kept beside '{normalized}': still being written when another file took its name");
+      return;
+    }
+  }
+
+  private string _DisplacedNameFor(string normalized, int attempt) {
+    var name = PoolPaths.GetName(normalized);
+    var dot = name.LastIndexOf('.');
+    var (stem, extension) = dot > 0 ? (name[..dot], name[dot..]) : (name, "");
+    var when = this._clock().ToLocalTime().ToString("yyyy-MM-dd HH-mm-ss", System.Globalization.CultureInfo.InvariantCulture);
+    var displaced = attempt == 1 ? $"{stem} (displaced {when}){extension}" : $"{stem} (displaced {when}, {attempt}){extension}";
+    var parent = PoolPaths.GetParent(normalized);
+    return parent.Length == 0 ? displaced : $"{parent}/{displaced}";
+  }
+
+  /// <summary>
+  /// A handle whose file was deleted while it was open reaches nothing any more. It used to stay bound
+  /// to the NAME, so once a new file took the name, the old writer's next write went into the new file.
+  /// </summary>
+  private static void _RefuseDeleted(HandleTable.OpenHandle open) {
+    if (open.File.Deleted)
+      throw new PoolFsException(PoolFsError.StaleHandle, "The file was deleted while this handle was open");
+  }
+
+  /// <summary>
+  /// A delete of a file the application still has open: every copy is renamed to a hidden name beside
+  /// it (journalled as the delete it is), the open state follows, and the last close removes it. A
+  /// power cut before then leaves temps the next mount sweeps, which is also what POSIX does with a
+  /// file deleted while open: it does not outlive the machine going down. The caller holds the lease.
+  /// </summary>
+  private void _RemoveNameKeepingOpenFile(string normalized, IReadOnlyList<PhysicalCopy> copies, IReadOnlyList<long>? staleIntents) {
+    var hidden = $"{normalized}.{Guid.NewGuid().ToString("N")[..8]}.OPEN.{DriveBender.DriveBenderConstants.TEMP_EXTENSION}";
+    var sequence = this._journal.LogIntent(JournalOp.Delete, normalized);
+    foreach (var copy in copies)
+      copy.Volume.AtomicReplace(normalized, hidden, copy.Shadow);
+
+    this._journal.Complete(sequence, JournalOp.Delete);
+    this._InvalidateChecksums(normalized);
+    foreach (var staleSequence in staleIntents ?? [])
+      this._journal.Complete(staleSequence, JournalOp.Write);
+
+    this._Invalidate(normalized);
+    this._Invalidate(hidden);
+    this._shadow.Remove(normalized);
+    this._handles.RenamePath(normalized, hidden);
+    this._handles.RemoveAtLastClose(hidden);
+  }
+
+  /// <summary>The last handle on a file deleted while open is gone: the hidden copies go with it.</summary>
+  private void _RemoveDeletedOpenFile(string hidden) {
+    using var lease = this._handles.AcquireWrite(hidden);
+    this._writeBuffer.Drain(hidden);
+    foreach (var copy in this._placement.ResolveCopies(hidden))
+      try {
+        copy.Volume.Delete(hidden, copy.Shadow);
+      } catch (PoolFsException) {
+        // swept as a temp on the next mount
+      }
+
+    this._Invalidate(hidden);
+    this._shadow.Remove(hidden); // reads through the open handles remembered it
+  }
+
   /// <summary>A path that is a folder on some member and a file on none — what a folder rename moves.</summary>
   private bool _IsFolderOnly(string normalized)
     => this._placement.ResolveCopies(normalized).Count == 0 && this._Online.Any(m => m.FolderExists(normalized, false));
@@ -1837,8 +1935,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // ARE the source; only a genuinely different path is a real target. And a rename that is refused
     // changes nothing, so the refusal comes before any preserving: a copy made first was store space
     // spent on nothing, with the target dropped from the pinned set on the way.
+    // A target somebody is still WRITING is never replaced out from under its writer: it is moved
+    // aside to a name beside it first, and the writer's handle goes with it, as any open file follows
+    // a rename. Its later writes and its close land there, and the rename takes the freed name.
+    // Replacing it instead lost data either way: discarded, the writer's work was gone; left bound to
+    // the name, the writer's next write went into the file that was renamed in.
+    if (!sameFile && (flags & RenameFlags.ReplaceExisting) != 0 && this._handles.IsOpenForWrite(toNormalized))
+      this._DisplaceLocked(toNormalized);
+
     var targetCopies = sameFile ? [] : this._placement.ResolveCopies(toNormalized);
-    if (targetCopies.Count > 0 && (flags & RenameFlags.ReplaceExisting) == 0)
+
+    // A target still being written (open, so its publish could not be done above) has no copy under
+    // its name yet — only a temp — but the name is taken all the same. Left alone, its publish at the
+    // last close renamed the temp over this rename's file and the renamed file's bytes were gone.
+    var stagedTarget = !sameFile && this._staging.ContainsKey(toNormalized);
+    if ((targetCopies.Count > 0 || stagedTarget) && (flags & RenameFlags.ReplaceExisting) == 0)
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {to}");
 
     this._PreserveIfPinned(fromNormalized, wholeFileReplaced: false);
@@ -1846,6 +1957,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._PreserveIfPinned(toNormalized, wholeFileReplaced: false);
 
     this._FlushPathLocked(fromNormalized); // pending mutations land under the old name first
+
+    // replaced, as a delete of a file still being written replaces it: it never becomes visible
+    if (stagedTarget)
+      this._DiscardStagedLocked(toNormalized);
 
     this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
@@ -1931,6 +2046,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     foreach (var dirty in this._writeBuffer.DirtyPaths.Where(p => p.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray())
       this.FlushPath(dirty);
 
+    // Edit sessions are keyed by path too, and the close that ends one looks under the file's NEW
+    // name, so a session left open here would never be completed. Completing it is safe: every
+    // write takes the gate this rename holds exclusively, so none is in flight, and each copy
+    // already has every acknowledged write. The next write opens a session under the new name.
+    foreach (var session in this._writeSessions.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray())
+      this._CloseWriteSession(session);
+
+    // A snapshot recorded its files by PATH, and after the move those paths name nothing, so each
+    // pinned child is preserved first, as a file rename preserves its source. Without it the moved
+    // file looks like any other live file, and the first edit to it overwrites the only bytes the
+    // snapshot promised. Only pinned children pay; the settled content is what gets set aside.
+    foreach (var pinnedChild in this._pinned.Keys.Where(k => k.StartsWith(fromPrefix, PoolPaths.PathComparison)).ToArray())
+      using (this._handles.AcquireWrite(pinnedChild))
+        this._PreserveIfPinned(pinnedChild, wholeFileReplaced: false);
+
     this._RecordTombstoneForOffline(JournalOp.Rename, fromNormalized, toNormalized);
     var sequence = this._journal.LogIntent(JournalOp.Rename, fromNormalized, toNormalized);
 
@@ -1947,8 +2077,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._handles.RenameSubtree(fromNormalized, toNormalized);
     this._shadow.Rename(fromNormalized, toNormalized);
 
-    // every cached child listing/placement under the old prefix is stale — drop the pool's caches
+    // every cached child listing/placement under the old prefix is stale — drop the pool's caches —
+    // and so are the children's cached blocks, under both names. The new name may hold blocks left
+    // there before: reads do not wait for this rename, so one in flight can cache the old path's
+    // bytes after the old side is dropped, and such blocks turn stale only when a folder takes that
+    // name back — the rename that brings it back drops them here as its target.
     this._cache.Metadata.InvalidatePool(this._poolId);
+    this._cache.Pages.InvalidateSubtree(this._poolId, fromNormalized);
+    this._cache.Pages.InvalidateSubtree(this._poolId, toNormalized);
     this._placement.InvalidateAll();
     DriveBender.Logger($"Renamed folder '{fromNormalized}' to '{toNormalized}' across {this._Online.Count(m => m.FolderExists(toNormalized, false))} member(s)");
   }
@@ -2405,33 +2541,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._PublishStagedLocked(normalized);
 
     // deleting a file that never finished writing: drop its temps — it never existed (FR-STAGED-WRITE)
-    if (this._staging.TryRemove(normalized, out var createSequence)) {
-      if (this._stripes.TryRemove(normalized, out var stripe))
-        foreach (var helper in stripe.CreatedHelpers())
-          try {
-            helper.Volume.Delete(helper.Path, helper.Shadow);
-          } catch (PoolFsException) {
-            // swept on the next mount
-          }
-
-      var stagedName = _StagedNameOf(normalized);
-      var discardedStaged = this._writeBuffer.Drain(normalized); // buffered blocks are moot
-      foreach (var member in this._Online)
-      foreach (var shadow in new[] { false, true })
-        if (member.FileExists(stagedName, shadow))
-          member.Delete(stagedName, shadow);
-
-      // complete the Create intent AND every owed-write intent the buffer held — otherwise they
-      // linger open forever and are replayed (noisily) at every subsequent mount
-      this._journal.Complete(createSequence, JournalOp.Create);
-      if (discardedStaged != null)
-        foreach (var staleSequence in discardedStaged.Value.journalSequences)
-          this._journal.Complete(staleSequence, JournalOp.Write);
-
-      this._InvalidateChecksums(stagedName);
-      this._Invalidate(stagedName);
-      this._Invalidate(normalized);
+    if (this._DiscardStagedLocked(normalized)) {
       this._shadow.Remove(normalized);
+      this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
       return;
     }
 
@@ -2446,6 +2558,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (copies.Count == 0) {
       // the only copy was the one just preserved — the delete has nothing left to do
       this._shadow.Remove(normalized);
+      this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
       return;
     }
 
@@ -2461,9 +2574,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // offline members keep their stale copies — record what they missed so no ghost resurrects
     this._RecordTombstoneForOffline(JournalOp.Delete, normalized);
 
+    // POSIX: a delete removes the NAME. A handle the application still holds keeps the file, and goes
+    // on reading and writing it until it closes; on Linux that is what replacing a file someone is
+    // reading does all the time. Refusing those handles reached the application as "access denied"
+    // in the middle of an ordinary replace. They follow the file instead: into the bin, or to a hidden
+    // name beside it that their last close removes. Either way the name is free for a new file that
+    // the old handles never reach.
+    var stillOpen = this._handles.IsOpen(normalized);
+
     if (binned) {
       // recoverable delete: all copies move to the hidden pool trash instead of dying (FR-TRASH)
-      this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true,
+      var kept = this._trash.MoveToTrash(normalized, copies, effective.Trash.DropDuplicatesInTrash ?? true,
         recordedAs);
       this._InvalidateChecksums(normalized);
       if (discarded != null)
@@ -2472,6 +2593,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
       this._Invalidate(normalized);
       this._shadow.Remove(normalized);
+      if (stillOpen && kept != null) {
+        this._handles.RenamePath(normalized, kept); // the open handles read on from the bin entry
+        this._Invalidate(kept);
+      } else
+        this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
+      return;
+    }
+
+    if (stillOpen) {
+      this._RemoveNameKeepingOpenFile(normalized, copies, discarded?.journalSequences);
       return;
     }
 
@@ -2514,6 +2645,46 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._Invalidate(normalized);
     this._shadow.Remove(normalized);
+    this._handles.DetachDeleted(normalized); // handles still open on the deleted file must never reach a new one at this name
+  }
+
+  /// <summary>
+  /// Drops a file that never finished writing — its temps, its stripe helpers, its buffered blocks and
+  /// its open intents — as though it had never existed; false when the path is not being written.
+  /// Deleting such a file, and renaming another over it, both end it this way. The caller holds the
+  /// path's write lease.
+  /// </summary>
+  private bool _DiscardStagedLocked(string normalized) {
+    if (!this._staging.TryRemove(normalized, out var createSequence))
+      return false;
+
+    this._completedStripes.TryRemove(normalized, out _);
+    if (this._stripes.TryRemove(normalized, out var stripe))
+      foreach (var helper in stripe.CreatedHelpers())
+        try {
+          helper.Volume.Delete(helper.Path, helper.Shadow);
+        } catch (PoolFsException) {
+          // swept on the next mount
+        }
+
+    var stagedName = _StagedNameOf(normalized);
+    var discardedStaged = this._writeBuffer.Drain(normalized); // buffered blocks are moot
+    foreach (var member in this._Online)
+    foreach (var shadow in new[] { false, true })
+      if (member.FileExists(stagedName, shadow))
+        member.Delete(stagedName, shadow);
+
+    // complete the Create intent AND every owed-write intent the buffer held — otherwise they
+    // linger open forever and are replayed (noisily) at every subsequent mount
+    this._journal.Complete(createSequence, JournalOp.Create);
+    if (discardedStaged != null)
+      foreach (var staleSequence in discardedStaged.Value.journalSequences)
+        this._journal.Complete(staleSequence, JournalOp.Write);
+
+    this._InvalidateChecksums(stagedName);
+    this._Invalidate(stagedName);
+    this._Invalidate(normalized);
+    return true;
   }
 
   public void MakeDir(string path) {
@@ -2676,7 +2847,17 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this._PreserveIfPinned(normalized, wholeFileReplaced: false);
     }
 
-    return this._handles.Open(normalized, mode).Handle;
+    // The handle is registered under the path's read lease, after looking once more: a delete holds
+    // the write lease, so an open lands either before it (and the file lives on for the handle, as
+    // POSIX keeps a deleted file for whoever has it open) or after it (and finds nothing). Checked
+    // and registered without the lease, an open slipped in between the delete's "is anyone holding
+    // it" and the copies going, and held a handle on a file that no longer existed anywhere.
+    using (this._handles.AcquireRead(normalized)) {
+      if (this._placement.ResolveCopies(this._DataName(normalized)).Count == 0)
+        throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
+
+      return this._handles.Open(normalized, mode).Handle;
+    }
   }
 
   public int Read(NodeHandle handle, Span<byte> buffer, long offset) {
@@ -2685,6 +2866,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return this._ReadSnapshotHandle(handle, buffer, offset);
 
     var open = this._handles.Get(handle);
+    _RefuseDeleted(open);
     if (offset < 0)
       throw new PoolFsException(PoolFsError.InvalidArgument, "Negative offset");
 
@@ -3268,6 +3450,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     _RefuseWriteToSnapshotHandle(handle);
     this._RequireWritable();
     var open = this._handles.Get(handle);
+    _RefuseDeleted(open);
     if ((open.Access & AccessMode.Write) == 0)
       throw new PoolFsException(PoolFsError.AccessDenied, "Handle is not open for writing");
     if (offset < 0)
@@ -3660,6 +3843,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._RequireWritable();
     _RefuseWriteToSnapshotHandle(handle);
     var open = this._handles.Get(handle);
+    _RefuseDeleted(open);
     if ((open.Access & AccessMode.Write) == 0)
       throw new PoolFsException(PoolFsError.AccessDenied, "Handle is not open for writing");
     if (length < 0)
@@ -3714,6 +3898,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (handle.Value < 0)
       return; // nothing was ever owed on a read-only view of the past
     var open = this._handles.Get(handle);
+    _RefuseDeleted(open);
 
     // one lease covers both steps: a publish that raced the flush could otherwise rename the
     // temp away between them and strand the just-flushed blocks
@@ -4407,8 +4592,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// application that wrote the file keeps running.
   /// </summary>
   public void MarkApplicationClosed(NodeHandle handle) {
+    // As Close: this can publish, and a publish takes the file off the staging list before it renames
+    // the temp on each member. A folder rename landing in between would see no staged child, carry the
+    // temp away with the folder, and leave it a temp for good — which recovery deletes.
+    using var namespaceHold = this._EnterNamespaceShared();
     var wrote = this._handles.TryGet(handle) is { } open && (open.Access & AccessMode.Write) != 0;
     this._handles.MarkApplicationClosed(handle);
+    if (this._handles.TryGet(handle) is { File.Deleted: true })
+      return; // the file is gone
 
     // publication hangs off "no application still has it open", which is exactly what just changed
     var path = this._handles.TryGetPath(handle);
@@ -4431,9 +4622,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var namespaceHold = this._EnterNamespaceShared(); // a close can publish, and publishing writes under the path
 
     var open = this._handles.Get(handle);
+    if (open.File.Deleted) {
+      this._handles.Close(handle); // the file is gone: nothing to publish, nothing to settle
+      return;
+    }
+
     var path = open.File.Path;
     var wrote = (open.Access & AccessMode.Write) != 0;
     this._handles.Close(handle);
+
+    // a file deleted while open: its last handle takes it along
+    if (open.File.RemoveAtLastClose) {
+      if (HandleTable.IsLastHandleGone(open.File))
+        this._RemoveDeletedOpenFile(path);
+      return;
+    }
 
     // the last writer is done: complete the file's edit session. Under the file's write lease, so a
     // write still in flight on another handle finishes first and cannot end up outside any intent.
@@ -4498,12 +4701,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // those it vouches for are published
     IReadOnlyList<PhysicalCopy>? striped = null;
     var healAfter = false;
-    if (this._stripes.TryRemove(normalized, out var stripe))
+    if (this._stripes.TryRemove(normalized, out var stripe)) {
       (striped, healAfter) = this._CompleteStripe(normalized, stripe);
+      this._completedStripes[normalized] = (striped, healAfter); // until the publish succeeds
+    } else if (this._completedStripes.TryGetValue(normalized, out var completed)) {
+      // a retry: only the finals that were whole, and of those only the ones still waiting for the
+      // rename (an earlier attempt may have renamed some before it failed)
+      var stagedTemp = _StagedNameOf(normalized);
+      (striped, healAfter) = ([.. completed.Whole.Where(c => c.Volume.IsOnline && c.Volume.FileExists(stagedTemp, c.Shadow))], completed.HealAfter);
+    }
 
     this._FlushPathLocked(normalized); // owed blocks land in the temp physical first (mapping still active)
-    if (!this._staging.TryRemove(normalized, out var createSequence))
+    if (!this._staging.TryRemove(normalized, out var createSequence)) {
+      this._completedStripes.TryRemove(normalized, out _);
       return; // another thread published concurrently
+    }
 
     var stagedName = _StagedNameOf(normalized);
 
@@ -4552,6 +4764,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       throw;
     }
 
+    this._completedStripes.TryRemove(normalized, out _);
     this._integrity.RenameFile(stagedName, normalized);
     this._journal.Complete(createSequence, JournalOp.Create);
     this._Invalidate(stagedName);

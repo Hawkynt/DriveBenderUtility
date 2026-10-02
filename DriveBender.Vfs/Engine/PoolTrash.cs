@@ -34,7 +34,10 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   private IEnumerable<IVolumeIO> _Online => members.Where(m => m.IsOnline);
 
   private static string _BaseTrashPathFor(string normalizedPath) => $"{TrashPrefix}/{normalizedPath}";
-  private static string _InfoPathFor(string trashPath) => trashPath + ".trashinfo";
+  /// <summary>The sidecar that describes a trashed file sits beside it under the file's name plus this.</summary>
+  public const string InfoSuffix = ".trashinfo";
+
+  private static string _InfoPathFor(string trashPath) => trashPath + InfoSuffix;
 
   /// <summary>
   /// The original path a trashed file was deleted from, read back out of its trash name
@@ -74,7 +77,8 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
   /// never destroyed by this one.
   /// </summary>
   /// <param name="recordedAs">The path the entry is listed and restored under, when it is not the path deleted (a file the kernel set aside under a hidden name first).</param>
-  public void MoveToTrash(string normalizedPath, IReadOnlyList<PhysicalCopy> copies, bool dropDuplicates, string? recordedAs = null) {
+  /// <returns>Where the kept copy now lives in the bin (a primary-side path on its member), or null when none was kept.</returns>
+  public string? MoveToTrash(string normalizedPath, IReadOnlyList<PhysicalCopy> copies, bool dropDuplicates, string? recordedAs = null) {
     var originalPath = recordedAs ?? normalizedPath;
     var trashPath = _NewTrashPathFor(originalPath);
     var sequence = journal.LogIntent(JournalOp.TrashMove, normalizedPath, trashPath);
@@ -101,6 +105,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
     }
 
     journal.Complete(sequence, JournalOp.TrashMove);
+    return kept > 0 ? trashPath : null;
   }
 
   private void _MoveShadowIntoTrash(IVolumeIO member, string normalizedPath, string trashPath) {
@@ -165,7 +170,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
           continue;
         }
 
-        if (!item.Name.EndsWith(".trashinfo", StringComparison.OrdinalIgnoreCase))
+        if (!item.Name.EndsWith(InfoSuffix, StringComparison.OrdinalIgnoreCase))
           continue;
 
         TrashInfo? info = null;
@@ -179,8 +184,8 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
         }
 
         if (info != null) {
-          described.Add(childPath[..^".trashinfo".Length]);
-          yield return (childPath[..^".trashinfo".Length], info);
+          described.Add(childPath[..^InfoSuffix.Length]);
+          yield return (childPath[..^InfoSuffix.Length], info);
         }
       }
 

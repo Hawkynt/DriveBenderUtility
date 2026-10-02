@@ -7,9 +7,9 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [36776548717](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36776548717).
+Generated from run: [36830391079](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/36830391079).
 
-251 scenarios — 230 passing on at least one target, 0 failing.
+251 scenarios — 231 passing on at least one target, 0 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
@@ -139,7 +139,7 @@ Generated from run: [36776548717](https://github.com/Hawkynt/DriveBenderUtility/
 | SharedAccess | `SharedFile_GivenAReaderHoldsItOpenWhileItIsRenamed_ThenNeitherSideIsCorrupted` | Given AReader Holds It Open While It Is Renamed , then Neither Side Is Corrupted | pass | pass |
 | SharedAccess | `SharedFile_GivenConcurrentReadersOnOneOpenFile_ThenEachSeesTheWholeContent` | Given Concurrent Readers On One Open File , then Each Sees The Whole Content | pass | pass |
 | SharedAccess | `SharedFile_GivenWritersOwningDisjointRegionsOfOneFile_ThenNoRegionIsCorruptedByAnother` | Given Writers Owning Disjoint Regions Of One File , then No Region Is Corrupted By Another | pass | pass |
-| SharedAccess | `SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeVersion` | Given Writers Replacing It By Rename , then Every Read Is AWhole Version _(held back: A file replaced by rename keeps serving its OLD content to readers re-opening the name. Measured: 16 replacements landed, all 3,200 reads returned version 1, and the read taken after the workers stopped returned version 60 - so the data is correct on disk. LOCALISED since: the same shape driven straight against the engine, with no driver in the way, is CLEAN - 564 replacements, 13,513 fresh-open reads, 0 torn, 179 distinct versions seen. So the engine resolves a fresh open to new content and the staleness is added above it, in the driver layer. That rules out the three things already tried (IndexNumber, the pooled physical handles, per-handle read-ahead - which holds no data at all, only a prefetch length). The next attempt belongs in WinFspAdapter, not the engine. See docs/Issues.md for how to re-run the probe.)_ | skipped | skipped |
+| SharedAccess | `SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeCurrentVersion` | Given Writers Replacing It By Rename , then Every Read Is AWhole Current Version | pass | pass |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(HDD over cloud)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(HDD over cloud) | pass | pass |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(RAM over cloud)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(RAM over cloud) | pass | pass |
 | SimulatedDevice | `Duplication_GivenOneCopyOnEachSpeed_ThenReadsAreNotHeldToTheSlowOne(RAM over SD card)` | Given One Copy On Each Speed , then Reads Are Not Held To The Slow One(RAM over SD card) | pass | pass |

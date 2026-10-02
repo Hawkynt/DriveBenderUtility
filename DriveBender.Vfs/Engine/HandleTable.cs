@@ -9,6 +9,15 @@ public sealed class FileState(string normalizedPath) {
   public string Path { get; internal set; } = normalizedPath;
   public FileLock Lock { get; } = new();
 
+  /// <summary>The file was deleted while handles were still open on it; they reach nothing any more (<see cref="HandleTable.DetachDeleted"/>).</summary>
+  public bool Deleted { get; internal set; }
+
+  /// <summary>
+  /// The file was deleted while the application still had it open, and lives on under a hidden name
+  /// for those handles (POSIX: a delete removes the name, not the file); the last close removes it.
+  /// </summary>
+  public bool RemoveAtLastClose { get; internal set; }
+
   /// <summary>
   /// Total pins keeping this state alive: open handles PLUS outstanding path leases. Changed only
   /// atomically: a lease on a path that is already pinned adds its pin WITHOUT the table's lock (see
@@ -341,6 +350,36 @@ public sealed class HandleTable {
       this._files[toNormalized] = file;
     }
   }
+
+  /// <summary>
+  /// Unbinds a deleted file's state from its name while handles are still open on it. Those handles
+  /// keep the state alive until they close, so without this the NEXT file created at the name was
+  /// given the same state, and the old handles wrote into it. The state moves to a key no pool path
+  /// can be, and is marked deleted, so the engine refuses anything but closing those handles.
+  ///
+  /// CONTRACT: as <see cref="RenamePath"/>, the caller holds the path's exclusive lease.
+  /// </summary>
+  public void DetachDeleted(string normalizedPath) {
+    lock (this._lock) {
+      if (!this._files.TryGetValue(normalizedPath, out var file) || file.HandleCount == 0)
+        return; // nothing open on it: the state retires with its last lease as always
+
+      this._files.TryRemove(normalizedPath, out _);
+      file.Deleted = true;
+      file.Path = $"deleted/{Guid.NewGuid():N}";
+      this._files[file.Path] = file;
+    }
+  }
+
+  /// <summary>Marks a path's state to be removed at its last close (a file deleted while open); the caller holds its lease.</summary>
+  public void RemoveAtLastClose(string normalizedPath) {
+    lock (this._lock)
+      if (this._files.TryGetValue(normalizedPath, out var file))
+        file.RemoveAtLastClose = true;
+  }
+
+  /// <summary>Whether no handle at all is open on the state any more.</summary>
+  public static bool IsLastHandleGone(FileState file) => Volatile.Read(ref file.HandleCount) == 0;
 
   /// <summary>Follows every open file under a renamed folder so their handles stay valid (folder FR-RENAME).</summary>
   public void RenameSubtree(string fromNormalized, string toNormalized) {

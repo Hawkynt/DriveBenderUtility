@@ -329,7 +329,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       var file = this._files.GetValueOrDefault(physical)
                  ?? throw new PoolFsException(PoolFsError.NotFound, $"File not found: {relativePath}");
 
-      return new FakeVolumeStream(this, file, writable: false);
+      return new FakeVolumeStream(this, file, writable: false, relativePath);
     }
   }
 
@@ -348,7 +348,7 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
         this._files[physical] = file;
       }
 
-      return new FakeVolumeStream(this, file, writable: true);
+      return new FakeVolumeStream(this, file, writable: true, relativePath);
     }
   }
 
@@ -562,9 +562,24 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       return this._folderStamps.GetValueOrDefault(PoolPaths.ToPhysicalFolder(relativeFolder, false));
   }
 
-  private sealed class FakeVolumeStream(FakeVolumeIO owner, FakeFile file, bool writable) : Stream {
+  private sealed class FakeVolumeStream(FakeVolumeIO owner, FakeFile file, bool writable, string relativePath) : Stream {
 
     private long _position;
+    private bool _closed;
+
+    /// <summary>
+    /// A read stream being closed fires <see cref="AfterOperation"/> as <see cref="VolumeOp.OpenRead"/>:
+    /// the moment the bytes are in the caller's hands and whatever it does with them (cache them,
+    /// above all) has not happened yet.
+    /// </summary>
+    protected override void Dispose(bool disposing) {
+      if (disposing && !writable && !this._closed) {
+        this._closed = true;
+        owner._After(VolumeOp.OpenRead, relativePath);
+      }
+
+      base.Dispose(disposing);
+    }
 
     public override bool CanRead => true;
     public override bool CanSeek => true;

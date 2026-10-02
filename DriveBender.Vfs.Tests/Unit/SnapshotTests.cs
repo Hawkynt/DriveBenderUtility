@@ -183,6 +183,28 @@ public class SnapshotTests {
 
   [Test]
   [Category("EdgeCase")]
+  public void RenameFolder_GivenASnapshotNamesAFileInside_ThenTheOldPathStillResolvesAfterTheFileIsEdited() {
+    // The same quiet case one level up: renaming the FOLDER moves every file in it, and the
+    // snapshot recorded their old paths. Worse than the file case, because the moved file then
+    // looks like any other live file — edit it in place and the only bytes the snapshot promised
+    // are overwritten, with nothing set aside.
+    var fs = this._Mounted();
+    fs.MakeDir("docs");
+    _Write(fs, "docs/draft.txt", [3, 3, 3]);
+    var taken = fs.TakeSnapshot("before-the-folder-rename");
+
+    fs.Rename("docs", "archive", RenameFlags.None);
+    var handle = fs.Open("archive/draft.txt", AccessMode.ReadWrite, ShareMode.Read);
+    fs.Write(handle, [7], 0, WriteMode.Normal);
+    fs.Close(handle);
+
+    _ReadSnapshotFile(fs, taken.Id, "docs/draft.txt").Should().Equal(new byte[] { 3, 3, 3 },
+      "the snapshot recorded this path holding this content; moving its folder and then editing the "
+      + "file is not permission to forget it");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
   public void Rename_GivenItOverwritesAPinnedTarget_ThenTheTargetsContentSurvives() {
     // The other end of the same operation: renaming ONTO a file destroys that file, which is a
     // delete wearing a different verb.

@@ -474,10 +474,20 @@ public static class LinuxFuseMountHost {
     Timer? pump = null;
     pump = new Timer(_ => {
       try {
-        scheduler.Pump();
+        // Registration FIRST, before the pump. The pump does the pool's background work, and a member
+        // throttled to a crawl makes one pump call take minutes; registering after it left a mounted,
+        // usable pool invisible to `dbmount status`, `unmount` and every verb that relays into the
+        // mount for that long (found by the starved-unmount scenario on the Linux runner, whose
+        // remount never registered within 90 s). Nor may a pump that throws skip it.
         if (!registered && (System.IO.Directory.Exists(target) && _IsMounted(target))) {
           registered = true;
           onMounted?.Invoke();
+        }
+
+        try {
+          scheduler.Pump();
+        } catch (Exception e) {
+          DriveBender.Logger($"[Warning]background pump failed: {e.Message}");
         }
 
         if (registered)

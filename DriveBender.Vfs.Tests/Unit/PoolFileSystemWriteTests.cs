@@ -225,6 +225,101 @@ public class PoolFileSystemWriteTests {
   }
 
   [Test]
+  [Category("EdgeCase")]
+  public void Rename_GivenAFolderMovedAwayAndBackAfterAnEdit_WhenTheFileIsRead_ThenItIsTheEditedContent() {
+    // Cached blocks are keyed by path. A folder rename moves every file under it without touching
+    // them one by one, so blocks cached under the OLD paths outlive the move; when the folder comes
+    // back to that name they are hits again, for files that have changed in the meantime.
+    this._fs.MakeDir("work");
+    this._fs.Close(this._CreateFileWithContent("work/doc.bin", [1, 1, 1, 1]));
+    var warm = this._fs.Open("work/doc.bin", AccessMode.Read, ShareMode.Read);
+    this._fs.Read(warm, new byte[4], 0); // cache its blocks under "work/doc.bin"
+    this._fs.Close(warm);
+
+    this._fs.Rename("work", "away", RenameFlags.None);
+    var edit = this._fs.Open("away/doc.bin", AccessMode.ReadWrite, ShareMode.Read);
+    this._fs.Write(edit, [2, 2, 2, 2], 0, WriteMode.Normal);
+    this._fs.Close(edit);
+    this._fs.Rename("away", "work", RenameFlags.None);
+
+    var readHandle = this._fs.Open("work/doc.bin", AccessMode.Read, ShareMode.Read);
+    var buffer = new byte[4];
+    this._fs.Read(readHandle, buffer, 0);
+    this._fs.Close(readHandle);
+    buffer.Should().Equal([2, 2, 2, 2], "a read must return what was written, not blocks cached before the folder moved");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Rename_GivenAReadInFlightAsItsFolderMoves_WhenTheFolderComesBackAfterAnEdit_ThenTheReadIsTheEditedContent() {
+    // Reads do not wait for a folder rename, so one can have its bytes from the old path in hand
+    // while the folder moves, and cache them AFTER the move dropped that subtree's blocks. Those
+    // blocks are then hits again once the folder takes its old name back, for a file edited since.
+    this._fs.MakeDir("work");
+    this._fs.Close(this._CreateFileWithContent("work/doc.bin", [1, 1, 1, 1]));
+
+    Thread? reader = null;
+    var holding = new ManualResetEventSlim();
+    var resume = new ManualResetEventSlim();
+    var fired = 0;
+    foreach (var volume in new[] { this._volume1, this._volume2 })
+      volume.AfterOperation = (op, path) => {
+        if (op == VolumeOp.OpenRead && path == "work/doc.bin" && Thread.CurrentThread == reader && Interlocked.Exchange(ref fired, 1) == 0) {
+          holding.Set(); // the old bytes are read and not yet cached
+          resume.Wait(TimeSpan.FromSeconds(10));
+        }
+      };
+
+    reader = new(() => {
+      var handle = this._fs.Open("work/doc.bin", AccessMode.Read, ShareMode.Read);
+      this._fs.Read(handle, new byte[4], 0);
+      this._fs.Close(handle);
+    });
+    reader.Start();
+    holding.Wait(TimeSpan.FromSeconds(10)).Should().BeTrue("the read must reach the disk, or this tests nothing");
+
+    var renamer = new Thread(() => this._fs.Rename("work", "away", RenameFlags.None));
+    renamer.Start();
+    renamer.Join(TimeSpan.FromMilliseconds(500)); // lands while the read holds its bytes, unless the read holds it off
+    resume.Set();
+    reader.Join(TimeSpan.FromSeconds(10)).Should().BeTrue();
+    renamer.Join(TimeSpan.FromSeconds(10)).Should().BeTrue();
+    foreach (var volume in new[] { this._volume1, this._volume2 })
+      volume.AfterOperation = null;
+
+    var edit = this._fs.Open("away/doc.bin", AccessMode.ReadWrite, ShareMode.Read);
+    this._fs.Write(edit, [2, 2, 2, 2], 0, WriteMode.Normal);
+    this._fs.Close(edit);
+    this._fs.Rename("away", "work", RenameFlags.None);
+
+    var readHandle = this._fs.Open("work/doc.bin", AccessMode.Read, ShareMode.Read);
+    var buffer = new byte[4];
+    this._fs.Read(readHandle, buffer, 0);
+    this._fs.Close(readHandle);
+    buffer.Should().Equal([2, 2, 2, 2], "a read must return what was written, not blocks a read cached as the folder moved");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Rename_GivenAFolderMovedUnderAnEditSession_WhenTheFileIsClosed_ThenNoWriteIntentIsLeftOpen() {
+    // An edit session's intent is keyed by the file's path. A folder rename moves the file without
+    // closing it, and the close that follows looks the session up under the NEW name — so the one
+    // logged under the old name was never completed, and every later mount's recovery would
+    // reconcile whatever came to live at that name.
+    this._fs.MakeDir("work");
+    this._fs.Close(this._CreateFileWithContent("work/doc.bin", [1, 1]));
+    var handle = this._fs.Open("work/doc.bin", AccessMode.ReadWrite, ShareMode.Read);
+    this._fs.Write(handle, [2], 0, WriteMode.Normal); // opens the session under "work/doc.bin"
+
+    this._fs.Rename("work", "done", RenameFlags.None);
+    this._fs.Write(handle, [3], 1, WriteMode.Normal);
+    this._fs.Close(handle);
+
+    new Journal(new MemberJournalStore([this._volume1, this._volume2])).ReadIncomplete()
+      .Where(r => r.Op == JournalOp.Write).Should().BeEmpty("the last writer closed the file, so its edit session is complete");
+  }
+
+  [Test]
   [Category("Exception")]
   public void Rename_GivenFolderTargetAlreadyExists_WhenRenamed_ThenExists() {
     this._fs.MakeDir("a");

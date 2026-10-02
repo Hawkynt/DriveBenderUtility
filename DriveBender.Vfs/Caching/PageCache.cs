@@ -205,19 +205,41 @@ public sealed class PageCache(Func<ICacheEvictionPolicy<PageKey>> newPolicy, int
 
     lock (shard.Lock) {
       Interlocked.Increment(ref shard.Epoch); // any in-flight background load's Put for this pool is now rejected
-      if (!shard.ByPath.Remove(path, out var blocks))
-        return; // nothing of this path is cached — O(1), not a scan of the whole shard
+      this._DropPathLocked(shard, poolId, path); // O(1) when nothing of it is cached, not a scan of the shard
+    }
+  }
 
-      foreach (var blockIndex in blocks) {
-        var key = new PageKey(poolId, path, blockIndex);
-        if (!shard.Blocks.TryRemove(key, out var block))
-          continue;
+  /// <summary>
+  /// Drops every cached block of every path under <paramref name="folder"/>. A folder rename moves
+  /// its files without touching them one by one, and blocks left under the old paths would be hits
+  /// again for DIFFERENT content the moment something takes that name back (SAFE-COHERE). Costs a
+  /// pass over the cached paths, not over the blocks; folder renames are rare enough for that.
+  /// </summary>
+  public void InvalidateSubtree(Guid poolId, string folder) {
+    if (!this._shards.TryGetValue(poolId, out var shard))
+      return;
 
-        --shard.Count;
-        Interlocked.Add(ref shard.Bytes, -block.Length);
-        Interlocked.Add(ref this._totalBytes, -block.Length);
-        shard.Policy.Remove(key);
-      }
+    var prefix = folder + "/";
+    lock (shard.Lock) {
+      Interlocked.Increment(ref shard.Epoch);
+      foreach (var path in shard.ByPath.Keys.Where(p => p.StartsWith(prefix, PoolPaths.PathComparison)).ToArray())
+        this._DropPathLocked(shard, poolId, path);
+    }
+  }
+
+  private void _DropPathLocked(PoolShard shard, Guid poolId, string path) {
+    if (!shard.ByPath.Remove(path, out var blocks))
+      return;
+
+    foreach (var blockIndex in blocks) {
+      var key = new PageKey(poolId, path, blockIndex);
+      if (!shard.Blocks.TryRemove(key, out var block))
+        continue;
+
+      --shard.Count;
+      Interlocked.Add(ref shard.Bytes, -block.Length);
+      Interlocked.Add(ref this._totalBytes, -block.Length);
+      shard.Policy.Remove(key);
     }
   }
 

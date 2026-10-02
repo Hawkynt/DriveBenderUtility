@@ -420,6 +420,12 @@ sequenceDiagram
     Note over Engine,B: copies still owed are held in the write buffer and completed in the background — the journal intent closes last
 ```
 
+A file still being written survives whatever happens to its name meanwhile. Renaming its folder
+takes it along, and the writer's later writes and its close land under the new name. Renaming
+another file over it keeps it beside the new one as `<name> (displaced <when>)<ext>`, with
+everything its writer wrote. Deleting it is the one deliberate end: handles still open on it are
+refused from then on, so they can never write into a new file that takes the name.
+
 ### Memory: three caches with different jobs
 
 One configurable pool of RAM, split between reading and writing. The split can be automatic, fixed,

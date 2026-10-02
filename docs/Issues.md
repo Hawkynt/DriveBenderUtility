@@ -1729,102 +1729,60 @@ nothing exercised end to end before.
 Two items that stood here are closed; they moved to "Closed, kept as a record" below rather than
 being deleted, because what they cost is the point.
 
-1. **A file replaced by rename keeps serving its OLD content to new readers — Windows.** After
-   `File.Move(source, target, overwrite: true)` succeeds, a reader that opens the target path
-   afresh still gets the pre-replacement bytes. Measured through a real WinFsp mount: six
-   replacements landed and the file settled on version 40, while all 3,200 reads taken during the
-   run returned version 1 — so the replacements were real and every reader missed all of them.
-   Atomic replace-by-rename is the pattern careful software uses precisely to publish a new
-   version safely, so this makes the safe pattern the broken one. Pinned by
-   `SharedAccessEndToEndTests.SharedFile_GivenWritersReplacingItByRename_...`, `[Ignore]`d with
-   this reason rather than weakened.
+1. **Withdrawn: "a file replaced by rename keeps serving its OLD content to new readers — Windows".**
+   It never served stale content. The scenario stopped its readers after a fixed 800 rounds each.
+   Windows refuses a rename over a file that has open handles (WinFsp's `FspFileNodeRenameCheck`
+   answers `STATUS_ACCESS_DENIED` unless the rename is POSIX, which this mount does not enable),
+   and four readers nearly always hold one. Under load the readers therefore finished every round
+   while each replacement was being refused, and the replacements landed afterwards. That is
+   exactly what was measured: "16 replacements landed, all 3,200 reads returned version 1, and the
+   read taken afterwards returned version 60". Reproduced this pass under CPU load, with timestamps:
+   31 replacements, 3,200 reads of version 1, and **0 of those reads started after any replacement
+   had completed**.
 
-   **Ruled out: IndexNumber.** `WinFspAdapter._Fill` never sets `FspFileInfo.IndexNumber`, so
-   every file reports file id 0, and Windows associates a file's cached data section with its
-   IndexNumber — a good story for why the section survives a replacing rename. It was implemented
-   (a real per-file identity from path plus creation time, which stays constant across appends and
-   changes when the name comes to hold a different file) and it does NOT fix this. Reverted rather
-   than carried, because it costs a hash on every `GetFileInfo`, which is a hot path, and bought
-   nothing measurable. Setting it may still be worth doing for its own sake; it is not the lever
-   here.
+   The earlier lead does not hold either. The Windows cache manager is not involved on this mount:
+   WinFsp sets `FO_CACHE_SUPPORTED` only when `FileInfoTimeout` is infinite (`create.c`), and ours
+   is 1000 ms, so every read reaches the adapter's `Read` callback.
 
-   **New evidence, and it narrows things a lot.** Re-measured this pass: 16 replacements landed,
-   all 3,200 reads during the run returned version 1 — and the read taken AFTER the workers stopped
-   returned version 60. So the bytes on disk are correct and the invalidation is not permanently
-   broken; the staleness lasts exactly as long as readers keep the name open. Whatever serves those
-   reads is pinned by an open handle and outlives the rename underneath it.
+   The scenario (`SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeCurrentVersion`)
+   is un-ignored. Its readers now run until the last writer finishes. It also has an oracle that can
+   tell a stale read from an early one: a read that starts after a replacement returned must not
+   see a version already superseded before that replacement began. Proved sensitive by making the
+   adapter serve the target from the first bytes it ever read: fails 2 of 2. Passes 6 of 6 under
+   18 busy CPU threads (about 54,000 judged reads, none stale) and 5 of 5 unloaded.
+2. **Narrowed: `_RenameFolder` holds no lease on any child file.** The window this entry described
+   (a write landing between the rename's flush and the member-level move) is closed, not by child
+   leases but by the namespace gate added with "renaming a folder while a file in it was being
+   written" below. Every operation that writes, creates, moves or publishes under a path holds the
+   gate shared, and a folder rename holds it exclusively from its flush to the end of the move.
+   Checking that claim against every caller this pass found one that did not hold it, and three kinds
+   of per-path state the move left behind. All four are fixed, each with a test that fails without
+   the fix:
+   - **`MarkApplicationClosed` published without the gate — a closed file could be lost.** It is
+     where a new file is published on Windows. The publish takes the file off the staging list
+     before renaming the temp on each member, so a folder rename landing in between moved the temp
+     with the folder, and the publish then failed. The file stayed a temp under the new folder, which
+     the next mount's recovery deletes. It takes the gate now, as `Close` does
+     (`FolderRenameRaceTests`, deterministic: the publish is held at its rename while the folder
+     moves).
+   - **Snapshots lost the files of a renamed folder.** A file rename preserves a pinned source
+     first; a folder rename did not, so the snapshot's paths named nothing, and the first edit of a
+     moved file overwrote the only copy of the snapshot's version. Pinned children are now preserved
+     before the move (`SnapshotTests`).
+   - **A folder moved away and back served blocks cached before it left.** Cached blocks are keyed
+     by path, and a folder rename dropped the metadata cache but not the page cache. The children's
+     blocks are now dropped under both names; the target side is what also catches a read that was
+     in flight during the move and cached old-path bytes after the drop (`PoolFileSystemWriteTests`,
+     two cases).
+   - **An edit session under the old name was never completed.** The close that ends a session
+     looks it up under the file's new name, so a Write intent stayed open in the journal for every
+     later mount's recovery. Children's sessions are completed before the move; no write is in flight
+     under the exclusive gate.
 
-   **Also ruled out, so the next pass need not re-walk them:**
-   - The engine's `Rename` does invalidate both endpoints, and `_Invalidate` clears placement and
-     the path's cache entry under the same name it caches them — no mismatch there.
-   - The pooled physical handles in `LocalVolumeIO.HandlePool` are not it. `AtomicReplace`
-     invalidates before AND after the swap, and `_Retire` removes the key from the dictionary, so a
-     handle rented before the replace is closed when its borrower returns it rather than re-pooled
-     — a later reader cannot be served the pre-replace file out of the pool.
-
-   **Read-ahead was the standing lead and it is wrong.** `FileState.ReadAhead` survives a rename,
-   which made it look promising, but `ReadAheadState` holds **no data**: it is a sequential-access
-   detector whose whole state is `_expectedNextOffset` and a window size, and `OnRead` returns a
-   prefetch *length*. There are no buffers in it to go stale. Reading the type settles this without
-   an experiment.
-
-   **The engine is clean — measured, not argued.** The same shape was driven straight against
-   `PoolFileSystem` with no driver in the way: three writers staging and renaming over a target,
-   four readers opening the target **fresh every time** and recording the version they saw. Result:
-   564 replacements, 13,513 reads, **0 torn reads, 179 distinct versions observed**, settling on the
-   newest. So a fresh open through the engine resolves to new content, and the defect is added
-   **above** the engine, in the driver layer.
-
-   That is the useful narrowing: with the engine, the handle pool, `_Invalidate`, `IndexNumber` and
-   read-ahead all eliminated, what is left is WinFsp and the Windows cache manager — the FSD can
-   answer a read out of a file's cached section without the filesystem being called at all, and the
-   section is associated with the name's FCB, which stays alive exactly as long as readers keep
-   re-opening it. That matches the one behaviour nothing else explained: the staleness lasts
-   precisely as long as the readers do.
-
-   **The next attempt belongs in `WinFspAdapter`, not the engine**, and it should start by
-   establishing whether the Linux/FUSE target shows the same thing — if it does not, that confirms
-   the layer outright. Worth doing before writing any code, since the last three attempts each cost
-   an implementation.
-
-   To re-run the engine probe: a console project referencing `DriveBender.Vfs`, two
-   `LocalVolumeIO` members and a `CacheInstance`, duplication 2, then the writer/reader threads
-   described above using `fs.Create`/`fs.Write`/`fs.Rename(..., RenameFlags.ReplaceExisting)` and
-   `fs.Open`/`fs.Read`/`fs.Close` per read. It needs no driver and runs in ten seconds.
-
-   It also passes when run ALONE and fails in the full suite, so it is timing-sensitive; a single
-   green run of this scenario means nothing without the whole suite behind it.
-2. **`_RenameFolder` holds leases on the two folder paths but on NO CHILD FILE while moving them.**
-   It flushes dirty children and publishes staged ones first, but takes no lease on any of them, so
-   a write can land between that flush and the member-level `RenameFolder` and address a path whose
-   physical file has since moved. Not reproduced end to end; the stress suite races file renames
-   only, which is why it would not be caught. Fixing it needs a lock-ordering story for an unbounded
-   set of children, which is why it is written down rather than attempted in passing.
-
-   **It now has an end-to-end guard, and the guard did not trip it.** `FolderRenameRaceEndToEndTests`
-   races four writers against a folder renamed back and forth underneath them, repeated, through a
-   real mount — the case the note says the stress suite misses because it races file renames only.
-   Its oracle is the one that matters and needs no timing: a write the pool ACKNOWLEDGED must be
-   findable afterwards, and a file must hold ONE version rather than a blend of two. Several
-   thousand acknowledged writes across dozens of renames later, nothing was lost.
-
-   One thing the guard turned up on its own: **on Windows the race cannot be built at all.** The OS
-   refuses to rename a directory while files beneath it are open, so with writers hammering four
-   children every attempt is declined before the pool ever sees it — the scenario came back with
-   zero renames there and now skips with that reason. Which also says the window is far harder to
-   reach on that platform, because the rename that would open it mostly cannot start. That does not
-   prove the window cannot open — a race that does not reproduce is not a race that cannot happen,
-   and the reasoning about the missing child lease still stands — but the risk is no longer
-   unobserved, and anything that makes it real from here fails a test instead of quietly losing a
-   file. The lock-ordering story for an unbounded set of children is still what a fix needs.
-
-   **Half of this entry was wrong and is withdrawn.** It also claimed `HandleTable.RenameSubtree`
-   repeats the defect fixed in `4ad2094` by re-keying children over any state already there. It does
-   re-key that way — and so does `RenamePath`, the method that fix landed in. Displacing an entry was
-   never the defect; the defect was the CLOSE path unkeying an entry that had come to belong to
-   somebody else, and `4ad2094` fixed that centrally by guarding both removal sites with
-   `ReferenceEquals(current, file)`. `RenameSubtree` therefore has the shape of the FIXED code, not
-   of the bug. Checked against the commit rather than inferred from the shape a second time.
+   Still outside the gate, looked at and not changed: reads, which may fail against a moving file
+   but do not mutate it, and `Open` for writing, whose snapshot preservation copies a pinned file
+   and could fail the open if the folder moves mid-copy. Neither is known to lose data; neither is
+   covered by a test.
 
 The three throughput items that stood here — sync-over-async across the providers, the absence of
 provider-level range reads, and the whole-object RAM spikes — are closed above.
@@ -1999,23 +1957,45 @@ These now fail the build rather than needing to be re-found:
   `5b67a05`, in which mounting any local pool was impossible. `DBE2E_REQUIRE_DRIVER=1` makes a
   missing driver a failure, so the suite cannot report green by skipping everything.
 
-### Open: `RemoveMedia…ThenTheyAreStillRecoverable` fails intermittently under battery load
+### Resolved (Linux cause): `RemoveMedia…ThenTheyAreStillRecoverable` failed intermittently under battery load
 
 `RemoveMedia_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable`
-(`SwapMediaEndToEndTests`), added with the disk-swap fix in `d8bfa25`, failed twice while three
-unrelated pull requests were being validated: once on the Linux runner (run `35323450800`, on a
-branch whose only change was inert for that path) and once in a local Windows battery. It passed in
-isolation on both platforms, passed on `main`'s own run for the commit that introduced it, and
-passed on every later run of the same branches.
+(`SnapshotEndToEndTests`) failed twice: once on the Linux runner (run `35323450800`) and once in a
+local Windows battery.
 
-So the evidence says intermittent-under-load rather than broken, but nobody has actually looked at
-why, and "it passed when I ran it again" is how a real fault gets written off. The assertion that
-fails is the restored snapshot version's content, which is the one thing in that scenario worth
-being sure about — a retired disk must not take a snapshot's only copy with it.
+**The Linux failure was the harness, and the log says so.** The note above guessed that the restored
+content was wrong. The run's own log shows otherwise: `pool-snapshot-restore` exited 1 with "Pool …
+is not mounted", straight after the scenario remounted the pool to retire a disk. The FUSE mount
+registers itself on a pump tick *after* the kernel mount appears, because libfuse has no "mounted"
+callback. The harness counted the pool as ready as soon as the mountpoint answered, and every verb
+that relays into the mount process (the snapshot verbs, `health --fix`) says "not mounted" until
+the registration lands. The harness now waits for both. Under load (six writers churning the temp
+disk) the fixture passed 3 of 3 afterwards; it also passed before, which is expected for a race this
+narrow, so this is not proof of the fix.
 
-Worth a deliberate reproduction under load before it is dismissed: run the full battery in a loop
-and capture the member dumps the failure already prints, rather than waiting to notice it again in
-somebody's unrelated pull request.
+The product-side gap remains, and is small: on Linux a script that waits for the mountpoint and then
+calls a snapshot verb can hit the same window, at most one 50 ms pump tick wide. On Windows the mount
+registers after the driver returns. A test trying to catch that window there did not fail even with
+the gap artificially widened to 500 ms, so nothing was changed on that path.
+
+**The local Windows failure is not explained.** Its output was not kept, and it did not recur here.
+
+**Found on the way: retiring a disk could separate a snapshot version from its sidecar.** The store
+only sees a version whose `.snapinfo` sits beside it on the same member. `_ScatterHiddenTree` sent
+each file to whichever member had the most free space at that moment, and moving the version lowered
+its target's free space, so the sidecar could go elsewhere. The version stayed on disk and the
+snapshot could no longer find it (the restore failed with "that copy is not available"). The recycle
+bin's `.trashinfo` had the same exposure. An item and its sidecar now move together, the sidecar
+deleted first from the leaving disk. This cannot have caused the E2E failures, because the E2E members
+share one disk and always tie on free space. `DataMovementCrashTests.RemoveMedia_GivenTheDiskHoldsASnapshotVersion_…`
+uses three disks, and fails without the change.
+
+**The product-side gap is closed too, and it was wider than one pump tick.** The FUSE mount
+registered itself on its background tick AFTER `scheduler.Pump()`, so the registration waited for the
+pool's background work. With a member throttled to a crawl one pump call takes minutes: the
+starved-unmount scenario's remount stayed unregistered past the harness's 90 s on the Linux runner
+(found once the harness started waiting for registration). A pump that threw skipped registration
+for that tick as well. Registration now comes first, and the pump's failures are its own.
 
 ### Resolved: copying a folder tree failed with "directory does not exist"
 
@@ -2197,6 +2177,67 @@ Added: scheduled snapshots (`snapshots.schedule`, off by default) — see docs/S
 built with, not the roles a live reload set (`UpdateMemberRoles`), so a disk made idle while mounted
 can still receive a new file's temporary blocks until the next mount. Placement of the file itself
 already honours the live role.
+
+### Resolved: a retried striped publish could put a copy with holes under the real name
+
+Completing a stripe session fills each final and returns the ones that are whole; only those are
+published. A final that could not be filled is deleted, and if that delete fails too, the temp is
+left for the next mount's sweep. When the publish itself then failed (a rename refused), it was
+retried later from "every temp that still has the staged name", which includes that unfilled final.
+The retry renamed it into place. The file then had one whole copy and one with holes, and reads
+routed to the second returned zeros.
+
+The whole finals are now remembered until the publish succeeds, and a retry publishes only those
+that still wait for their rename. Found by reading the publish path. Covered by
+`StripeCrashTests.Stripe_GivenAFinalCouldNotBeFilledNorRemovedAndThePublishIsRetried_…`, which
+fails without the change: three injected faults (the fill, the delete, one rename).
+
+### Resolved: a file renamed onto a name still being written was lost at the writer's close, and an old handle could write into a newer file
+
+A file being written has no copy under its name yet, only a temp, which its last close publishes.
+A rename onto that name while it was open (`rename x t` on Linux; Windows refuses a rename over an
+open file) replaced nothing, and the writer's close then renamed its temp over the file just renamed
+in. `x`'s bytes were gone, after the rename had been acknowledged. Until the close, reads of `t`
+also returned the writer's data rather than the renamed file's. The fix for the pending-publish case
+above covered closed files only, because an open file cannot be published.
+
+A replacing rename now moves the file being written aside first, to `t (displaced <when>).bin` in the
+same folder, and only then takes the freed name. The writer's handle follows the file as it follows any
+rename, so everything it writes afterwards and its close land in the displaced file. The renamed file
+is never touched. This applies whether the target is a new file still being written or an existing
+file being edited in place, and only to files open for WRITING: replacing a file that is merely open
+for reading is the atomic-save pattern, and nothing is displaced. A non-replacing rename onto the name
+is still refused with `Exists`, and a second displacement in the same second gets its own name.
+
+An earlier version of this fix discarded the file being written instead, as a delete of it does. A
+delete is deliberate; a rename over a file is not a decision about the writer's data, so that version
+traded one loss for another and was replaced. `CrashConsistencyTests` now cuts the power at every one
+of the 26 steps of the move, the rename and the close (measured; the matrix was 15 steps before the
+move existed). It requires the renamed content to be whole under exactly one name, a kept-aside copy
+to be the writer's content whole, and every copy of each to agree. `RenameWhileWritingTests` covers
+the rest; without the move, 15 of the affected tests fail.
+
+**A handle outliving its file could write into the next file at that name.** That was still open
+here, and it was real. A deleted file's state stayed bound to the NAME while its handles were open,
+so the next file created at that name was given the same state, and the old writer's next byte landed
+in the new file (`05 06 05` where `05 05 05` was written). A rename over an edited file did the same
+before the move above. A delete now frees the NAME and leaves the file to the handles still open on it, which is what a
+POSIX delete means: the application that holds it goes on reading and writing it until it closes,
+and the next file at that name is its own. The copies move to a hidden name beside it (or, with the
+bin on, the open handles follow the file into the bin), and the last close removes them; a power cut
+first leaves temps the next mount sweeps. A first version refused those handles instead, with a
+stale-handle error. That stopped the corruption, but on Linux, replacing a file someone is reading
+makes the kernel delete the old one once its readers let go, and under load that delete reaches the
+pool while a reader's close is still in flight: its next read failed, and the application saw "access
+denied" in the middle of an ordinary replace (`SharedFile_GivenWritersReplacingItByRename_…`, 1 run
+in a few on a loaded runner; reproduced under load in WSL, with the pool logging the stale handle).
+A file still being written for the first time has no data worth keeping, and is still detached.
+
+Also audited this pass, with no defect found: the drainer's and the healer's commit paths
+(`_CommitDrainedCopy`, `_CommitHealedCopy`: check, rename and copy-list refresh all under one lease),
+`_CompleteStripe`'s own failure path (the session is put back), and `_RehomeStripe`. No new crash
+matrix was added for them; the existing ones (drain 21 steps, heal 21, striped write and close 19
+and 27) still pass.
 
 ### Resolved: with one required copy, a power cut could lose an acknowledged write
 

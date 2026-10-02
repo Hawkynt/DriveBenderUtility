@@ -101,21 +101,17 @@ public class SharedAccessEndToEndTests {
 
   [Test]
   [Category("EdgeCase")]
-  [Ignore("A file replaced by rename keeps serving its OLD content to readers re-opening the name. "
-          + "Measured: 16 replacements landed, all 3,200 reads returned version 1, and the read taken "
-          + "after the workers stopped returned version 60 - so the data is correct on disk. "
-          + "LOCALISED since: the same shape driven straight against the engine, with no driver in the "
-          + "way, is CLEAN - 564 replacements, 13,513 fresh-open reads, 0 torn, 179 distinct versions "
-          + "seen. So the engine resolves a fresh open to new content and the staleness is added above "
-          + "it, in the driver layer. That rules out the three things already tried (IndexNumber, the "
-          + "pooled physical handles, per-handle read-ahead - which holds no data at all, only a "
-          + "prefetch length). The next attempt belongs in WinFspAdapter, not the engine. "
-          + "See docs/Issues.md for how to re-run the probe.")]
-  public void SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeVersion() {
+  public void SharedFile_GivenWritersReplacingItByRename_ThenEveryReadIsAWholeCurrentVersion() {
     // The atomic-replace pattern every careful application uses: write a temp, then rename over
     // the target. THAT is the one a filesystem must make tear-free — a plain truncate-and-rewrite
     // is legitimately observable half-done by a concurrent reader on any filesystem, so demanding
     // atomicity there would be asserting a guarantee that does not exist.
+    //
+    // And the replacement must be SEEN. "More than one version was observed" cannot tell a stale
+    // read from a read that simply came before the replacement, so the oracle is timing: a read
+    // that STARTS after a replacement has returned must not see a version that was already gone
+    // before that replacement began. Timestamps come from one monotonic clock, taken around the
+    // rename and before the open, so no scheduling delay can make a correct read fail.
     const int writers = 3;
     const int readers = 4;
     const int rounds = 20;
@@ -125,25 +121,26 @@ public class SharedAccessEndToEndTests {
     _SharedWrite(path, _Version(1, length));
 
     var tears = new System.Collections.Concurrent.ConcurrentBag<string>();
-    var observed = new System.Collections.Concurrent.ConcurrentDictionary<int, byte>();
+    var installs = new System.Collections.Concurrent.ConcurrentBag<(long Start, long End, int Version)>();
+    var seen = new System.Collections.Concurrent.ConcurrentBag<(long Start, int Version)>();
     var writersActive = writers;
     var reads = 0;
-    var replaced = 0;
 
     _RunWorkers(writers + readers, TimeSpan.FromMinutes(3), worker => {
       if (worker < writers) {
         try {
           for (var round = 0; round < rounds; ++round) {
-            var version = 1 + worker * rounds + round;
+            var version = 1 + worker * rounds + round + 1; // 1 is the original, never a replacement
             var staging = this._pool.PathTo($"replace-{worker}.tmp");
             _SharedWrite(staging, _Version(version, length));
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try {
               File.Move(staging, path, overwrite: true);
-              Interlocked.Increment(ref replaced);
+              installs.Add((started, System.Diagnostics.Stopwatch.GetTimestamp(), version));
             } catch (Exception e) when (e is IOException or UnauthorizedAccessException) {
-              // Windows may refuse to replace a file that readers hold open, depending on the
-              // share modes in play — a legal answer, and not something to assert against. What
-              // must never happen is a reader seeing the file half-replaced.
+              // Windows refuses to replace a file that readers hold open — a legal answer, and not
+              // something to assert against. What must never happen is a reader seeing the file
+              // half-replaced, or still seeing the old one after the replacement returned.
               try {
                 File.Delete(staging);
               } catch (Exception) {
@@ -164,12 +161,20 @@ public class SharedAccessEndToEndTests {
         return;
       }
 
-      for (var round = 0; round < rounds * 40 && (round < 2 || Volatile.Read(ref writersActive) > 0); ++round)
+      // Readers run for as long as ANY writer does, never for a fixed number of rounds. Windows
+      // refuses to rename over a file that has open handles, and four readers nearly always hold
+      // one, so most replacements are refused until the readers pause. With a round limit the
+      // readers could finish every round before the first replacement got through — and that is
+      // precisely what was once written down as "every read returned the old version": 3,200
+      // reads of version 1, all taken before any replacement had landed. It was the scenario
+      // ending its readers early, not the pool serving stale data.
+      for (var round = 0; round < 2 || Volatile.Read(ref writersActive) > 0; ++round)
         try {
+          var started = System.Diagnostics.Stopwatch.GetTimestamp();
           var got = _SharedRead(path);
           Interlocked.Increment(ref reads);
           if (got.Length > 0)
-            observed.TryAdd((got[0] * _INVERSE_OF_SEVEN) & 0xFF, 0);
+            seen.Add((started, (got[0] * _INVERSE_OF_SEVEN) & 0xFF));
           if (_DescribeTearing(got, length) is { } torn)
             tears.Add(torn);
         } catch (IOException) {
@@ -177,11 +182,32 @@ public class SharedAccessEndToEndTests {
         }
     }, "reader or writer");
 
+    // When each version stopped being current at the latest: the start of the first replacement
+    // that began after it was installed and finished. The original counts as installed at -inf.
+    var installed = installs.ToDictionary(i => i.Version, i => i.End);
+    installed[1] = long.MinValue;
+    long GoneBy(int version) => installs
+      .Where(later => later.Version != version && later.Start > installed[version])
+      .Select(later => later.End)
+      .DefaultIfEmpty(long.MaxValue)
+      .Min();
+
+    var stale = seen
+      .Where(read => installed.ContainsKey(read.Version) && GoneBy(read.Version) < read.Start)
+      .ToList();
+    var judged = seen.Count(read => installs.Any(i => i.End < read.Start));
+    var summary = $"replacements={installs.Count}, reads={reads} ({judged} started after a replacement), "
+      + $"versions seen=[{string.Join(",", seen.Select(r => r.Version).Distinct().Order())}], "
+      + $"settled version={(_SharedRead(path) is { Length: > 0 } f ? (f[0] * _INVERSE_OF_SEVEN) & 0xFF : -1)}";
+    TestContext.Progress.WriteLine(summary);
+
     tears.Should().BeEmpty("a file replaced by rename must never be observed half-replaced");
-    replaced.Should().BeGreaterThan(0, "at least one atomic replacement must have gone through, or nothing was exercised");
-    observed.Should().HaveCountGreaterThan(1,
-      $"the readers must have seen the file CHANGING under them — otherwise nothing was shared and this proves nothing. "
-      + $"replacements={replaced}, reads={reads}, versions seen=[{string.Join(",", observed.Keys.Order())}], settled version={(_SharedRead(path) is { Length: > 0 } f ? (f[0] * _INVERSE_OF_SEVEN) & 0xFF : -1)}");
+    installs.Should().NotBeEmpty("at least one atomic replacement must have gone through, or nothing was exercised");
+    judged.Should().BePositive($"some read must have started after a replacement, or staleness was never tested. {summary}");
+    seen.Select(r => r.Version).Where(v => !installed.ContainsKey(v)).Should().BeEmpty(
+      "every version read must be the original or one a replacement installed");
+    stale.Should().BeEmpty(
+      $"a read that starts after a replacement has returned must not see a version that replacement already superseded. {summary}");
     _DescribeTearing(_SharedRead(path), length).Should().BeNull("the file must settle on a whole version");
   }
 
