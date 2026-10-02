@@ -76,9 +76,14 @@ public sealed class PlacementResolver(Guid poolId, IReadOnlyList<IVolumeIO> memb
   /// to fail gracefully in.
   /// </summary>
   private long _UsableFree(IVolumeIO member) {
-    var reserve = memberReserves != null && memberReserves.TryGetValue(member.MemberId, out var bytes) ? bytes : 0;
+    var reserve = this._reserves != null && this._reserves.TryGetValue(member.MemberId, out var bytes) ? bytes : 0;
     return Math.Max(0, member.BytesFree - reserve);
   }
+
+  private IReadOnlyDictionary<Guid, long>? _reserves = memberReserves;
+
+  /// <summary>Swaps the member reserves live: placement stops short of the new ones at once.</summary>
+  public void UpdateReserves(IReadOnlyDictionary<Guid, long> reserves) => this._reserves = reserves;
 
   private bool _IsEligible(IVolumeIO member, long size, MemberRole? roleFilter) {
     if (!member.IsOnline || this._UsableFree(member) < size)

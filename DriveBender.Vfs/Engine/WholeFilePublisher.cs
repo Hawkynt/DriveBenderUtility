@@ -170,11 +170,21 @@ public static class WholeFilePublisher {
   /// meant "the pool touched this last".
   /// </param>
   /// <returns>False when <paramref name="commit"/> declined to publish; true otherwise.</returns>
+  /// <summary>
+  /// The temp a copy into <paramref name="normalizedPath"/> is written to before its rename. Never
+  /// the name a file being written lives under (<c>&lt;name&gt;.TEMP.$DRIVEBENDER</c>, the engine's staged
+  /// name): an overwrite stages its replacement beside every existing copy under that name, and its
+  /// publish renames whatever it finds there into place. When the healer's half-written copy had that
+  /// same name, the publish took it for the replacement and made it a copy of the file: full length,
+  /// holding neither version (found on Linux under load by the heal-versus-overwrite race).
+  /// </summary>
+  public static string CopyTempOf(string normalizedPath) => normalizedPath + ".COPY." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+
   public static bool PublishStream(IVolumeIO member, string normalizedPath, bool shadow, Func<Stream> openSource, long? expectedLength = null, bool blockingSource = false,
     Action<long>? admit = null, Func<IDisposable?>? commit = null, FileMeta? preserve = null) {
     long written;
     if ((member.Caps & BackendCaps.AtomicRename) != 0) {
-      var temp = normalizedPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+      var temp = CopyTempOf(normalizedPath);
       using (var source = openSource())
       using (var stream = member.OpenWrite(temp, shadow, true)) {
         stream.SetLength(0); // never inherit a stale temp's tail
@@ -287,7 +297,7 @@ public static class WholeFilePublisher {
     Action<long>? admit = null) {
     if ((member.Caps & BackendCaps.BlockClone) != 0 && (member.Caps & BackendCaps.AtomicRename) != 0
         && member.Stat(sourcePath, sourceShadow) is { } meta) {
-      var temp = targetPath + "." + DriveBender.DriveBenderConstants.TEMP_EXTENSION;
+      var temp = CopyTempOf(targetPath);
       try {
         if (member.FileExists(temp, targetShadow))
           member.Delete(temp, targetShadow); // a clone is created, never written into an old temp

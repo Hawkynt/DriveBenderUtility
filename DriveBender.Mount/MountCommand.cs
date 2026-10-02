@@ -146,6 +146,7 @@ internal static class MountCommand {
       fs.ReloadConfig(config);
       fs.UpdateMemberRoles(manifest.Members.ToDictionary(m => m.MemberId, m => m.Role)); // tier changes act on new writes immediately
       fs.UpdateMemberLimits(manifest.Members.Select(m => (m.MemberId, m.EffectiveLimits)));
+      fs.UpdateMemberReserves(manifest.Members.Where(m => m.ReserveBytes > 0).ToDictionary(m => m.MemberId, m => m.ReserveBytes)); // room promised elsewhere, kept at once
 
       // raising the duplication level owes new copies — hand that to the background heal job
       // (it converges incrementally via the scheduler) instead of a blocking RestorePool that
