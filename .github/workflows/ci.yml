@@ -288,7 +288,10 @@ jobs:
       - name: Install FUSE
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-3
+          # the library package follows its ABI: libfuse3-3 up to 3.16, libfuse3-4 from 3.17, and the
+          # runner image moved from one to the other; the adapter loads either SONAME
+          sudo apt-get install -y fuse3
+          sudo apt-get install -y libfuse3-4 || sudo apt-get install -y libfuse3-3
           # the runner user must be able to open the device, else every mount fails with EPERM
           sudo chmod 666 /dev/fuse
           ls -l /dev/fuse
