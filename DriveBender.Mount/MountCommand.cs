@@ -203,7 +203,10 @@ internal static class MountCommand {
         pool.Manifest.Members.ToDictionary(m => m.MemberId, m => m.Role));
       switch (op) {
         case "health" or "health-deep" or "fix": {
-          var service = new HealthService(ios, new SmartctlMonitor(), fs.Integrity, media, space: fs.CreateSpaceOptimizer());
+          // duplication is restored by the engine's own healer: this pool is being served, and only
+          // the healer copies a file with the guards that keep a concurrent write from being lost
+          var service = new HealthService(ios, new SmartctlMonitor(), fs.Integrity, media, space: fs.CreateSpaceOptimizer(),
+            restore: operation => media.RestoreMounted(fs, operation));
           var report = op == "fix"
             ? service.CheckAndCorrect(operation: context)
             : service.Check(deep: op == "health-deep", operation: context);
@@ -211,7 +214,7 @@ internal static class MountCommand {
           break;
         }
         case "restore": {
-          var report = media.RestorePool(context);
+          var report = media.RestoreMounted(fs, context); // never behind the live engine's back
           json = System.Text.Json.JsonSerializer.Serialize(new { ok = true, copiesCreated = report.CopiesCreated });
           break;
         }

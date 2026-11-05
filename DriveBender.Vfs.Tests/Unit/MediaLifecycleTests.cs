@@ -1,4 +1,4 @@
-using DivisonM.Vfs;
+﻿using DivisonM.Vfs;
 using DivisonM.Vfs.Engine;
 using DivisonM.Vfs.Tests.TestSupport;
 using FluentAssertions;
@@ -190,6 +190,77 @@ public class MediaLifecycleTests {
     this._Lifecycle(1, this._v1, this._v2).ScatterAndRemove(this._v1.MemberId);
 
     this._journal.ReadIncomplete().Should().BeEmpty("every relocation intent was completed (resumable, SAFE-WAL)");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void ScatterAndRemove_GivenTheLeavingCopyIsNewerThanTheSurvivor_ThenTheNewerContentIsKept() {
+    // B was away while the file was edited on A. B came back, and A is retired before the pool was
+    // ever mounted to bring B up to date. The scatter used to see "a copy survives on B" and delete
+    // A's — the only copy of the edit — leaving B's stale one as the file.
+    this._v1.Seed("f.bin", false, _Bytes(2, 2, 2));
+    this._v1.SetTimestamps("f.bin", false, null, new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc));
+    this._v2.Seed("f.bin", true, _Bytes(1, 1, 1));
+    this._v2.SetTimestamps("f.bin", true, null, new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc));
+
+    this._Lifecycle(2, this._v1, this._v2).ScatterAndRemove(this._v1.MemberId);
+
+    this._v1.FileExists("f.bin", false).Should().BeFalse("the member is retired");
+    this._v2.GetContent("f.bin", true).Should().Equal(new byte[] { 2, 2, 2 },
+      "the edit made while B was away is the file; retiring A must not leave B's older copy behind as it");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void ScatterAndRemove_GivenCopiesThatDisagree_ThenTheOverwrittenVersionIsKeptAsAConflict() {
+    // Two copies edited outside the pool to different content: nothing proves the newer one is the
+    // one that matters. Converging them picks the newer, as recovery does, but the older version must
+    // survive somewhere a person can find it, exactly as a scrub keeps it.
+    this._v1.Seed("f.bin", false, _Bytes(2, 2, 2));
+    this._v1.SetTimestamps("f.bin", false, null, new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc));
+    this._v2.Seed("f.bin", true, _Bytes(7, 7, 7, 7));
+    this._v2.SetTimestamps("f.bin", true, null, new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc));
+
+    this._Lifecycle(2, this._v1, this._v2).ScatterAndRemove(this._v1.MemberId);
+
+    this._v2.GetContent("f.bin", true).Should().Equal(new byte[] { 2, 2, 2 });
+    var kept = this._v2.FilePaths.Where(p => p.Contains("conflicts/", StringComparison.OrdinalIgnoreCase) && p.Contains("f.bin")).ToArray();
+    kept.Should().ContainSingle("the version that was overwritten is preserved");
+    this._v2.GetContent(kept[0], false).Should().Equal(new byte[] { 7, 7, 7, 7 });
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void ScatterAndRemove_GivenAnInterruptedWriteAcknowledgedOnTheLeavingMember_ThenNoCopyLosesIt() {
+    // Two writes a power cut left open, each acknowledged on one copy only: block 0 on A's primary,
+    // block 1 on B's shadow. Recovery replays them by range from the copy each names — but once A is
+    // gone, the intent naming it can only fall back to "newest copy wins", and one of the two
+    // acknowledged blocks is lost. Retiring A must reconcile while A can still answer.
+    var original = new byte[8192];
+    var onA = (byte[])original.Clone();
+    Array.Fill(onA, (byte)0xAA, 0, 4096);
+    var onB = (byte[])original.Clone();
+    Array.Fill(onB, (byte)0xBB, 4096, 4096);
+    this._v1.Seed("F", false, onA);
+    this._v2.Seed("F", true, onB);
+    this._journal.LogIntent(JournalOp.Write, "F", offset: 0, length: 4096, memberId: this._v1.MemberId, shadow: false);
+    this._journal.LogIntent(JournalOp.Write, "F", offset: 4096, length: 4096, memberId: this._v2.MemberId, shadow: true);
+
+    this._Lifecycle(2, this._v1, this._v2, this._v3).ScatterAndRemove(this._v1.MemberId);
+    new PoolRecovery([this._v2, this._v3], new Journal(new MemberJournalStore([this._v2, this._v3]))).Run();
+
+    var expected = new byte[8192];
+    Array.Fill(expected, (byte)0xAA, 0, 4096);
+    Array.Fill(expected, (byte)0xBB, 4096, 4096);
+    var copies = 0;
+    foreach (var member in new[] { this._v2, this._v3 })
+      foreach (var shadow in new[] { false, true })
+        if (member.GetContent("F", shadow) is { } copy) {
+          ++copies;
+          copy.Should().Equal(expected, $"the copy on '{member.DisplayName}' (shadow: {shadow}) holds both acknowledged blocks");
+        }
+
+    copies.Should().Be(2, "the file keeps its duplication level on the members that stay");
   }
 
 }

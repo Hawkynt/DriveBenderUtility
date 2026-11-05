@@ -29,13 +29,20 @@ public sealed record HealthReport(
 /// repair and conflict handling (via <see cref="IntegrityService"/>), and duplication
 /// restoration (via <see cref="MediaLifecycle"/>) into one check-and-fix pass.
 /// </summary>
+/// <param name="restore">
+/// How duplication is restored; null for <see cref="MediaLifecycle.RestorePool"/>, which copies between
+/// the members directly and is only safe while nothing else uses them. A mounted pool passes its
+/// healer instead (<see cref="MediaLifecycle.RestoreMounted"/>): restoring behind a live engine's back
+/// could publish an image taken before a write over the copy that held it.
+/// </param>
 public sealed class HealthService(
   IReadOnlyList<IVolumeIO> members,
   ISmartMonitor smart,
   IntegrityService integrity,
   MediaLifecycle media,
   Func<IVolumeIO, string>? deviceOf = null,
-  SpaceOptimizer? space = null) {
+  SpaceOptimizer? space = null,
+  Func<OperationContext, MediaLifecycleReport>? restore = null) {
 
   private readonly Func<IVolumeIO, string> _deviceOf = deviceOf ?? (m => m.PhysicalVolumeId);
 
@@ -66,7 +73,7 @@ public sealed class HealthService(
   public HealthReport CheckAndCorrect(Action<string>? invalidateCaches = null, OperationContext? operation = null) {
     var context = operation ?? OperationContext.None;
     var issues = integrity.ScrubAll(invalidateCaches, context);
-    var restore = media.RestorePool(context);
+    var restored = restore != null ? restore(context) : media.RestorePool(context);
     context.Phase("counting under-duplicated files");
     var underDuplicatedAfter = media.CountUnderDuplicated();
 
@@ -80,7 +87,7 @@ public sealed class HealthService(
       saved = space.Run(context);
     }
 
-    return new(this._MemberHealth(), issues, underDuplicatedAfter, restore.CopiesCreated, Corrected: true, DeepScan: true, saved);
+    return new(this._MemberHealth(), issues, underDuplicatedAfter, restored.CopiesCreated, Corrected: true, DeepScan: true, saved);
   }
 
 }
