@@ -55,6 +55,12 @@ public static partial class DriveBender {
     );
 
     public static (ulong free, ulong total) GetDiskFreeSpace(DirectoryInfo path) {
+      if (Path.DirectorySeparatorChar != '\\') {
+        // kernel32 exists only on Windows; elsewhere the runtime answers for the filesystem holding the path
+        var drive = new DriveInfo(path.FullName);
+        return ((ulong)drive.AvailableFreeSpace, (ulong)drive.TotalSize);
+      }
+
       if (_GetDiskFreeSpaceEx(path.FullName, out _, out var totalNumberOfBytes, out var totalNumberOfFreeBytes))
         return (totalNumberOfFreeBytes, totalNumberOfBytes);
 
@@ -471,7 +477,7 @@ public static partial class DriveBender {
     var volumes = mountPoint.Volumes;
     foreach (var folderName in folders) {
       foreach (Volume volume in volumes) {
-        var path = volume.Root.Directory(folderName).Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
+        var path = _Subdirectory(volume.Root, folderName).Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
         if(path.Exists)
           continue;
 
@@ -494,7 +500,7 @@ public static partial class DriveBender {
       for (var i = 1; i < locations.Length; ++i) {
         var current = locations[i].file;
         Logger($@"  ! Comparing primaries {file.FullName} from {locations[0].volume.Name} and {locations[i].volume.Name}, possibly a duplicate");
-        if (!first.IsContentEqualTo(current)) {
+        if (!ContentEquals(first, current)) {
           Logger($@"  !!! WARNING: Different File content for {file.FullName} from {locations[0].volume.Name} and {locations[i].volume.Name}");
           continue;
         }
@@ -514,7 +520,7 @@ public static partial class DriveBender {
       for (var i = 1; i < locations.Length; ++i) {
         var current = locations[i].file;
         Logger($@"  ! Comparing shadow-copies {file.FullName} from {locations[0].volume.Name} and {locations[i].volume.Name}, possibly a duplicate");
-        if (!first.IsContentEqualTo(current)) {
+        if (!ContentEquals(first, current)) {
           Logger($@"  !!! WARNING: Different File content for {file.FullName} from {locations[0].volume.Name} and {locations[i].volume.Name}");
           continue;
         }
@@ -699,7 +705,73 @@ public static partial class DriveBender {
 
   private static void _Copy(string source, string target) {
     Directory.CreateDirectory(Path.GetDirectoryName(target));
+    CopyDurably(source, target);
+  }
+
+  /// <summary>
+  /// Copies <paramref name="source"/> to the new file <paramref name="target"/> and returns only once
+  /// the copy is on the disk and as long as the source.
+  ///
+  /// Every caller goes on to rename the copy into place and often deletes the original after that.
+  /// A plain copy returns while its bytes may still sit in the cache, so a power cut after the delete
+  /// could leave an empty or zero-filled file as the only remaining copy.
+  /// </summary>
+  internal static void CopyDurably(string source, string target) {
     System.IO.File.Copy(source, target);
+    FlushToDisk(target);
+
+    var expected = new FileInfo(source).Length;
+    var actual = new FileInfo(target).Length;
+    if (actual != expected)
+      throw new IOException($"Copy of '{source}' to '{target}' is incomplete: {actual} of {expected} bytes");
+  }
+
+  /// <summary>
+  /// A folder below <paramref name="root"/>, where an empty or missing relative path means the root
+  /// itself (the extension method throws for those, which made every whole-pool walk fail).
+  /// </summary>
+  private static DirectoryInfo _Subdirectory(DirectoryInfo root, string relative)
+    => string.IsNullOrEmpty(relative) ? root : new DirectoryInfo(Path.Combine(root.FullName, relative));
+
+  /// <summary>Whether two files hold exactly the same bytes.</summary>
+  internal static bool ContentEquals(FileInfo first, FileInfo second) {
+    first.Refresh();
+    second.Refresh();
+    if (first.Length != second.Length)
+      return false;
+
+    const int size = 1 << 16;
+    var a = new byte[size];
+    var b = new byte[size];
+    using var left = first.OpenRead();
+    using var right = second.OpenRead();
+    while (true) {
+      var readA = _ReadFully(left, a);
+      var readB = _ReadFully(right, b);
+      if (readA != readB)
+        return false;
+      if (readA == 0)
+        return true;
+
+      for (var i = 0; i < readA; ++i)
+        if (a[i] != b[i])
+          return false;
+    }
+  }
+
+  private static int _ReadFully(Stream stream, byte[] buffer) {
+    var total = 0;
+    int read;
+    while (total < buffer.Length && (read = stream.Read(buffer, total, buffer.Length - total)) > 0)
+      total += read;
+
+    return total;
+  }
+
+  /// <summary>Forces a file's data out of the cache onto the disk.</summary>
+  internal static void FlushToDisk(string path) {
+    using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+    stream.Flush(true);
   }
 
   private static void _Move(string source, string target) {
@@ -724,7 +796,7 @@ public static partial class DriveBender {
     if (!sourceFile.Exists)
       return;
 
-    var targetDirectory = targetDrive.Root.Directory(physicalFile.Parent?.FullName);
+    var targetDirectory = _Subdirectory(targetDrive.Root, physicalFile.Parent?.FullName);
     if (!asPrimary)
       targetDirectory = targetDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
 
@@ -735,14 +807,10 @@ public static partial class DriveBender {
     targetDirectory.Create();
 
     try {
-      sourceFile.CopyTo(tempFile);
-      if (!System.IO.File.Exists(tempFile))
-        return;
-
+      CopyDurably(sourceFile.FullName, tempFile);
       System.IO.File.Move(tempFile, targetFile.FullName);
-
     } finally {
-      if (!System.IO.File.Exists(tempFile))
+      if (System.IO.File.Exists(tempFile))
         System.IO.File.Delete(tempFile);
     }
   }
@@ -754,7 +822,7 @@ public static partial class DriveBender {
     if (!sourceFile.Exists)
       return;
 
-    var targetDirectory = targetDrive.Root.Directory(physicalFile.Parent?.FullName);
+    var targetDirectory = _Subdirectory(targetDrive.Root, physicalFile.Parent?.FullName);
     if (physicalFile.IsShadowCopy)
       targetDirectory = targetDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
 
@@ -765,22 +833,23 @@ public static partial class DriveBender {
     targetDirectory.Create();
 
     try {
-      sourceFile.CopyTo(tempFile);
-      if (!System.IO.File.Exists(tempFile))
-        return;
-
+      // the source goes away below, so the copy must be complete and on the disk first
+      CopyDurably(sourceFile.FullName, tempFile);
       System.IO.File.Move(tempFile, targetFile.FullName);
       sourceFile.Attributes &= ~(FileAttributes.ReadOnly | FileAttributes.System | FileAttributes.Hidden);
       try {
         sourceFile.Delete();
       } catch (UnauthorizedAccessException) {
 
-        // could not delete source file - delete target file, otherwise we have too many copies
+        // could not delete source file - delete target file, otherwise we have too many copies;
+        // the source is still there, so this only undoes the copy
         var tries = 3;
         Exception ex = null;
         while (tries-- > 0) {
           try {
             targetFile.Delete();
+            ex = null;
+            break;
           } catch (Exception e) {
             ex = e;
             Thread.Sleep(100);
@@ -793,7 +862,7 @@ public static partial class DriveBender {
       }
 
     } finally {
-      if (!System.IO.File.Exists(tempFile))
+      if (System.IO.File.Exists(tempFile))
         System.IO.File.Delete(tempFile);
     }
   }
@@ -894,7 +963,7 @@ public static partial class DriveBender {
 
       // return primaries first
       foreach (var volume in mountpoint.volumes) {
-        var primaryDirectory = volume.Root.Directory(path);
+        var primaryDirectory = _Subdirectory(volume.Root, path);
         if(!primaryDirectory.Exists)
           continue;
 
@@ -933,7 +1002,7 @@ public static partial class DriveBender {
 
       // search for shadow copies without primary
       foreach (var volume in mountpoint.volumes) {
-        var primaryDirectory = volume.Root.Directory(path);
+        var primaryDirectory = _Subdirectory(volume.Root, path);
         var shadowDirectory = primaryDirectory.Directory(DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
 
         if(!shadowDirectory.Exists)

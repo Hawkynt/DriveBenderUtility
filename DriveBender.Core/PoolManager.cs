@@ -61,11 +61,9 @@ namespace DivisonM {
     }
     
     public static bool DeletePool(PoolName poolName, bool removeData = false) {
-      var mountPoints = DriveBender.DetectedMountPoints;
-      var pool = mountPoints.FirstOrDefault(mp => string.Equals(mp.Name, poolName.Value, StringComparison.OrdinalIgnoreCase));
-      
+      var pool = _FindPool(poolName, out var error);
       if (pool == null) {
-        DriveBender.Logger?.Invoke($"Pool '{poolName}' not found");
+        DriveBender.Logger?.Invoke(error);
         return false;
       }
       
@@ -95,11 +93,9 @@ namespace DivisonM {
     }
     
     public static bool AddDriveToPool(PoolName poolName, DrivePath drivePath) {
-      var mountPoints = DriveBender.DetectedMountPoints;
-      var pool = mountPoints.FirstOrDefault(mp => string.Equals(mp.Name, poolName.Value, StringComparison.OrdinalIgnoreCase));
-      
+      var pool = _FindPool(poolName, out var error);
       if (pool == null) {
-        DriveBender.Logger?.Invoke($"Pool '{poolName}' not found");
+        DriveBender.Logger?.Invoke(error);
         return false;
       }
       
@@ -140,16 +136,14 @@ namespace DivisonM {
       var result = new DriveOperationResult();
       
       try {
-        var mountPoints = DriveBender.DetectedMountPoints;
-        var pool = mountPoints.FirstOrDefault(mp => string.Equals(mp.Name, poolName.Value, StringComparison.OrdinalIgnoreCase));
-        
+        var pool = _FindPool(poolName, out var error);
         if (pool == null) {
           result.Success = false;
-          result.Message = $"Pool '{poolName}' not found";
+          result.Message = error;
           return result;
         }
         
-        var volume = pool.Volumes.FirstOrDefault(v => v.Name.Equals(drivePath.Value, StringComparison.OrdinalIgnoreCase));
+        var volume = _FindVolume(pool, drivePath);
         if (volume == null) {
           result.Success = false;
           result.Message = $"Drive '{drivePath}' not found in pool '{poolName}'";
@@ -181,9 +175,29 @@ namespace DivisonM {
           filesProcessed += moveResult.FilesProcessed;
           dataProcessed += moveResult.DataProcessed;
           warnings.AddRange(moveResult.Warnings);
+          if (!moveResult.Success) {
+            result.Success = false;
+            result.Message = $"Drive '{drivePath}' was NOT removed: {moveResult.Message}";
+            result.Warnings = warnings;
+            return result;
+          }
         }
-        
-        _RemovePoolStructureFromDrive(volume, !options.AutoBalance);
+
+        // The drive leaves the pool only when nothing on it is the last copy of a file. Whatever
+        // could not be moved stays where it is and the drive stays a member, so no file drops out of
+        // the pool; detaching never deletes data either way.
+        var stranded = _FilesWithoutCopyElsewhere(pool, volume).ToArray();
+        if (stranded.Length > 0) {
+          warnings.AddRange(stranded.Take(20).Select(f => $"Only copy is on the drive: {f}"));
+          result.Success = false;
+          result.Message = $"Drive '{drivePath}' was NOT removed: {stranded.Length} file(s) have no other copy in the pool";
+          result.FilesProcessed = filesProcessed;
+          result.DataProcessed = dataProcessed;
+          result.Warnings = warnings;
+          return result;
+        }
+
+        _RemovePoolStructureFromDrive(volume, false);
         
         result.Success = true;
         result.Message = $"Drive '{drivePath}' removed from pool '{poolName}' successfully";
@@ -206,16 +220,14 @@ namespace DivisonM {
       var result = new SpaceCheckResult();
       
       try {
-        var mountPoints = DriveBender.DetectedMountPoints;
-        var pool = mountPoints.FirstOrDefault(mp => string.Equals(mp.Name, poolName.Value, StringComparison.OrdinalIgnoreCase));
-        
+        var pool = _FindPool(poolName, out var error);
         if (pool == null) {
           result.HasSufficientSpace = false;
-          result.RecommendedAction = "Pool not found";
+          result.RecommendedAction = error;
           return result;
         }
         
-        var volumeToRemove = pool.Volumes.FirstOrDefault(v => v.Name.Equals(drivePath.Value, StringComparison.OrdinalIgnoreCase));
+        var volumeToRemove = _FindVolume(pool, drivePath);
         if (volumeToRemove == null) {
           result.HasSufficientSpace = false;
           result.RecommendedAction = "Drive not found in pool";
@@ -339,12 +351,10 @@ namespace DivisonM {
       var result = new DriveOperationResult();
       
       try {
-        var mountPoints = DriveBender.DetectedMountPoints;
-        var pool = mountPoints.FirstOrDefault(mp => string.Equals(mp.Name, poolName.Value, StringComparison.OrdinalIgnoreCase));
-        
+        var pool = _FindPool(poolName, out var error);
         if (pool == null) {
           result.Success = false;
-          result.Message = $"Pool '{poolName}' not found";
+          result.Message = error;
           return result;
         }
         
@@ -367,12 +377,14 @@ namespace DivisonM {
           var files = sourceVolume.Items.OfType<DriveBender.IPhysicalFile>().Take(10); // Limit for performance
           
           foreach (var file in files) {
-            var targetVolume = targetVolumes.OrderByDescending(v => v.BytesFree).FirstOrDefault();
-            if (targetVolume != null && targetVolume.BytesFree > file.Size) {
+            // a drive that already holds a copy of this file would end up with both
+            var targetVolume = targetVolumes.Where(v => !file.ExistsOnDrive(v)).OrderByDescending(v => v.BytesFree).FirstOrDefault();
+            var size = file.Size;
+            if (targetVolume != null && targetVolume.BytesFree > size) {
               try {
                 file.MoveToDrive(targetVolume);
                 filesProcessed++;
-                dataProcessed += file.Size;
+                dataProcessed += size;
               } catch (Exception ex) {
                 warnings.Add($"Failed to move file {file.FullName}: {ex.Message}");
               }
@@ -401,7 +413,7 @@ namespace DivisonM {
       var poolRootPath = Path.Combine(drivePath, $"{{{poolId}}}");
       Directory.CreateDirectory(poolRootPath);
       
-      var infoFileName = Path.Combine(drivePath, $"Pool.{DriveBender.DriveBenderConstants.INFO_EXTENSION}");
+      var infoFileName = _InfoFileNameFor(drivePath, poolId);
       var infoContent = new[] {
         $"volumelabel:{poolName}",
         $"id:{poolId}",
@@ -417,9 +429,10 @@ namespace DivisonM {
         var drivePath = vol.Root.Parent?.FullName;
         if (drivePath == null) return;
         
-        var infoFiles = Directory.GetFiles(drivePath, $"*.{DriveBender.DriveBenderConstants.INFO_EXTENSION}");
-        foreach (var file in infoFiles) {
-          File.Delete(file);
+        // only THIS pool's info files: a drive can be a member of several pools
+        foreach (var file in Directory.GetFiles(drivePath, $"*.{DriveBender.DriveBenderConstants.INFO_EXTENSION}")) {
+          if (_ReadPoolId(file) == vol.Id)
+            File.Delete(file);
         }
         
         if (removeData && Directory.Exists(vol.Root.FullName)) {
@@ -450,24 +463,45 @@ namespace DivisonM {
         var filesProcessed = 0;
         var dataProcessed = ByteSize.FromBytes(0);
         var warnings = new List<string>();
+        var failed = 0;
         
-        foreach (var item in sourceVolume.Items) {
-          if (item is DriveBender.IPhysicalFile file) {
-            try {
-              var targetVolume = otherVolumes.OrderByDescending(v => v.BytesFree).FirstOrDefault();
-              if (targetVolume != null && targetVolume.BytesFree > file.Size) {
-                if (!options.DryRun) {
-                  file.MoveToDrive(targetVolume);
-                }
-                filesProcessed++;
-                dataProcessed += file.Size;
-              } else {
-                warnings.Add($"Insufficient space to move file: {file.FullName}");
-              }
-            } catch (Exception ex) {
-              warnings.Add($"Failed to move file {file.FullName}: {ex.Message}");
+        // every folder, not just the top level: a file left behind here is a file the pool loses
+        foreach (var file in sourceVolume.Items.EnumerateFiles().ToArray()) {
+          try {
+            var size = file.Size; // read now: once moved, the source it describes is gone
+            // a drive that already holds a copy of this file would end up with both
+            var targetVolume = otherVolumes.Where(v => !file.ExistsOnDrive(v)).OrderByDescending(v => v.BytesFree).FirstOrDefault();
+            if (targetVolume == null) {
+              // every other drive already has a copy, so this one is redundant there; it is left
+              // in place and the drive is still detached only if that copy really exists
+              warnings.Add($"Not moved, every other drive already holds a copy: {file.FullName}");
+              continue;
             }
+
+            if (targetVolume.BytesFree <= size) {
+              warnings.Add($"Insufficient space to move file: {file.FullName}");
+              ++failed;
+              continue;
+            }
+
+            if (!options.DryRun)
+              file.MoveToDrive(targetVolume);
+
+            filesProcessed++;
+            dataProcessed += size;
+          } catch (Exception ex) {
+            warnings.Add($"Failed to move file {file.FullName}: {ex.Message}");
+            ++failed;
           }
+        }
+
+        if (failed > 0) {
+          result.Success = false;
+          result.Message = $"{failed} file(s) could not be moved off the drive";
+          result.FilesProcessed = filesProcessed;
+          result.DataProcessed = dataProcessed;
+          result.Warnings = warnings;
+          return result;
         }
         
         result.Success = true;
@@ -487,14 +521,84 @@ namespace DivisonM {
       return result;
     }
     
+    /// <summary>Where pools are discovered; replaceable so the selection rules can be tested off Windows.</summary>
+    internal static Func<DriveBender.IMountPoint[]> MountPointSource = () => DriveBender.DetectedMountPoints;
+
+    /// <summary>
+    /// The one pool with that name, or null with the reason.
+    ///
+    /// Names are labels, not identities: an old pool's info files left on a spare disk, or two pools
+    /// created with the same label, make a name match more than one pool, and picking the first
+    /// would run a destructive operation on whichever pool sorts first.
+    /// </summary>
+    private static DriveBender.IMountPoint _FindPool(PoolName poolName, out string error) {
+      var matches = MountPointSource().Where(mp => string.Equals(mp.Name, poolName.Value, StringComparison.OrdinalIgnoreCase)).ToArray();
+      switch (matches.Length) {
+        case 0:
+          error = $"Pool '{poolName}' not found";
+          return null;
+        case 1:
+          error = null;
+          return matches[0];
+        default:
+          error = $"Pool name '{poolName}' is ambiguous: it matches {matches.Length} pools ({string.Join(", ", matches.Select(m => m.Id))}); nothing was changed";
+          return null;
+      }
+    }
+
+    /// <summary>The member on <paramref name="drivePath"/>, matched by its path rather than by its display name.</summary>
+    private static DriveBender.IVolume _FindVolume(DriveBender.IMountPoint pool, DrivePath drivePath) {
+      string Normalize(string p) => p.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+      var wanted = Normalize(drivePath.Value);
+      return pool.Volumes.FirstOrDefault(v =>
+        v is DriveBender.Volume vol
+          ? string.Equals(Normalize(vol.Root.Parent?.FullName ?? string.Empty), wanted, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Normalize(vol.Root.FullName), wanted, StringComparison.OrdinalIgnoreCase)
+          : string.Equals(v.Name, wanted, StringComparison.OrdinalIgnoreCase)
+      );
+    }
+
+    /// <summary>Pool-relative paths of files on <paramref name="volume"/> that no other member holds a copy of.</summary>
+    private static IEnumerable<string> _FilesWithoutCopyElsewhere(DriveBender.IMountPoint pool, DriveBender.IVolume volume) {
+      var others = pool.Volumes.Where(v => !Equals(v, volume)).ToArray();
+      foreach (var file in volume.Items.EnumerateFiles())
+        if (!others.Any(file.ExistsOnDrive))
+          yield return file.FullName;
+    }
+
+    /// <summary>
+    /// The info file for <paramref name="poolId"/> on a drive: the conventional name unless another
+    /// pool already owns it there, because overwriting it would silently detach that pool.
+    /// </summary>
+    private static string _InfoFileNameFor(string drivePath, Guid poolId) {
+      var conventional = Path.Combine(drivePath, $"Pool.{DriveBender.DriveBenderConstants.INFO_EXTENSION}");
+      if (!File.Exists(conventional) || _ReadPoolId(conventional) == poolId)
+        return conventional;
+
+      var existing = Directory.GetFiles(drivePath, $"*.{DriveBender.DriveBenderConstants.INFO_EXTENSION}").FirstOrDefault(f => _ReadPoolId(f) == poolId);
+      return existing ?? Path.Combine(drivePath, $"Pool.{poolId:N}.{DriveBender.DriveBenderConstants.INFO_EXTENSION}");
+    }
+
+    private static Guid? _ReadPoolId(string infoFile) {
+      try {
+        foreach (var line in File.ReadAllLines(infoFile)) {
+          var parts = line.Split(new[] { ':' }, 2);
+          if (parts.Length == 2 && string.Equals(parts[0].Trim(), "id", StringComparison.OrdinalIgnoreCase) && Guid.TryParse(parts[1].Trim(), out var id))
+            return id;
+        }
+      } catch (IOException) {
+      } catch (UnauthorizedAccessException) {
+      }
+
+      return null;
+    }
+
     private static ByteSize _CalculateVolumeDataSize(DriveBender.IVolume volume) {
       try {
         var totalSize = ByteSize.FromBytes(0);
-        foreach (var item in volume.Items) {
-          if (item is DriveBender.IPhysicalFile file) {
-            totalSize += file.Size;
-          }
-        }
+        foreach (var file in volume.Items.EnumerateFiles())
+          totalSize += file.Size;
+
         return totalSize;
       } catch {
         // If we can't calculate the exact size, estimate based on used space
