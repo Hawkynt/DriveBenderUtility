@@ -1,4 +1,4 @@
-using DivisonM.EndToEnd.Tests.TestSupport;
+﻿using DivisonM.EndToEnd.Tests.TestSupport;
 using FluentAssertions;
 using NUnit.Framework;
 
@@ -175,7 +175,9 @@ public class MediaReplaceEndToEndTests {
     var replacement = _NewDisk(pool, "swap-in-partial");
     var old = "";
     pool.WhileUnmounted(() => {
-      string[] HeldBy(string member) => [.. contents.Keys.Where(n => File.Exists(Path.Combine(member, n))).Order(StringComparer.Ordinal)];
+      // in the order the replace walks them, which is the folder's listing order: tmpfs lists the
+      // newest first, so sorting by name picked the FIRST file walked and nothing ever moved
+      string[] HeldBy(string member) => [.. Directory.EnumerateFiles(member, "doc*.bin").Select(Path.GetFileName).Where(n => contents.ContainsKey(n!)).Select(n => n!)];
       old = pool.MemberPaths.OrderByDescending(m => HeldBy(m).Length).First();
       var held = HeldBy(old);
       held.Length.Should().BeGreaterThanOrEqualTo(2, $"the swapped disk must hold files to strand.{Environment.NewLine}{pool.DescribeMembers()}");

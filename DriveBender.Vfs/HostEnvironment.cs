@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
@@ -218,9 +218,36 @@ public sealed class RealHostEnvironment : IHostEnvironment {
 
   public IEnumerable<string> EnumerateVolumeRoots() {
     foreach (var drive in DriveInfo.GetDrives()) {
-      if (drive is { IsReady: true, DriveType: DriveType.Fixed or DriveType.Removable or DriveType.Network })
+      if (drive.DriveType is not (DriveType.Fixed or DriveType.Removable or DriveType.Network))
+        continue;
+
+      if (_IsReadyWithin(drive, _READY_PROBE_TIMEOUT))
         yield return drive.RootDirectory.FullName;
     }
+  }
+
+  private static readonly TimeSpan _READY_PROBE_TIMEOUT = TimeSpan.FromSeconds(3);
+
+  /// <summary>
+  /// Whether a drive answers, without waiting on one that never will. Readiness is a statfs of the
+  /// mount, and a hung network or FUSE mount anywhere on the host (a stalled gvfs session is enough)
+  /// blocks that call indefinitely — and with it every mount, since discovery walks every drive before
+  /// the pool comes up. The probe that does not return in time is abandoned, and that drive skipped.
+  /// </summary>
+  private static bool _IsReadyWithin(DriveInfo drive, TimeSpan timeout) {
+    var probe = Task.Run(() => {
+      try {
+        return drive.IsReady;
+      } catch (Exception e) when (e is IOException or UnauthorizedAccessException) {
+        return false;
+      }
+    });
+
+    if (probe.Wait(timeout))
+      return probe.Result;
+
+    DriveBender.Logger($"[Warning]Skipping '{drive.Name}': it did not answer within {timeout.TotalSeconds:0}s (a hung network or FUSE mount)");
+    return false;
   }
 
   public bool FileExists(string path) => File.Exists(path);

@@ -1,4 +1,4 @@
-namespace DivisonM.Vfs.Engine;
+﻿namespace DivisonM.Vfs.Engine;
 
 public sealed record MediaLifecycleReport(int FilesMoved, int CopiesCreated, int CopiesRemoved) {
   public bool AnythingDone => this.FilesMoved + this.CopiesCreated + this.CopiesRemoved > 0;
@@ -18,8 +18,15 @@ public sealed record MediaLifecycleReport(int FilesMoved, int CopiesCreated, int
 /// This is the path an operator most wants held down — scattering or replacing a member reads one
 /// disk end to end and writes another flat out, for hours, while the pool stays mounted and in use.
 /// </param>
+/// <param name="poolMemberIds">
+/// Every member the pool's manifest lists, online or not. Retiring a member replays the namespace
+/// changes owed to members that were away (the tombstone log), and that replay forgets whatever is
+/// owed to a member it is not told about — so it only runs when the full list is given, never with
+/// just the members that happen to be online.
+/// </param>
 public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal journal, int duplicationLevel, bool allowSamePhysical = false,
-  Action<IVolumeIO, long>? admit = null, IReadOnlyDictionary<Guid, MemberRole>? roles = null) {
+  Action<IVolumeIO, long>? admit = null, IReadOnlyDictionary<Guid, MemberRole>? roles = null,
+  IReadOnlyCollection<Guid>? poolMemberIds = null) {
 
   private sealed record Copy(IVolumeIO Member, string Path, bool Shadow);
 
@@ -151,6 +158,9 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
     if (this._Online.Count(m => m != leaving) == 0)
       throw new PoolFsException(PoolFsError.NoSpace, "No other online member to scatter onto");
 
+    this._ReconcileBeforeRetiring();
+    this._leavingId = memberId;
+
     var moved = 0;
     var removed = 0;
     foreach (var (path, allCopies) in this._EnumerateLogicalFiles()) {
@@ -159,6 +169,7 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
         continue;
 
       var elsewhere = allCopies.Where(c => c.Member.MemberId != memberId).ToList();
+      moved += this._ConvergeCopies(path, allCopies);
       foreach (var copy in here) {
         // Before this copy goes, the members that stay must hold the file at its duplication level —
         // or on every independent disk left, when fewer remain. It used to be enough that ONE copy
@@ -198,6 +209,122 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
 
     DriveBender.Logger($"Removed media '{leaving.DisplayName}': {moved} file(s) relocated, {removed} copy(ies) cleared");
     return new(moved, moved, removed);
+  }
+
+  /// <summary>
+  /// Does what a mount does before it serves anything, while every member is still here to answer:
+  /// finishes the journal's interrupted operations and replays the namespace changes owed to members
+  /// that were away.
+  ///
+  /// Retiring a member used to skip both, and the member being retired is often the one that knows
+  /// most. A write the power cut left open, acknowledged on that member's copy only, is replayed by
+  /// byte range FROM that copy; once the member is gone, recovery can only fall back to "the newest
+  /// copy wins" for the whole file, and a block acknowledged on another copy is overwritten by it. A
+  /// member that was online while another was away also holds the only tombstones telling the
+  /// returning one which of its files were deleted or renamed meanwhile — and those leave with it.
+  ///
+  /// Only for a pool nobody has mounted (the callers hold the engine lock): run behind a live engine,
+  /// recovery would take its in-flight intents for interrupted ones.
+  /// </summary>
+  private void _ReconcileBeforeRetiring() {
+    journal.ReconcileMirrors();
+    var online = this._Online.ToArray();
+    var snapshots = new PoolSnapshots(online, journal, () => DateTime.UtcNow, admit);
+    var report = new PoolRecovery(online, journal, admit, snapshots).Run();
+    if (report.AnythingDone)
+      DriveBender.Logger($"Recovery before retiring media: {report.RolledForward} rolled forward, {report.Reconciled} reconciled, {report.TempsRemoved} staging files removed");
+
+    if (poolMemberIds == null)
+      return;
+
+    var replayed = new TombstoneLog(online).Replay(online, poolMemberIds);
+    if (replayed > 0)
+      DriveBender.Logger($"Applied {replayed} missed namespace change(s) from the tombstone log before retiring media");
+  }
+
+  /// <summary>
+  /// Brings every copy of a file to the same content before one of them is deleted, by the rule
+  /// recovery uses: the newest copy wins, and a tie goes to the content most copies already hold.
+  ///
+  /// The scatter used to delete the leaving copy as soon as ANOTHER copy existed, without asking
+  /// whether the two agreed. A member that was away while the file was edited comes back holding the
+  /// old version; retire the member that took the edit before the pool is mounted again and the edit
+  /// is deleted, with the stale copy left behind as the file.
+  ///
+  /// Copies that agree in length and modification time are taken as one version without reading
+  /// them: neither rule could prefer one over the other anyway, and a member being retired is read
+  /// end to end already for every file it has to give away. Only when they disagree are they hashed —
+  /// a copy that merely carries another time is not rewritten.
+  /// </summary>
+  /// <returns>How many copies were rewritten.</returns>
+  private int _ConvergeCopies(string path, IReadOnlyList<Copy> copies) {
+    if (copies.Count < 2)
+      return 0;
+
+    var stated = new List<(Copy copy, long length, DateTime written)>();
+    foreach (var copy in copies)
+      if (copy.Member.Stat(copy.Path, copy.Shadow) is { IsDirectory: false } meta)
+        stated.Add((copy, meta.Length, meta.LastWriteTimeUtc));
+
+    if (stated.Count < 2 || stated.All(s => s.length == stated[0].length && s.written == stated[0].written))
+      return 0;
+
+    var hashed = new List<(Copy copy, DateTime written, string hash)>();
+    foreach (var (copy, _, written) in stated)
+      try {
+        using var stream = copy.Member.OpenRead(copy.Path, copy.Shadow);
+        hashed.Add((copy, written, ChecksumDatabase.HashOf(stream))); // streamed
+      } catch (PoolFsException) {
+        // an unreadable copy can neither win nor be trusted to agree; it is left as it is
+      }
+
+    if (hashed.Count < 2)
+      return 0;
+
+    var winner = hashed
+      .OrderByDescending(h => h.written.Ticks)
+      .ThenByDescending(h => hashed.Count(o => o.hash == h.hash))
+      .First();
+
+    var rewritten = 0;
+    foreach (var (copy, _, hash) in hashed) {
+      if (hash == winner.hash)
+        continue;
+
+      // Newest wins, as in recovery, but nothing proves the newer copy is the one that matters: two
+      // copies edited outside the pool are a conflict. The version about to be overwritten is kept
+      // under conflicts/ on its own member first, as a scrub keeps it. When that fails the retire
+      // stops here: overwriting would lose that version, and going on would delete the newer one
+      // with the leaving member.
+      if (copy.Member.MemberId != this._leavingId)
+        _KeepAsConflict(copy, path);
+
+      var sequence = journal.LogIntent(JournalOp.Rebalance, path, memberId: copy.Member.MemberId);
+      WholeFilePublisher.CopyBetween(winner.copy.Member, path, winner.copy.Shadow, copy.Member, path, copy.Shadow,
+        admit: WholeFilePublisher.Pace(admit, winner.copy.Member, copy.Member));
+      journal.Complete(sequence, JournalOp.Rebalance);
+      ++rewritten;
+    }
+
+    if (rewritten > 0)
+      DriveBender.Logger($" - '{path}': {rewritten} copy(ies) brought up to the newest version on '{winner.copy.Member.DisplayName}' before retiring media");
+
+    return rewritten;
+  }
+
+  /// <summary>The member being retired by the running scatter; its copies are going anyway.</summary>
+  private Guid _leavingId;
+
+  private static void _KeepAsConflict(Copy copy, string path) {
+    var kept = $"{PoolPaths.UtilityFolderName}/conflicts/{path}.retire.{Guid.NewGuid():N}";
+    try {
+      copy.Member.EnsureFolder(PoolPaths.GetParent(kept), false);
+      WholeFilePublisher.CopyBetween(copy.Member, path, copy.Shadow, copy.Member, kept, false);
+      DriveBender.Logger($" - '{path}': the version on '{copy.Member.DisplayName}' differs and is kept as {kept}");
+    } catch (PoolFsException e) {
+      throw new PoolFsException(e.Error,
+        $"'{path}' has differing copies, and the one on '{copy.Member.DisplayName}' could not be preserved before converging them ({e.Message}); its copies were left as they are and the member was not removed", e);
+    }
   }
 
   /// <summary>
@@ -312,6 +439,10 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
     // manifest — silently abandoning all its data. Refuse instead so the data is not lost (SAFE-DUP).
     if (!old.IsOnline)
       throw new PoolFsException(PoolFsError.Offline, $"Cannot replace '{old.DisplayName}' — it is offline; its data would be abandoned. Bring it online, or use restore/remove-media which rebuild from surviving copies.");
+
+    // the same reasoning as for a scatter: a journal intent naming the old member, or a tombstone
+    // only it carries, cannot be acted on once it has left
+    this._ReconcileBeforeRetiring();
 
     var moved = 0;
     foreach (var (path, shadow) in this._WalkMember(old).ToArray()) {
@@ -429,6 +560,87 @@ public sealed class MediaLifecycle(IReadOnlyList<IVolumeIO> members, Journal jou
     context.Step(done, files.Count, "done");
     DriveBender.Logger($"Restored pool: {created} copy(ies) created/promoted to reach duplication level {duplicationLevel}");
     return new(0, created, 0);
+  }
+
+  /// <summary>
+  /// Restores duplication on a pool that is MOUNTED, through the engine's own healer rather than by
+  /// copying between the members behind its back.
+  ///
+  /// <see cref="RestorePool"/> is the right tool for a pool nobody is using. Run against a live mount
+  /// — the daemon did exactly that for pool-restore and pool-health --fix — it copied files the
+  /// engine was serving with none of the healer's protection: no namespace gate, no lease, no check
+  /// for a file being open or written, no watch on the source, no refresh of the engine's copy list.
+  /// Promoting a lone shadow copied it to a primary and deleted the shadow; a write that landed in
+  /// between went to the shadow, the rename published the image taken before it, and the delete
+  /// removed the only copy that held the write. Creating a shadow could likewise publish a stale
+  /// image over one the engine had just written.
+  ///
+  /// The healer already does this work with all of those guards, so the mounted case asks it to and
+  /// waits for it to settle. It runs on the scheduler's pump, which is the only thread allowed to
+  /// advance it.
+  /// </summary>
+  /// <param name="settleCheckEvery">How often the pool is counted for progress; the walk is metadata only, but a whole pool.</param>
+  /// <param name="giveUpAfter">
+  /// How long the count may stay the same before this stops waiting. A file held open is deferred by
+  /// the healer for as long as it stays open, so "nothing pending" can be a long time coming; the
+  /// work is not abandoned, it carries on in the background, it is just no longer waited for.
+  /// </param>
+  public MediaLifecycleReport RestoreMounted(PoolFileSystem fs, OperationContext? operation = null,
+    TimeSpan? settleCheckEvery = null, TimeSpan? giveUpAfter = null) {
+    if (!fs.IsMounted)
+      return this.RestorePool(operation);
+
+    if (fs.IsReadOnly)
+      throw new PoolFsException(PoolFsError.AccessDenied, "The pool is mounted read-only; its healer does not change members. Remount it writable, or unmount it, to restore duplication.");
+
+    var context = operation ?? OperationContext.None;
+    var checkEvery = settleCheckEvery ?? TimeSpan.FromSeconds(30);
+    var stallLimit = giveUpAfter ?? TimeSpan.FromMinutes(10);
+
+    context.Phase("looking at what the members hold");
+    var owedAtStart = this.CountUnderDuplicated();
+
+    // A restore is asked for because somebody believes the disks no longer hold what the engine
+    // thinks — a copy lost to a bad sector or deleted by hand. The engine's cached copy lists still
+    // describe the copies as they were, and a healer going by those finds every file whole. Drop
+    // them, as a member coming or going does, so the heal looks at the members themselves.
+    fs.Placement.InvalidateAll();
+    fs.RequestHeal();
+
+    var owed = owedAtStart;
+    var lastCheck = Environment.TickCount64;
+    var lastProgress = lastCheck;
+    while (fs.HealPending) {
+      context.ThrowIfStopping();
+      Thread.Sleep(50);
+
+      var now = Environment.TickCount64;
+      if (now - lastCheck < checkEvery.TotalMilliseconds)
+        continue;
+
+      lastCheck = now;
+      var current = this.CountUnderDuplicated();
+      context.Step(Math.Max(0, owedAtStart - current), owedAtStart, "the pool's healer is restoring copies");
+
+      // Pending can stay true for a file that is merely held open, whole or not; once nothing is
+      // owed any more there is nothing left worth waiting for.
+      if (current == 0)
+        break;
+
+      if (current < owed) {
+        owed = current;
+        lastProgress = now;
+      } else if (now - lastProgress >= stallLimit.TotalMilliseconds) {
+        DriveBender.Logger($"[Warning]Restore stopped waiting with {current} file(s) still below their duplication level — they are in use or have nowhere to go; the healer keeps trying in the background");
+        break;
+      }
+    }
+
+    var left = this.CountUnderDuplicated();
+    context.Step(owedAtStart, owedAtStart, "done");
+    var restored = Math.Max(0, owedAtStart - left);
+    DriveBender.Logger($"Restored pool through its healer: {restored} file(s) brought back to duplication level {duplicationLevel}, {left} still owed");
+    return new(0, restored, 0);
   }
 
 }

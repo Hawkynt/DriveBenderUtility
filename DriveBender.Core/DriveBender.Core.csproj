@@ -15,6 +15,9 @@
     <Reference Include="System.Net.Http" />
   </ItemGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="DriveBender.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="FrameworkExtensions.Corlib" Version="1.0.2.398" />
   </ItemGroup>
 </Project>

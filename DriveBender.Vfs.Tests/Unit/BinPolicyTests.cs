@@ -129,6 +129,56 @@ public class BinPolicyTests {
     this._Binned("a.log.old").Should().Be(1, "a.log being kept moments ago says nothing about a.log.old");
   }
 
+  private static byte[] _Read(PoolFileSystem fs, string path) {
+    var handle = fs.Open(path, AccessMode.Read, ShareMode.Read);
+    try {
+      var buffer = new byte[fs.GetAttributes(path).Length];
+      var read = 0;
+      while (read < buffer.Length && fs.Read(handle, buffer.AsSpan(read), read) is var got and > 0)
+        read += got;
+
+      return buffer[..read];
+    } finally {
+      fs.Close(handle);
+    }
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Replaced_GivenTheOnlyKeptVersionWasRestored_ThenTheIntervalDoesNotRefuseTheNextOne() {
+    // the interval spares the bin near-duplicates of a version it HOLDS; once that version is
+    // restored out of it, the bin holds nothing of the file and the next replaced version is its only copy
+    using var fs = this._Engine(""", "replacedInterval": "15m" """);
+    _Write(fs, "f", [1]);
+    fs.Unlink("f");
+    fs.RestoreFromTrash("f");
+    this._Binned("f").Should().Be(0);
+
+    this._now = this._now.AddMinutes(1);
+    _Write(fs, "f", [2]);
+
+    fs.Trash.NewestVersionOf("f").Should().NotBeNull("the bin held no version of f, so the replaced one is kept");
+    fs.Rename("f", "f.live", RenameFlags.None);
+    fs.RestoreFromTrash("f");
+    _Read(fs, "f").Should().Equal([(byte)1]);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Replaced_GivenTheOnlyKeptVersionWasPurged_ThenTheIntervalDoesNotRefuseTheNextOne() {
+    using var fs = this._Engine(""", "replacedInterval": "15m", "retention": "1m" """);
+    _Write(fs, "f", [1]);
+    _Write(fs, "f", [2]);
+    this._Binned("f").Should().Be(1);
+    this._now = this._now.AddMinutes(2);
+    fs.PurgeTrash().Should().Be(1);
+    this._Binned("f").Should().Be(0);
+
+    _Write(fs, "f", [3]);
+
+    this._Binned("f").Should().Be(1, "the bin held no version of f after the purge, so the replaced one is kept");
+  }
+
   #endregion
 
   #region maxFileSize

@@ -230,6 +230,137 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
       if (Fsync((int)handle.DangerousGetHandle()) != 0)
         throw new IOException("fsync failed", Marshal.GetLastPInvokeError());
     }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "MoveFileExW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
+
+    private const uint _MOVEFILE_WRITE_THROUGH = 0x8;
+
+    [DllImport("libc", SetLastError = true, EntryPoint = "open")]
+    private static extern int Open(string path, int flags);
+
+    [DllImport("libc", SetLastError = true, EntryPoint = "close")]
+    private static extern int Close(int fd);
+
+    private const int _O_RDONLY = 0;
+    private const int _EIO = 5;
+
+    /// <summary>
+    /// A rename that does not return until the NTFS log holding it is on disk. Without the flag the
+    /// move sits in the cache like any other metadata, and a power cut can undo it after the caller
+    /// has already been told the new name exists. It never replaces an existing target — the caller
+    /// asks for that separately — so a failure reads exactly like <see cref="File.Move(string, string)"/>'s.
+    /// </summary>
+    public static void MoveWriteThrough(string from, string to) {
+      if (MoveFileEx(_LongPath(from), _LongPath(to), _MOVEFILE_WRITE_THROUGH))
+        return;
+
+      // shaped like the exceptions File.Move raises, so Translate and the callers' catches see the same thing
+      var error = Marshal.GetLastWin32Error();
+      var message = $"Cannot move '{from}' to '{to}' (Win32 error {error})";
+      throw error switch {
+        2 /* ERROR_FILE_NOT_FOUND */ => new FileNotFoundException(message, from),
+        3 /* ERROR_PATH_NOT_FOUND */ => new DirectoryNotFoundException(message),
+        5 /* ERROR_ACCESS_DENIED */ => new UnauthorizedAccessException(message),
+        _ => new IOException(message, unchecked((int)0x80070000 | error)),
+      };
+    }
+
+    /// <summary>
+    /// The extended-length form of a full path. File.Move adds it by itself where a path needs it;
+    /// a direct call does not, and without it a pool with deep paths would fail every rename past
+    /// 260 characters on a machine where long paths are not enabled system-wide.
+    /// </summary>
+    private static string _LongPath(string path) {
+      if (path.Length < 248 || path.StartsWith(@"\\?\", StringComparison.Ordinal))
+        return path;
+
+      path = path.Replace('/', '\\'); // the extended form is taken literally: no separator is translated
+
+      return path.StartsWith(@"\\", StringComparison.Ordinal)
+        ? @"\\?\UNC\" + path[2..]
+        : @"\\?\" + path;
+    }
+
+    /// <summary>
+    /// fsync on a DIRECTORY: what makes a rename, link or create inside it survive a power cut on
+    /// Linux. Fsyncing a file makes its content durable, not the name pointing at it — the entry
+    /// lives in the directory, and until the directory is flushed ext4/xfs may come back with the
+    /// old name, the new one, or neither.
+    ///
+    /// Returns false when the directory cannot be opened or the filesystem does not support
+    /// syncing a directory (some FUSE and network filesystems answer EINVAL): the rename has
+    /// already happened, and failing it now would tell the caller its file is NOT there when it is.
+    /// An I/O error is different — the disk could not store the name — and is reported.
+    /// </summary>
+    public static bool FlushDirectory(string path) {
+      var fd = Open(path, _O_RDONLY);
+      if (fd < 0)
+        return false;
+
+      try {
+        if (Fsync(fd) == 0)
+          return true;
+
+        var errno = Marshal.GetLastPInvokeError();
+        if (errno == _EIO)
+          throw new IOException($"fsync of directory '{path}' failed", errno);
+
+        return false;
+      } finally {
+        Close(fd);
+      }
+    }
+  }
+
+  private long _namespaceFlushes;
+
+  /// <summary>
+  /// How many renames this volume has made durable: directory fsyncs on Unix, write-through moves
+  /// on Windows. A power cut cannot be simulated against a real disk, so this is how a test proves
+  /// the barrier is actually taken on every publish path.
+  /// </summary>
+  public long NamespaceFlushes => Interlocked.Read(ref this._namespaceFlushes);
+
+  /// <summary>Makes the entries of one directory durable (Unix); a no-op where the rename itself already was.</summary>
+  private void _FlushFolder(string folder) {
+    if (OperatingSystem.IsWindows())
+      return;
+
+    if (NativeMethods.FlushDirectory(folder))
+      Interlocked.Increment(ref this._namespaceFlushes);
+  }
+
+  /// <summary>Renames a file without replacing an existing target, durably on Windows (Unix flushes the folders after).</summary>
+  private void _MoveFile(string from, string to) {
+    if (!OperatingSystem.IsWindows()) {
+      File.Move(from, to);
+      return;
+    }
+
+    NativeMethods.MoveWriteThrough(from, to);
+    Interlocked.Increment(ref this._namespaceFlushes);
+  }
+
+  /// <summary>
+  /// Creates a folder and every missing parent so that they survive a power cut: each new entry
+  /// lives in its parent directory, and a rename into a folder whose own entry was lost is lost
+  /// with it. Only the levels actually created are flushed, so the common case — the folder is
+  /// already there — costs one existence check.
+  /// </summary>
+  private void _EnsureFolderDurably(string folder) {
+    if (Directory.Exists(folder))
+      return;
+
+    var created = new List<string>();
+    for (var level = folder; !string.IsNullOrEmpty(level) && !Directory.Exists(level); level = System.IO.Path.GetDirectoryName(level))
+      created.Add(level);
+
+    Directory.CreateDirectory(folder);
+    for (var i = created.Count - 1; i >= 0; --i)
+      if (System.IO.Path.GetDirectoryName(created[i]) is { Length: > 0 } parent)
+        this._FlushFolder(parent);
   }
 
   private readonly string _rootPath = System.IO.Path.GetFullPath(rootPath);
@@ -563,11 +694,41 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     if (Directory.Exists(toPath) || File.Exists(toPath))
       throw new PoolFsException(PoolFsError.Exists, $"Target already exists: {toRelativeFolder}");
 
-    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(toPath)!);
+    var toParent = System.IO.Path.GetDirectoryName(toPath)!;
+    this._EnsureFolderDurably(toParent);
     this._pool.InvalidatePrefix(fromPath + System.IO.Path.DirectorySeparatorChar); // pooled keys move with the subtree
-    Directory.Move(fromPath, toPath);
+    if (OperatingSystem.IsWindows()) {
+      NativeMethods.MoveWriteThrough(fromPath, toPath); // MoveFileEx moves folders too, durably
+      Interlocked.Increment(ref this._namespaceFlushes);
+    } else
+      Directory.Move(fromPath, toPath);
     this._pool.InvalidatePrefix(fromPath + System.IO.Path.DirectorySeparatorChar); // and any re-cached during the move
+
+    // as for a file: the moved folder's entry is durable only once both parents are flushed
+    var fromParent = System.IO.Path.GetDirectoryName(fromPath)!;
+    this._FlushFolder(toParent);
+    if (!string.Equals(fromParent, toParent, StringComparison.Ordinal))
+      this._FlushFolder(fromParent);
   });
+
+  /// <summary>
+  /// Windows only: <see cref="File.Replace(string, string, string?)"/> has no write-through form, so
+  /// the replaced file is flushed afterwards — FlushFileBuffers commits the NTFS log up to that
+  /// file's last change, which includes the rename. Best effort: a target that cannot be opened
+  /// for writing (read-only) keeps the rename the replace already made, merely not forced out yet.
+  /// </summary>
+  private void _FlushReplaced(string finalPath) {
+    if (!OperatingSystem.IsWindows())
+      return;
+
+    try {
+      using var handle = File.OpenHandle(finalPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+      NativeMethods.FlushToDisk(handle);
+      Interlocked.Increment(ref this._namespaceFlushes);
+    } catch (Exception e) when (e is IOException or UnauthorizedAccessException) {
+      _ = e;
+    }
+  }
 
   public void AtomicReplace(string tempRelative, string finalRelative, bool shadow) => this._Guard(() => {
     var tempPath = this._Resolve(tempRelative, shadow);
@@ -579,8 +740,10 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     // anyway cost as much as the rename itself on every publish. Only a move into another folder
     // needs it.
     var finalFolder = System.IO.Path.GetDirectoryName(finalPath)!;
-    if (!string.Equals(finalFolder, System.IO.Path.GetDirectoryName(tempPath), StringComparison.OrdinalIgnoreCase))
-      Directory.CreateDirectory(finalFolder);
+    var tempFolder = System.IO.Path.GetDirectoryName(tempPath)!;
+    var sameFolder = string.Equals(finalFolder, tempFolder, StringComparison.OrdinalIgnoreCase);
+    if (!sameFolder)
+      this._EnsureFolderDurably(finalFolder);
 
     this._pool.Invalidate(tempPath);
     this._pool.Invalidate(finalPath);
@@ -590,11 +753,21 @@ public sealed class LocalVolumeIO(Guid memberId, string displayName, string root
     // target that does exist fails the move with "already exists" and is then REPLACED, keeping the
     // replace semantics (attributes and security carried over) for exactly the case that needs them.
     try {
-      File.Move(tempPath, finalPath);
+      this._MoveFile(tempPath, finalPath);
     } catch (IOException e) when (File.Exists(finalPath) && File.Exists(tempPath)) {
       _ = e;
       File.Replace(tempPath, finalPath, null, true);
+      this._FlushReplaced(finalPath);
     }
+
+    // The caller treats the publish as done once this returns — the staged temp is gone from its
+    // point of view, and mount recovery deletes any temp it finds. On Linux the rename is only in
+    // the page cache until the directory is flushed, so a power cut inside the filesystem's commit
+    // window used to leave the fsynced temp under its old name and no final name: recovery then
+    // deleted the temp, and a file the caller was told is safe was gone.
+    this._FlushFolder(finalFolder);
+    if (!sameFolder)
+      this._FlushFolder(tempFolder);
     // invalidate again AFTER: a reader that re-cached the old finalPath during the replace must
     // not keep serving the pre-replace file (its handle stays valid under FileShare.Delete)
     this._pool.Invalidate(finalPath);

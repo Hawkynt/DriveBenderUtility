@@ -121,4 +121,54 @@ public class JournalTests {
     second.Should().BeGreaterThan(first, "sequences stay monotonic across restarts (SAFE-IDEMP)");
   }
 
+  [Test]
+  [Category("Exception")]
+  public void ReadIncomplete_GivenEachMirrorMissedADifferentAppend_WhenReloadedAfterCrash_ThenBothIntentsReplayed() {
+    for (var i = 0; i < 9; ++i)
+      this._journal.Complete(this._journal.LogIntent(JournalOp.Write, $"warmup{i}.txt"), JournalOp.Write);
+
+    // an append succeeds when ANY mirror takes it: intent 10 reaches only member1, intent 11 only member2
+    this._member2.FailNext(VolumeOp.OpenWrite, PoolFsError.IoError);
+    var tenth = this._journal.LogIntent(JournalOp.Delete, "ten.txt");
+    this._member1.FailNext(VolumeOp.OpenWrite, PoolFsError.IoError);
+    var eleventh = this._journal.LogIntent(JournalOp.Delete, "eleven.txt");
+    tenth.Should().Be(10);
+    eleventh.Should().Be(11);
+
+    this._member1.SimulateCrash();
+    this._member2.SimulateCrash();
+    var reloaded = new Journal(new MemberJournalStore([this._member1, this._member2]));
+
+    reloaded.ReadIncomplete().Select(r => r.Sequence).Should().Equal([10L, 11L],
+      "an intent is durable once any mirror holds it; reading only the mirror with the highest sequence dropped intent 10");
+
+    // reconciling must spread the union, not overwrite the lower mirror with the higher one
+    reloaded.ReconcileMirrors();
+    this._member2.IsOnline = false;
+    new Journal(new MemberJournalStore([this._member1, this._member2])).ReadIncomplete().Select(r => r.Sequence).Should().Equal([10L, 11L]);
+    this._member2.IsOnline = true;
+    this._member1.IsOnline = false;
+    new Journal(new MemberJournalStore([this._member1, this._member2])).ReadIncomplete().Select(r => r.Sequence).Should().Equal([10L, 11L]);
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void ReadIncomplete_GivenMirrorThatMissedACompaction_WhenUnioned_ThenItsCompletedIntentIsNotResurrected() {
+    var stale = this._journal.LogIntent(JournalOp.Delete, "gone.txt");
+
+    // member2 is away while the delete completes and the journal is compacted down to a checkpoint
+    this._member2.IsOnline = false;
+    this._journal.Complete(stale, JournalOp.Delete);
+    this._member2.IsOnline = true;
+
+    // and the pool carries on: a later intent reaches only member2
+    this._member1.FailNext(VolumeOp.OpenWrite, PoolFsError.IoError);
+    var later = this._journal.LogIntent(JournalOp.Write, "later.txt");
+
+    var reloaded = new Journal(new MemberJournalStore([this._member1, this._member2]));
+
+    reloaded.ReadIncomplete().Select(r => r.Sequence).Should().Equal([later],
+      "member2's copy of the delete predates the compaction that proved it complete, so only the newer intent is open");
+  }
+
 }

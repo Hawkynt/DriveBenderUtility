@@ -46,33 +46,29 @@ namespace DivisonM {
         throw new ArgumentNullException(nameof(mountPoint));
       
       try {
-        var files = mountPoint.GetItems(folderPath.Value, SearchOption.AllDirectories).OfType<DriveBender.IFile>();
-        
-        foreach (var file in files) {
-          var shadowCopies = GetShadowCopies(file).ToArray();
-          foreach (var shadow in shadowCopies) {
-            DeleteShadowCopy(shadow);
-          }
-        }
-        
-        foreach (var volume in mountPoint.Volumes) {
-          if (volume is DriveBender.Volume vol) {
-            var shadowPath = Path.Combine(vol.Root.FullName, folderPath.Value, DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME);
-            if (Directory.Exists(shadowPath)) {
-              Directory.Delete(shadowPath, true);
+        var volumes = mountPoint.Volumes.OfType<DriveBender.Volume>().ToArray();
+        foreach (var volume in volumes) {
+          var top = new DirectoryInfo(Path.Combine(volume.Root.FullName, folderPath.Value));
+          if (!top.Exists)
+            continue;
+
+          var folders = new[] { top }.Concat(top.EnumerateDirectories("*", SearchOption.AllDirectories)).Where(d => !_IsShadowFolder(d.Name)).ToArray();
+          foreach (var folder in folders)
+          foreach (var shadowFolder in folder.EnumerateDirectories().Where(d => _IsShadowFolder(d.Name)).ToArray()) {
+            var logicalFolder = _RelativePath(volume.Root.FullName, folder.FullName);
+            foreach (var shadow in shadowFolder.EnumerateFiles().ToArray()) {
+              if (_HasEqualPrimary(volumes, Path.Combine(logicalFolder, shadow.Name), shadow))
+                DeleteShadowCopy((volume, shadow));
+              else
+                DriveBender.Logger?.Invoke($"[Warning]Kept shadow copy '{shadow.FullName}': no primary with the same content exists, so it may be the only good copy");
             }
-            
-            var i = 1;
-            string additionalShadowPath;
-            do {
-              additionalShadowPath = Path.Combine(vol.Root.FullName, folderPath.Value, $"{DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME}.{i}");
-              if (Directory.Exists(additionalShadowPath)) {
-                Directory.Delete(additionalShadowPath, true);
-                i++;
-              } else {
-                break;
-              }
-            } while (true);
+
+            // never recursive: whatever is still inside is a copy that was just judged worth keeping
+            try {
+              shadowFolder.Delete(false);
+            } catch (IOException) {
+              DriveBender.Logger?.Invoke($"[Warning]Kept '{shadowFolder.FullName}': it still holds shadow copies without a matching primary");
+            }
           }
         }
         
@@ -200,12 +196,52 @@ namespace DivisonM {
     private static void DecreaseDuplicationLevel(DriveBender.IMountPoint mountPoint, FolderPath folderPath, int levelsToRemove) {
       var files = mountPoint.GetItems(folderPath.Value, SearchOption.AllDirectories).OfType<DriveBender.IFile>();
       
+      var volumes = mountPoint.Volumes.OfType<DriveBender.Volume>().ToArray();
       foreach (var file in files) {
-        var shadowCopies = GetShadowCopies(file).Take(levelsToRemove);
-        foreach (var shadow in shadowCopies) {
+        var removed = 0;
+        foreach (var shadow in GetShadowCopies(file).ToArray()) {
+          if (removed >= levelsToRemove)
+            break;
+
+          // a shadow is only redundant while a primary holds the same bytes; without one it is the file
+          if (!_HasEqualPrimary(volumes, file.FullName, shadow.file)) {
+            DriveBender.Logger?.Invoke($"[Warning]Kept shadow copy '{shadow.file.FullName}': no primary with the same content exists, so it may be the only good copy");
+            continue;
+          }
+
           DeleteShadowCopy(shadow);
+          ++removed;
         }
       }
+    }
+
+    private static bool _IsShadowFolder(string name)
+      => string.Equals(name, DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME, StringComparison.OrdinalIgnoreCase)
+         || name.StartsWith(DriveBender.DriveBenderConstants.SHADOW_COPY_FOLDER_NAME + ".", StringComparison.OrdinalIgnoreCase);
+
+    private static string _RelativePath(string root, string path) {
+      var trimmedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+      return path.Length <= trimmedRoot.Length ? string.Empty : path.Substring(trimmedRoot.Length + 1);
+    }
+
+    /// <summary>Whether some volume holds a primary of <paramref name="logicalPath"/> with exactly the shadow's content.</summary>
+    private static bool _HasEqualPrimary(IEnumerable<DriveBender.Volume> volumes, string logicalPath, FileInfo shadow) {
+      foreach (var volume in volumes) {
+        var primary = new FileInfo(Path.Combine(volume.Root.FullName, logicalPath));
+        if (!primary.Exists || primary.FullName.Equals(shadow.FullName, StringComparison.OrdinalIgnoreCase))
+          continue;
+
+        try {
+          if (DriveBender.ContentEquals(primary, shadow))
+            return true;
+        } catch (IOException e) {
+          DriveBender.Logger?.Invoke($"[Warning]Could not compare '{primary.FullName}' with '{shadow.FullName}': {e.Message}");
+        } catch (UnauthorizedAccessException e) {
+          DriveBender.Logger?.Invoke($"[Warning]Could not compare '{primary.FullName}' with '{shadow.FullName}': {e.Message}");
+        }
+      }
+
+      return false;
     }
     
     private static IEnumerable<(DriveBender.IVolume volume, FileInfo file)> GetShadowCopies(DriveBender.IFile file) {

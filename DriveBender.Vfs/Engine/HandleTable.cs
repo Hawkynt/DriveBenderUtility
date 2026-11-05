@@ -28,7 +28,11 @@ public sealed class FileState(string normalizedPath) {
   /// <summary>
   /// The file's copies were checked for shared (hard-linked) data, and separated where they had it,
   /// since this state came to life — so the write path pays that check once per open file, not once
-  /// per write. The optimizer never links a file that is open, so it stays true while the state lives.
+  /// per write. The optimizer never links a file the APPLICATION has open, but the state can outlive
+  /// that: on Windows the kernel's close comes long after the application's, and a reopen or a late
+  /// cached write reuses this state. So the flag is dropped when the last application handle goes
+  /// (<see cref="HandleTable.MarkApplicationClosed"/>); kept, it let a write go in place into a file
+  /// the optimizer had since hard-linked to another, changing both.
   /// </summary>
   public bool LinksSeparated;
 
@@ -280,7 +284,8 @@ public sealed class HandleTable {
         --open.File.WriteHandleCount;
       if (!open.ApplicationClosed) {
         open.ApplicationClosed = true; // a handle closed without an explicit cleanup still counts
-        --open.File.AppHandleCount;
+        if (--open.File.AppHandleCount == 0)
+          open.File.LinksSeparated = false; // see LinksSeparated
       }
 
       this._UnpinLocked(open.File); // only ever unkeys OUR OWN entry (see _ReleaseState)
@@ -328,7 +333,8 @@ public sealed class HandleTable {
         return;
 
       open.ApplicationClosed = true;
-      --open.File.AppHandleCount;
+      if (--open.File.AppHandleCount == 0)
+        open.File.LinksSeparated = false; // the optimizer may link it from now on: see LinksSeparated
     }
   }
 

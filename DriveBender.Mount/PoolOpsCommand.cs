@@ -442,7 +442,11 @@ internal static class PoolOpsCommand {
     var ios = online.Select(m => m.io).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
 
-    new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online)).ScatterAndRemove(member.MemberId);
+    // the whole manifest, not just who is online: the scatter first reconciles the pool as a mount
+    // would — journal recovery and the tombstones owed to members that were away — while the member
+    // leaving can still answer for what only it knows
+    new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online),
+      [.. pool.Manifest.Members.Select(m => m.MemberId)]).ScatterAndRemove(member.MemberId);
     lifecycle.RemoveMember(pool.Manifest, member.MemberId); // drop from the manifest once its data is scattered
     Console.WriteLine($"Removed media '{member.Label ?? member.Path}' from pool '{pool.Name}'; data scattered over the remaining members.");
     return 0;
@@ -480,7 +484,8 @@ internal static class PoolOpsCommand {
     IVolumeIO replacement = new LocalVolumeIO(joined.MemberId, newPath, newPath, host.GetVolumeIdentity(newPath).PhysicalVolumeId);
     var ios = online.Select(m => m.io).Where(io => io.MemberId != joined.MemberId).Append(replacement).ToArray();
     var journal = new Journal(new MemberJournalStore(ios));
-    new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online)).Replace(oldMember.MemberId, replacement);
+    new MediaLifecycle(ios, journal, duplication, allowSamePhysical, admit, _RolesOf(online),
+      [.. manifest.Members.Select(m => m.MemberId)]).Replace(oldMember.MemberId, replacement); // reconciles first, as remove-media does
 
     lifecycle.RemoveMember(manifest, oldMember.MemberId);
     Console.WriteLine($"Replaced media '{oldMember.Label ?? oldMember.Path}' with '{options.New}' in pool '{pool.Name}'.");

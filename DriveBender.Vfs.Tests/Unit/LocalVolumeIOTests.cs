@@ -191,4 +191,62 @@ public class LocalVolumeIOTests {
     this._Read("size.bin").Skip(40).Should().OnlyContain(b => b == 0);
   }
 
+  // A power cut cannot be staged against a real disk, so these prove the barrier is TAKEN — the
+  // directory was fsynced (Unix) or the move written through (Windows) and the OS said yes — not
+  // that the hardware honoured it. What the barrier guards against is modelled in FakeVolumeIO.
+
+  [Test]
+  [Category("Exception")]
+  public void AtomicReplace_GivenANewName_WhenPublished_ThenTheRenameIsMadeDurable() {
+    this._Write("docs/f.txt.tmp", [1, 2, 3]);
+    var before = this._volume.NamespaceFlushes;
+
+    this._volume.AtomicReplace("docs/f.txt.tmp", "docs/f.txt", false);
+
+    this._Read("docs/f.txt").Should().Equal(1, 2, 3);
+    this._volume.NamespaceFlushes.Should().BeGreaterThan(before,
+      "a publish the caller treats as done must not live only in the page cache — recovery deletes the temp it would leave behind");
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void AtomicReplace_GivenAnExistingTarget_WhenReplaced_ThenTheRenameIsMadeDurable() {
+    this._Write("docs/f.txt", [9]);
+    this._Write("docs/f.txt.tmp", [1, 2, 3]);
+    var before = this._volume.NamespaceFlushes;
+
+    this._volume.AtomicReplace("docs/f.txt.tmp", "docs/f.txt", false);
+
+    this._Read("docs/f.txt").Should().Equal(1, 2, 3);
+    this._volume.NamespaceFlushes.Should().BeGreaterThan(before);
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void AtomicReplace_GivenAMoveIntoANewFolder_WhenPublished_ThenEveryChangedDirectoryIsFlushed() {
+    this._Write("stage/f.txt.tmp", [4]);
+    var before = this._volume.NamespaceFlushes;
+
+    this._volume.AtomicReplace("stage/f.txt.tmp", "deep/er/f.txt", false);
+
+    this._Read("deep/er/f.txt").Should().Equal(4);
+    if (OperatingSystem.IsWindows())
+      this._volume.NamespaceFlushes.Should().BeGreaterThan(before);
+    else
+      // root (holds the new 'deep'), 'deep' (holds 'er'), 'deep/er' (the new name), 'stage' (the old one)
+      this._volume.NamespaceFlushes.Should().Be(before + 4);
+  }
+
+  [Test]
+  [Category("Exception")]
+  public void RenameFolder_GivenAFolder_WhenMoved_ThenTheRenameIsMadeDurable() {
+    this._Write("a/f.txt", [5]);
+    var before = this._volume.NamespaceFlushes;
+
+    this._volume.RenameFolder("a", "b");
+
+    this._Read("b/f.txt").Should().Equal(5);
+    this._volume.NamespaceFlushes.Should().BeGreaterThan(before);
+  }
+
 }

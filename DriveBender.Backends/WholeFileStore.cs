@@ -813,6 +813,13 @@ public sealed class WholeFileVolumeIO(Guid memberId, string displayName, string 
         using (var content = this._store.OpenRead(source))
           this._store.Upload(target, content, entry.Length);
 
+        // the source is the only other copy: a read stream that ended early instead of failing
+        // would otherwise turn a rename into a truncation
+        var landed = this._store.Stat(target);
+        if (landed is not { IsFolder: false } || (entry.Length >= 0 && landed.Length != entry.Length))
+          throw new PoolFsException(PoolFsError.IoError,
+            $"Moving '{source}' to '{target}' left {landed?.Length.ToString() ?? "nothing"} of {entry.Length} bytes; the source was kept");
+
         this._store.DeleteFile(source);
       }
     }

@@ -155,30 +155,45 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
   }
 
   /// <summary>
-  /// The union of the FRESHEST journal mirrors only. Each member's file carries its high-water
-  /// sequence (in its records, incl. compaction checkpoints); a member that was offline during
-  /// a compaction has a lower high-water, so its stale copy — which may hold a long-completed
-  /// intent whose completion record was compacted away elsewhere — is excluded. Without this a
-  /// returning member's orphan "Delete F" would be replayed against a since-recreated F.
+  /// The union of every readable mirror — minus what a compaction has proven finished.
+  ///
+  /// An append counts as durable once ANY mirror takes it, so no single mirror is guaranteed to
+  /// hold every intent: intent N can reach only A and intent N+1 only B. Reading just the mirror
+  /// with the highest sequence then read B alone, and intent N was never replayed after a crash.
+  ///
+  /// Taking everything is not safe either. A member that was offline during a compaction keeps
+  /// intents whose completion records were compacted away elsewhere; replayed, its orphan
+  /// "Delete F" would destroy a since-recreated F. A compaction writes a checkpoint carrying the
+  /// high-water sequence it covered, and a mirror holding that checkpoint holds every intent at
+  /// or below it that was still open. So below the newest checkpoint only the mirrors carrying it
+  /// are believed; above it nothing has been compacted yet, and every mirror's records count.
+  /// Completion records are taken from every mirror at any sequence: sequences are never reused,
+  /// so a completion can only ever close the intent it was written for.
   /// </summary>
   public IEnumerable<string> ReadAll() {
     var perMember = this._ReadPerMember();
     if (perMember.Count == 0)
       return [];
 
-    var globalMax = perMember.Max(m => m.maxSeq);
+    var newestCheckpoint = perMember.Max(m => m.checkpoint);
     var seen = new HashSet<string>(StringComparer.Ordinal);
     var lines = new List<string>();
-    foreach (var (_, memberMax, memberLines) in perMember)
-      if (memberMax == globalMax)
-        foreach (var line in memberLines)
-          if (seen.Add(line))
-            lines.Add(line);
+    foreach (var (_, memberCheckpoint, memberLines) in perMember) {
+      var current = memberCheckpoint == newestCheckpoint;
+      foreach (var line in memberLines)
+        if ((current || _IsCompletion(line) || _SeqOf(line) > newestCheckpoint) && seen.Add(line))
+          lines.Add(line);
+    }
 
     return lines;
   }
 
-  private List<(IVolumeIO member, long maxSeq, List<string> lines)> _ReadPerMember() {
+  // System.Text.Json escapes quotes inside strings, so a path can never forge these markers
+  private static bool _IsCompletion(string line) => line.Contains("\"done\":true", StringComparison.Ordinal);
+
+  private static bool _IsCheckpoint(string line) => line.Contains("\"chk\":true", StringComparison.Ordinal);
+
+  private List<(IVolumeIO member, long checkpoint, List<string> lines)> _ReadPerMember() {
     var perMember = new List<(IVolumeIO, long, List<string>)>();
     foreach (var member in this._Online) {
       if (!member.FileExists(JournalPath, false))
@@ -193,19 +208,19 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
         continue;
       }
 
+      // the newest compaction this mirror took part in (0 when it was never compacted)
       var lines = new List<string>();
-      long maxSeq = 0;
+      long checkpoint = 0;
       foreach (var line in content.Split('\n')) {
         if (line.Length == 0)
           continue;
 
         lines.Add(line);
-        var seq = _SeqOf(line);
-        if (seq > maxSeq)
-          maxSeq = seq;
+        if (_IsCheckpoint(line) && _SeqOf(line) is var seq && seq > checkpoint)
+          checkpoint = seq;
       }
 
-      perMember.Add((member, maxSeq, lines));
+      perMember.Add((member, checkpoint, lines));
     }
 
     return perMember;
@@ -226,22 +241,26 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
     return long.TryParse(line.AsSpan(start, end - start), out var value) ? value : 0;
   }
 
+  /// <summary>
+  /// Writes the merged view (<see cref="ReadAll"/>) to every mirror that does not already hold
+  /// exactly it. Copying the mirror with the highest sequence over the others used to do this, and
+  /// that erased any intent the others held but it had missed.
+  /// </summary>
   public void ReconcileMirrors() {
     var perMember = this._ReadPerMember();
     if (perMember.Count == 0)
       return;
 
-    var globalMax = perMember.Max(m => m.maxSeq);
-    var authoritative = perMember.First(m => m.maxSeq == globalMax).lines;
-    var authoritativeSet = new HashSet<string>(authoritative, StringComparer.Ordinal);
+    var merged = this.ReadAll().ToArray();
+    var mergedSet = new HashSet<string>(merged, StringComparer.Ordinal);
 
-    // any member whose journal is not already exactly the authoritative set gets overwritten —
-    // a returning member's stale intents are wiped so they can never resurface (SAFE-OFFLINE)
-    foreach (var (member, maxSeq, lines) in perMember) {
-      if (maxSeq == globalMax && lines.Count == authoritativeSet.Count && lines.All(authoritativeSet.Contains))
+    // any member whose journal is not already exactly the merged set gets overwritten — a
+    // returning member's stale intents are wiped so they can never resurface (SAFE-OFFLINE)
+    foreach (var (member, _, lines) in perMember) {
+      if (lines.Count == mergedSet.Count && lines.All(mergedSet.Contains))
         continue;
 
-      this._RewriteOne(member, authoritative);
+      this._RewriteOne(member, merged);
     }
   }
 
