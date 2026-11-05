@@ -122,12 +122,10 @@ touches the checksum sidecar, never pool data. With that in place, `--fix` repai
 from the good one, and rot on EVERY copy is reported as unrecoverable instead of `healthy (deep
 scan)`. Both scenarios pass.
 
-**Still open — a scrub of a MOUNTED pool loses its baseline.** `pool-health` runs in its own
-process and writes the checksum sidecar; the mounted engine holds the same sidecar and saves its
-own view over the top on unmount, so the baseline silently disappears. That is why the repair
-scenarios only pass with the scrub run while nothing is mounted, which is what they now do. For a
-user this means the obvious action — health-check the pool you have mounted — achieves nothing
-durable. The two processes need to agree on ownership of that file.
+**Closed — a scrub of a MOUNTED pool lost its baseline.** `pool-health` ran in its own process and
+the mounted engine saved its own view of the checksum sidecar over it on unmount. `ChecksumDatabase.Save`
+now merges with what is on disk instead of overwriting it (`7860a1c`, `ChecksumStalenessTests`), and a
+scrub of a mounted pool is relayed into the pool's own process anyway.
 
 **Now a setting — `integrity.verifyReads`.** Trusting reads stays the default (`never`), for the
 reason below. `before` checks the copy that is about to serve a read against its recorded checksum
@@ -1783,6 +1781,17 @@ being deleted, because what they cost is the point.
    but do not mutate it, and `Open` for writing, whose snapshot preservation copies a pinned file
    and could fail the open if the folder moves mid-copy. Neither is known to lose data; neither is
    covered by a test.
+3. **A snapshot taken while a file is being overwritten does not name that file.** An overwrite
+   moves the old file aside and writes the new one under a hidden temp until its last close, so the
+   namespace a snapshot records has no file at that name. The old content is kept for the snapshots
+   that already named it, and in the bin where it is on, but not for the new snapshot.
+4. **Hard links, clones and deletes do not flush their folder.** Renames and publishes do (see
+   "Resolved: data-loss audit" below). A power cut can still undo a just-made hard link or clone,
+   which only costs the space saving, or bring back a just-deleted file.
+5. **The legacy console cannot run a real repair or skip moving data.** `--dry-run` and
+   `--move-data` are switches that default to true, so `repair` is always a dry run and
+   `remove-drive` always moves data. Safe, but `repair` tells the user to pass `--dry-run false`,
+   which the parser does not accept.
 
 The three throughput items that stood here — sync-over-async across the providers, the absence of
 provider-level range reads, and the whole-object RAM spikes — are closed above.
@@ -2652,3 +2661,100 @@ Long runs of zeros are released (sparse files). Both are on by default (`space.d
   process". Linking now retires pooled handles on the existing name first.
 - **Limit:** a program writing straight into a member's folder, bypassing the pool, writes into both
   names of a hard link. Block-cloned files are not affected.
+
+### Resolved: data-loss audit — engine, media operations and the legacy tools
+
+A pass over every path that deletes, overwrites or moves data, with each finding reproduced by a test
+that failed before its fix. Engine tests are in `DataLossAuditTests` unless named otherwise; the
+legacy tier's are in `DataLossSafetyTests`.
+
+**Engine**
+
+- **An fsync after a truncate was not durable.** A truncate owes the write buffer nothing, so the
+  fsync that followed found nothing to flush. After a power cut some copies had the old length and
+  some the new, with no open intent left to reconcile them. The truncate now reaches the disk
+  before its intent completes.
+- **A file named like a staging temp was deleted at the next mount.** `notes.TEMP.$DRIVEBENDER`
+  could be created, written and fsynced, and recovery then swept it as an abandoned write. Names
+  the pool reserves (staging temps, shadow-copy folders, the utility folder, pool info files)
+  cannot be created or renamed to through the mount any more.
+- **A save was lost when the bin could not take the version it replaced.** The publish took the
+  file off the staging list before keeping the old version in the bin, outside the code that puts
+  it back on failure. One failed bin copy, or one failed journal append, and the next mount swept
+  the new content as an abandoned temp. Both now sit inside the retry.
+- **A crash between the per-copy renames of an overwrite left copies disagreeing for good.** The
+  publish journaled the temp's name, so recovery reconciled temps it was about to sweep, not the
+  real copies. It journals the final name now. Only pools without a checksum database showed it,
+  because the mount's quick scan otherwise converged them.
+- **A rename was not durable** (`LocalVolumeIOTests`, `FakeVolumeFaultTests`). On Linux the folder
+  was never fsynced and on Windows the move was not write-through, so a power cut inside the
+  filesystem's commit window left the fsynced temp under its old name, and recovery deleted it.
+  Renames and publishes flush their folders on Linux and use `MOVEFILE_WRITE_THROUGH` on Windows.
+- **The journal could skip an intent** (`JournalTests`). An append counts once any mirror takes it,
+  but reads used only the mirror with the highest sequence, so an intent that reached a different
+  mirror was never replayed. Reads now take every mirror, trusting only checkpoint holders below the
+  newest compaction, so a completed intent cannot come back.
+- **Restoring over a taken name could destroy the live file.** The swap sends the file holding the
+  name to the bin, but only checked that the bin was on, not that it would take this file. A file
+  over `trash.maxFileSize`, or on a disk short of `trash.minFreeSpace`, was deleted for good. The
+  restore now refuses instead.
+- **A deleted single-copy file a snapshot named never reached the bin.** The snapshot took the only
+  copy by rename, so the file lived only as long as the snapshot. With the bin on, the snapshot now
+  copies and the file goes to the bin.
+- **Deleting a snapshot left the others unprotected while the pins were rebuilt.** The set was
+  emptied first and then refilled from every index, and a write in between went unpreserved. It is
+  only added to now; a stale pin costs one lookup at its next write.
+- **A snapshot taken while a version was being preserved lost its protection.** The preserve ended
+  by dropping the path's pin, which removed the new snapshot's pin as well. Taking a snapshot now
+  excludes preserves.
+- **On Windows, a write could change a file the optimizer had hard-linked to another.** The
+  "links already separated" flag lived as long as the kernel's handle, which outlives the
+  application's, so a reopen skipped copy-on-write. It is dropped when the last application handle
+  goes.
+- **A scrub of a mounted pool repaired copies under the application's writes.** It quarantined a
+  copy and renamed a repaired one over it with nothing held, so a write in between was lost on that
+  copy, and a copy merely behind on owed bytes was overwritten. A repairing pass now holds the
+  namespace gate and the file's lease per file, skips files open for writing, staged or owed bytes,
+  and drops the file's caches before it lets go.
+- **A failed quarantine did not stop the overwrite** (`IntegrityTests`). The copy is now left as it
+  is and reported as `RepairDeferred`. With several differing edits, every copy about to be
+  overwritten is preserved, not only the losing edits.
+- **The bin refused a replaced version because of one it no longer held** (`BinPolicyTests`). The
+  remembered time of the last kept version outlived a restore or a purge of it.
+
+**Media operations** (`MediaLifecycleTests`, `MountedMediaOpTests`)
+
+- **`pool-restore` and `pool-health --fix` on a mounted pool copied behind the engine.** Promoting a
+  lone shadow could publish an image taken before a write and then delete the copy holding it. A
+  mounted restore now goes through the engine's healer.
+- **Remove-media and replace-media did not reconcile first.** A member that missed an edit kept the
+  stale copy while the edited one was deleted, and a write acknowledged only on the leaving member
+  was lost with it. Both now run recovery and the tombstone replay first, and bring every copy to
+  the newest version before the leaving one goes. A copy that differs is preserved under `conflicts/` before it is
+  overwritten, and if that fails the retire stops rather than delete the newer version with the
+  leaving member.
+
+**Legacy tools** (`DriveBender.Core`)
+
+- Disabling or lowering duplication deleted shadow copies without a primary (the file's only copy),
+  and recursively deleted the shadow folders whole. A shadow now goes only when a primary with the
+  same content exists, and a folder only when empty.
+- Integrity repair kept the newest of two different copies and deleted the other. Copies are now
+  removed only when a fresh hash matches the kept one. A backup that fails stops the repair (it was
+  written to a drive-relative path on Windows). A promoted primary is written into the pool folder,
+  and a corrupt copy is replaced through a temp rather than deleted first.
+- `delete-pool` picked the first pool whose name matched, and deleted every pool's info file on the
+  disk. An ambiguous name is refused, and only that pool's info files go. Creating a pool no longer
+  overwrites another pool's info file.
+- Remove-drive never matched a drive (a name was compared with a path). Behind that, it moved only
+  top-level files, could put both copies on one disk, and wiped the disk when not moving data. It now
+  moves every file, keeps copies on different disks, and detaches the drive only when no file has its
+  only copy there.
+- Copies made before a source is deleted are flushed and size-checked first. A whole-pool walk failed
+  at the pool root, so whole-pool integrity checks and repairs found nothing; it works now.
+- A cloud member's folder rename checks the copy's length before deleting the source.
+
+**Found on the way: one hung mount on the host stopped every pool from mounting.** Discovery asks
+every drive whether it is ready, which is a statfs, and a stalled gvfs session on the test machine
+never answered it. `dbmount mount` waited for good before serving anything, with nothing in its
+output. Each probe now has three seconds, and a drive that does not answer is skipped and logged.
