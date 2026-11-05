@@ -115,14 +115,38 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       this._partialWriteBytes = bytes;
   }
 
-  /// <summary>Power loss: unflushed content reverts to the last flushed state; never-flushed files vanish.</summary>
+  /// <summary>
+  /// Whether a rename is durable the moment it returns. True models what LocalVolumeIO guarantees
+  /// (it flushes the directory, or moves write-through, before returning) and what the engine is
+  /// written against. False models a backend that renames only in the cache — LocalVolumeIO before
+  /// it flushed directories — so a crash test can show what that costs: <see cref="SimulateCrash"/>
+  /// then undoes every rename made since the last crash, leaving the staged name and not the final one.
+  /// </summary>
+  public bool RenamesDurable { get; init; } = true;
+
+  /// <summary>Renames a crash would undo, oldest first: (staged name, final name, the file, what the final name held before).</summary>
+  private readonly List<(string temp, string final, FakeFile file, FakeFile? replaced)> _volatileRenames = [];
+
+  /// <summary>Power loss: unflushed content reverts to the last flushed state; never-flushed files vanish; non-durable renames are undone.</summary>
   public void SimulateCrash() {
-    lock (this._lock)
+    lock (this._lock) {
+      // names first, newest rename first, so a chain of renames unwinds to where it started
+      for (var i = this._volatileRenames.Count - 1; i >= 0; --i) {
+        var (temp, final, file, replaced) = this._volatileRenames[i];
+        if (this._files.GetValueOrDefault(final) is { } current && ReferenceEquals(current, file))
+          this._files.Remove(final);
+        if (replaced != null)
+          this._files[final] = replaced;
+        this._files[temp] = file;
+      }
+
+      this._volatileRenames.Clear();
       foreach (var (path, file) in this._files.ToArray())
         if (file.Persisted == null)
           this._files.Remove(path);
         else
           file.Current = (byte[])file.Persisted.Clone();
+    }
   }
 
   /// <summary>
@@ -450,6 +474,9 @@ public sealed class FakeVolumeIO(Guid memberId, string displayName, string physi
       // ext4 only heuristically), and it hid exactly the bug it should catch: an engine that renames
       // a file into view before flushing it would pass every crash test here and lose the file on a
       // real power cut. Content is durable when it was flushed, and only then.
+      if (!this.RenamesDurable)
+        this._volatileRenames.Add((tempPhysical, finalPhysical, staged, this._files.GetValueOrDefault(finalPhysical)));
+
       this._files.Remove(tempPhysical);
       this._EnsureParents(finalPhysical);
       this._files[finalPhysical] = staged;

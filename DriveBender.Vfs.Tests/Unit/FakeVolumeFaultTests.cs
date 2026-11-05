@@ -129,4 +129,36 @@ public class FakeVolumeFaultTests {
     this._volume.GetContent("torn.bin", false).Should().Equal(1, 2);
   }
 
+  private static void _Stage(FakeVolumeIO volume, string path, byte[] content) {
+    using var stream = volume.OpenWrite(path, false, true);
+    stream.Write(content, 0, content.Length);
+    stream.Flush();
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void SimulateCrash_GivenARenameOnlyInTheCache_WhenCrashed_ThenTheFlushedFileIsBackUnderItsStagedName() {
+    var volume = new FakeVolumeIO(Guid.NewGuid(), "cached-renames", "VOL-R") { RenamesDurable = false };
+    volume.Seed("f.txt", false, [9]);
+    _Stage(volume, "f.txt.tmp", [1, 2, 3]);
+    volume.AtomicReplace("f.txt.tmp", "f.txt", false);
+
+    volume.SimulateCrash();
+
+    volume.GetContent("f.txt.tmp", false).Should().Equal(new byte[] { 1, 2, 3 }, "the content was flushed; only the rename was lost");
+    volume.GetContent("f.txt", false).Should().Equal(new byte[] { 9 }, "the final name still holds what it held before the rename");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void SimulateCrash_GivenDurableRenames_WhenCrashed_ThenThePublishedNameSurvives() {
+    _Stage(this._volume, "f.txt.tmp", [1, 2, 3]);
+    this._volume.AtomicReplace("f.txt.tmp", "f.txt", false);
+
+    this._volume.SimulateCrash();
+
+    this._volume.GetContent("f.txt", false).Should().Equal(1, 2, 3);
+    this._volume.GetContent("f.txt.tmp", false).Should().BeNull();
+  }
+
 }
