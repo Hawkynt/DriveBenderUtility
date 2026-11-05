@@ -72,6 +72,14 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
 
   private void _Kept(string originalPath, DateTime when) => this._lastKept[originalPath] = when;
 
+  /// <summary>
+  /// Drops what this mount remembers of when the bin last took a version of a path, once an entry of
+  /// it has left the bin or been re-dated: the next <see cref="LastKeptUtc"/> asks the bin again. A
+  /// remembered time outliving the version it describes would have the interval refuse the next
+  /// replaced version for a near-duplicate the bin no longer holds, and that version is then gone.
+  /// </summary>
+  private void _Forget(string originalPath) => this._lastKept.TryRemove(originalPath, out _);
+
   private TrashInfo? _ReadInfo(IVolumeIO member, string trashPath) {
     try {
       using var stream = member.OpenRead(_InfoPathFor(trashPath), false);
@@ -156,7 +164,8 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
     }
 
     journal.Complete(sequence, JournalOp.TrashMove);
-    this._Kept(originalPath, clock());
+    if (kept > 0)
+      this._Kept(originalPath, clock());
     return kept > 0 ? trashPath : null;
   }
 
@@ -333,6 +342,7 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
       member.Delete(_InfoPathFor(trashPath), false);
 
     journal.Complete(sequence, JournalOp.TrashMove);
+    this._Forget(normalized);
     return (member, normalized);
   }
 
@@ -446,6 +456,9 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
         DriveBender.Logger($"[Warning]Could not correct a future deletion date on '{member.DisplayName}': {e.Message}");
       }
     }
+
+    // a future time remembered from when the version was kept would refuse every replaced version until then
+    this._Forget(PoolPaths.Normalize(originalPath));
   }
 
   private void _PurgeEntry(string originalPath) {
@@ -461,6 +474,8 @@ public sealed class PoolTrash(IReadOnlyList<IVolumeIO> members, Journal journal,
       member.Delete(trashPath, false);
     if (member.FileExists(_InfoPathFor(trashPath), false))
       member.Delete(_InfoPathFor(trashPath), false);
+
+    this._Forget(normalized);
   }
 
 }

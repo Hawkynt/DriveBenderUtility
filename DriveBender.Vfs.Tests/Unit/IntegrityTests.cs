@@ -218,4 +218,85 @@ public class IntegrityTests {
     reloaded.ScrubAll().Should().BeEmpty("a fresh service sees the persisted baselines");
   }
 
+  /// <summary>Whether a member holds a path as a shadow copy rather than the primary.</summary>
+  private static bool _ShadowOn(FakeVolumeIO volume, string path) => !volume.FileExists(path, false);
+
+  /// <summary>Every preserve under conflicts/ fails, as on a member whose utility folder cannot be written.</summary>
+  private static void _QuarantineFailsOn(params FakeVolumeIO[] volumes) {
+    foreach (var volume in volumes)
+      volume.BeforeOperation = (_, path) => {
+        if (path.Contains($"{PoolPaths.UtilityFolderName}/conflicts", StringComparison.OrdinalIgnoreCase))
+          throw new PoolFsException(PoolFsError.IoError, "Injected: conflicts/ cannot be written");
+      };
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Scrub_GivenAStaleCopyThatCannotBeQuarantined_ThenItIsNotOverwritten() {
+    // no baseline yet, so neither copy deviates from a DB entry — they only deviate from each other
+    var handle = this._fs.Create("lag.txt", NodeKind.File, CreateFlags.None);
+    this._fs.Write(handle, new byte[] { 1, 2, 3 }, 0, WriteMode.Normal);
+    this._fs.Close(handle);
+    var newer = this._volume1;
+    var stale = this._volume2;
+    stale.CorruptSilently("lag.txt", _ShadowOn(stale, "lag.txt"), c => c[0] = 77);
+    stale.SetTimestamps("lag.txt", _ShadowOn(stale, "lag.txt"), null, new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+    newer.SetTimestamps("lag.txt", _ShadowOn(newer, "lag.txt"), null, new DateTime(2027, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+    _QuarantineFailsOn(this._volume1, this._volume2);
+
+    var issues = this._fs.RunScrub();
+
+    stale.GetContent("lag.txt", _ShadowOn(stale, "lag.txt")).Should().Equal(new byte[] { 77, 2, 3 },
+      "a copy whose replaced content could not be preserved is not overwritten — the clock that picked the winner may be wrong (SAFE-NOLOSS)");
+    issues.Should().Contain(i => i.Kind == IntegrityIssueKind.RepairDeferred, "the skipped repair is reported, not silent");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Scrub_GivenAnAcceptedEditWhoseReplacedCopyCannotBeQuarantined_ThenThatCopyIsNotOverwritten() {
+    this._CreateWithContent("doc.txt", [1, 1, 1]);
+    var (holder, shadow) = this._PrimaryHolder("doc.txt");
+    holder.CorruptSilently("doc.txt", shadow, content => content[0] = 42);
+    holder.SetTimestamps("doc.txt", shadow, null, new DateTime(2027, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+    var other = new[] { this._volume1, this._volume2 }.Single(v => v != holder);
+    _QuarantineFailsOn(other);
+
+    var issues = this._fs.RunScrub();
+
+    other.GetContent("doc.txt", _ShadowOn(other, "doc.txt")).Should().Equal(new byte[] { 1, 1, 1 });
+    issues.Should().Contain(i => i.Kind == IntegrityIssueKind.RepairDeferred);
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Scrub_GivenTwoDifferingEditsAndAnUntouchedThirdCopy_ThenTheThirdIsQuarantinedBeforeBeingOverwritten() {
+    // the untouched copy still matches its checksum, so it is no "edit" — yet the newest edit is
+    // propagated over it, and the version it held is the one the other two copies replaced
+    var volumes = new[] {
+      new FakeVolumeIO(Guid.NewGuid(), "t1", "PHYS-T1", capacity: 1L << 20),
+      new FakeVolumeIO(Guid.NewGuid(), "t2", "PHYS-T2", capacity: 1L << 20),
+      new FakeVolumeIO(Guid.NewGuid(), "t3", "PHYS-T3", capacity: 1L << 20),
+    };
+    var cache = new CacheInstance("i3" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
+    using var fs = new PoolFileSystem(_pool, [.. volumes.Select(v => new EngineMember(v))], cache, ConfigResolver.ResolveEffective(null, """{ "duplication": 3 }"""));
+    fs.Mount(new(@"X:"));
+    var original = new byte[] { 5, 6, 7, 8 };
+    var handle = fs.Create("tri.txt", NodeKind.File, CreateFlags.None);
+    fs.Write(handle, original, 0, WriteMode.Normal);
+    fs.Close(handle);
+    fs.RunScrub();
+    volumes.Should().OnlyContain(v => v.FileExists("tri.txt", false) || v.FileExists("tri.txt", true), "duplication 3 puts a copy on each member");
+
+    volumes[0].CorruptSilently("tri.txt", _ShadowOn(volumes[0], "tri.txt"), c => c[0] = 11);
+    volumes[0].SetTimestamps("tri.txt", _ShadowOn(volumes[0], "tri.txt"), null, new DateTime(2027, 1, 2, 0, 0, 0, DateTimeKind.Utc));
+    volumes[1].CorruptSilently("tri.txt", _ShadowOn(volumes[1], "tri.txt"), c => c[0] = 22);
+    volumes[1].SetTimestamps("tri.txt", _ShadowOn(volumes[1], "tri.txt"), null, new DateTime(2027, 1, 3, 0, 0, 0, DateTimeKind.Utc));
+
+    fs.RunScrub();
+
+    volumes[2].FilePaths.Where(p => p.Contains("conflicts/tri.txt"))
+      .Select(p => volumes[2].GetContent(p, false))
+      .Should().Contain(c => c!.SequenceEqual(original), "the untouched copy's content is preserved before the newest edit replaces it (SAFE-NOLOSS)");
+  }
+
 }

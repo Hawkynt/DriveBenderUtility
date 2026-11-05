@@ -240,6 +240,7 @@ public enum IntegrityIssueKind {
   ExternalEditDetected,
   StaleCopyRepaired,
   StaleCopyDetected,
+  RepairDeferred,
 }
 
 public sealed record IntegrityIssue(IntegrityIssueKind Kind, string Path, string Message);
@@ -257,6 +258,18 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
 
   private readonly Dictionary<Guid, ChecksumDatabase> _databases = members.ToDictionary(m => m.MemberId, m => new ChecksumDatabase(m));
   private long _quarantineCounter;
+
+  /// <summary>
+  /// Set by a mounted engine: holds one file still for a repairing pass, or answers null when the
+  /// file must be left alone for now (open for writing, still being written, owed bytes).
+  ///
+  /// A scrub rewrites copies — it quarantines one and renames a repaired copy over it — and on a
+  /// mounted pool it ran beside the application's writes with nothing between them. A write landing
+  /// between the repair's read and its rename was lost on that copy after it had been acknowledged,
+  /// and a copy merely BEHIND (an ack quorum below the copy count) was "repaired" with the other
+  /// copy's newer blocks over its own. A detect-only pass changes no pool data and is not held.
+  /// </summary>
+  public Func<string, IDisposable?>? FileGuard { get; set; }
 
   // a per-instance token so a quarantine path from THIS run can never collide with (and overwrite)
   // a version quarantined by an earlier run/process — every preserved version stays preserved
@@ -406,11 +419,19 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
         context.ThrowIfStopping();
         context.Step(done++, paths.Length, path);
 
-        var views = this._CollectCopies(path, quick);
-        if (views == null)
-          continue; // quick scan: nothing deviates
+        IDisposable? hold = null;
+        if (!detectOnly && this.FileGuard is { } guard && (hold = guard(path)) == null)
+          continue; // busy now; the next pass sees it settled
 
-        this._ClassifyAndReconcile(path, views, issues, invalidateCaches, detectOnly);
+        try {
+          var views = this._CollectCopies(path, quick);
+          if (views == null)
+            continue; // quick scan: nothing deviates
+
+          this._ClassifyAndReconcile(path, views, issues, invalidateCaches, detectOnly);
+        } finally {
+          hold?.Dispose();
+        }
       }
 
       context.Step(done, paths.Length, "done");
@@ -554,8 +575,9 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
       } else {
         var source = good.Length > 0 ? good[0] : edited.OrderByDescending(v => v.MTimeTicks).First();
         foreach (var corrupt in bitRot) {
-          this._Quarantine(corrupt, path, "bitrot");
-          this._Repair(source, corrupt, path);
+          if (!this._PreserveThenRepair(source, corrupt, path, "bitrot", issues))
+            continue;
+
           issues.Add(new(IntegrityIssueKind.BitRotRepaired, path, $"Repaired silent corruption on '{corrupt.Member.DisplayName}' from a checksum-verified copy; corrupt content quarantined"));
           DriveBender.Logger($" - Repaired bit-rot on '{path}' ({corrupt.Member.DisplayName})");
         }
@@ -600,15 +622,15 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
 
           // quarantine each stale copy BEFORE overwriting it — a skewed clock could make the
           // "newest" wrong, so the replaced content is always recoverable (SAFE-NOLOSS)
-          foreach (var stale in staleCopies) {
-            this._Quarantine(stale, path, "stale");
-            this._Repair(winner, stale, path);
-          }
+          var resynced = staleCopies.Count(stale => this._PreserveThenRepair(winner, stale, path, "stale", issues));
 
           this.RecordHash(winner.Member, path, winner.Shadow, winner.Hash);
           invalidateCaches?.Invoke(path);
-          issues.Add(new(IntegrityIssueKind.StaleCopyRepaired, path, $"Re-synchronized {staleCopies.Length} stale cop(ies) from the newest write (replaced content quarantined)"));
-          DriveBender.Logger($" - Re-synchronized {staleCopies.Length} stale cop(ies) of '{path}'");
+          if (resynced > 0) {
+            issues.Add(new(IntegrityIssueKind.StaleCopyRepaired, path, $"Re-synchronized {resynced} stale cop(ies) from the newest write (replaced content quarantined)"));
+            DriveBender.Logger($" - Re-synchronized {resynced} stale cop(ies) of '{path}'");
+          }
+
           return;
         }
 
@@ -638,15 +660,18 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
         // one coherent external edit: accept it as authoritative, re-propagate (SAFE-OOB case 2).
         // Quarantine each replaced copy first so an accepted-but-wrong edit stays recoverable.
         var winner = edited[0];
-        foreach (var stale in views.Where(v => v.Hash != winner.Hash)) {
-          this._Quarantine(stale, path, "replaced");
-          this._Repair(winner, stale, path);
-        }
+        var replaced = views.Where(v => v.Hash != winner.Hash).ToArray();
+        var propagated = replaced.Count(stale => this._PreserveThenRepair(winner, stale, path, "replaced", issues));
 
         this.RecordHash(winner.Member, path, winner.Shadow, winner.Hash);
         invalidateCaches?.Invoke(path);
-        issues.Add(new(IntegrityIssueKind.ExternalEditAccepted, path, "External edit accepted as authoritative and re-propagated to all copies"));
-        DriveBender.Logger($" - Accepted external edit of '{path}' and re-synchronized {views.Count - 1} cop(ies)");
+        if (propagated == replaced.Length) {
+          // only then: a report of nothing but ExternalEditAccepted reads as healthy, and a copy left
+          // behind has already reported itself as deferred
+          issues.Add(new(IntegrityIssueKind.ExternalEditAccepted, path, "External edit accepted as authoritative and re-propagated to all copies"));
+          DriveBender.Logger($" - Accepted external edit of '{path}' and re-synchronized {propagated} cop(ies)");
+        }
+
         return;
       }
 
@@ -660,12 +685,23 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
         var ranked = edited.OrderByDescending(v => v.MTimeTicks).ToArray();
         var ambiguous = ranked.Length > 1 && ranked[0].MTimeTicks == ranked[1].MTimeTicks && ranked[0].Hash != ranked[1].Hash;
         var winner = ranked[0];
-        foreach (var loser in edited.Where(v => v != winner))
-          this._Quarantine(loser, path, "conflict");
 
-        if (!ambiguous && editPolicy == ExternalEditPolicy.AcceptNewest)
-          foreach (var stale in views.Where(v => v.Hash != winner.Hash))
+        // Everything the newest edit is about to replace is preserved first, not only the losing
+        // edits: a copy that still matches its checksum (or has none yet) holds the version both
+        // edits started from, and is overwritten just the same. One whose preserve fails stays as it is.
+        var overwritten = !ambiguous && editPolicy == ExternalEditPolicy.AcceptNewest
+          ? views.Where(v => v.Hash != winner.Hash).ToArray()
+          : [];
+        var preserved = new HashSet<CopyView>();
+        foreach (var copy in edited.Where(v => v != winner).Union(overwritten))
+          if (this._Quarantine(copy, path, "conflict"))
+            preserved.Add(copy);
+
+        foreach (var stale in overwritten)
+          if (preserved.Contains(stale))
             this._Repair(winner, stale, path);
+          else
+            this._ReportDeferred(stale, path, issues);
 
         invalidateCaches?.Invoke(path);
         issues.Add(new(IntegrityIssueKind.Conflict, path, $"{distinctEdits.Length} divergent versions detected; all preserved under {PoolPaths.UtilityFolderName}/conflicts for resolution"));
@@ -675,15 +711,41 @@ public sealed class IntegrityService(IReadOnlyList<IVolumeIO> members, ExternalE
     }
   }
 
+  /// <summary>
+  /// Overwrites <paramref name="target"/> from <paramref name="source"/> only once its content is
+  /// preserved under conflicts/. When the preserve fails the copy is left exactly as it is and
+  /// reported: the winner was picked by checksums and timestamps a skewed clock can mislead, so the
+  /// replaced content may be the one that mattered. The next scrub tries again (SAFE-NOLOSS).
+  /// </summary>
+  /// <returns>Whether the copy was repaired.</returns>
+  private bool _PreserveThenRepair(CopyView source, CopyView target, string path, string reason, List<IntegrityIssue> issues) {
+    if (!this._Quarantine(target, path, reason)) {
+      this._ReportDeferred(target, path, issues);
+      return false;
+    }
+
+    this._Repair(source, target, path);
+    return true;
+  }
+
+  private void _ReportDeferred(CopyView copy, string path, List<IntegrityIssue> issues) {
+    issues.Add(new(IntegrityIssueKind.RepairDeferred, path,
+      $"The copy on '{copy.Member.DisplayName}' differs, but its content could not be preserved under {PoolPaths.UtilityFolderName}/conflicts — left untouched, retried on the next scrub"));
+    DriveBender.Logger($"[Warning]Not overwriting the copy of '{path}' on '{copy.Member.DisplayName}': its content could not be preserved first");
+  }
+
   /// <summary>Preserves a copy under conflicts/ before it is overwritten — streamed, with a per-run unique name so no earlier version is clobbered (SAFE-NOLOSS).</summary>
-  private void _Quarantine(CopyView copy, string path, string reason) {
+  /// <returns>Whether the content is preserved; a copy whose preserve failed must not be overwritten.</returns>
+  private bool _Quarantine(CopyView copy, string path, string reason) {
     var quarantinePath = $"{PoolPaths.UtilityFolderName}/conflicts/{path}.{reason}.{this._quarantineToken}.{Interlocked.Increment(ref this._quarantineCounter)}";
     try {
       copy.Member.EnsureFolder(PoolPaths.GetParent(quarantinePath), false);
       WholeFilePublisher.CopyBetween(copy.Member, path, copy.Shadow, copy.Member, quarantinePath, false,
         admit: WholeFilePublisher.Pace(admit, copy.Member, copy.Member));
+      return true;
     } catch (PoolFsException e) {
       DriveBender.Logger($"[Warning]Could not quarantine '{path}' on '{copy.Member.DisplayName}': {e.Message}");
+      return false;
     }
   }
 

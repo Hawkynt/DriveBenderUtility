@@ -48,6 +48,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// never again, because a path leaves the set the moment its content has been preserved.
   /// </summary>
   private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _pinned = new(PoolPaths.PathComparer);
+
+  /// <summary>
+  /// Taking a snapshot excludes preserving a version, and nothing else. A preserve ends by dropping
+  /// the path from <see cref="_pinned"/>, and a snapshot taken while it ran pinned that path anew: the
+  /// drop then undid the new pin, and every later write to the file went unpreserved for a snapshot
+  /// that still pointed at it. Preserves share the lock among themselves.
+  /// </summary>
+  private readonly ReaderWriterLockSlim _snapshotTaking = new(LockRecursionPolicy.SupportsRecursion);
   private readonly IntegrityService _integrity;
   private readonly ReadVerifier _readVerifier;
   private readonly ActivityFeed _activity;
@@ -425,6 +433,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._trash = new([.. members.Select(m => m.Io)], this._journal, this._clock, this.AdmitBulk);
     this._snapshots = new([.. members.Select(m => m.Io)], this._journal, this._clock, this.AdmitBulk);
     this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest, this.AdmitBulk);
+    this._integrity.FileGuard = this._HoldForScrub;
     this._readVerifier = new(this._integrity, this._Invalidate, this._RepairAfterReadCheck);
     this._activity = new(clock: this._clock);
     this._placement = new(
@@ -741,6 +750,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         if (swapped || this._staging.ContainsKey(normalized) || this._handles.IsOpen(normalized) || !this._BinFor(normalized).Keeps)
           throw new PoolFsException(PoolFsError.Exists,
             $"'{normalized}' is in use, or exists again and the recycle bin is off here — rename or delete that file first, then restore");
+
+        // Being on is not the same as taking THIS file: one over trash.maxFileSize, or on a disk short of
+        // trash.minFreeSpace, is deleted for good by the unlink below. The swap would then have
+        // destroyed the live file to bring back an older one.
+        if (this._BinRefuses(normalized, this._placement.ResolveCopies(normalized), replaced: false) is { } why)
+          throw new PoolFsException(PoolFsError.Exists,
+            $"'{normalized}' exists again and the recycle bin would not keep it ({why}) — rename or delete that file first, then restore");
       }
 
       this.Unlink(normalized); // into the bin: the restore is a swap
@@ -924,6 +940,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (handle.Value < 0)
       throw new PoolFsException(PoolFsError.AccessDenied,
         "This handle is onto a snapshot's copy of a file, which is a record of what the pool held and cannot be changed.");
+  }
+
+  /// <summary>
+  /// Names the pool keeps for itself on its members — staging temps, the shadow-copy folders, the
+  /// utility folder, pool info files — cannot be created through the mount.
+  ///
+  /// They are hidden from listings, but nothing stopped an application from creating one, and the
+  /// pool treats them as its own: a file called <c>notes.TEMP.$DRIVEBENDER</c> could be written, read
+  /// back and fsynced, and the next mount's recovery then deleted it as an abandoned write.
+  /// </summary>
+  private static void _RefuseReservedName(string normalized) {
+    foreach (var segment in normalized.Split('/'))
+      if (segment.Length > 0 && PoolPaths.IsHiddenName(segment))
+        throw new PoolFsException(PoolFsError.InvalidArgument,
+          $"'{normalized}' uses a name the pool reserves for its own files ('{segment}') and cannot be created");
   }
 
   private static void _RefuseWriteToSnapshotTree(string normalized) {
@@ -1266,6 +1297,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
+    _RefuseReservedName(normalized);
     if (kind == NodeKind.Directory) {
       this.MakeDir(normalized);
       return NodeHandle.Invalid;
@@ -1843,6 +1875,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     var toNormalized = PoolPaths.Normalize(to);
     _RefuseWriteToSnapshotTree(fromNormalized);
     _RefuseWriteToSnapshotTree(toNormalized);
+    _RefuseReservedName(toNormalized);
 
     // renaming a path to itself (identical, or only a case change on a case-insensitive backend)
     // must NEVER go through the overwrite path — "the target" resolves to the source's own copies,
@@ -2327,11 +2360,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._PublishClosedStaged();
     var paths = this._AllLogicalFiles().ToArray();
-    var taken = this._snapshots.Take(name, paths);
-    foreach (var path in paths)
-      this._pinned[path] = 0;
+    this._snapshotTaking.EnterWriteLock();
+    try {
+      var taken = this._snapshots.Take(name, paths);
+      foreach (var path in paths)
+        this._pinned[path] = 0;
 
-    return taken;
+      return taken;
+    } finally {
+      this._snapshotTaking.ExitWriteLock();
+    }
   }
 
   /// <summary>
@@ -2634,7 +2672,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   private void _RebuildPinned() {
-    this._pinned.Clear();
+    // Added to, never cleared first. Emptying the set and then walking every snapshot index and the
+    // whole version store left every path unprotected for the length of that walk, and a write in
+    // that window destroyed what a surviving snapshot still needed. A path that no longer needs
+    // protecting costs one lookup at its next write, which drops it (see _PreserveIfPinned).
     foreach (var path in this._snapshots.PinnedPaths())
       this._pinned[path] = 0;
   }
@@ -2656,6 +2697,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (!this._pinned.ContainsKey(normalized))
       return;
 
+    this._snapshotTaking.EnterReadLock();
+    try {
+      this._PreserveIfPinnedHeld(normalized, wholeFileReplaced);
+    } finally {
+      this._snapshotTaking.ExitReadLock();
+    }
+  }
+
+  private void _PreserveIfPinnedHeld(string normalized, bool wholeFileReplaced) {
     var pins = this._snapshots.SnapshotsNeeding(normalized);
     if (pins.Count == 0) {
       this._pinned.TryRemove(normalized, out _);
@@ -2764,8 +2814,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
 
     // a snapshot that named this path keeps the content: the live file is renamed into the store
-    // before the delete takes the rest (docs/Snapshots.md)
-    this._PreserveIfPinned(normalized, wholeFileReplaced: true);
+    // before the delete takes the rest (docs/Snapshots.md). With the bin on and a single copy, that
+    // rename would take the only copy and leave the bin nothing, so the file then lives only as long
+    // as the snapshot — and a pruned snapshot took a deleted file the bin promised to keep for days.
+    // The snapshot gets its own copy instead, and the file itself goes on to the bin.
+    this._PreserveIfPinned(normalized, wholeFileReplaced: !(binned && copies.Count == 1));
     copies = this._placement.ResolveCopies(normalized);
     if (copies.Count == 0) {
       // the only copy was the one just preserved — the delete has nothing left to do
@@ -2912,6 +2965,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
+    _RefuseReservedName(normalized);
     if (normalized.Length == 0)
       throw new PoolFsException(PoolFsError.Exists, "The pool root always exists");
 
@@ -2999,6 +3053,47 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     foreach (var issue in this._integrity.ScrubFile(normalized, this._Invalidate))
       this._activity.Publish(ActivityKind.Scrub, issue.Path, reason: $"{issue.Kind}: {issue.Message}");
+  }
+
+  /// <summary>
+  /// What a repairing scrub holds while it works on one file: the namespace gate and the file's
+  /// write lease, as the read-check repair above and the healer take them. Null — skip the file this
+  /// pass — while an application has it open for writing, it is still a staged temp, or a copy is
+  /// still owed bytes: its copies differ for a reason the scrub cannot see, and "repairing" them
+  /// would put one copy's state over the other's.
+  /// </summary>
+  private IDisposable? _HoldForScrub(string normalized) {
+    var gate = this._EnterNamespaceShared();
+    IDisposable? lease = null;
+    try {
+      lease = this._handles.AcquireWrite(normalized);
+      if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpenForWrite(normalized)) {
+        lease.Dispose();
+        gate.Dispose();
+        return null;
+      }
+
+      // whatever the pass rewrote is dropped from the caches before the file is let go, whichever
+      // caller ran the scrub — the health service's pass hands no invalidation callback of its own
+      var held = new _ScrubHold(lease, gate, () => this._Invalidate(normalized));
+      lease = null;
+      return held;
+    } catch {
+      lease?.Dispose();
+      gate.Dispose();
+      throw;
+    }
+  }
+
+  private sealed class _ScrubHold(IDisposable lease, IDisposable gate, Action invalidate) : IDisposable {
+    public void Dispose() {
+      try {
+        invalidate();
+      } finally {
+        lease.Dispose();
+        gate.Dispose();
+      }
+    }
   }
 
   /// <summary>How many copies read checks have hashed so far — their whole added cost.</summary>
@@ -4214,11 +4309,25 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // Copy engines size a file before filling it, so every copied file passes through here once
       // while still a staging temp — where an intent recovers nothing (the temp is swept after a
       // crash) and the publish's flush commits the size along with the content.
-      var sequence = _IsStagedName(dataPath) ? 0 : this._journal.LogIntent(JournalOp.Truncate, dataPath, length: length);
+      var staged = _IsStagedName(dataPath);
+      var sequence = staged ? 0 : this._journal.LogIntent(JournalOp.Truncate, dataPath, length: length);
       foreach (var copy in copies) {
         WholeFilePublisher.SeparateIfLinked(copy.Volume, dataPath, copy.Shadow, keepBytes: length); // copy-on-write, of what survives the cut
         copy.Volume.Truncate(dataPath, copy.Shadow, length); // grows zero-filled or shrinks on all copies (FR-TRUNC)
       }
+
+      // The new length reaches the disk before the intent is completed. A truncate owes the write
+      // buffer nothing, so a later fsync found nothing to flush and returned at once: an application
+      // that truncated, fsynced and lost power got the old length back on some copies and the new
+      // one on others, with no open intent left to reconcile them. A staging temp needs none of this;
+      // its publish makes every copy durable before the name appears.
+      if (!staged)
+        _ForEachCopy(copies, i => {
+          var copy = copies[i];
+          if ((copy.Volume.Caps & BackendCaps.DurableFlush) != 0)
+            using (var stream = copy.Volume.OpenWrite(dataPath, copy.Shadow, false))
+              stream.Flush();
+        });
 
       this._journal.Complete(sequence, JournalOp.Truncate);
       this._InvalidateChecksums(dataPath);
@@ -5076,14 +5185,23 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // publish replaces a visible file copy by copy, and a crash between two of those renames would
     // leave copies that disagree. That is exactly what the intent is for, so it is logged, durably,
     // before the first rename: the same guarantee every staged create used to pay for up front.
-    if (createSequence == 0 && this._placement.ResolveCopies(normalized).Count > 0)
-      createSequence = this._journal.LogIntent(JournalOp.Create, stagedName);
-
-    // the version this publish replaces (an overwrite's original, or a file another client published
-    // at the name meanwhile) goes to the recycle bin first, where the bin is on
-    this._KeepReplacedInBin(normalized, this._placement.ResolveCopies(normalized));
-
+    //
+    // Both of these sit inside the try, with the renames: the entry taken off the staging list above
+    // is the only record that a temp waits to be published, and a journal append or a bin copy that
+    // throws used to take it along. The application was told its save had failed, or on Windows was
+    // told nothing at all, and the next mount swept the temp as an abandoned write.
     try {
+      // Under the FINAL name: that is where a crash between two renames leaves copies that disagree
+      // (some renamed, some still the old file), and what recovery has to reconcile. Logged under the
+      // temp name, recovery looked at the temps it was about to sweep anyway and left the real copies
+      // divergent for good wherever no checksum database was there to notice.
+      if (createSequence == 0 && this._placement.ResolveCopies(normalized).Count > 0)
+        createSequence = this._journal.LogIntent(JournalOp.Create, normalized);
+
+      // the version this publish replaces (an overwrite's original, or a file another client
+      // published at the name meanwhile) goes to the recycle bin first, where the bin is on
+      this._KeepReplacedInBin(normalized, this._placement.ResolveCopies(normalized));
+
       var copies = striped ?? this._placement.ResolveCopies(stagedName);
 
       // Content first, name second: writes into the temp skipped their barriers, so each copy is
