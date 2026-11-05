@@ -7,15 +7,23 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <canvas id="fx" aria-hidden="true"></canvas>
   <header>
-    <h1>🗂️ Drive Bender Pool Manager</h1>
-    <button id="new-pool" class="primary">＋ New pool</button>
+    <svg class="mark" width="34" height="34" viewBox="0 0 34 34" aria-hidden="true">
+      <circle cx="17" cy="17" r="15.5" class="mark-disc"/>
+      <circle cx="17" cy="17" r="11" class="mark-trk"/>
+      <circle cx="17" cy="17" r="7" class="mark-trk"/>
+      <circle cx="17" cy="17" r="3" class="mark-hub"/>
+      <path d="M30 6 L19.5 15.5" class="mark-arm"/>
+    </svg>
+    <h1>Drive Bender <span>Pool Manager</span></h1>
+    <button id="new-pool" class="primary">New pool</button>
     <div class="live"><span id="live-dot" class="dot"></span><span id="live-text">connecting…</span></div>
   </header>
   <main>
     <div id="prereq" class="prereq" hidden></div>
     <div id="pools" class="grid"></div>
-    <div id="empty" class="empty" hidden>No pools yet — click <b>New pool</b> to create one.</div>
+    <div id="empty" class="empty" hidden>No pools yet. Create one with <b>New pool</b>.</div>
   </main>
   <div id="modal-root"></div>
   <script src="app.js"></script>

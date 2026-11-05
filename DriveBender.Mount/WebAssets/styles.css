@@ -1,58 +1,114 @@
+/* Drive Bender Pool Manager — "a drive bay at night".
+   The look comes from the hardware the tool manages: sled-steel panels on a dark bay, labels set in
+   a DIN face like the ones stamped on drive caddies, health shown as the LED colours a bay already
+   uses, and the two kinds of traffic told apart by colour — platter cyan for reads, write magenta
+   for writes. Motion is reserved for data that is really moving. */
 :root {
   color-scheme: dark;
-  --bg: #0e1116;
-  --panel: #171c24;
-  --panel-2: #1e242e;
-  --line: #2a323d;
-  --text: #e6edf3;
-  /* --muted drives most secondary text; both theme values clear WCAG AA (>=7:1)
-     against their surfaces so it never degrades into low-contrast gray. */
-  --muted: #9fb0c3;
-  --accent: #4aa3ff;
-  --ok: #3fb950;
-  --warn: #d29922;      /* bright gold: for fills, dots, borders */
-  --warn-text: #d29922; /* readable gold FOR TEXT — darkened in light mode below */
-  --bad: #f85149;
-  --flow: #4aa3ff;
-  --radius: 12px;
-  --shadow: 0 6px 24px rgba(0,0,0,.35);
+  --bg: #0d1419;
+  --bg-2: #101b22;
+  --panel: #141f27;
+  --panel-2: #1b2a35;
+  --line: #29404f;
+  --text: #e7eef2;
+  /* --muted drives most secondary text; both theme values clear WCAG AA against their surfaces */
+  --muted: #9cb0bf;
+  --accent: #52cfff;
+  --accent-ink: #04202c;
+  --write: #ff7ab6;
+  --ok: #3ddc84;
+  --warn: #f2b33d;      /* bright gold: for fills, dots, borders */
+  --warn-text: #f2b33d; /* readable gold FOR TEXT — darkened in light mode below */
+  --bad: #ff5a5f;
+  --flow: #52cfff;
+  --mote: #7fa3b8;
+  --mote-strength: 1;
+  --slot: #15222b;      /* the recessed surface a disk or a meter sits in */
+  --radius: 14px;
+  --radius-sm: 8px;
+  --shadow: 0 1px 0 rgba(255,255,255,.04) inset, 0 18px 40px -18px rgba(0,0,0,.7);
+  --glow: 0 0 0 1px rgba(82,207,255,.35), 0 0 24px -4px rgba(82,207,255,.45);
+  --display: "Bahnschrift", "DIN Alternate", "D-DIN", "Barlow Semi Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --body: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Noto Sans", sans-serif;
+  --mono: "Cascadia Mono", "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
 }
 @media (prefers-color-scheme: light) {
   :root {
     color-scheme: light;
-    --bg:#f4f6fa; --panel:#fff; --panel-2:#eef1f6; --line:#dde3ec; --text:#1b2430;
-    --muted:#475162; --warn-text:#8a6100; --shadow:0 6px 20px rgba(20,30,50,.10);
+    --bg: #eef3f6; --bg-2: #e3ebf0; --panel: #ffffff; --panel-2: #e9f0f4; --line: #cddae3; --text: #132029;
+    --muted: #45586a; --accent: #0a84c6; --accent-ink: #ffffff; --write: #c2367a; --flow: #0a84c6;
+    --warn-text: #8a6100; --mote: #8fb3c9; --mote-strength: .55; --slot: #dfe8ee;
+    --shadow: 0 1px 0 rgba(255,255,255,.9) inset, 0 14px 32px -16px rgba(20,40,60,.28);
+    --glow: 0 0 0 1px rgba(10,132,198,.35), 0 0 22px -6px rgba(10,132,198,.4);
   }
 }
 * { box-sizing: border-box; }
 /* the [hidden] attribute must win over any element's own display (e.g. .prereq/.empty
    set display:flex, which would otherwise keep them visible while empty) */
 [hidden] { display: none !important; }
+html { background: var(--bg); }
 body {
-  margin: 0; background: var(--bg); color: var(--text);
-  font: 14px/1.5 -apple-system, "Segoe UI", Roboto, Inter, sans-serif;
+  margin: 0; color: var(--text); min-height: 100vh;
+  font: 14px/1.5 var(--body);
+  font-variant-numeric: tabular-nums;
+  background:
+    radial-gradient(1200px 600px at 85% -10%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, color-mix(in srgb, var(--write) 6%, transparent), transparent 60%),
+    linear-gradient(180deg, var(--bg-2), var(--bg) 40%);
+  background-attachment: fixed;
 }
+#fx { position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 0; pointer-events: none; }
+header, main { position: relative; z-index: 1; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 header {
   display: flex; align-items: center; gap: 16px;
-  padding: 14px 22px; border-bottom: 1px solid var(--line);
-  background: linear-gradient(180deg, var(--panel), var(--bg));
+  padding: 14px 24px; border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
+  backdrop-filter: blur(14px) saturate(1.3);
   position: sticky; top: 0; z-index: 10;
 }
-header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+header .mark { flex: 0 0 auto; }
+.mark-disc { fill: var(--panel-2); stroke: var(--line); }
+.mark-trk { fill: none; stroke: color-mix(in srgb, var(--accent) 45%, transparent); stroke-width: 1; }
+.mark-hub { fill: var(--accent); }
+.mark-arm { stroke: var(--text); stroke-width: 2.4; stroke-linecap: round; }
+header h1 {
+  font: 600 21px/1 var(--display); margin: 0; letter-spacing: .01em; font-stretch: condensed;
+}
+header h1 span { color: var(--muted); font-weight: 400; }
 header .live { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); }
-.dot.on { background: var(--ok); box-shadow: 0 0 0 0 rgba(63,185,80,.6); animation: pulse 2s infinite; }
-@keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(63,185,80,.5)} 70%{box-shadow:0 0 0 8px rgba(63,185,80,0)} 100%{box-shadow:0 0 0 0 rgba(63,185,80,0)} }
+.dot.on { background: var(--ok); box-shadow: 0 0 10px var(--ok); animation: pulse 2.4s infinite; }
+@keyframes pulse { 0%{box-shadow:0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent)} 70%{box-shadow:0 0 0 9px transparent} 100%{box-shadow:0 0 0 0 transparent} }
 
-main { padding: 22px; max-width: 1200px; margin: 0 auto; }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 18px; }
+main { padding: 26px 24px 48px; max-width: 1280px; margin: 0 auto; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); gap: 22px; }
+.grid > .card { min-width: 0; }   /* a long path or the flow map must not widen its column past the screen */
+.member > span, .warnings, .sub { overflow-wrap: anywhere; }
+@media (max-width: 440px) { .grid { grid-template-columns: minmax(0, 1fr); } main { padding: 18px 16px 40px; } header { padding: 12px 16px; } header h1 span { display: none; } }
 
+/* a pool is a drive sled: brushed panel, an LED strip along its top edge in the pool's health
+   colour, and a rim of light that wakes only while the pool is mounted */
 .card {
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 16px; box-shadow: var(--shadow); transition: transform .15s ease, border-color .2s ease;
+  position: relative; isolation: isolate;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--panel) 92%, var(--accent) 8%), var(--panel) 120px);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 20px 18px 18px; box-shadow: var(--shadow);
+  transition: border-color .25s ease, box-shadow .35s ease;
+  animation: sled-in .7s cubic-bezier(.2,.7,.2,1) both; animation-delay: var(--enter, 0ms);
 }
-.card:hover { transform: translateY(-2px); border-color: var(--accent); }
-.card h2 { font-size: 15px; margin: 0 0 2px; display: flex; align-items: center; gap: 8px; }
+@keyframes sled-in { from { opacity: 0; transform: translateY(14px) scale(.985); filter: blur(4px); } to { opacity: 1; transform: none; filter: none; } }
+.card::before {
+  content: ""; position: absolute; left: 18px; right: 18px; top: -1px; height: 3px; border-radius: 0 0 3px 3px;
+  background: var(--ok); box-shadow: 0 0 14px var(--ok); opacity: .9;
+}
+.card.degraded::before { background: var(--warn); box-shadow: 0 0 16px var(--warn); animation: led-breathe 2.6s ease-in-out infinite; }
+@keyframes led-breathe { 50% { opacity: .35; box-shadow: 0 0 4px var(--warn); } }
+.card.spun-up { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.card:hover { border-color: color-mix(in srgb, var(--accent) 65%, var(--line)); box-shadow: var(--shadow), var(--glow); }
+.card h2 { font: 600 20px/1.15 var(--display); margin: 0 0 4px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; letter-spacing: .01em; }
 .card .sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
 
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
@@ -143,7 +199,6 @@ button {
   padding: 6px 12px; cursor: pointer; font: inherit; transition: background .15s, border-color .15s;
 }
 button:hover { border-color: var(--accent); background: var(--panel); }
-button.primary { background: var(--accent); color: #06121f; border-color: var(--accent); font-weight: 600; }
 
 .warnings { margin-top: 10px; font-size: 12px; color: var(--warn-text); }
 .warnings div { margin-top: 4px; }
@@ -241,3 +296,94 @@ table.browse tr.dir:hover td { background: var(--panel-2); color: var(--accent);
 /* job progress — shown only once the operation knows its denominator */
 .progress-bar { height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; margin: 8px 0 2px; }
 .progress-fill { height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .35s ease; }
+
+/* ---- identity layer ------------------------------------------------------------------------ */
+
+/* the platter: a disc with tracks and a sheen that turns with the pool's traffic (app.js, fx);
+   the used-space arc rides its rim */
+.platter .disc { fill: var(--slot); stroke: var(--line); stroke-width: 1; }
+.platter .trk { fill: none; stroke: color-mix(in srgb, var(--accent) 16%, transparent); stroke-width: .8; }
+.platter .sheen { fill: color-mix(in srgb, var(--accent) 22%, transparent); }
+.platter .sheen.dim { fill: color-mix(in srgb, var(--write) 12%, transparent); }
+.platter .hub { fill: var(--panel); stroke: var(--line); }
+.platter .track { stroke: color-mix(in srgb, var(--line) 80%, transparent); }
+.platter .fill { filter: drop-shadow(0 0 4px currentColor); color: var(--accent); }
+.platter text { font: 600 14px var(--display); fill: var(--text); }
+.cap-legend { font-size: 13px; }
+.cap-legend b { font: 600 17px/1.3 var(--display); }
+
+/* badges read like the small printed labels on a caddy */
+.badge { font: 600 11px/1.6 var(--body); padding: 1px 9px; border: 1px solid currentColor; background: transparent !important; letter-spacing: .01em;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* meters: lit bars, the lit end glowing */
+.bar { height: 6px; background: var(--slot); }
+.bar > span { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 55%, transparent), var(--accent)); box-shadow: 0 0 10px -1px var(--accent); }
+.bar.write > span { background: linear-gradient(90deg, color-mix(in srgb, var(--write) 55%, transparent), var(--write)); box-shadow: 0 0 10px -1px var(--write); }
+.bar.hit > span { background: linear-gradient(90deg, color-mix(in srgb, var(--ok) 55%, transparent), var(--ok)); box-shadow: 0 0 10px -1px var(--ok); }
+.spark path.area { fill: color-mix(in srgb, var(--accent) 14%, transparent); }
+.spark path.line { stroke: var(--accent); filter: drop-shadow(0 0 3px var(--accent)); }
+
+/* members: each disk is a slot in the bay */
+.member { background: color-mix(in srgb, var(--panel-2) 70%, transparent); border: 1px solid color-mix(in srgb, var(--line) 60%, transparent); border-radius: var(--radius-sm); }
+.member .status { box-shadow: 0 0 8px currentColor; }
+.member .status.st-healthy { color: var(--ok); }
+
+/* the flow map: nodes as bay slots, packets as lit data with a tail */
+.flowmap .fnode rect { fill: var(--slot); }
+.flowmap .fnode.hub rect { stroke: var(--accent); filter: drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 50%, transparent)); }
+.flowmap .fnode text { font-family: var(--display); font-size: 10.5px; }
+.flowmap .guide { stroke: color-mix(in srgb, var(--accent) 25%, var(--line)); stroke-dasharray: 2 4; opacity: .7; }
+.pkt circle { filter: drop-shadow(0 0 4px currentColor) drop-shadow(0 0 9px currentColor); }
+.pkt.write { fill: var(--write); color: var(--write); }
+.topo .flow.drain, .pkt.drain { color: #ff9f43; fill: #ff9f43; }
+
+/* buttons: quiet steel keys; the one primary action is lit */
+button {
+  position: relative; overflow: hidden; isolation: isolate;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--panel-2) 85%, #fff 4%), var(--panel-2));
+  border-radius: var(--radius-sm); padding: 7px 14px;
+  transition: border-color .15s, box-shadow .2s, transform .08s, background .15s;
+}
+button:hover { border-color: color-mix(in srgb, var(--accent) 70%, var(--line)); box-shadow: 0 0 14px -6px var(--accent); background: var(--panel-2); }
+button:active { transform: translateY(1px); }
+button.primary {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 85%, #fff 15%), var(--accent));
+  color: var(--accent-ink); border-color: transparent; font-weight: 650;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent), 0 6px 22px -8px var(--accent);
+}
+button.primary:hover { box-shadow: 0 0 0 1px var(--accent), 0 8px 28px -6px var(--accent); background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 75%, #fff 25%), var(--accent)); }
+button.danger { background: transparent; border-color: color-mix(in srgb, var(--bad) 70%, transparent); color: var(--bad); }
+button.danger:hover { background: color-mix(in srgb, var(--bad) 12%, transparent); box-shadow: 0 0 14px -6px var(--bad); border-color: var(--bad); }
+/* the ripple a press leaves where it landed (app.js) */
+button .ink {
+  position: absolute; border-radius: 50%; pointer-events: none; z-index: -1;
+  background: radial-gradient(circle, color-mix(in srgb, currentColor 35%, transparent) 0, transparent 60%);
+  transform: scale(0); animation: ink .55s ease-out forwards;
+}
+@keyframes ink { to { transform: scale(1); opacity: 0; } }
+
+select, input, textarea { accent-color: var(--accent); }
+.member .role-select { border-radius: 6px; }
+
+/* dialogs rise out of a dimmed, blurred bay */
+.overlay { background: color-mix(in srgb, var(--bg) 55%, transparent); backdrop-filter: blur(6px); animation: veil .2s ease both; }
+@keyframes veil { from { opacity: 0; backdrop-filter: blur(0); } }
+.modal {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+  box-shadow: var(--shadow), 0 30px 80px -30px rgba(0,0,0,.8), var(--glow);
+  animation: rise .28s cubic-bezier(.2,.8,.2,1) both;
+}
+@keyframes rise { from { opacity: 0; transform: translateY(10px) scale(.97); } }
+.modal h2 { font: 600 21px/1.2 var(--display); }
+.modal input:focus, .modal select:focus, .modal textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+.progress-fill { background: linear-gradient(90deg, var(--accent), var(--write)); box-shadow: 0 0 10px var(--accent); }
+
+.empty { font: 400 18px/1.5 var(--display); padding: 80px 20px; }
+.activity { font-family: var(--mono); }
+
+/* everyone who asked for stillness gets it: no entrances, breathing, ripples or travelling dashes */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+  .pkt { display: none; }
+}
