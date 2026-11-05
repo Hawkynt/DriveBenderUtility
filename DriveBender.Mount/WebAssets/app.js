@@ -32,16 +32,26 @@ function ago(stamp) {
   return "· " + Math.floor(s / 3600) + "h ago";
 }
 
-function donut(free, total) {
+// The capacity ring is drawn as a disk platter: concentric tracks, a used-space arc on the rim, and
+// a sheen that turns with the pool's live throughput (see fx below). The spinning part carries the
+// pool id, so the rotation survives the 1 Hz re-render of the card's top zone.
+function donut(free, total, poolId) {
   const used = total > 0 ? (total - free) / total : 0;
-  const r = 34, c = 2 * Math.PI * r, off = c * (1 - used);
+  const r = 37, c = 2 * Math.PI * r, off = c * (1 - used);
   const pct = Math.round(used * 100);
-  return `<svg class="donut" width="84" height="84" viewBox="0 0 84 84">
-    <circle class="track" cx="42" cy="42" r="${r}" fill="none" stroke-width="9"/>
-    <circle class="fill" cx="42" cy="42" r="${r}" fill="none" stroke-width="9"
+  const tone = pct > 90 ? "var(--bad)" : pct > 75 ? "var(--warn)" : "var(--accent)";
+  const tracks = [31, 27, 23].map(t => `<circle class="trk" cx="46" cy="46" r="${t}"/>`).join("");
+  return `<svg class="donut platter" width="92" height="92" viewBox="0 0 92 92" role="img" aria-label="${pct}% used">
+    <circle class="disc" cx="46" cy="46" r="34"/>
+    <g class="spin" data-spin="${esc(poolId || "")}">${tracks}
+      <path class="sheen" d="M46 46 L46 12 A34 34 0 0 1 75.4 29 Z"/>
+      <path class="sheen dim" d="M46 46 L46 80 A34 34 0 0 1 16.6 63 Z"/></g>
+    <circle class="hub" cx="46" cy="46" r="17"/>
+    <circle class="track" cx="46" cy="46" r="${r}" fill="none" stroke-width="5"/>
+    <circle class="fill" cx="46" cy="46" r="${r}" fill="none" stroke-width="5"
       stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}"
-      transform="rotate(-90 42 42)" style="stroke:${pct>90?'var(--bad)':pct>75?'var(--warn)':'var(--accent)'}"/>
-    <text x="42" y="47" text-anchor="middle" font-size="16">${pct}%</text>
+      transform="rotate(-90 46 46)" style="stroke:${tone}"/>
+    <text x="46" y="50.5" text-anchor="middle">${pct}%</text>
   </svg>`;
 }
 
@@ -504,9 +514,12 @@ function memberRow(pool, m) {
   return row;
 }
 
+let cardsShown = 0;
+
 function card(pool) {
   const c = el("div", "card");
   c.dataset.id = pool.id;
+  c.style.setProperty("--enter", `${Math.min(cardsShown++, 8) * 90}ms`); // one staggered entrance on first paint
   patchCard(c, pool);
   return c;
 }
@@ -525,8 +538,10 @@ function patchCard(c, pool) {
     c.append(top, fm, bottom);
   }
 
+  c.classList.toggle("degraded", !!pool.degraded);
+  c.classList.toggle("spun-up", !!pool.mounted);
   const health = pool.degraded ? '<span class="badge warn">degraded</span>' : '<span class="badge ok">healthy</span>';
-  const mountBadge = pool.mounted ? `<span class="badge info">mounted ${pool.mounted}</span>` : "";
+  const mountBadge = pool.mounted ? `<span class="badge info" title="mounted at ${esc(pool.mounted)}">mounted ${esc(pool.mounted)}</span>` : "";
   // a mounted pool always shows its live-stats section (zeros until the first snapshot lands);
   // an unmounted pool shows a hint where the stats will appear
   const m = pool.metrics || (pool.mounted ? {} : null);
@@ -536,7 +551,7 @@ function patchCard(c, pool) {
     <h2>${esc(pool.name)} ${health} ${mountBadge}</h2>
     <div class="sub">${esc(pool.source)} · ${pool.failureDomains} failure domain(s) · <span title="primary placement strategy — change it via the Duplication dialog">⚖ ${esc(pool.placementStrategy || "most-free-space")}</span></div>
     <div class="capacity-row">
-      ${donut(pool.bytesFree, pool.bytesTotal)}
+      ${donut(pool.bytesFree, pool.bytesTotal, pool.id)}
       <div class="cap-legend">
         <div><b>${fmtBytes(pool.bytesFree)}</b> free</div>
         <div>of <b>${fmtBytes(pool.bytesTotal)}</b></div>
@@ -1368,6 +1383,7 @@ function render(data) {
     if (existing) patchCard(existing, pool); else container.appendChild(card(pool));
   }
   container.querySelectorAll(".card").forEach(c => { if (!seen.has(c.dataset.id)) { flowState.delete(c.dataset.id); c.remove(); } });
+  fx.sample(pools);
 }
 
 // ---- modals: a stack so a folder picker / credential dialog can open on top of the -----------
@@ -1581,3 +1597,159 @@ function connect() {
 // initial paint, then live stream
 fetch("/api/pools", auth).then(r => r.json()).then(render).catch(() => {});
 connect();
+
+// ---- ambient effects ------------------------------------------------------------------------
+// Everything here is driven by the pools' real traffic. The background motes are magnetic domains
+// drifting across the bay: a handful while the pools idle, a dense stream under load, cyan for reads
+// and magenta for writes in the proportion actually measured. Each platter turns with its own pool's
+// throughput and stands still while the pool is not mounted. Nothing moves for anyone who asked the
+// system for reduced motion, and nothing runs while the page is in the background.
+const fx = (() => {
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)");
+  const pools = new Map();   // id -> { r, w, bps, readShare, mounted, angle }
+  let level = 0;             // 0..1, smoothed across every pool
+  let readShare = 0.5;
+
+  const intensity = bps => Math.max(0, Math.min(1, Math.log10(1 + bps / 50_000) / 3.3)); // ~100 MB/s is full
+
+  function sample(list) {
+    const seen = new Set();
+    let total = 0, reads = 0;
+    for (const pool of list) {
+      seen.add(pool.id);
+      const st = pools.get(pool.id) || { r: null, w: null, bps: 0, readShare: 0.5, angle: Math.random() * 360 };
+      const m = pool.metrics || {};
+      const r = m.readBytes || 0, w = m.writtenBytes || 0;
+      const dr = st.r == null ? 0 : Math.max(0, r - st.r), dw = st.w == null ? 0 : Math.max(0, w - st.w);
+      st.r = r; st.w = w;
+      st.bps = st.bps * 0.4 + (dr + dw) * 0.6;   // the stream ticks once a second
+      if (dr + dw > 0) st.readShare = dr / (dr + dw);
+      st.mounted = !!pool.mounted;
+      pools.set(pool.id, st);
+      total += st.bps; reads += st.bps * st.readShare;
+    }
+    for (const id of [...pools.keys()]) if (!seen.has(id)) pools.delete(id);
+    level = intensity(total);
+    readShare = total > 0 ? reads / total : 0.5;
+  }
+
+  // -- the mote field --------------------------------------------------------------------------
+  const canvas = document.getElementById("fx");
+  const ctx = canvas ? canvas.getContext("2d") : null;
+  const motes = [];
+  let w = 0, h = 0, dpr = 1, last = 0, running = false;
+
+  const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  let tones = { read: "#52cfff", write: "#ff7ab6", idle: "#7fa3b8" }, strength = 1;
+  const sprites = {};
+  function sprite(color) {
+    if (sprites[color]) return sprites[color];
+    const s = document.createElement("canvas"); s.width = s.height = 32;
+    const g = s.getContext("2d"), grad = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+    grad.addColorStop(0, color); grad.addColorStop(0.25, color + "cc"); grad.addColorStop(1, color + "00");
+    g.fillStyle = grad; g.fillRect(0, 0, 32, 32);
+    return sprites[color] = s;
+  }
+  function readTones() {
+    tones = { read: css("--accent") || tones.read, write: css("--write") || tones.write, idle: css("--mote") || tones.idle };
+    strength = parseFloat(css("--mote-strength")) || 1;
+    for (const k in sprites) delete sprites[k];
+  }
+
+  function spawn(x) {
+    const kind = level < 0.02 ? "idle" : Math.random() < readShare ? "read" : "write";
+    return {
+      x: x ?? Math.random() * w, y: Math.random() * h,
+      v: 8 + Math.random() * 18, phase: Math.random() * Math.PI * 2,
+      size: 0.6 + Math.random() * 1.8, depth: 0.35 + Math.random() * 0.65, kind,
+    };
+  }
+
+  function resize() {
+    if (!canvas) return;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    w = canvas.clientWidth; h = canvas.clientHeight;
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    readTones();
+    if (reduced.matches) drawStill();
+  }
+
+  function draw(dt) {
+    ctx.clearRect(0, 0, w, h);
+    const want = Math.round((w * h) / 26000 * (0.35 + level * 1.9));
+    while (motes.length < want) motes.push(spawn(motes.length < want / 2 ? undefined : -10));
+    if (motes.length > want) motes.length = Math.max(want, motes.length - 3);
+    const speed = 1 + level * 9;
+    ctx.globalCompositeOperation = "lighter";
+    for (const p of motes) {
+      p.x += p.v * speed * p.depth * dt;
+      p.phase += dt * 0.6;
+      p.y += Math.sin(p.phase) * 6 * dt;
+      if (p.x > w + 20) Object.assign(p, spawn(-20));
+      const alpha = (0.18 + 0.5 * level) * p.depth * strength;
+      const r = p.size * (2.4 + level * 2) * p.depth;
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(sprite(tones[p.kind] || tones.idle), p.x - r * 2, p.y - r * 2, r * 4, r * 4);
+      if (level > 0.15) {                                    // under load the motes streak
+        ctx.globalAlpha = alpha * 0.35;
+        ctx.strokeStyle = tones[p.kind] || tones.idle;
+        ctx.lineWidth = r * 0.6;
+        ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.v * speed * p.depth * 0.08, p.y); ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+  }
+
+  function drawStill() {
+    if (!ctx) return;
+    motes.length = 0; level = 0;
+    for (let i = 0; i < (w * h) / 40000; ++i) motes.push(spawn());
+    draw(0);
+  }
+
+  function spin(dt) {
+    for (const [id, st] of pools) {
+      const degPerSec = st.mounted ? 24 + intensity(st.bps) * 900 : 0;
+      st.angle = (st.angle + degPerSec * dt) % 360;
+      for (const g of document.querySelectorAll(`[data-spin="${CSS.escape(id)}"]`))
+        g.setAttribute("transform", `rotate(${st.angle.toFixed(2)} 46 46)`);
+    }
+  }
+
+  function frame(t) {
+    if (!running) return;
+    const dt = Math.min(0.05, last ? (t - last) / 1000 : 0);
+    last = t;
+    if (ctx) draw(dt);
+    spin(dt);
+    requestAnimationFrame(frame);
+  }
+
+  function start() {
+    if (running || reduced.matches || document.hidden) return;
+    running = true; last = 0; requestAnimationFrame(frame);
+  }
+  function stop() { running = false; }
+
+  window.addEventListener("resize", resize);
+  document.addEventListener("visibilitychange", () => (document.hidden ? stop() : start()));
+  reduced.addEventListener("change", () => { if (reduced.matches) { stop(); drawStill(); } else start(); });
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", readTones);
+  resize();
+  start();
+
+  // -- a press answers where it landed ----------------------------------------------------------
+  document.addEventListener("pointerdown", e => {
+    const b = e.target.closest("button");
+    if (!b || b.disabled || reduced.matches) return;
+    const rect = b.getBoundingClientRect(), d = Math.max(rect.width, rect.height) * 2;
+    const ink = document.createElement("span");
+    ink.className = "ink";
+    ink.style.cssText = `width:${d}px;height:${d}px;left:${e.clientX - rect.left - d / 2}px;top:${e.clientY - rect.top - d / 2}px`;
+    b.appendChild(ink);
+    ink.addEventListener("animationend", () => ink.remove());
+  });
+
+  return { sample };
+})();
