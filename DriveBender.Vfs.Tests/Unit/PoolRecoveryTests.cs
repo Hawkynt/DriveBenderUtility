@@ -134,7 +134,7 @@ public class PoolRecoveryTests {
   [Category("HappyPath")]
   public void EndToEnd_GivenPowerLossAfterAckedWrite_WhenRemounted_ThenAckedDataPresentAndConsistent() {
     var cache = new Caching.CacheInstance("r" + Guid.NewGuid().ToString("N"), new() { Size = "65536", BlockSize = "16", MetadataEntries = 100, MetadataTtl = "1m" });
-    var config = ConfigResolver.ResolveEffective(null, """{ "duplication": 2 }""");
+    var config = TestConfig.Resolve("""{ "duplication": 2 }""");
     var fs = new PoolFileSystem(Guid.NewGuid(), [new(this._volume1), new(this._volume2)], cache, config, this._journal);
     fs.Mount(new(@"X:\"));
     var handle = fs.Create("acked.bin", NodeKind.File, CreateFlags.None);

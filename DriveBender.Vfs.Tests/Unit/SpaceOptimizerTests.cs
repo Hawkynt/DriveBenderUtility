@@ -267,7 +267,7 @@ public class SpaceOptimizerTests {
 
       disk.SimulateCrash();
       var cache = new CacheInstance("so" + Guid.NewGuid().ToString("N"), new() { Size = "1048576", BlockSize = "512", MetadataEntries = 100, MetadataTtl = "1m" });
-      using (var recovered = new PoolFileSystem(Guid.NewGuid(), [new(disk)], cache, ConfigResolver.ResolveEffective(null, null)))
+      using (var recovered = new PoolFileSystem(Guid.NewGuid(), [new(disk)], cache, TestConfig.Resolve(null)))
         recovered.Mount(new(@"X:\")); // recovery sweeps temps
 
       disk.GetContent("a.bin", false).Should().Equal(_CONTENT, $"power cut at step {step}");

@@ -31,7 +31,7 @@ public class CapabilityAdaptationTests {
 
   private PoolFileSystem _CreateFs(string configJson) {
     var cache = new CacheInstance("cap" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    var fs = new PoolFileSystem(_pool, [new(this._local), new(this._remote)], cache, ConfigResolver.ResolveEffective(null, configJson));
+    var fs = new PoolFileSystem(_pool, [new(this._local), new(this._remote)], cache, TestConfig.Resolve(configJson));
     fs.Mount(new(@"X:\"));
     return fs;
   }
@@ -103,7 +103,7 @@ public class CapabilityAdaptationTests {
     // landing SSD + rename-less remote capacity: the drain must fall back to put-and-verify
     var ssd = new FakeVolumeIO(Guid.NewGuid(), "ssd", "PHYS-SSD", capacity: 1L << 20);
     var cache = new CacheInstance("cap2" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    var config = ConfigResolver.ResolveEffective(null, """{ "duplication": 1 }""");
+    var config = TestConfig.Resolve("""{ "duplication": 1 }""");
     var fs = new PoolFileSystem(_pool, [new(ssd, MemberRole.Landing), new(this._remote)], cache, config);
     fs.Mount(new(@"Y:\"));
 

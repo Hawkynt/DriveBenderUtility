@@ -62,7 +62,7 @@ public class ObservabilityTests {
     var volume2 = new FakeVolumeIO(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 20);
     var cache = new CacheInstance("o" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 100, MetadataTtl = "1m" });
     // pinned to the unstriped path: this tests the RAM owed-copy buffer, which new files only reach with striping off
-    var fs = new PoolFileSystem(Guid.NewGuid(), [new(volume1), new(volume2)], cache, ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "write": { "striping": false } }"""));
+    var fs = new PoolFileSystem(Guid.NewGuid(), [new(volume1), new(volume2)], cache, TestConfig.Resolve("""{ "duplication": 2, "write": { "striping": false } }"""));
     fs.Mount(new(@"X:\"));
 
     var handle = fs.Create("f.bin", NodeKind.File, CreateFlags.None);

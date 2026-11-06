@@ -38,7 +38,7 @@ public class PlacementBalanceTests {
 
   private static PoolFileSystem _Engine(params IVolumeIO[] members) {
     var cache = new CacheInstance("pb" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    var fs = new PoolFileSystem(_pool, [.. members.Select(m => new EngineMember(m))], cache, ConfigResolver.ResolveEffective(null, """{ "duplication": 1 }"""));
+    var fs = new PoolFileSystem(_pool, [.. members.Select(m => new EngineMember(m))], cache, TestConfig.Resolve("""{ "duplication": 1 }"""));
     fs.Mount(new(@"X:\"));
     return fs;
   }

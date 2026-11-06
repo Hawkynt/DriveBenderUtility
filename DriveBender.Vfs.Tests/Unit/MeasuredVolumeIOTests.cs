@@ -59,7 +59,7 @@ public class MeasuredVolumeIOTests {
   [Category("Exception")]
   public void Config_GivenAnOldManifestStillAskingForAnAutomaticLandingZone_ThenItLoadsAndTheKeyIsIgnored() {
     // pools created while the feature existed carry the key; they must keep mounting
-    var config = ConfigResolver.ResolveEffective(null, """{ "placement": { "autoLandingZone": true, "strategy": "round-robin" } }""");
+    var config = TestConfig.Resolve("""{ "placement": { "autoLandingZone": true, "strategy": "round-robin" } }""");
 
     config.Placement.Should().NotBeNull();
     config.Placement!.Strategy.Should().Be(PlacementStrategy.RoundRobin, "the rest of the block still applies");

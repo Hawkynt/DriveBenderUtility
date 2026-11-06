@@ -33,7 +33,7 @@ public class SpaceOptimizerEngineTests {
 
   private PoolFileSystem _Engine() {
     var cache = new CacheInstance("soe" + Guid.NewGuid().ToString("N"), new() { Size = "1048576", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
-    var fs = new PoolFileSystem(Guid.NewGuid(), [new(this._disk)], cache, ConfigResolver.ResolveEffective(null, """{ "duplication": 1 }"""));
+    var fs = new PoolFileSystem(Guid.NewGuid(), [new(this._disk)], cache, TestConfig.Resolve("""{ "duplication": 1 }"""));
     fs.Mount(new(@"X:\"));
     return fs;
   }

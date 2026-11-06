@@ -24,7 +24,7 @@ public class MemberLimitTests {
 
   private static VolumeQueues _Queues(MemberLimits limits, out FakeVolumeIO member) {
     member = new(Guid.NewGuid(), "m", "PHYS-M", capacity: 1L << 30);
-    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    var queues = new VolumeQueues(TestConfig.Resolve(null), new Dictionary<Guid, MemberRole>());
     queues.SetThrottles([(member.MemberId, limits)]);
     return queues;
   }
@@ -145,7 +145,7 @@ public class MemberLimitTests {
     // on either end is a real bound on the copy rather than a suggestion
     var source = new FakeVolumeIO(Guid.NewGuid(), "slow-source", "PHYS-S", capacity: 1L << 30);
     var target = new FakeVolumeIO(Guid.NewGuid(), "fast-target", "PHYS-T", capacity: 1L << 30);
-    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    var queues = new VolumeQueues(TestConfig.Resolve(null), new Dictionary<Guid, MemberRole>());
     queues.SetThrottles([
       (source.MemberId, new MemberLimits { BackgroundThroughput = 1 * _MIB }),
       (target.MemberId, MemberLimits.None),

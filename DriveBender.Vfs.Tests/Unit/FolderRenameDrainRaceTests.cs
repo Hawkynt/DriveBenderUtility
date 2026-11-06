@@ -32,7 +32,7 @@ public class FolderRenameDrainRaceTests {
     FakeVolumeIO[] all = [ssd, hdd1, hdd2];
     var cache = new CacheInstance("dr" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
     using var fs = new PoolFileSystem(_pool, [new(ssd, MemberRole.Landing), new(hdd1), new(hdd2)], cache,
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 1, "write": { "policy": "write-through" }, "readAhead": { "enabled": false } }"""));
+      TestConfig.Resolve("""{ "duplication": 1, "write": { "policy": "write-through" }, "readAhead": { "enabled": false } }"""));
     fs.Mount(new(@"X:\"));
 
     var failures = new List<string>();

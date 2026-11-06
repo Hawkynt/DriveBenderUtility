@@ -69,7 +69,7 @@ public class ScatterIoTests {
         "readAhead": {{readAhead ?? """{ "enabled": false }"""}}{{(io == null ? "" : ", \"io\": " + io)}}
       }
       """;
-    var fs = new PoolFileSystem(_pool, [.. probes.Select(p => new EngineMember(p))], _Cache(), ConfigResolver.ResolveEffective(null, json));
+    var fs = new PoolFileSystem(_pool, [.. probes.Select(p => new EngineMember(p))], _Cache(), TestConfig.Resolve(json));
     fs.Mount(new(@"X:\"));
     foreach (var probe in probes)
       probe.ResetCounters(); // the mount's own scan is not what is being measured
@@ -556,7 +556,7 @@ public class VolumeQueueTests {
   [Category("HappyPath")]
   public void DepthFor_GivenAMemberNamedInTheConfig_ThenThatWinsOverItsRole() {
     var member = _Member("slow-usb", "PHYS-A");
-    var config = ConfigResolver.ResolveEffective(null,
+    var config = TestConfig.Resolve(
       """{ "io": { "queueDepthPerVolume": { "slow-usb": 1, "capacity": 9, "default": 7 } } }""");
     var queues = new VolumeQueues(config, new Dictionary<Guid, MemberRole> { [member.MemberId] = MemberRole.Capacity });
 
@@ -567,7 +567,7 @@ public class VolumeQueueTests {
   [Category("HappyPath")]
   public void DepthFor_GivenOnlyARoleInTheConfig_ThenTheRoleApplies() {
     var member = _Member("ssd0", "PHYS-B");
-    var config = ConfigResolver.ResolveEffective(null,
+    var config = TestConfig.Resolve(
       """{ "io": { "queueDepthPerVolume": { "landing": 12, "default": 3 } } }""");
     var queues = new VolumeQueues(config, new Dictionary<Guid, MemberRole> { [member.MemberId] = MemberRole.Landing });
 
@@ -579,7 +579,7 @@ public class VolumeQueueTests {
   public void DepthFor_GivenRotatingMedia_ThenTheDefaultIsShallow() {
     var member = _Member("archive", "PHYS-SPINDLE");
     MediaProbe.Override("PHYS-SPINDLE", MediaClass.Rotational);
-    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    var queues = new VolumeQueues(TestConfig.Resolve(null), new Dictionary<Guid, MemberRole>());
 
     queues.DepthFor(member).Should().Be(2,
       "§6.4: a spindle serves a deep queue by seeking between the requests, which is slower than "
@@ -592,7 +592,7 @@ public class VolumeQueueTests {
     var first = _Member("part1", "PHYS-SHARED");
     var second = _Member("part2", "PHYS-SHARED");
     var separate = _Member("other", "PHYS-OTHER");
-    var config = ConfigResolver.ResolveEffective(null, """{ "io": { "queueDepthPerVolume": { "default": 4 } } }""");
+    var config = TestConfig.Resolve("""{ "io": { "queueDepthPerVolume": { "default": 4 } } }""");
     var queues = new VolumeQueues(config, new Dictionary<Guid, MemberRole>());
 
     queues.FanOutFor([new(first, false), new(second, true)]).Should().Be(4,

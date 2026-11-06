@@ -27,7 +27,7 @@ public class PoolTrashTests {
 
   private PoolFileSystem _CreateFs(string trashJson = """{ "enabled": true }""", int duplication = 2) {
     var cache = new CacheInstance("t" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    var config = ConfigResolver.ResolveEffective(null, $$"""{ "duplication": {{duplication}}, "trash": {{trashJson}} }""");
+    var config = TestConfig.Resolve($$"""{ "duplication": {{duplication}}, "trash": {{trashJson}} }""");
     var fs = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2)], cache, config, clock: () => this._now);
     fs.Mount(new(@"X:\"));
     return fs;

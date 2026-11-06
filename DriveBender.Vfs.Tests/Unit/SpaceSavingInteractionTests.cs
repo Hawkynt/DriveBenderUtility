@@ -36,7 +36,7 @@ public class SpaceSavingInteractionTests {
 
   private PoolFileSystem _Engine(string config = """{ "duplication": 1, "trash": { "enabled": true } }""") {
     var cache = new CacheInstance("ss" + Guid.NewGuid().ToString("N"), new() { Size = "1048576", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
-    var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)], cache, ConfigResolver.ResolveEffective(null, config));
+    var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)], cache, TestConfig.Resolve(config));
     fs.Mount(new(@"X:\"));
     return fs;
   }

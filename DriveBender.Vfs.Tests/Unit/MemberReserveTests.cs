@@ -35,7 +35,7 @@ public class MemberReserveTests {
     var cache = new CacheInstance("rs" + Guid.NewGuid().ToString("N"),
       new() { Size = "1048576", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
     var fs = new PoolFileSystem(_pool, [new(this._v1, ReserveBytes: reserve), new(this._v2, ReserveBytes: reserve)], cache,
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": {{duplication}}, "readAhead": { "enabled": false } }"""));
+      TestConfig.Resolve($$"""{ "duplication": {{duplication}}, "readAhead": { "enabled": false } }"""));
     fs.Mount(new(@"X:\"));
     return fs;
   }

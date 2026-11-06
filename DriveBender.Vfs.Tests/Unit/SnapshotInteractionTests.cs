@@ -36,7 +36,7 @@ public class SnapshotInteractionTests {
     var cache = new CacheInstance("si" + Guid.NewGuid().ToString("N"),
       new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
     EngineMember[] members = threeMembers ? [new(this._a), new(this._b), new(this._c)] : [new(this._a), new(this._b)];
-    var fs = new PoolFileSystem(_pool, members, cache, ConfigResolver.ResolveEffective(null, config));
+    var fs = new PoolFileSystem(_pool, members, cache, TestConfig.Resolve(config));
     fs.Mount(new(@"X:\"));
     return fs;
   }

@@ -53,7 +53,7 @@ public class CrashConsistencyTests {
   private PoolFileSystem _NewEngine()
     => new(_pool, [new(this._v1), new(this._v2)],
       new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, _CONFIG));
+      TestConfig.Resolve(_CONFIG));
 
   private static byte[] _Version(int version, int length = 1024) {
     var content = new byte[length];
@@ -394,7 +394,7 @@ public class CrashConsistencyTests {
 
     using (var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)],
              new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
-             ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 2, "write": { "policy": "{{policy}}" }, "readAhead": { "enabled": false } }"""))) {
+             TestConfig.Resolve($$"""{ "duplication": 2, "write": { "policy": "{{policy}}" }, "readAhead": { "enabled": false } }"""))) {
       fs.Mount(new(@"X:\"));
       var handle = fs.Create("saved.bin", NodeKind.File, CreateFlags.None);
       if (presized)
@@ -434,7 +434,7 @@ public class CrashConsistencyTests {
   private PoolFileSystem _EngineWith(string policy)
     => new(_pool, [new(this._v1), new(this._v2)],
       new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 2, "write": { "policy": "{{policy}}" }, "readAhead": { "enabled": false } }"""));
+      TestConfig.Resolve($$"""{ "duplication": 2, "write": { "policy": "{{policy}}" }, "readAhead": { "enabled": false } }"""));
 
   private static void _WriteNew(PoolFileSystem fs, string path, byte[] content) {
     var handle = fs.Create(path, NodeKind.File, CreateFlags.None);
@@ -549,7 +549,7 @@ public class CrashConsistencyTests {
 
     PoolFileSystem Engine() => new(_pool, [new(this._v1), new(this._v2)],
       new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, config));
+      TestConfig.Resolve(config));
 
     using (var fs = Engine()) {
       fs.Mount(new(@"X:\"));
@@ -591,7 +591,7 @@ public class CrashConsistencyTests {
 
     PoolFileSystem Engine() => new(_pool, [new(this._v1), new(this._v2)],
       new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, config));
+      TestConfig.Resolve(config));
 
     using (var fs = Engine()) {
       fs.Mount(new(@"X:\"));
@@ -631,7 +631,7 @@ public class CrashConsistencyTests {
 
     PoolFileSystem Engine() => new(_pool, [new(this._v1), new(this._v2)],
       new("crash" + Guid.NewGuid().ToString("N"), new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, config));
+      TestConfig.Resolve(config));
 
     using (var fs = Engine()) {
       fs.Mount(new(@"X:\"));

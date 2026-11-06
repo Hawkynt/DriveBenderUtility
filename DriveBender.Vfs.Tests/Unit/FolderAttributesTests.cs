@@ -29,7 +29,7 @@ public class FolderAttributesTests {
     this._volume1 = new(Guid.NewGuid(), "v1", "PHYS-1", capacity: 1L << 20);
     this._volume2 = new(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 20);
     var cache = new CacheInstance("test", new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    this._fs = new(Guid.NewGuid(), [new(this._volume1), new(this._volume2)], cache, ConfigResolver.ResolveEffective(null, null));
+    this._fs = new(Guid.NewGuid(), [new(this._volume1), new(this._volume2)], cache, TestConfig.Resolve(null));
     this._fs.Mount(new(@"X:\"));
   }
 

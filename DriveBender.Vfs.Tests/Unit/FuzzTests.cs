@@ -31,7 +31,7 @@ public class FuzzTests {
     this._v2 = new(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 24);
     this._cache = new("fuzz" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "64", MetadataEntries = 1000, MetadataTtl = "1m" });
     this._fs = new(_pool, [new(this._v1), new(this._v2)], this._cache,
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "io": { "mirrorReadSplitThreshold": "256" } }"""));
+      TestConfig.Resolve("""{ "duplication": 2, "io": { "mirrorReadSplitThreshold": "256" } }"""));
     this._fs.Mount(new(@"X:\"));
   }
 
@@ -151,7 +151,7 @@ public class FuzzTests {
     // remount so nothing is cached, then kill the PRIMARY's storage before reading
     var fresh = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)],
       new("fuzz2" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "64", MetadataEntries = 1000, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "io": { "mirrorReadSplitThreshold": "256" } }"""));
+      TestConfig.Resolve("""{ "duplication": 2, "io": { "mirrorReadSplitThreshold": "256" } }"""));
     fresh.Mount(new(@"X:\"));
     this._v1.AlwaysFail(VolumeOp.OpenRead);
 
@@ -255,7 +255,7 @@ public class FuzzTests {
 
     var fresh = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)],
       new("lag" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "64", MetadataEntries = 1000, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "io": { "mirrorReadSplitThreshold": "256" } }"""));
+      TestConfig.Resolve("""{ "duplication": 2, "io": { "mirrorReadSplitThreshold": "256" } }"""));
     fresh.Mount(new(@"X:\"));
 
     var read = fresh.Open("lagging.bin", AccessMode.Read, ShareMode.Read);
@@ -286,7 +286,7 @@ public class FuzzTests {
     // fresh engine: cold cache, large read over the split threshold → blocks load from BOTH copies in parallel
     var fresh = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)],
       new("fuzz3" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "64", MetadataEntries = 1000, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "io": { "mirrorReadSplitThreshold": "256" } }"""));
+      TestConfig.Resolve("""{ "duplication": 2, "io": { "mirrorReadSplitThreshold": "256" } }"""));
     fresh.Mount(new(@"X:\"));
 
     var read = fresh.Open("split.bin", AccessMode.Read, ShareMode.Read);

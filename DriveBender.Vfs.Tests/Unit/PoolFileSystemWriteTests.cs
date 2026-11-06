@@ -29,7 +29,7 @@ public class PoolFileSystemWriteTests {
 
   private PoolFileSystem _CreateFs(string configJson) {
     this._cache = new("t" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    return new(_pool, [new(this._volume1), new(this._volume2)], this._cache, ConfigResolver.ResolveEffective(null, configJson));
+    return new(_pool, [new(this._volume1), new(this._volume2)], this._cache, TestConfig.Resolve(configJson));
   }
 
   private NodeHandle _CreateFileWithContent(string path, byte[] content) {
@@ -476,7 +476,7 @@ public class PoolFileSystemWriteTests {
       using var fs = new PoolFileSystem(_pool,
         [.. roots.Select((root, i) => new EngineMember(new LocalVolumeIO(Guid.NewGuid(), $"m{i}", root, $"PHYS-W{i}")))],
         new("w" + Guid.NewGuid().ToString("N"), new() { Size = "33554432" }),
-        ConfigResolver.ResolveEffective(null, """{ "duplication": 2 }"""));
+        TestConfig.Resolve("""{ "duplication": 2 }"""));
       fs.Mount(new(@"W:\"));
       fs.Close(fs.Create("big.bin", NodeKind.File, CreateFlags.None));
 
@@ -516,7 +516,7 @@ public class PoolFileSystemWriteTests {
       using var fs = new PoolFileSystem(_pool,
         [.. roots.Select((root, i) => new EngineMember(new LocalVolumeIO(Guid.NewGuid(), $"m{i}", root, $"PHYS-S{i}")))],
         new("s" + Guid.NewGuid().ToString("N"), new() { Size = "33554432" }),
-        ConfigResolver.ResolveEffective(null, """{ "duplication": 1 }"""));
+        TestConfig.Resolve("""{ "duplication": 1 }"""));
       fs.Mount(new(@"S:\"));
 
       const int chunk = 4 << 20;

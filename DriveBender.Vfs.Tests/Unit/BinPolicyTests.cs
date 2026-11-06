@@ -39,7 +39,7 @@ public class BinPolicyTests {
     var cache = new CacheInstance("bp" + Guid.NewGuid().ToString("N"),
       new() { Size = "1048576", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
     var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)], cache,
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 2, "trash": { "enabled": true {{trash}} } }"""), clock: () => this._now);
+      TestConfig.Resolve($$"""{ "duplication": 2, "trash": { "enabled": true {{trash}} } }"""), clock: () => this._now);
     fs.Mount(new(@"X:\"));
     return fs;
   }
@@ -247,7 +247,7 @@ public class BinPolicyTests {
   [TestCase("minFreeSpace", "-5%")]
   [Category("Exception")]
   public void Config_GivenAnInvalidBinSetting_ThenItIsRefusedWithItsName(string key, string value) {
-    var config = ConfigResolver.ResolveEffective(null, $$"""{ "trash": { "enabled": true, "{{key}}": "{{value}}" } }""");
+    var config = TestConfig.Resolve($$"""{ "trash": { "enabled": true, "{{key}}": "{{value}}" } }""");
     var validate = () => ConfigValidator.Validate(config, 1L << 34);
     validate.Should().Throw<ConfigValidationException>().Which.Message.Should().Contain(key);
   }

@@ -23,7 +23,7 @@ public class IntegrityTests {
     this._volume1 = new(Guid.NewGuid(), "v1", "PHYS-1", capacity: 1L << 20);
     this._volume2 = new(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 20);
     var cache = new CacheInstance("i" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    this._fs = new(_pool, [new(this._volume1), new(this._volume2)], cache, ConfigResolver.ResolveEffective(null, """{ "duplication": 2 }"""));
+    this._fs = new(_pool, [new(this._volume1), new(this._volume2)], cache, TestConfig.Resolve("""{ "duplication": 2 }"""));
     this._fs.Mount(new(@"X:\"));
   }
 
@@ -196,7 +196,7 @@ public class IntegrityTests {
     holder.SetTimestamps("roam.txt", shadow, null, new DateTime(2027, 3, 1, 0, 0, 0, DateTimeKind.Utc));
 
     var cache = new CacheInstance("i2" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    var remounted = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2)], cache, ConfigResolver.ResolveEffective(null, """{ "duplication": 2 }"""));
+    var remounted = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2)], cache, TestConfig.Resolve("""{ "duplication": 2 }"""));
     remounted.Mount(new(@"X:\"));
 
     var other = new[] { this._volume1, this._volume2 }.Single(v => v != holder);
@@ -278,7 +278,7 @@ public class IntegrityTests {
       new FakeVolumeIO(Guid.NewGuid(), "t3", "PHYS-T3", capacity: 1L << 20),
     };
     var cache = new CacheInstance("i3" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    using var fs = new PoolFileSystem(_pool, [.. volumes.Select(v => new EngineMember(v))], cache, ConfigResolver.ResolveEffective(null, """{ "duplication": 3 }"""));
+    using var fs = new PoolFileSystem(_pool, [.. volumes.Select(v => new EngineMember(v))], cache, TestConfig.Resolve("""{ "duplication": 3 }"""));
     fs.Mount(new(@"X:"));
     var original = new byte[] { 5, 6, 7, 8 };
     var handle = fs.Create("tri.txt", NodeKind.File, CreateFlags.None);

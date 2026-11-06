@@ -36,7 +36,7 @@ public class RenameWhileWritingTests {
     var cache = new CacheInstance("rw" + Guid.NewGuid().ToString("N"),
       new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
     var fs = new PoolFileSystem(_pool, [new(this._d1), new(this._d2), new(this._d3)], cache,
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": {{duplication}}, "readAhead": { "enabled": false } }"""));
+      TestConfig.Resolve($$"""{ "duplication": {{duplication}}, "readAhead": { "enabled": false } }"""));
     fs.Mount(new(@"X:\"));
     return fs;
   }
@@ -257,7 +257,7 @@ public class RenameWhileWritingTests {
     // application as "access denied" in the middle of an ordinary replace.
     using var fs = this._Engine();
     if (bin)
-      fs.ReloadConfig(ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "trash": { "enabled": true }, "readAhead": { "enabled": false } }"""));
+      fs.ReloadConfig(TestConfig.Resolve("""{ "duplication": 2, "trash": { "enabled": true }, "readAhead": { "enabled": false } }"""));
     _WriteClosed(fs, "photo.jpg", [7, 7, 7, 7]);
     var reader = fs.Open("photo.jpg", AccessMode.Read, ShareMode.Read | ShareMode.Delete);
 

@@ -32,7 +32,7 @@ public class StagedPublishTests {
     var cache = new CacheInstance("sp" + Guid.NewGuid().ToString("N"),
       new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
     var fs = new PoolFileSystem(_pool, [new(this._a), new(this._b)], cache,
-      ConfigResolver.ResolveEffective(null,
+      TestConfig.Resolve(
         """{ "duplication": 2, "placement": { "shadowNeverSamePhysical": false }, "trash": { "enabled": false } }"""));
     fs.Mount(new(@"X:\"));
     return fs;

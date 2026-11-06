@@ -40,7 +40,7 @@ public class StripeCrashTests {
     var cache = new CacheInstance("sc" + Guid.NewGuid().ToString("N"),
       new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
     var fs = new PoolFileSystem(_pool, [new(this._d1), new(this._d2), new(this._d3)], cache,
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": {{duplication}}, "readAhead": { "enabled": false } }"""));
+      TestConfig.Resolve($$"""{ "duplication": {{duplication}}, "readAhead": { "enabled": false } }"""));
     fs.Mount(new(@"X:\"));
     return fs;
   }

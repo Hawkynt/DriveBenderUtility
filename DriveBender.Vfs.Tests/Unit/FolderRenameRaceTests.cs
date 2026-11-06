@@ -28,7 +28,7 @@ public class FolderRenameRaceTests {
       new(Guid.NewGuid(), "v2", "PHYS-2", capacity: 64L << 20),
     ];
     var cache = new CacheInstance("fr" + Guid.NewGuid().ToString("N"), new() { Size = "4194304", BlockSize = "512", MetadataEntries = 1000, MetadataTtl = "1m" });
-    var fs = new PoolFileSystem(_pool, [.. members.Select(m => new EngineMember(m))], cache, ConfigResolver.ResolveEffective(null, config));
+    var fs = new PoolFileSystem(_pool, [.. members.Select(m => new EngineMember(m))], cache, TestConfig.Resolve(config));
     fs.Mount(new(@"X:\"));
     return fs;
   }

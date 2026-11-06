@@ -22,7 +22,7 @@ public class DataSafetyTests {
   private static PoolFileSystem _NewPool(FakeVolumeIO v1, FakeVolumeIO v2, string config)
     => new(_pool, [new(v1), new(v2)],
       new("safety" + Guid.NewGuid().ToString("N"), new() { Size = "4194304", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, config));
+      TestConfig.Resolve(config));
 
   private const string _MIRRORED = """
     { "duplication": 2, "write": { "policy": "write-through" }, "readAhead": { "enabled": false } }

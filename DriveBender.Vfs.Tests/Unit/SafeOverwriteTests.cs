@@ -37,7 +37,7 @@ public class SafeOverwriteTests {
     var cache = new CacheInstance("ow" + Guid.NewGuid().ToString("N"),
       new() { Size = "1048576", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
     var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)], cache,
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 2, "readAhead": { "enabled": false } {{extra}} }"""));
+      TestConfig.Resolve($$"""{ "duplication": 2, "readAhead": { "enabled": false } {{extra}} }"""));
     fs.Mount(new(@"X:\"));
     return fs;
   }

@@ -33,7 +33,7 @@ public class StaleMirrorRecoveryTests {
   private PoolFileSystem _CreateFs(bool mount = true, string? config = null) {
     var cache = new CacheInstance("sm" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
     var fs = new PoolFileSystem(_pool, [new(this._a), new(this._b), new(this._m)], cache,
-      ConfigResolver.ResolveEffective(null, config ?? """{ "duplication": 2, "trash": { "enabled": false } }"""));
+      TestConfig.Resolve(config ?? """{ "duplication": 2, "trash": { "enabled": false } }"""));
     if (mount)
       fs.Mount(new(@"X:\"));
     return fs;

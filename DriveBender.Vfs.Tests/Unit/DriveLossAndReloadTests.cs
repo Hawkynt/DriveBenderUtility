@@ -25,7 +25,7 @@ public class DriveLossPolicyTests {
 
   private PoolFileSystem _CreateFs(string onMemberLoss, int duplication = 1) {
     var cache = new CacheInstance("dl" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
-    var config = ConfigResolver.ResolveEffective(null, $$"""{ "duplication": {{duplication}}, "resilience": { "onMemberLoss": "{{onMemberLoss}}" } }""");
+    var config = TestConfig.Resolve($$"""{ "duplication": {{duplication}}, "resilience": { "onMemberLoss": "{{onMemberLoss}}" } }""");
     var fs = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2)], cache, config);
     fs.Mount(new(@"X:\"));
     return fs;
@@ -169,7 +169,7 @@ public class LiveConfigReloadTests {
     this._volume1 = new(Guid.NewGuid(), "v1", "PHYS-1", capacity: 1L << 20);
     this._volume2 = new(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 20);
     var cache = new CacheInstance("rl" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
-    var config = ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "resilience": { "onMemberLoss": "retain-metadata" } }""");
+    var config = TestConfig.Resolve("""{ "duplication": 2, "resilience": { "onMemberLoss": "retain-metadata" } }""");
     this._fs = new(_pool, [new(this._volume1), new(this._volume2)], cache, config);
     this._fs.Mount(new(@"X:\"));
   }
@@ -179,7 +179,7 @@ public class LiveConfigReloadTests {
   public void ReloadConfig_GivenNewDriveLossPolicy_WhenApplied_ThenTakesEffectLive() {
     this._fs.MemberLossPolicy.Should().Be(MemberLossPolicy.RetainMetadata);
 
-    this._fs.ReloadConfig(ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "resilience": { "onMemberLoss": "discard-inaccessible" } }"""));
+    this._fs.ReloadConfig(TestConfig.Resolve("""{ "duplication": 2, "resilience": { "onMemberLoss": "discard-inaccessible" } }"""));
 
     this._fs.MemberLossPolicy.Should().Be(MemberLossPolicy.DiscardInaccessible, "config reload applies without unmount (CFG.reload)");
   }
@@ -192,7 +192,7 @@ public class LiveConfigReloadTests {
     this._fs.Close(handle);
 
     // reloading must not strand any dirty data (SAFE-NOLOSS)
-    this._fs.ReloadConfig(ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "readAhead": { "maxWindow": "16MiB" } }"""));
+    this._fs.ReloadConfig(TestConfig.Resolve("""{ "duplication": 2, "readAhead": { "maxWindow": "16MiB" } }"""));
 
     this._fs.WriteBuffer.DirtyPaths.Should().BeEmpty("reload flushes owed writes before applying new caps");
     var count = new[] { this._volume1, this._volume2 }.Count(v => (v.GetContent("f.bin", false) ?? v.GetContent("f.bin", true) ?? []).SequenceEqual(new byte[] { 5, 5, 5 }));
@@ -202,7 +202,7 @@ public class LiveConfigReloadTests {
   [Test]
   [Category("Exception")]
   public void ReloadConfig_GivenInvalidConfig_WhenApplied_ThenRejectedAndOldConfigKept() {
-    var act = () => this._fs.ReloadConfig(ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "safety": { "journalEnabled": false } }"""));
+    var act = () => this._fs.ReloadConfig(TestConfig.Resolve("""{ "duplication": 2, "safety": { "journalEnabled": false } }"""));
     act.Should().Throw<ConfigValidationException>("an invalid reload is refused, never partially applied (CFG-VALIDATE)");
     this._fs.MemberLossPolicy.Should().Be(MemberLossPolicy.RetainMetadata);
   }
