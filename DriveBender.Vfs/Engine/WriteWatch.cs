@@ -36,6 +36,24 @@ public sealed class WriteWatch {
       return !this._watched.TryGetValue(path, out var entry) || entry.Changes != token;
   }
 
+  /// <summary>How many jobs are watching this path right now.</summary>
+  public int Watchers(string path) {
+    if (Volatile.Read(ref this._count) == 0)
+      return 0;
+
+    lock (this._lock)
+      return this._watched.TryGetValue(path, out var entry) ? entry.Watchers : 0;
+  }
+
+  /// <summary>Whether a job is copying this path right now (it holds a watch on it).</summary>
+  public bool IsWatched(string path) {
+    if (Volatile.Read(ref this._count) == 0)
+      return false;
+
+    lock (this._lock)
+      return this._watched.ContainsKey(path);
+  }
+
   /// <summary>Stops watching (once per <see cref="Begin"/>).</summary>
   public void End(string path) {
     lock (this._lock) {

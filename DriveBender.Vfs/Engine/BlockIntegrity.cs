@@ -295,14 +295,18 @@ public sealed class BlockIntegrity(IReadOnlyList<IVolumeIO> members, int parityS
   /// or time changing — rot — and rot that happened identically on every copy would otherwise be
   /// enshrined as the content to defend.
   /// </param>
-  public List<(PhysicalCopy Copy, BlockIndex Index)>? Build(string normalized, IReadOnlyList<PhysicalCopy> copies, Func<PhysicalCopy, FileMeta, string?>? baselineOf = null) {
+  /// <param name="yieldTo">True when the build should give way now (another job started copying the file); the build then stops at its next chunk.</param>
+  public List<(PhysicalCopy Copy, BlockIndex Index)>? Build(string normalized, IReadOnlyList<PhysicalCopy> copies, Func<PhysicalCopy, FileMeta, string?>? baselineOf = null,
+    Func<bool>? yieldTo = null) {
     var built = new List<(PhysicalCopy, BlockIndex)>();
     foreach (var copy in copies) {
       try {
         if (copy.Volume.Stat(normalized, copy.Shadow) is not { IsDirectory: false } meta || meta.Length < this.MinFileBytes)
           return null;
 
-        using var stream = new _HashingStream(copy.Volume.OpenRead(normalized, copy.Shadow), copy.Volume, admit, this.Stopping);
+        var stopping = this.Stopping;
+        using var stream = new _HashingStream(copy.Volume.OpenRead(normalized, copy.Shadow), copy.Volume, admit,
+          () => stopping?.Invoke() == true || yieldTo?.Invoke() == true);
         var index = BlockIndex.Build(stream, meta.Length, meta.LastWriteTimeUtc.Ticks, this.ParityShards);
         if (baselineOf?.Invoke(copy, meta) is { } baseline && !string.Equals(baseline, stream.Hex, StringComparison.OrdinalIgnoreCase)) {
           DriveBender.Logger($"[Warning]'{normalized}' on '{copy.Volume.DisplayName}' no longer matches its recorded checksum though its size and time are unchanged — not indexed; the scrub decides which copy is right");

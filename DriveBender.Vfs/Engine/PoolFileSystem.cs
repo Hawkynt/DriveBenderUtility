@@ -3482,10 +3482,27 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (copies.Count == 0)
       return true; // gone
 
+    // The pool's own copying comes first. A file the healer or the drainer is copying, or one still
+    // short of its copies, is about to get a copy the index would not cover — and reading it now
+    // would take the throttled member's bandwidth from the very copy that restores its protection.
+    // Measured: a heal under a member limit ran past the time its abandoned temp should have been
+    // cleaned up, because the indexer was reading the same file through the same limit.
+    var wanted = Math.Min(this._placement.DuplicationLevelFor(PoolPaths.GetParent(normalized)), this._Online.Count());
+    if (this._writeWatch.IsWatched(normalized) || copies.Count < wanted)
+      return false;
+
     var watch = this._writeWatch.Begin(normalized);
     try {
-      var built = this._blocks.Build(normalized, copies,
-        (copy, meta) => this._integrity.TrustedBaseline(copy.Volume, normalized, copy.Shadow, meta)?.Hash);
+      // a heal or a drain that starts on this file while it is read takes precedence: the build stops
+      // at its next chunk, and the file is indexed again once that copy is done (the watch beyond ours)
+      List<(PhysicalCopy Copy, BlockIndex Index)>? built;
+      try {
+        built = this._blocks.Build(normalized, copies,
+          (copy, meta) => this._integrity.TrustedBaseline(copy.Volume, normalized, copy.Shadow, meta)?.Hash,
+          () => this._writeWatch.Watchers(normalized) > 1);
+      } catch (OperationCanceledException) when (!this._indexerStopping) {
+        return false;
+      }
       if (built == null)
         return true; // copies that disagree, or too small: the scrub settles the first
 
