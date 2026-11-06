@@ -58,27 +58,24 @@ public sealed class BlockIntegrity(IReadOnlyList<IVolumeIO> members, int parityS
     if (!this._stale.TryAdd(normalized, 0))
       return; // already stale: a file under continuous writes pays this once
 
+    // The mark set grows with every file written; past a bound it is emptied. That is safe because
+    // every marked path's indexes were deleted below when it was marked — the mark only spares later
+    // writes the deletion — so a path written again just pays it once more.
+    if (this._stale.Count > 200_000) {
+      this._stale.Clear();
+      this._stale.TryAdd(normalized, 0);
+    }
+
     foreach (var key in this._cache.Keys)
       if (PoolPaths.PathComparer.Equals(key.Path, normalized))
         this._cache.TryRemove(key, out _);
 
-    ThreadPool.QueueUserWorkItem(_ => this._DeleteIndexes(normalized));
+    // Deleted now, not in the background: a deleted file must leave nothing under its name, and an
+    // index that outlives the content it describes is exactly what this layer must never have.
+    DeleteIndexes(members, normalized);
   }
 
   /// <summary>Recovery: a write intent named this path, so whatever index it has may be stale.</summary>
-
-  private void _DeleteIndexes(string normalized) {
-    var all = DeleteIndexes(members, normalized) && members.All(m => m.IsOnline);
-
-    // Only once nothing is left on disk is the mark lifted, and the cache is cleared again first: a
-    // lookup that raced the first clearing may have cached the old index in between. A member that
-    // was offline may still hold one; it stays marked until a rebuild commits a fresh index.
-    foreach (var key in this._cache.Keys)
-      if (PoolPaths.PathComparer.Equals(key.Path, normalized))
-        this._cache.TryRemove(key, out _);
-    if (all)
-      this._stale.TryRemove(normalized, out _);
-  }
 
   /// <summary>Deletes every index of a path on the members given; false when one could not be deleted.</summary>
   public static bool DeleteIndexes(IEnumerable<IVolumeIO> members, string normalized) {
@@ -269,6 +266,9 @@ public sealed class BlockIntegrity(IReadOnlyList<IVolumeIO> members, int parityS
     this.QueuedCallback?.Invoke();
   }
 
+  /// <summary>True once the pool is shutting down: a build in progress stops at its next chunk.</summary>
+  public Func<bool>? Stopping { get; set; }
+
   /// <summary>Called whenever a file joins the queue — the indexer's wake-up.</summary>
   public Action? QueuedCallback { get; set; }
 
@@ -289,16 +289,27 @@ public sealed class BlockIntegrity(IReadOnlyList<IVolumeIO> members, int parityS
   /// whichever was read as the truth — the scrub settles that first. Returns the indexes to commit,
   /// one per copy, or null when there is nothing to commit.
   /// </summary>
-  public List<(PhysicalCopy Copy, BlockIndex Index)>? Build(string normalized, IReadOnlyList<PhysicalCopy> copies) {
+  /// <param name="baselineOf">
+  /// The copy's recorded whole-file checksum, when the checksum database holds one that still
+  /// describes it. A copy whose content contradicts it is not indexed: it changed without its size
+  /// or time changing — rot — and rot that happened identically on every copy would otherwise be
+  /// enshrined as the content to defend.
+  /// </param>
+  public List<(PhysicalCopy Copy, BlockIndex Index)>? Build(string normalized, IReadOnlyList<PhysicalCopy> copies, Func<PhysicalCopy, FileMeta, string?>? baselineOf = null) {
     var built = new List<(PhysicalCopy, BlockIndex)>();
     foreach (var copy in copies) {
       try {
         if (copy.Volume.Stat(normalized, copy.Shadow) is not { IsDirectory: false } meta || meta.Length < this.MinFileBytes)
           return null;
 
-        admit?.Invoke(copy.Volume, meta.Length);
-        using var stream = copy.Volume.OpenRead(normalized, copy.Shadow);
-        built.Add((copy, BlockIndex.Build(stream, meta.Length, meta.LastWriteTimeUtc.Ticks, this.ParityShards)));
+        using var stream = new _HashingStream(copy.Volume.OpenRead(normalized, copy.Shadow), copy.Volume, admit, this.Stopping);
+        var index = BlockIndex.Build(stream, meta.Length, meta.LastWriteTimeUtc.Ticks, this.ParityShards);
+        if (baselineOf?.Invoke(copy, meta) is { } baseline && !string.Equals(baseline, stream.Hex, StringComparison.OrdinalIgnoreCase)) {
+          DriveBender.Logger($"[Warning]'{normalized}' on '{copy.Volume.DisplayName}' no longer matches its recorded checksum though its size and time are unchanged — not indexed; the scrub decides which copy is right");
+          return null;
+        }
+
+        built.Add((copy, index));
       } catch (Exception e) when (e is PoolFsException or IOException) {
         return null;
       }
@@ -308,6 +319,43 @@ public sealed class BlockIntegrity(IReadOnlyList<IVolumeIO> members, int parityS
       return null;
 
     return built;
+  }
+
+  /// <summary>Reads through, hashing the whole file the way the checksum database does.</summary>
+  /// <summary>
+  /// Paced like any other bulk read — chunk by chunk, so a member held to a crawl is admitted a piece
+  /// at a time rather than asked once for the whole file — and abandoned at the next chunk when the
+  /// pool shuts down: an index not finished is simply built again later.
+  /// </summary>
+  private sealed class _HashingStream(Stream inner, IVolumeIO volume, Action<IVolumeIO, long>? admit, Func<bool>? stopping) : Stream {
+    private const int _CHUNK = 1 << 20;
+    private readonly System.IO.Hashing.XxHash3 _hash = new();
+    public string Hex => Convert.ToHexString(this._hash.GetCurrentHash());
+    public override int Read(byte[] buffer, int offset, int count) => this.Read(buffer.AsSpan(offset, count));
+    public override int Read(Span<byte> buffer) {
+      if (stopping?.Invoke() == true)
+        throw new OperationCanceledException("the pool is shutting down");
+
+      var slice = buffer[..Math.Min(buffer.Length, _CHUNK)];
+      admit?.Invoke(volume, slice.Length);
+      var read = inner.Read(slice);
+      this._hash.Append(slice[..read]);
+      return read;
+    }
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => inner.Length;
+    public override long Position { get => inner.Position; set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    protected override void Dispose(bool disposing) {
+      if (disposing)
+        inner.Dispose();
+      base.Dispose(disposing);
+    }
   }
 
   /// <summary>

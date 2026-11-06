@@ -464,6 +464,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       this.AdmitBulk);
     this._writeWatch.Listener = this._blocks.Changed;
     this._blocks.QueuedCallback = () => this._indexSignal.Release();
+    this._blocks.Stopping = () => this._indexerStopping;
     this._readVerifier = new(this._integrity, this._Invalidate, this._RepairAfterReadCheck);
     this._activity = new(clock: this._clock);
     this._placement = new(
@@ -3457,6 +3458,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
             retryAt = DateTime.UtcNow + TimeSpan.FromSeconds(3);
           later.Add(path);
         }
+      } catch (OperationCanceledException) {
+        // shutting down: the file is indexed on a later mount
       } catch (Exception e) {
         DriveBender.Logger($"[Warning]Could not index '{path}': {e.Message}");
       } finally {
@@ -3481,7 +3484,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     var watch = this._writeWatch.Begin(normalized);
     try {
-      var built = this._blocks.Build(normalized, copies);
+      var built = this._blocks.Build(normalized, copies,
+        (copy, meta) => this._integrity.TrustedBaseline(copy.Volume, normalized, copy.Shadow, meta)?.Hash);
       if (built == null)
         return true; // copies that disagree, or too small: the scrub settles the first
 

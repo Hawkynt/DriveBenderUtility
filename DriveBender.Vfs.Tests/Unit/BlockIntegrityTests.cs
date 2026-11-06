@@ -123,6 +123,7 @@ public class BlockIntegrityTests {
     using var fs = this._Indexed("film.bin", _Content());
     foreach (var (volume, shadow) in this._Copies("film.bin"))
       volume.CorruptSilently("film.bin", shadow, bytes => { bytes[1_000] ^= 1; bytes[70_000] ^= 1; bytes[140_000] ^= 1; });
+    this._AssertIndexedNow("film.bin");
 
     var read = () => _Read(fs, "film.bin");
 
@@ -243,6 +244,38 @@ public class BlockIntegrityTests {
     issues.Should().NotContain(i => i.Kind == IntegrityIssueKind.BitRotUnrecoverable);
     foreach (var (volume, shadow) in this._Copies("archive.bin"))
       volume.GetContent("archive.bin", shadow).Should().Equal(content);
+  }
+
+  /// <summary>The premise of a test about checked reads: every copy's index is intact and describes the copy right now.</summary>
+  private void _AssertIndexedNow(string path) {
+    foreach (var (volume, shadow) in this._Copies(path)) {
+      var meta = volume.Stat(path, shadow)!.Value;
+      var index = Integrity.BlockIndex.Deserialize(volume.GetContent(BlockIntegrity.IndexPathFor(path, shadow), false)
+                                                   ?? throw new AssertionException($"premise: {volume.DisplayName} has no index"));
+      index.Should().NotBeNull($"premise: {volume.DisplayName}'s index is intact");
+      index!.Describes(meta.Length, meta.LastWriteTimeUtc).Should().BeTrue(
+        $"premise: {volume.DisplayName}'s index describes the copy (index {index.Length}/{index.MTimeTicks}, copy {meta.Length}/{meta.LastWriteTimeUtc.Ticks})");
+    }
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Index_GivenRotOnEveryCopyThatTheChecksumDatabaseRecordedBefore_ThenTheRotIsNotIndexed() {
+    using (var writer = this._Engine()) {
+      _Write(writer, "old.bin", _Content());
+      writer.RunScrub(); // records the whole-file baseline
+      writer.WaitForIndexing(TimeSpan.FromSeconds(5));
+    }
+
+    BlockIntegrity.DeleteIndexes([this._v1, this._v2], "old.bin"); // a file indexed only later
+    foreach (var (volume, shadow) in this._Copies("old.bin"))
+      volume.CorruptSilently("old.bin", shadow, bytes => bytes[50_000] ^= 0x40);
+
+    using var fs = this._Engine();
+    fs.IndexFile("old.bin");
+
+    this._Copies("old.bin").Should().OnlyContain(c => !c.Volume.FileExists(BlockIntegrity.IndexPathFor("old.bin", c.Shadow), false),
+      "identical rot on every copy contradicts the recorded checksum, and must not become the content an index defends");
   }
 
   private static bool _Eventually(Func<bool> condition) {
