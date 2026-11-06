@@ -178,6 +178,16 @@ public enum ReadVerification {
   /// once, then logged as a warning and repaired from an intact copy.
   /// </summary>
   [JsonStringEnumMemberName("after")] After,
+
+  /// <summary>
+  /// Files with a block index (integrity.blockIndexMinSize and up) are checked shard by shard as
+  /// they are served, which costs a hash at memory speed per shard read from disk and nothing on a
+  /// cache hit; a damaged shard is served from another copy or rebuilt from parity, and repaired.
+  /// Smaller files are checked whole before their first read, as with "before". A large file not
+  /// yet indexed is served as it is and indexed in the background — its first read never waits for
+  /// a whole-file hash.
+  /// </summary>
+  [JsonStringEnumMemberName("blocks")] Blocks,
 }
 
 /// <summary>What the mounted view does when a member drops out live (§10 SAFE-DEGRADE).</summary>
@@ -332,6 +342,16 @@ public sealed record IntegrityConfig {
   [JsonPropertyName("strongHash")] public string? StrongHash { get; init; }
   [JsonPropertyName("onExternalEdit")] public ExternalEditPolicy? OnExternalEdit { get; init; }
   [JsonPropertyName("verifyReads")] public ReadVerification? VerifyReads { get; init; }
+
+  /// <summary>
+  /// Reed-Solomon parity shards per stripe of up to 32 data shards (2 MiB): 0, 1, 2, 4, 8 or 16 —
+  /// about 0, 3, 6, 12, 25 or 50 percent of a file's size. Each repairs that many damaged shards per
+  /// stripe from the copy's own data, even where no other copy is intact. Default 2.
+  /// </summary>
+  [JsonPropertyName("parity")] public int? Parity { get; init; }
+
+  /// <summary>Files from this size up get a block index (per-shard hashes and parity). Default 64KiB.</summary>
+  [JsonPropertyName("blockIndexMinSize")] public string? BlockIndexMinSize { get; init; }
   [JsonPropertyName("scrubberSchedule")] public string? ScrubberSchedule { get; init; }
   [JsonPropertyName("deepScrubSchedule")] public string? DeepScrubSchedule { get; init; }
   [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
@@ -521,7 +541,9 @@ public static class ConfigResolver {
       "fastHash": "xxh3",
       "strongHash": null,
       "onExternalEdit": "accept-newest",
-      "verifyReads": "never",
+      "verifyReads": "blocks",
+      "parity": 2,
+      "blockIndexMinSize": "64KiB",
       "scrubberSchedule": "idle-weekly",
       "deepScrubSchedule": null
     },

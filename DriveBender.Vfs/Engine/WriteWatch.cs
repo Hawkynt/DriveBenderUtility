@@ -1,4 +1,4 @@
-namespace DivisonM.Vfs.Engine;
+﻿namespace DivisonM.Vfs.Engine;
 
 /// <summary>
 /// "Has this file's content changed since I started copying it?" — for the jobs that copy a file
@@ -36,6 +36,24 @@ public sealed class WriteWatch {
       return !this._watched.TryGetValue(path, out var entry) || entry.Changes != token;
   }
 
+  /// <summary>How many jobs are watching this path right now.</summary>
+  public int Watchers(string path) {
+    if (Volatile.Read(ref this._count) == 0)
+      return 0;
+
+    lock (this._lock)
+      return this._watched.TryGetValue(path, out var entry) ? entry.Watchers : 0;
+  }
+
+  /// <summary>Whether a job is copying this path right now (it holds a watch on it).</summary>
+  public bool IsWatched(string path) {
+    if (Volatile.Read(ref this._count) == 0)
+      return false;
+
+    lock (this._lock)
+      return this._watched.ContainsKey(path);
+  }
+
   /// <summary>Stops watching (once per <see cref="Begin"/>).</summary>
   public void End(string path) {
     lock (this._lock) {
@@ -51,8 +69,15 @@ public sealed class WriteWatch {
     }
   }
 
+  /// <summary>
+  /// Told of every change, watched or not — what must stop believing anything recorded about the
+  /// path's old content (the block indexes). Runs on the writer's thread, under its lease.
+  /// </summary>
+  public Action<string>? Listener { get; set; }
+
   /// <summary>Reports that <paramref name="path"/>'s content changed — call once the bytes have landed.</summary>
   public void Changed(string path) {
+    this.Listener?.Invoke(path);
     if (Volatile.Read(ref this._count) == 0)
       return; // nothing is being copied: the common case costs this read and nothing else
 

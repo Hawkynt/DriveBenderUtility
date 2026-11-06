@@ -21,6 +21,10 @@
     <ProjectReference Include="..\DriveBender.Mount\DriveBender.Mount.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <!-- the original JavaReedSolomon (MIT) and a driver, compiled at test time as the codec's oracle -->
+    <None Include="Oracle\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
     <PackageReference Include="NUnit" Version="3.14.0" />
     <PackageReference Include="NUnit3TestAdapter" Version="4.5.0" />

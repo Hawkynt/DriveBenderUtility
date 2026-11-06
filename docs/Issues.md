@@ -2806,3 +2806,47 @@ this change; the snapshot tests all used duplication 1.
 the staging list before renaming it, and an open in between saw neither name. It asks again under the
 path's lease before reporting "not found".
 
+### Added: block indexes — per-shard hashes and Reed-Solomon parity, checked on every read
+
+The whole-file checksums could only tell that a copy had changed, and checking a read against them
+meant hashing the whole file first, which is why read checks were off by default. Silent damage on
+one copy was served to applications until a scrub found it; damage on every copy was unrecoverable.
+
+**What exists now.** Every copy of a file from `integrity.blockIndexMinSize` (64 KiB) up has a block
+index beside it on the same member, under `.drivebenderutility/blocks/`. The data file is never
+touched, so a pool stays readable without this. The index holds a hash per shard and Reed-Solomon
+parity per stripe of up to 32 shards. Full stripes use 64 KiB shards; short ones (a file's tail, or a
+small file) use the smallest power of two that fits them in 32 shards, so parity costs about the
+configured share. `integrity.parity` sets the parity shards per stripe: 1, 2, 4, 8 or 16 — about 3,
+6, 12, 25 or 50 percent of the file — default 2. The codec is a port of Backblaze's
+JavaReedSolomon (MIT), verified byte for byte against the Java original, with AVX2/SSSE3 paths
+(6–16 GB/s per core encoding 32+2).
+
+**Reads.** `integrity.verifyReads: blocks`, now the default, checks every shard as it is loaded from a
+member; a cache hit costs nothing. A damaged shard sends the read to the next copy. If every copy is
+damaged there, each copy's own parity is tried, and only content that matches the recorded hashes is
+served. The damaged copies are then repaired in place, under the file's lease, keeping their time. A
+read that cannot be repaired fails, never serving wrong bytes. Measured on a 256 MiB file: 3.2–4.6
+GB/s checked against 3.0–4.2 GB/s unchecked. Files below the minimum keep the whole-file check, and
+a large file not indexed yet is served unchecked and queued.
+
+**Building.** A low-priority indexer indexes a file once its writer is done and it has settled: every
+copy is read whole, without holding the file, and the indexes are committed under its lease only if
+nothing changed meanwhile. Copies that disagree get no index; one of them is damaged or behind, and
+an index built then would enshrine whichever was read. A file that is read and has no index is
+queued, and the scrub queues every file, so an existing pool acquires indexes as it is used.
+
+**The invariant.** An index is believed only while it describes the copy: same length, same time,
+and the engine has not changed the path since. Every change drops the path's indexes under its write
+lease before any reader can see the new bytes, and recovery drops the indexes of every path an
+interrupted intent names. This is what makes repair safe: a rewrite at the same length within one
+timestamp tick leaves an index that LOOKS current, and repairing from its parity would write the old
+content back over an acknowledged write. `Write_GivenARewriteThatKeepsLengthAndTime_…` reproduces
+exactly that and fails, serving the old bytes, with the drop disabled.
+
+**Scrub.** Rot on every copy was the end of the line for a copy-against-copy scrub. The scrub now
+tries the file's parity first and reports what it rebuilt as repaired.
+
+**Not covered.** Files below the minimum size (whole-file checks only), files not yet indexed, and
+damage beyond a stripe's parity on every copy, which is detected and refused, not repaired.
+

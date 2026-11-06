@@ -83,6 +83,14 @@ goes away.
   - Timestamp inconsistencies
   - Permission issues
   - Duplicate primaries
+- ✅ Every file from 64 KiB up carries a block index beside each copy: a hash per shard and
+  Reed-Solomon parity per 2 MiB stripe (`integrity.parity`: 1, 2, 4, 8 or 16 shards — about
+  3–50% of the file, default 2); the data files themselves are never touched
+- ✅ Reads are checked shard by shard as they are served (`integrity.verifyReads: blocks`, the
+  default) at memory speed; a damaged shard is served from another copy, or rebuilt from parity
+  when every copy is damaged there, and the damaged copy is repaired in the background — a read
+  that cannot be repaired fails rather than hand over wrong bytes
+- ✅ The scrub rebuilds from parity what a copy-against-copy comparison cannot: rot on every copy
 - ✅ Automated repair with backup creation
 - ✅ Dry-run mode for safe testing
 - ✅ Deep scan capabilities

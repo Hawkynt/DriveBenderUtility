@@ -1,4 +1,4 @@
-namespace DivisonM.Vfs.Engine;
+﻿namespace DivisonM.Vfs.Engine;
 
 public sealed record RecoveryReport(int RolledForward, int Reconciled, int TempsRemoved) {
   public bool AnythingDone => this.RolledForward + this.Reconciled + this.TempsRemoved > 0;
@@ -39,6 +39,15 @@ public sealed class PoolRecovery(IReadOnlyList<IVolumeIO> members, Journal journ
       reconciled += this._ReplayRanges(file.Key, [.. file]) ? 1 : 0;
 
     foreach (var intent in incomplete) {
+      // Whatever an interrupted operation was changing, the block indexes recorded for it may now
+      // describe content that is no longer there — and one that still LOOKS current (same length,
+      // same timestamp tick) would have a repair write the old content back over the new. They go
+      // before anything else is done; the file is indexed again once it is in use.
+      if (intent.Path != null)
+        BlockIntegrity.DeleteIndexes(this._Online, intent.Path);
+      if (intent.TargetPath != null)
+        BlockIntegrity.DeleteIndexes(this._Online, intent.TargetPath);
+
       switch (intent.Op) {
         case JournalOp.Write when _NamesItsCopy(intent):
           break; // replayed by range above

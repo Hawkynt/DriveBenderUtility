@@ -49,7 +49,7 @@ public class EngineHotPathBenchmarks {
       engineMembers[i] = new(new MeasuredVolumeIO(new LocalVolumeIO(Guid.NewGuid(), $"m{i}", root, $"PHYS-BENCH-{i}")));
     }
 
-    var config = TestConfig.Resolve(configJson);
+    var config = ConfigResolver.ResolveEffective(null, configJson);
     var fs = new PoolFileSystem(_pool, engineMembers, new CacheInstance("bench" + Guid.NewGuid().ToString("N"), new() { Size = cacheSize }), config);
     fs.Mount(new(@"X:\"));
     return fs;
@@ -167,6 +167,26 @@ public class EngineHotPathBenchmarks {
       TestContext.Out.WriteLine($"{threads,7} | {count / closed.TotalSeconds,8:N0} | {count / durable.TotalSeconds,16:N0}");
       count.Should().BeGreaterThan(0);
     }
+  }
+
+  [TestCase("never")]
+  [TestCase("blocks")]
+  [Description("A sequential read of an indexed 256 MiB file the pool has not cached (the OS may have): what checking every shard as it is served costs in CPU.")]
+  public void ColdSequentialRead_WithAndWithoutBlockChecks(string verifyReads) {
+    const long size = 256L << 20;
+    var config = $$"""{ "duplication": 2, "readAhead": { "enabled": true }, "write": { "closeIsDurable": true }, "integrity": { "verifyReads": "{{verifyReads}}", "parity": 2 } }""";
+    var fs = this._NewPool(config, cacheSize: "16MiB");
+    _WriteFile(fs, "big.bin", size);
+    fs.FlushPath("big.bin"); // the second copy is owed bytes until the background flush; this is it
+    fs.IndexFile("big.bin").Should().BeTrue();
+    fs.Dispose();
+    fs.Mount(new(@"X:")); // a fresh mount: nothing of the file is in the pool's cache
+
+    var clock = Stopwatch.StartNew();
+    _ReadAll(fs, "big.bin", size);
+    clock.Stop();
+    TestContext.Out.WriteLine($"verifyReads={verifyReads}: {size / (1 << 20) / clock.Elapsed.TotalSeconds:N0} MiB/s, shards checked {fs.BlockIntegrityStats.Checked:N0}");
+    fs.Dispose();
   }
 
   [ThreadStatic]

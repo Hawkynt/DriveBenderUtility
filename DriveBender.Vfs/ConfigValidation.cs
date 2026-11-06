@@ -201,6 +201,10 @@ public static class ConfigValidator {
       throw new ConfigValidationException($"'integrity.fastHash' must be 'xxh3' or 'blake3', got '{fastHash}'");
     if (integrity.StrongHash is { } strongHash && strongHash is not ("blake3" or "sha256"))
       throw new ConfigValidationException($"'integrity.strongHash' must be 'blake3' or 'sha256', got '{strongHash}'");
+    if (integrity.Parity is { } parity && parity is not (0 or 1 or 2 or 4 or 8 or 16))
+      throw new ConfigValidationException($"'integrity.parity' must be 0, 1, 2, 4, 8 or 16 shards per stripe of 32, got {parity}");
+    if (integrity.BlockIndexMinSize is { } minSize)
+      SizeSpec.Parse(minSize);
   }
 
   private static void _ValidateTrash(TrashConfig? trash) {
