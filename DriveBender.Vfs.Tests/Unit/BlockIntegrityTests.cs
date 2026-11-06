@@ -23,10 +23,32 @@ public class BlockIntegrityTests {
   private FakeVolumeIO _v1 = null!;
   private FakeVolumeIO _v2 = null!;
 
+  private readonly System.Collections.Concurrent.ConcurrentQueue<string> _log = new();
+
   [SetUp]
   public void SetUp() {
     this._v1 = new(Guid.NewGuid(), "v1", "PHYS-1", 1L << 26);
     this._v2 = new(Guid.NewGuid(), "v2", "PHYS-2", 1L << 26);
+    this._log.Clear();
+    DriveBender.Logger = message => this._log.Enqueue($"{DateTime.UtcNow:HH:mm:ss.fff} {message}");
+  }
+
+  /// <summary>On a failure, what the engine said and what each copy's index looked like — the evidence a CI run leaves.</summary>
+  [TearDown]
+  public void TearDown() {
+    if (TestContext.CurrentContext.Result.Outcome.Status != NUnit.Framework.Interfaces.TestStatus.Failed)
+      return;
+
+    foreach (var line in this._log)
+      TestContext.Out.WriteLine("log: " + line);
+    foreach (var path in new[] { "film.bin", "db.bin", "x.bin", "archive.bin", "log.bin", "old.bin", "a.bin", "b.bin" })
+      foreach (var (volume, shadow) in this._Copies(path)) {
+        var meta = volume.Stat(path, shadow)!.Value;
+        var bytes = volume.GetContent(BlockIntegrity.IndexPathFor(path, shadow), false);
+        var index = bytes == null ? null : Integrity.BlockIndex.Deserialize(bytes);
+        TestContext.Out.WriteLine($"copy {path} {volume.DisplayName} shadow={shadow} len={meta.Length} t={meta.LastWriteTimeUtc.Ticks} "
+                                  + $"index={(bytes == null ? "none" : index == null ? "corrupt" : $"{index.Length}/{index.MTimeTicks} describes={index.Describes(meta.Length, meta.LastWriteTimeUtc)}")}");
+      }
   }
 
   private PoolFileSystem _Engine(string extra = "") {
