@@ -1,3 +1,4 @@
+﻿using DivisonM.Vfs.Tests.TestSupport;
 using System.Diagnostics;
 using DivisonM.Vfs.Caching;
 using DivisonM.Vfs.Engine;
@@ -39,13 +40,16 @@ public class EngineHotPathBenchmarks {
   private PoolFileSystem _NewPool(string configJson, string cacheSize = "512MiB", int members = 2) {
     var engineMembers = new EngineMember[members];
     for (var i = 0; i < members; ++i) {
-      var root = Path.Combine(Path.GetTempPath(), "dbbench" + Guid.NewGuid().ToString("N"));
+      // DBBENCH_ROOT puts the members on a real disk: /tmp is often tmpfs, where a flush costs nothing
+      // and every durability number would be a fiction
+      var root = Path.Combine(Environment.GetEnvironmentVariable("DBBENCH_ROOT") is { Length: > 0 } benchRoot ? benchRoot : Path.GetTempPath(),
+        "dbbench" + Guid.NewGuid().ToString("N"));
       Directory.CreateDirectory(root);
       this._roots.Add(root);
       engineMembers[i] = new(new MeasuredVolumeIO(new LocalVolumeIO(Guid.NewGuid(), $"m{i}", root, $"PHYS-BENCH-{i}")));
     }
 
-    var config = ConfigResolver.ResolveEffective(null, configJson);
+    var config = TestConfig.Resolve(configJson);
     var fs = new PoolFileSystem(_pool, engineMembers, new CacheInstance("bench" + Guid.NewGuid().ToString("N"), new() { Size = cacheSize }), config);
     fs.Mount(new(@"X:\"));
     return fs;
@@ -131,6 +135,37 @@ public class EngineHotPathBenchmarks {
         (handle, random) => _RandomRead(fs, handle, random, 8L << 20), fs.Close);
       TestContext.Out.WriteLine($"{threads,7} | {same,14:N0} | {own,13:N0}");
       same.Should().BeGreaterThan(0);
+    }
+  }
+
+  [TestCase(false)]
+  [TestCase(true)]
+  [Description("Small files (4 KiB, duplication 2): how fast closes return, and how fast files are durable on every member.")]
+  public void SmallFiles_CreateWriteClose(bool closeIsDurable) {
+    var payload = new byte[4096];
+    new Random(3).NextBytes(payload);
+    TestContext.Out.WriteLine($"closeIsDurable={closeIsDurable}");
+    TestContext.Out.WriteLine("threads | closes/s | durable files/s");
+    foreach (var threads in new[] { 1, 16 }) {
+      var fs = this._NewPool($$"""{ "duplication": 2, "write": { "closeIsDurable": {{(closeIsDurable ? "true" : "false")}} } }""");
+      var count = 0;
+      var clock = Stopwatch.StartNew();
+      var until = TimeSpan.FromSeconds(4);
+      var workers = Enumerable.Range(0, threads).Select(worker => new Thread(() => {
+        for (var i = 0; clock.Elapsed < until; ++i) {
+          var handle = fs.Create($"w{worker}-{i}.bin", NodeKind.File, CreateFlags.None);
+          fs.Write(handle, payload, 0, WriteMode.Normal);
+          fs.Close(handle);
+          Interlocked.Increment(ref count);
+        }
+      })).ToArray();
+      foreach (var w in workers) w.Start();
+      foreach (var w in workers) w.Join();
+      var closed = clock.Elapsed;
+      fs.Dispose(); // publishes whatever is still queued: the files are durable when this returns
+      var durable = clock.Elapsed;
+      TestContext.Out.WriteLine($"{threads,7} | {count / closed.TotalSeconds,8:N0} | {count / durable.TotalSeconds,16:N0}");
+      count.Should().BeGreaterThan(0);
     }
   }
 
