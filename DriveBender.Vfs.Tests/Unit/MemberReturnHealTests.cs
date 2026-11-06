@@ -30,7 +30,7 @@ public class MemberReturnHealTests {
 
   private PoolFileSystem _CreateFs(string configJson = """{ "duplication": 2, "trash": { "enabled": false } }""", bool mount = true) {
     var cache = new CacheInstance("hr" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
-    var fs = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2)], cache, ConfigResolver.ResolveEffective(null, configJson));
+    var fs = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2)], cache, TestConfig.Resolve(configJson));
     if (mount)
       fs.Mount(new(@"X:\"));
     return fs;
@@ -62,7 +62,7 @@ public class MemberReturnHealTests {
       new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
     // pinned to the unstriped path: this tests the RAM owed-copy buffer, which new files only reach with striping off
     var fs = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2), new(volume3)], cache,
-      ConfigResolver.ResolveEffective(null,
+      TestConfig.Resolve(
         """{ "duplication": 3, "placement": { "shadowNeverSamePhysical": false }, "trash": { "enabled": false }, "write": { "striping": false } }"""));
     fs.Mount(new(@"X:\"));
 
@@ -264,7 +264,7 @@ public class MemberReturnHealTests {
     var volume3 = new FakeVolumeIO(Guid.NewGuid(), "v3", "PHYS-3", capacity: 1L << 20);
     var cache = new CacheInstance("ch" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
     var fs = new PoolFileSystem(_pool, [new(this._volume1), new(this._volume2), new(volume3)], cache,
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "trash": { "enabled": false } }"""));
+      TestConfig.Resolve("""{ "duplication": 2, "trash": { "enabled": false } }"""));
     fs.Mount(new(@"X:\"));
     var scheduler = fs.CreateScheduler();
     var volumes = new[] { this._volume1, this._volume2, volume3 };

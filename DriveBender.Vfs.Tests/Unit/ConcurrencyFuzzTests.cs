@@ -45,7 +45,7 @@ public class ConcurrencyFuzzTests {
     this._v2 = new(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 26);
     this._fs = new(_pool, [new(this._v1), new(this._v2)],
       new("conc" + Guid.NewGuid().ToString("N"), new() { Size = "16777216", BlockSize = "512", MetadataEntries = 1000, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, _CONFIG));
+      TestConfig.Resolve(_CONFIG));
     this._fs.Mount(new(@"X:\"));
   }
 

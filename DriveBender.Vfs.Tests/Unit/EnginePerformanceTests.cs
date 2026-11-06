@@ -23,7 +23,7 @@ public class EnginePerformanceTests {
   private static PoolFileSystem _NewPool(FakeVolumeIO v1, FakeVolumeIO v2, string blockSize = "4096", string cacheSize = "8388608")
     => new(_pool, [new(v1), new(v2)],
       new("perf" + Guid.NewGuid().ToString("N"), new() { Size = cacheSize, BlockSize = blockSize, MetadataEntries = 10_000, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "readAhead": { "enabled": false } }"""));
+      TestConfig.Resolve("""{ "duplication": 2, "readAhead": { "enabled": false } }"""));
 
   [Test]
   [Category("HappyPath")]
@@ -67,7 +67,7 @@ public class EnginePerformanceTests {
     var v2 = new FakeVolumeIO(Guid.NewGuid(), "v2", "P2", capacity: 1L << 28);
     using var fs = new PoolFileSystem(_pool, [new(v1), new(v2)],
       new("alloc" + Guid.NewGuid().ToString("N"), new() { Size = "8388608", BlockSize = "65536", MetadataEntries = 1000, MetadataTtl = "1h" }),
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2 }"""));
+      TestConfig.Resolve("""{ "duplication": 2 }"""));
     fs.Mount(new(@"X:\"));
 
     const int size = 1 << 20;
@@ -164,7 +164,7 @@ public class EnginePerformanceTests {
     // it TWICE (once directly, once inside the ack-quorum check), Unlink once, and every
     // placement/heal decision once more — so with any "folders" override configured this ran per
     // operation. The merge depends only on WHICH globs matched, so it is memoised by match set.
-    var config = ConfigResolver.ResolveEffective(null, """
+    var config = TestConfig.Resolve("""
       {
         "duplication": 2,
         "folders": {
@@ -204,7 +204,7 @@ public class EnginePerformanceTests {
     var v2 = new FakeVolumeIO(Guid.NewGuid(), "v2", "P2", capacity: 1L << 28);
     using var fs = new PoolFileSystem(_pool, [new(v1), new(v2)],
       new("route" + Guid.NewGuid().ToString("N"), new() { Size = "4194304", BlockSize = "512", MetadataEntries = 2000, MetadataTtl = "1m" }),
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "readAhead": { "enabled": false } }"""));
+      TestConfig.Resolve("""{ "duplication": 2, "readAhead": { "enabled": false } }"""));
     fs.Mount(new(@"X:\"));
 
     const int size = 128 * 1024;

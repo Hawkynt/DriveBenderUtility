@@ -1,4 +1,4 @@
-using DivisonM.Vfs;
+﻿using DivisonM.Vfs;
 using DivisonM.Vfs.Engine;
 using DivisonM.Vfs.Tests.TestSupport;
 using FluentAssertions;
@@ -169,6 +169,52 @@ public class JournalTests {
 
     reloaded.ReadIncomplete().Select(r => r.Sequence).Should().Equal([later],
       "member2's copy of the delete predates the compaction that proved it complete, so only the newer intent is open");
+  }
+
+  [Test]
+  [Category("Performance")]
+  public void LogIntent_GivenOneSlowMirror_ThenTheAppendReturnsOnTheOtherTwoAndTheSlowOneCatchesUp() {
+    // a pool of fast disks with one slow one: the journal used to run at the slow disk's pace
+    var slow = new FakeVolumeIO(Guid.NewGuid(), "slow", "PHYS-3");
+    var journal = new Journal(new MemberJournalStore([this._member1, this._member2, slow]));
+    slow.BeforeOperation = (op, path) => {
+      if (op == VolumeOp.OpenWrite && path == MemberJournalStore.JournalPath)
+        Thread.Sleep(1500);
+    };
+
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    var sequence = journal.LogIntent(JournalOp.Delete, "f.txt");
+    clock.Elapsed.Should().BeLessThan(TimeSpan.FromMilliseconds(1000), "two durable mirrors are enough to proceed");
+
+    this._member1.GetContent(MemberJournalStore.JournalPath, false).Should().NotBeNull();
+    this._member2.GetContent(MemberJournalStore.JournalPath, false).Should().NotBeNull();
+    journal.ReadIncomplete().Should().ContainSingle(r => r.Sequence == sequence, "a read waits for the lagging mirror and sees everything");
+    System.Text.Encoding.UTF8.GetString(slow.GetContent(MemberJournalStore.JournalPath, false)!).Should().Contain("f.txt",
+      "the slow mirror still receives every line");
+  }
+
+  [Test]
+  [Category("EdgeCase")]
+  public void Compaction_GivenALaggingMirror_ThenNoCompletedIntentComesBackAfterIt() {
+    // a line still on its way to a slow mirror must land before a compaction rewrites that mirror —
+    // landing after it, it would bring back an intent the compaction had already retired
+    var slow = new FakeVolumeIO(Guid.NewGuid(), "slow", "PHYS-3");
+    var store = new MemberJournalStore([this._member1, this._member2, slow]);
+    var journal = new Journal(store);
+    slow.BeforeOperation = (op, path) => {
+      if (op == VolumeOp.OpenWrite && path == MemberJournalStore.JournalPath)
+        Thread.Sleep(30);
+    };
+
+    for (var i = 0; i < 20; ++i)
+      journal.Complete(journal.LogIntent(JournalOp.Delete, $"f{i}.txt"), JournalOp.Delete);
+    journal.Checkpoint(); // compacts: every mirror is rewritten without the completed intents
+
+    // read the slow mirror on its own, at once, while it is still slow: anything still arriving
+    // there after the rewrite would show up as an intent with no completion beside it
+    new Journal(new MemberJournalStore([slow])).ReadIncomplete().Should().BeEmpty("the slow mirror alone must not resurrect anything");
+    slow.BeforeOperation = null;
+    journal.ReadIncomplete().Should().BeEmpty();
   }
 
 }

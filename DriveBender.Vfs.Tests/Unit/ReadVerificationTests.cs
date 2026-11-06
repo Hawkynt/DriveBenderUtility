@@ -38,7 +38,7 @@ public class ReadVerificationTests {
     this._volume2 = new(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 20);
     var cache = new CacheInstance("r" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
     this._fs = new(Guid.NewGuid(), [new(this._volume1), new(this._volume2)], cache,
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 2, "integrity": { "verifyReads": "{{verifyReads}}" } }"""));
+      TestConfig.Resolve($$"""{ "duplication": 2, "integrity": { "verifyReads": "{{verifyReads}}" } }"""));
     this._fs.Mount(new(@"X:\"));
   }
 
@@ -255,7 +255,7 @@ public class ReadVerificationTests {
   [Test]
   [Category("Exception")]
   public void Config_GivenAnUnknownMode_WhenResolved_ThenItIsRejected() {
-    var act = () => ConfigResolver.ResolveEffective(null, """{ "integrity": { "verifyReads": "sometimes" } }""");
+    var act = () => TestConfig.Resolve("""{ "integrity": { "verifyReads": "sometimes" } }""");
 
     act.Should().Throw<Exception>("a typo must not silently mean \"never\"");
   }

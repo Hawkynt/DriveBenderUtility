@@ -37,7 +37,7 @@ public class SnapshotTreeTests {
     var cache = new CacheInstance("st" + Guid.NewGuid().ToString("N"),
       new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
     var fs = new PoolFileSystem(_pool, [new(this._a), new(this._b)], cache,
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 1, "trash": { "enabled": false } }"""));
+      TestConfig.Resolve("""{ "duplication": 1, "trash": { "enabled": false } }"""));
     fs.Mount(new(@"X:\"));
     return fs;
   }

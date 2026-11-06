@@ -41,7 +41,7 @@ public class IdleRoleTests {
       [this._hdd.MemberId] = MemberRole.Capacity,
       [this._idle.MemberId] = MemberRole.Idle,
     };
-    return new(_pool, members, _Metadata(), ConfigResolver.ResolveEffective(null, null), roles);
+    return new(_pool, members, _Metadata(), TestConfig.Resolve(null), roles);
   }
 
   #region placement: nothing automatic ever lands on an idle member
@@ -98,7 +98,7 @@ public class IdleRoleTests {
     // the whole engine, not just the resolver: create, duplicate, heal
     var cache = new CacheInstance("idle" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "512", MetadataEntries = 1000, MetadataTtl = "1m" });
     using var fs = new PoolFileSystem(_pool, [new(this._ssd), new(this._hdd), new(this._idle, MemberRole.Idle)], cache,
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2 }"""));
+      TestConfig.Resolve("""{ "duplication": 2 }"""));
     fs.Mount(new(@"X:\"));
 
     for (var i = 0; i < 10; ++i) {

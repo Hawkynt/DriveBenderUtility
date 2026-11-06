@@ -2758,3 +2758,51 @@ legacy tier's are in `DataLossSafetyTests`.
 every drive whether it is ready, which is a statfs, and a stalled gvfs session on the test machine
 never answered it. `dbmount mount` waited for good before serving anything, with nothing in its
 output. Each probe now has three seconds, and a drive that does not answer is skipped and logged.
+
+### Changed: a close no longer waits for the disk (POSIX), and the journal is durable on two mirrors
+
+**A close returns at once** (`write.closeIsDurable`, now `false` by default). Making every close
+durable meant one flush and one rename per copy, in series, before the application could open its
+next file. A copy tool writing small files spent nearly all its time waiting on disk barriers one at a
+time. Now a pool of publishers takes closed files the moment it is free, flushes each copy and then
+renames it, and overlapping flushes share journal commits in the filesystem. The cost is POSIX's
+bargain and nothing more: a power cut within about a second of a close loses that file's new content,
+leaving the previous version (or no file for a new one), never a torn one. An fsync is durable at once,
+as before. `closeIsDurable: true` restores the old behaviour. A closed file still waiting for its
+publish is settled before anything else touches it (open, delete, rename, restore, snapshot, new
+times), so it is never mistaken for a file being written for the first time.
+
+**Renames into one folder share their folder flush.** A flush covers every change made in the folder
+before it started, so writers arriving while one runs share the next. Without that, the folder flushes
+added for durable renames halved small-file throughput.
+
+**Journal appends are durable on two mirrors.** The rest receive every line behind, in order, without
+the caller waiting. One slow disk in a pool of fast ones no longer sets the cost of every create,
+rename and delete. Mirrors are caught up before any of them is read or rewritten, so a late line can
+never land after a compaction. Two durable mirrors survive the loss of any one disk; losing the two
+that took an intent before the others caught up loses that intent. With two disks or fewer, nothing
+changes: every mirror is the quorum.
+
+**Measured** with `EngineHotPathBenchmarks.SmallFiles_CreateWriteClose` (4 KiB files,
+duplication 2, two members on one NVMe drive, btrfs), before the host became heavily loaded:
+
+| | 1 writer | 16 writers |
+| --- | ---: | ---: |
+| Durable close, before | 216 files/s | 1,072 files/s |
+| POSIX close: closes returned | 556 files/s | 1,578 files/s |
+| POSIX close: durable on both disks | 554 files/s | 1,095 files/s |
+| POSIX close, folder flushes shared: durable | 588 files/s | 1,288 files/s |
+
+Without any folder flush at all, 16 writers reach about 2,050 durable files/s. That gap is the price of
+renames that survive a power cut.
+
+**Found on the way: saving over a snapshotted file failed with duplication 2.** The snapshot store
+keeps one copy of the old content; the other copies stayed at the name, so the save truncated them,
+one short of the duplication level, and its first write was refused. The other copies now go with the
+preserved version and the replacement is a new file at full duplication. It failed the same way before
+this change; the snapshot tests all used duplication 1.
+
+**Found on the way: an open could report a just-written file missing.** A publish takes the file off
+the staging list before renaming it, and an open in between saw neither name. It asks again under the
+path's lease before reporting "not found".
+

@@ -33,7 +33,7 @@ public class SnapshotScheduleTests {
     var cache = new CacheInstance("sc" + Guid.NewGuid().ToString("N"),
       new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "5m" });
     var fs = new PoolFileSystem(_pool, [new(this._a), new(this._b)], cache,
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 1, "snapshots": {{snapshots}} }"""), clock: () => this._now);
+      TestConfig.Resolve($$"""{ "duplication": 1, "snapshots": {{snapshots}} }"""), clock: () => this._now);
     fs.Mount(new(@"X:\") { ReadOnly = readOnly });
     return fs;
   }
@@ -173,7 +173,7 @@ public class SnapshotScheduleTests {
     scheduler.Quiesce();
     fs.ListSnapshots().Should().BeEmpty();
 
-    fs.ReloadConfig(ConfigResolver.ResolveEffective(null, """{ "duplication": 1, "snapshots": { "schedule": { "every": "1d" } } }"""));
+    fs.ReloadConfig(TestConfig.Resolve("""{ "duplication": 1, "snapshots": { "schedule": { "every": "1d" } } }"""));
     scheduler.Quiesce();
 
     _Scheduled(fs).Should().ContainSingle();
@@ -297,7 +297,7 @@ public class SnapshotScheduleTests {
   [TestCase("-1h", TestName = "Validate_GivenANegativeScheduleInterval_ThenItIsRejected")]
   [Category("Exception")]
   public void Validate_GivenABadScheduleInterval_ThenItIsRejected(string every) {
-    var config = ConfigResolver.ResolveEffective(null, $$"""{ "snapshots": { "schedule": { "every": "{{every}}" } } }""");
+    var config = TestConfig.Resolve($$"""{ "snapshots": { "schedule": { "every": "{{every}}" } } }""");
 
     var validate = () => ConfigValidator.Validate(config);
 
@@ -310,7 +310,7 @@ public class SnapshotScheduleTests {
   [TestCase("OFF", TestName = "Validate_GivenTheScheduleOffInCapitals_ThenItIsAccepted")]
   [Category("HappyPath")]
   public void Validate_GivenAGoodScheduleInterval_ThenItIsAccepted(string every) {
-    var config = ConfigResolver.ResolveEffective(null, $$"""{ "snapshots": { "schedule": { "every": "{{every}}" } } }""");
+    var config = TestConfig.Resolve($$"""{ "snapshots": { "schedule": { "every": "{{every}}" } } }""");
 
     var validate = () => ConfigValidator.Validate(config);
 
@@ -322,7 +322,7 @@ public class SnapshotScheduleTests {
   [TestCase(1, true, TestName = "Validate_GivenAKeepCountOfOne_ThenItIsAccepted")]
   [Category("EdgeCase")]
   public void Validate_GivenAKeepCount_ThenOnlyAtLeastOneIsAccepted(int keep, bool accepted) {
-    var config = ConfigResolver.ResolveEffective(null, $$"""{ "snapshots": { "schedule": { "every": "1d", "keep": {{keep}} } } }""");
+    var config = TestConfig.Resolve($$"""{ "snapshots": { "schedule": { "every": "1d", "keep": {{keep}} } } }""");
 
     var validate = () => ConfigValidator.Validate(config);
 
@@ -335,7 +335,7 @@ public class SnapshotScheduleTests {
   [Test]
   [Category("Exception")]
   public void Validate_GivenAReserveThatIsNotASize_ThenItIsRejected() {
-    var config = ConfigResolver.ResolveEffective(null, """{ "snapshots": { "reserve": "lots" } }""");
+    var config = TestConfig.Resolve("""{ "snapshots": { "reserve": "lots" } }""");
 
     var validate = () => ConfigValidator.Validate(config);
 
@@ -345,7 +345,7 @@ public class SnapshotScheduleTests {
   [Test]
   [Category("HappyPath")]
   public void Defaults_GivenNoSnapshotSettings_ThenTheScheduleIsOffAndKeepsSeven() {
-    var config = ConfigResolver.ResolveEffective(null, null);
+    var config = TestConfig.Resolve(null);
 
     config.Snapshots!.Schedule!.Interval.Should().Be(TimeSpan.Zero, "scheduled snapshots are off unless asked for");
     config.Snapshots.Schedule.Keep.Should().Be(7);

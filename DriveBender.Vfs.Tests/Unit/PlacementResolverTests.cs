@@ -34,7 +34,7 @@ public class PlacementResolverTests {
       [this._hdd1.MemberId] = MemberRole.Capacity,
       [this._hdd2.MemberId] = MemberRole.Capacity,
     };
-    return new(_pool, members, this._metadata, config ?? ConfigResolver.ResolveEffective(null, null), roles, reserves, loadOf);
+    return new(_pool, members, this._metadata, config ?? TestConfig.Resolve(null), roles, reserves, loadOf);
   }
 
   [Test]
@@ -138,7 +138,7 @@ public class PlacementResolverTests {
     // The feature in its own right: a pool is rarely the only user of a disk, so a mechanical drive
     // shared with something else - or a cloud endpoint with a rate limit and a bill - can be told
     // to take only its share.
-    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    var queues = new VolumeQueues(TestConfig.Resolve(null), new Dictionary<Guid, MemberRole>());
     queues.SetThrottles([(this._hdd1.MemberId, 20, 0)]); // 20 operations per second
 
     // the bucket starts full, so drain the first second of credit before timing anything
@@ -158,7 +158,7 @@ public class PlacementResolverTests {
   [Test]
   [Category("HappyPath")]
   public void Throttle_GivenNoLimitIsSet_ThenNothingIsSlowedDown() {
-    var queues = new VolumeQueues(ConfigResolver.ResolveEffective(null, null), new Dictionary<Guid, MemberRole>());
+    var queues = new VolumeQueues(TestConfig.Resolve(null), new Dictionary<Guid, MemberRole>());
     queues.SetThrottles([(this._hdd1.MemberId, 5, 0)]); // a limit on a DIFFERENT member
 
     var clock = System.Diagnostics.Stopwatch.StartNew();
@@ -243,7 +243,7 @@ public class PlacementResolverTests {
   [Test]
   [Category("HappyPath")]
   public void ChoosePrimaryTarget_GivenRoundRobinStrategy_WhenPlacingTwice_ThenDifferentMembers() {
-    var config = ConfigResolver.ResolveEffective(null, """{ "placement": { "strategy": "round-robin" }, "tiers": { "fast": { "members": [] } } }""");
+    var config = TestConfig.Resolve("""{ "placement": { "strategy": "round-robin" }, "tiers": { "fast": { "members": [] } } }""");
     var resolver = this._Resolver(config, ssdIsLanding: false);
 
     var first = resolver.ChoosePrimaryTarget(10);
@@ -279,7 +279,7 @@ public class PlacementResolverTests {
   public void ChooseShadowTarget_GivenSubfolderMembersOnOneDisk_WhenPlacingShadow_ThenTreatedAsOneDomain() {
     var sameDisk = new FakeVolumeIO(Guid.NewGuid(), "same-disk-other-folder", "PHYS-HDD1", capacity: 50_000);
     var members = new IVolumeIO[] { this._hdd1, sameDisk };
-    var resolver = new PlacementResolver(_pool, members, this._metadata, ConfigResolver.ResolveEffective(null, null));
+    var resolver = new PlacementResolver(_pool, members, this._metadata, TestConfig.Resolve(null));
 
     resolver.ChooseShadowTarget(100, [this._hdd1]).Should().BeNull(
       "two members on the same physical volume are one failure domain — 2 copies there survive a disk loss as 0 (SAFE-PHYS)");
@@ -290,7 +290,7 @@ public class PlacementResolverTests {
   public void ChooseShadowTarget_GivenSameDiskAllowedAndNoIndependentDomain_WhenPlacing_ThenCoLocatesForBitRotProtection() {
     var sameDisk = new FakeVolumeIO(Guid.NewGuid(), "same-disk-other-folder", "PHYS-HDD1", capacity: 50_000);
     var members = new IVolumeIO[] { this._hdd1, sameDisk };
-    var config = ConfigResolver.ResolveEffective(null, """{"placement":{"shadowNeverSamePhysical":false}}""");
+    var config = TestConfig.Resolve("""{"placement":{"shadowNeverSamePhysical":false}}""");
     var resolver = new PlacementResolver(_pool, members, this._metadata, config);
 
     resolver.ChooseShadowTarget(100, [this._hdd1]).Should().Be(sameDisk,
@@ -304,7 +304,7 @@ public class PlacementResolverTests {
     var fast = new MeasuredVolumeIO(this._hdd2);
     slow.RecordLatency(25);
     fast.RecordLatency(1.5);
-    var config = ConfigResolver.ResolveEffective(null, """{"placement":{"strategy":"lowest-latency"}}""");
+    var config = TestConfig.Resolve("""{"placement":{"strategy":"lowest-latency"}}""");
     var resolver = new PlacementResolver(_pool, [slow, fast], this._metadata, config);
 
     resolver.ChoosePrimaryTarget(100).Should().Be(fast,
@@ -314,7 +314,7 @@ public class PlacementResolverTests {
   [Test]
   [Category("HappyPath")]
   public void ChoosePrimaryTarget_GivenRoundRobinStrategy_WhenPlacingTwice_ThenTargetsAlternate() {
-    var config = ConfigResolver.ResolveEffective(null, """{"placement":{"strategy":"round-robin"}}""");
+    var config = TestConfig.Resolve("""{"placement":{"strategy":"round-robin"}}""");
     var resolver = new PlacementResolver(_pool, [this._hdd1, this._hdd2], this._metadata, config);
 
     var first = resolver.ChoosePrimaryTarget(100);
@@ -341,7 +341,7 @@ public class PlacementResolverTests {
   [Test]
   [Category("HappyPath")]
   public void ChooseShadowTarget_GivenSameDiskAllowedButIndependentDomainFree_WhenPlacing_ThenStillPrefersIndependentDomain() {
-    var config = ConfigResolver.ResolveEffective(null, """{"placement":{"shadowNeverSamePhysical":false}}""");
+    var config = TestConfig.Resolve("""{"placement":{"shadowNeverSamePhysical":false}}""");
 
     var target = this._Resolver(config).ChooseShadowTarget(100, [this._hdd1]);
 

@@ -38,7 +38,7 @@ public class LandingOverflowTests {
   private PoolFileSystem _Engine(string extra = "") {
     var cache = new CacheInstance("lo" + Guid.NewGuid().ToString("N"), new() { Size = "4194304", BlockSize = "4096", MetadataEntries = 500, MetadataTtl = "1m" });
     var fs = new PoolFileSystem(_pool, [new(this._ssd, MemberRole.Landing), new(this._hdd1), new(this._hdd2)], cache,
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 1, "readAhead": { "enabled": false }{{extra}} }"""));
+      TestConfig.Resolve($$"""{ "duplication": 1, "readAhead": { "enabled": false }{{extra}} }"""));
     fs.Mount(new(@"X:\"));
     return fs;
   }

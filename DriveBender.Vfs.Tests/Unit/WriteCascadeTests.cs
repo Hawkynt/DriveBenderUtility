@@ -40,7 +40,7 @@ public class WriteCascadeTests {
       new(this._hdd1),
       new(this._hdd2),
     };
-    var fs = new PoolFileSystem(_pool, members, cache, ConfigResolver.ResolveEffective(null, configJson), clock: () => this._now);
+    var fs = new PoolFileSystem(_pool, members, cache, TestConfig.Resolve(configJson), clock: () => this._now);
     fs.Mount(new(@"X:\"));
     return fs;
   }

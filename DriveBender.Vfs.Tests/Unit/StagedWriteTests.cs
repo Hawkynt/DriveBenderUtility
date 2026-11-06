@@ -30,7 +30,7 @@ public class StagedWriteTests {
 
   private PoolFileSystem _CreateFs(string configJson) {
     var cache = new CacheInstance("s" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)], cache, ConfigResolver.ResolveEffective(null, configJson));
+    var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)], cache, TestConfig.Resolve(configJson));
     fs.Mount(new(@"X:\"));
     return fs;
   }
@@ -127,7 +127,7 @@ public class StagedWriteTests {
 
     var cache = new CacheInstance("r" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
     var fs = new PoolFileSystem(_pool, [new(fast), new(slow)], cache,
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "write": { "policy": "write-back", "minCopiesBeforeAck": 1 } }"""));
+      TestConfig.Resolve("""{ "duplication": 2, "write": { "policy": "write-back", "minCopiesBeforeAck": 1 } }"""));
     fs.Mount(new(@"X:\"));
 
     var handle = fs.Create("vid.bin", NodeKind.File, CreateFlags.None);

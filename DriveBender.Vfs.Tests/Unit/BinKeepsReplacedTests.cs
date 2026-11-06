@@ -44,7 +44,7 @@ public class BinKeepsReplacedTests {
   private PoolFileSystem _Engine(string config = _BIN) {
     var cache = new CacheInstance("bk" + Guid.NewGuid().ToString("N"),
       new() { Size = "1048576", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
-    var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)], cache, ConfigResolver.ResolveEffective(null, config));
+    var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)], cache, TestConfig.Resolve(config));
     fs.Mount(new(@"X:\"));
     return fs;
   }

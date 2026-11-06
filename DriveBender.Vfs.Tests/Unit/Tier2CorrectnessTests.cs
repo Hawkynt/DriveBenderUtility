@@ -23,7 +23,7 @@ public class Tier2CorrectnessTests {
     this._v1 = new(Guid.NewGuid(), "v1", "PHYS-1", capacity: 1L << 20);
     this._v2 = new(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 20);
     var cache = new CacheInstance("t2" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 100, MetadataTtl = "5m" });
-    this._fs = new(_pool, [new(this._v1), new(this._v2)], cache, ConfigResolver.ResolveEffective(null, """{ "duplication": 2 }"""));
+    this._fs = new(_pool, [new(this._v1), new(this._v2)], cache, TestConfig.Resolve("""{ "duplication": 2 }"""));
     this._fs.Mount(new(@"X:\"));
   }
 

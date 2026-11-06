@@ -24,7 +24,7 @@ public class DrainTransparencyTests {
     var hdd = new FakeVolumeIO(Guid.NewGuid(), "hdd", "PHYS-HDD", capacity: 1L << 22);
     var cache = new CacheInstance("dt" + Guid.NewGuid().ToString("N"), new() { Size = "1048576", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
     using var fs = new PoolFileSystem(_pool, [new(ssd, MemberRole.Landing), new(hdd)], cache,
-      ConfigResolver.ResolveEffective(null, """{ "duplication": 1, "readAhead": { "enabled": false } }"""));
+      TestConfig.Resolve("""{ "duplication": 1, "readAhead": { "enabled": false } }"""));
     fs.Mount(new(@"X:\"));
 
     var original = Enumerable.Range(0, 4096).Select(i => (byte)i).ToArray();

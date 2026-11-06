@@ -295,7 +295,7 @@ public class WholeFileVolumeIOTests {
     // local durable member takes the ack; the SharpGrip member receives its copy asynchronously (SAFE-REMOTE)
     var local = new FakeVolumeIO(Guid.NewGuid(), "local", "PHYS-LOCAL", capacity: 1L << 20);
     var cache = new CacheInstance("sg" + Guid.NewGuid().ToString("N"), new() { Size = "262144", BlockSize = "16", MetadataEntries = 100, MetadataTtl = "1m" });
-    var config = ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "write": { "policy": "write-back", "minCopiesBeforeAck": 1, "acceptVolatileAck": false } }""");
+    var config = TestConfig.Resolve("""{ "duplication": 2, "write": { "policy": "write-back", "minCopiesBeforeAck": 1, "acceptVolatileAck": false } }""");
     var fs = new PoolFileSystem(Guid.NewGuid(), [new(local), new(this._volume)], cache, config);
     fs.Mount(new(@"X:\"));
 

@@ -23,7 +23,7 @@ public class PoolFileSystemTests {
     this._volume1 = new(Guid.NewGuid(), "v1", "PHYS-1", capacity: 1L << 20);
     this._volume2 = new(Guid.NewGuid(), "v2", "PHYS-2", capacity: 1L << 20);
     this._cache = new("test", new() { Size = "262144", BlockSize = "16", MetadataEntries = 1000, MetadataTtl = "1m" });
-    this._fs = new(_pool, [new(this._volume1), new(this._volume2)], this._cache, ConfigResolver.ResolveEffective(null, """{ "io": { "mirrorReadSplitThreshold": "64" } }"""));
+    this._fs = new(_pool, [new(this._volume1), new(this._volume2)], this._cache, TestConfig.Resolve("""{ "io": { "mirrorReadSplitThreshold": "64" } }"""));
     this._fs.Mount(new(@"X:\"));
   }
 
@@ -188,7 +188,7 @@ public class PoolFileSystemTests {
   [Category("EdgeCase")]
   public void StatFs_GivenTwoMembersOnOnePhysicalVolume_WhenQueried_ThenCountedOnce() {
     var sameDisk = new FakeVolumeIO(Guid.NewGuid(), "v1b", "PHYS-1", capacity: 1L << 20);
-    var fs = new PoolFileSystem(_pool, [new(this._volume1), new(sameDisk, ReserveBytes: 100)], this._cache, ConfigResolver.ResolveEffective(null, null));
+    var fs = new PoolFileSystem(_pool, [new(this._volume1), new(sameDisk, ReserveBytes: 100)], this._cache, TestConfig.Resolve(null));
     fs.Mount(new(@"Y:\"));
 
     var stats = fs.StatFs();
@@ -211,7 +211,7 @@ public class PoolFileSystemTests {
   [Category("Exception")]
   public void Open_GivenReadOnlyMount_WhenOpenedForWrite_ThenAccessDenied() {
     this._volume1.Seed("f.bin", false, [1]);
-    var fs = new PoolFileSystem(_pool, [new(this._volume1)], this._cache, ConfigResolver.ResolveEffective(null, null));
+    var fs = new PoolFileSystem(_pool, [new(this._volume1)], this._cache, TestConfig.Resolve(null));
     fs.Mount(new(@"Z:\", ReadOnly: true));
 
     var act = () => fs.Open("f.bin", AccessMode.ReadWrite, ShareMode.None);
@@ -233,7 +233,7 @@ public class PoolFileSystemTests {
   [Category("Exception")]
   public void Mount_GivenAllMembersOffline_WhenMounted_ThenRefused() {
     this._volume1.IsOnline = false;
-    var fs = new PoolFileSystem(_pool, [new(this._volume1)], this._cache, ConfigResolver.ResolveEffective(null, null));
+    var fs = new PoolFileSystem(_pool, [new(this._volume1)], this._cache, TestConfig.Resolve(null));
 
     var act = () => fs.Mount(new(@"Q:\"));
     act.Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.Offline);
@@ -242,7 +242,7 @@ public class PoolFileSystemTests {
   [Test]
   [Category("EdgeCase")]
   public void AnyOp_GivenUnmountedFs_WhenCalled_ThenRejected() {
-    var fs = new PoolFileSystem(_pool, [new(this._volume1)], this._cache, ConfigResolver.ResolveEffective(null, null));
+    var fs = new PoolFileSystem(_pool, [new(this._volume1)], this._cache, TestConfig.Resolve(null));
     var act = () => fs.GetAttributes("f");
     act.Should().Throw<PoolFsException>().Which.Error.Should().Be(PoolFsError.InvalidArgument);
   }

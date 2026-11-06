@@ -199,6 +199,15 @@ public sealed record WriteConfig {
   [JsonPropertyName("fsyncIsDurable")] public bool? FsyncIsDurable { get; init; }
 
   /// <summary>
+  /// Whether closing a newly written file waits until it is on disk. Off by default, which is what
+  /// POSIX promises: an fsync is the barrier, and a close returns at once. The file is published
+  /// in the background within about a second, flushed before it is renamed, so a power cut in that
+  /// window leaves the previous version (or no file) — never a torn one. On, every close pays its
+  /// own flush and rename before it returns.
+  /// </summary>
+  [JsonPropertyName("closeIsDurable")] public bool? CloseIsDurable { get; init; }
+
+  /// <summary>
   /// Stripe sessions for new files (docs/IncomingFiles.md): while a file is written its blocks go to
   /// whichever disks of its group can take them first, and the final disks are filled before the
   /// file is published. On unless set to false.
@@ -475,7 +484,8 @@ public static class ConfigResolver {
       "deferWindow": "5s",
       "maxDeferSeconds": 30,
       "acceptVolatileAck": false,
-      "fsyncIsDurable": true
+      "fsyncIsDurable": true,
+      "closeIsDurable": false
     },
     "cacheHost": { "maxTotal": "50%" },
     "caches": {

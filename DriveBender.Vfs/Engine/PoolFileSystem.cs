@@ -147,6 +147,22 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// <summary>Striped files closed under the performance policy, published in the background.</summary>
   private readonly System.Collections.Concurrent.ConcurrentQueue<string> _deferredPublishes = new();
 
+  /// <summary>Closed files waiting for the background publisher (write.closeIsDurable off; see _QueuesPublish).</summary>
+  private readonly System.Collections.Concurrent.ConcurrentQueue<string> _closedPublishes = new();
+  private readonly SemaphoreSlim _closedPublishSignal = new(0);
+  private int _closedPublishesPending;
+  private Thread[]? _closedPublishers;
+  private volatile bool _closedPublisherStopping;
+
+  /// <summary>
+  /// How many closed files may wait to be published before a close publishes its own file inline.
+  /// The bound keeps the window a power cut can reach short when files arrive faster than the disks
+  /// take them, and it is what turns an endless stream of small files into back-pressure rather than
+  /// an ever-growing backlog of unsaved work.
+  /// </summary>
+  private const int _MAX_CLOSED_PUBLISHES_PENDING = 2048;
+
+
   private static bool _IsStagedName(string physical)
     => physical.EndsWith("." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, StringComparison.OrdinalIgnoreCase);
 
@@ -716,6 +732,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   public void RestoreFromTrash(string originalPath) {
     this._RequireWritable();
     var normalized = PoolPaths.Normalize(originalPath);
+    this._SettleClosed(normalized);
     _RefuseWriteToSnapshotTree(normalized);
 
     // The version to bring back is chosen BEFORE anything else moves: when the name is taken, the file
@@ -799,6 +816,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     }
 
     this._mountOptions = options;
+    this._StartClosedPublisher();
 
     // Which paths the snapshots still point at the LIVE file for. Held in memory because it is
     // consulted before every write, and therefore rebuilt from the members here — without this a
@@ -817,8 +835,10 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return;
 
     // clean unmount: staged files publish and every owed copy applies before the mount releases (FR-CLEAN-UNMOUNT)
-    foreach (var stagedPath in this._staging.Keys.ToArray())
-      this._PublishStaged(stagedPath);
+    this._StopClosedPublisher();
+    if (this._PublishInParallel(this._staging.Keys.ToArray(), skipOpen: false) is { Count: > 0 } unpublished)
+      throw new PoolFsException(PoolFsError.IoError,
+        $"{unpublished.Count} file(s) could not be published before unmounting and stay under their temp names: {string.Join(", ", unpublished.Take(5))}");
     foreach (var path in this._writeBuffer.DirtyPaths)
       this.FlushPath(path);
 
@@ -1092,6 +1112,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public void SetAttributes(string path, FileMetaPatch patch) {
     this._RequireWritable();
+    this._SettleClosed(PoolPaths.Normalize(path));
     using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
@@ -1294,6 +1315,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public NodeHandle Create(string path, NodeKind kind, CreateFlags flags) {
     this._RequireWritable();
+    this._SettleClosed(PoolPaths.Normalize(path));
     using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
@@ -1349,9 +1371,24 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // replacement is staged to a temp and published by a rename, exactly as any new file is, and
       // the pair of renames is the whole design. Opening for writing WITHOUT that promise cannot do
       // this, and falls to the conservative copy in Open.
-      if ((flags & CreateFlags.Truncate) != 0) {
+      if ((flags & CreateFlags.Truncate) != 0 && this._pinned.ContainsKey(normalized)) {
         this._PreserveIfPinned(normalized, wholeFileReplaced: true);
         existing = this._placement.ResolveCopies(normalized);
+
+        // The store keeps ONE copy of the content, so with duplication the others are still here,
+        // holding the very bytes just preserved. Left in place, they took the create down the
+        // existing-file branch: a truncate of whichever copies remained, one short of the
+        // duplication level, and the first write was then refused for want of a second copy — a
+        // plain save over a snapshotted file failed. They go, as the replace was going to drop them,
+        // and the replacement is a new file placed at full duplication like any other.
+        if (existing.Count > 0 && !this._pinned.ContainsKey(normalized)) {
+          this._RecordTombstoneForOffline(JournalOp.Delete, normalized);
+          foreach (var copy in existing)
+            copy.Volume.Delete(normalized, copy.Shadow);
+
+          this._Invalidate(normalized);
+          existing = this._placement.ResolveCopies(normalized);
+        }
       }
     }
 
@@ -1783,6 +1820,145 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   /// <summary>
+  /// Whether this close hands its file to the background publisher instead of publishing it before
+  /// it returns — which is what POSIX asks of a close (nothing: the barrier is fsync), and what
+  /// <c>write.closeIsDurable</c> turns back off.
+  ///
+  /// Making every close durable meant one flush and one rename per copy, in series, before the
+  /// application could open its next file; a copy tool writing small files spent nearly all its time
+  /// waiting on disk barriers one at a time. Queued, the publishes of many files run side by side,
+  /// and the filesystem folds their flushes into far fewer journal commits.
+  ///
+  /// What it costs is exactly POSIX's bargain: a power cut within about a second of the close loses
+  /// that file's new content. Never into a torn file — a publish still flushes before it renames —
+  /// so what remains is the previous version, or no file for a new one. An fsync publishes at once.
+  /// </summary>
+  private bool _QueuesPublish(string path) {
+    if (this._closedPublishers == null || this._closedPublisherStopping)
+      return false;
+
+    var effective = ConfigResolver.ResolveForFolder(this._config, PoolPaths.GetParent(path));
+    if (effective.Write?.CloseIsDurable == true)
+      return false;
+
+    if (Volatile.Read(ref this._closedPublishesPending) >= _MAX_CLOSED_PUBLISHES_PENDING)
+      return false; // back-pressure: the disks are behind, so this close pays for its own file
+
+    Interlocked.Increment(ref this._closedPublishesPending);
+    this._closedPublishes.Enqueue(path);
+    this._closedPublishSignal.Release();
+    return true;
+  }
+
+  /// <summary>
+  /// Publishes a file whose writer has closed it but whose background publish has not run yet,
+  /// before anything else is done to it.
+  ///
+  /// A staged file is "being written for the first time" everywhere else in the engine: a delete
+  /// drops it as a file that never existed, a snapshot leaves it out, a restore sees its name as in
+  /// use. Those rules are right for a file still open for its first write, and wrong for one its
+  /// writer has finished — so the moment anything reaches for such a file, it becomes the ordinary
+  /// published file it would have been with a durable close. Called before the namespace gate is
+  /// taken, as every caller's own gate follows.
+  /// </summary>
+  private void _SettleClosed(string normalized) {
+    if (!this._staging.ContainsKey(normalized) || this._handles.IsOpen(normalized))
+      return;
+
+    using var namespaceHold = this._EnterNamespaceShared();
+    using var lease = this._handles.AcquireWrite(normalized);
+    if (this._staging.ContainsKey(normalized) && !this._handles.IsOpen(normalized))
+      this._PublishStagedLocked(normalized);
+  }
+
+  /// <summary>
+  /// Starts the publishers: several threads, each taking the next closed file the moment it is free.
+  /// Their flushes overlap, and the filesystem folds overlapping flushes into shared journal commits.
+  /// Batches were tried first and lost to plain synchronous closes under many writers: a batch
+  /// waits for its slowest file before the next one starts, and the disk idles in between.
+  /// </summary>
+  private void _StartClosedPublisher() {
+    if (this._closedPublishers != null || this.IsReadOnly)
+      return;
+
+    this._closedPublisherStopping = false;
+    this._closedPublishers = [.. Enumerable.Range(0, Math.Clamp(Environment.ProcessorCount, 4, 16))
+      .Select(i => new Thread(this._RunClosedPublisher) { IsBackground = true, Name = $"pool-publish-{i}" })];
+    foreach (var worker in this._closedPublishers)
+      worker.Start();
+  }
+
+  /// <summary>Stops taking closes into the queue and publishes everything already in it.</summary>
+  private void _StopClosedPublisher() {
+    var workers = this._closedPublishers;
+    if (workers == null)
+      return;
+
+    this._closedPublisherStopping = true;
+    this._closedPublishSignal.Release(workers.Length);
+    foreach (var worker in workers)
+      worker.Join();
+
+    this._closedPublishers = null;
+    var left = new List<string>();
+    while (this._closedPublishes.TryDequeue(out var path)) {
+      Interlocked.Decrement(ref this._closedPublishesPending);
+      left.Add(path);
+    }
+
+    this._PublishInParallel([.. left.Distinct(PoolPaths.PathComparer)], skipOpen: true); // the unmount publishes any that fail
+  }
+
+  private void _RunClosedPublisher() {
+    while (!this._closedPublisherStopping) {
+      if (!this._closedPublishes.TryDequeue(out var path)) {
+        this._closedPublishSignal.Wait(TimeSpan.FromMilliseconds(250));
+        continue;
+      }
+
+      Interlocked.Decrement(ref this._closedPublishesPending);
+      if (!this._staging.ContainsKey(path) || this._handles.IsOpen(path))
+        continue; // published, deleted or renamed since, or reopened: its next close decides again
+
+      try {
+        using var namespaceHold = this._EnterNamespaceShared();
+        this._PublishStaged(path);
+      } catch (Exception e) when (e is PoolFsException or IOException or UnauthorizedAccessException) {
+        // it stays staged; tried again shortly, and at the latest by the unmount
+        DriveBender.Logger($"[Warning]Could not publish '{path}' yet: {e.Message}");
+        Thread.Sleep(TimeSpan.FromMilliseconds(500)); // a failing disk is not retried in a tight loop
+        Interlocked.Increment(ref this._closedPublishesPending);
+        this._closedPublishes.Enqueue(path);
+      } catch (Exception e) {
+        DriveBender.Logger($"[Warning]Background publish of '{path}' failed: {e.Message}");
+      }
+    }
+  }
+
+  /// <summary>
+  /// Publishes several staged files side by side. Each publish is the same flush-then-rename as
+  /// ever; running them together is what lets the filesystem share one journal commit among many
+  /// files' flushes. Returns the paths whose publish failed (they stay staged).
+  /// </summary>
+  private List<string> _PublishInParallel(IReadOnlyList<string> paths, bool skipOpen) {
+    var failed = new System.Collections.Concurrent.ConcurrentBag<string>();
+    Parallel.ForEach(paths, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount, 4, 16) }, path => {
+      if (!this._staging.ContainsKey(path) || (skipOpen && this._handles.IsOpen(path)))
+        return; // published, deleted or renamed since, or reopened: its next close decides again
+
+      try {
+        using var namespaceHold = this._EnterNamespaceShared();
+        this._PublishStaged(path);
+      } catch (Exception e) when (e is PoolFsException or IOException or UnauthorizedAccessException) {
+        DriveBender.Logger($"[Warning]Could not publish '{path}' yet: {e.Message}");
+        failed.Add(path);
+      }
+    });
+
+    return [.. failed];
+  }
+
+  /// <summary>
   /// Publishing a striped file waits for its finals to be filled — unless the folder's policy is
   /// performance, where the close returns at once and the publish runs in the background.
   /// </summary>
@@ -1873,6 +2049,8 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._RequireWritable();
     var fromNormalized = PoolPaths.Normalize(from);
     var toNormalized = PoolPaths.Normalize(to);
+    this._SettleClosed(fromNormalized);
+    this._SettleClosed(toNormalized);
     _RefuseWriteToSnapshotTree(fromNormalized);
     _RefuseWriteToSnapshotTree(toNormalized);
     _RefuseReservedName(toNormalized);
@@ -2779,6 +2957,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   public void Unlink(string path) {
     this._RequireWritable();
+    this._SettleClosed(PoolPaths.Normalize(path));
     using var namespaceHold = this._EnterNamespaceShared(); // before any lease: a folder rename must not move the path mid-operation
     var normalized = PoolPaths.Normalize(path);
     _RefuseWriteToSnapshotTree(normalized);
@@ -3146,8 +3325,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       return this._OpenSnapshotTreeFile(normalized);
     }
 
+    this._SettleClosed(normalized);
+
+    // A publish takes the file off the staging list before it renames the temp on each member, so
+    // for that instant neither name resolves. Asked again under the path's lease — which waits for
+    // the publish holding it — before "not found" is believed: with closes published in the
+    // background, a file the application has just written was otherwise reported missing.
     if (this._placement.ResolveCopies(this._DataName(normalized)).Count == 0)
-      throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
+      using (this._handles.AcquireRead(normalized))
+        if (this._placement.ResolveCopies(this._DataName(normalized)).Count == 0)
+          throw new PoolFsException(PoolFsError.NotFound, $"File not found: {path}");
 
     // Opened for writing with no promise about how much of it will be rewritten, so the content is
     // preserved by copy. A caller that goes on to truncate has already been given the cheap path by
@@ -5052,7 +5239,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (path == null)
       return;
 
-    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path) && !this._DefersPublish(path))
+    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path) && !this._DefersPublish(path) && !this._QueuesPublish(path))
       this._PublishStaged(path);
 
     if (wrote)
@@ -5093,7 +5280,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     // last handle gone: publish the staged temp to its final name — the atomic rename is the
     // LAST action before the Create journal intent completes (FR-STAGED-WRITE)
-    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path) && !this._DefersPublish(path))
+    if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path) && !this._DefersPublish(path) && !this._QueuesPublish(path))
       this._PublishStaged(path);
 
     if (wrote)

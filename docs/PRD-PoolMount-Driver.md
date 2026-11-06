@@ -1039,7 +1039,8 @@ on typical HW).
     "deferWindow": "5s",
     "maxDeferSeconds": 30,
     "acceptVolatileAck": false,            // performance-mode only: ack from RAM before a durable copy (risky)
-    "fsyncIsDurable": true                 // fsync always forces min-copies durability (cannot be disabled)
+    "fsyncIsDurable": true,                // fsync always forces min-copies durability (cannot be disabled)
+    "closeIsDurable": false                // POSIX: close returns at once, the file is durable within ~1 s; true = every close waits for disk
   },
   // ── cache scoping (global-scope keys; §6.5A) ──────────────────────────────
   "cacheHost": {

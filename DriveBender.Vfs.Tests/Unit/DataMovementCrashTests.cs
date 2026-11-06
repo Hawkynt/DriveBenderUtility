@@ -55,7 +55,7 @@ public class DataMovementCrashTests {
       new(this._ssd, withLandingZone ? MemberRole.Landing : MemberRole.Capacity),
       new(this._hdd1),
       new(this._hdd2),
-    ], cache, ConfigResolver.ResolveEffective(null, config));
+    ], cache, TestConfig.Resolve(config));
     fs.Mount(new(@"X:\"));
     return fs;
   }
@@ -409,7 +409,7 @@ public class DataMovementCrashTests {
 
     var cache = new CacheInstance("rm" + Guid.NewGuid().ToString("N"),
       new() { Size = "2097152", BlockSize = "512", MetadataEntries = 500, MetadataTtl = "1m" });
-    using var remaining = new PoolFileSystem(_pool, [.. staying.Select(v => new EngineMember(v))], cache, ConfigResolver.ResolveEffective(null, single));
+    using var remaining = new PoolFileSystem(_pool, [.. staying.Select(v => new EngineMember(v))], cache, TestConfig.Resolve(single));
     remaining.Mount(new(@"X:\"));
     remaining.RestoreFromSnapshot(snapshot, "quarterly.bin");
 
