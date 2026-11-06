@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -118,13 +118,27 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
   public void Append(string line) => this.AppendBatch([line]);
 
   /// <summary>
-  /// One write and one flush per member, with the members done CONCURRENTLY.
+  /// How many mirrors must hold an append before it counts as durable. The rest receive it behind,
+  /// in order, without the caller waiting for them.
+  /// </summary>
+  public const int DurableQuorum = 2;
+
+  /// <summary>
+  /// Each member's appends, chained so they reach its mirror in the order they were made even when
+  /// the caller stopped waiting for that member long ago.
+  /// </summary>
+  private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, Task> _tails = new();
+  private readonly Lock _chainLock = new();
+
+  /// <summary>
+  /// Durable on <see cref="DurableQuorum"/> mirrors before it returns; on the remaining ones behind it.
   ///
-  /// Two costs used to be paid needlessly. Lines were appended one at a time, so ten records cost
-  /// ten durability barriers; and the members were walked in sequence, so the journal cost the SUM
-  /// of their flushes rather than the slowest one. The mirror is NOT reduced — every member still
-  /// receives every line, because a journal that survives on only one disk is not a journal — it is
-  /// only the waiting that is overlapped.
+  /// Every append used to wait for EVERY member's flush, so the journal ran at the pace of the
+  /// pool's slowest disk — one spinning disk in a pool of SSDs set the cost of every create, rename
+  /// and delete. Two durable mirrors already survive the loss of any one disk; the others still get
+  /// every line, in order, a moment later. Lines a lagging mirror never received are harmless:
+  /// reads combine every mirror (see ReadAll), and a mirror that missed lines is rewritten whole at
+  /// the next reconciliation.
   /// </summary>
   public void AppendBatch(IReadOnlyList<string> lines) {
     if (lines.Count == 0)
@@ -136,22 +150,75 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
 
     var bytes = Encoding.UTF8.GetBytes(builder.ToString());
     var targets = this._Online.ToArray();
-    var wrote = 0;
-
-    Parallel.ForEach(targets, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, targets.Length) }, member => {
-      try {
-        using var stream = member.OpenWrite(JournalPath, false, true);
-        stream.Seek(0, SeekOrigin.End);
-        stream.Write(bytes, 0, bytes.Length);
-        stream.Flush();
-        Interlocked.Increment(ref wrote);
-      } catch (PoolFsException e) {
-        DriveBender.Logger($"[Warning]Journal append failed on '{member.DisplayName}': {e.Message}");
-      }
-    });
-
-    if (Volatile.Read(ref wrote) == 0)
+    if (targets.Length == 0)
       throw new PoolFsException(PoolFsError.IoError, "Journal intent could not be persisted on any member — refusing the mutation (SAFE-WAL)");
+
+    // Every mirror IS the quorum (two disks or fewer): nothing would run behind, so the chains only
+    // cost a task per member. Written directly, once anything still queued for these mirrors from a
+    // time with more of them online has landed, which keeps each mirror's lines in order.
+    if (targets.Length <= DurableQuorum) {
+      this._CatchUp();
+      var wrote = 0;
+      Parallel.ForEach(targets, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, targets.Length) }, member => {
+        if (_AppendTo(member, bytes))
+          Interlocked.Increment(ref wrote);
+      });
+
+      if (wrote == 0)
+        throw new PoolFsException(PoolFsError.IoError, "Journal intent could not be persisted on any member — refusing the mutation (SAFE-WAL)");
+      return;
+    }
+
+    var quorum = DurableQuorum;
+    var succeeded = 0;
+    var finished = 0;
+    using var progress = new SemaphoreSlim(0);
+
+    lock (this._chainLock) // the chains are extended in one order for all members
+      foreach (var member in targets) {
+        var previous = this._tails.TryGetValue(member.MemberId, out var tail) ? tail : Task.CompletedTask;
+        this._tails[member.MemberId] = previous.ContinueWith(_ => {
+          try {
+            if (_AppendTo(member, bytes))
+              Interlocked.Increment(ref succeeded);
+          } finally {
+            Interlocked.Increment(ref finished);
+            try {
+              progress.Release();
+            } catch (ObjectDisposedException) {
+              // the caller has its quorum and is gone; this mirror simply caught up behind it
+            }
+          }
+        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+      }
+
+    // until enough mirrors have it, or every mirror has answered
+    while (Volatile.Read(ref succeeded) < quorum && Volatile.Read(ref finished) < targets.Length)
+      progress.Wait();
+
+    if (Volatile.Read(ref succeeded) == 0)
+      throw new PoolFsException(PoolFsError.IoError, "Journal intent could not be persisted on any member — refusing the mutation (SAFE-WAL)");
+  }
+
+  private static bool _AppendTo(IVolumeIO member, byte[] bytes) {
+    try {
+      using var stream = member.OpenWrite(JournalPath, false, true);
+      stream.Seek(0, SeekOrigin.End);
+      stream.Write(bytes, 0, bytes.Length);
+      stream.Flush();
+      return true;
+    } catch (PoolFsException e) {
+      DriveBender.Logger($"[Warning]Journal append failed on '{member.DisplayName}': {e.Message}");
+      return false;
+    }
+  }
+
+  /// <summary>Waits until every mirror holds every append made so far — before a mirror is read or rewritten.</summary>
+  private void _CatchUp() {
+    Task[] tails;
+    lock (this._chainLock)
+      tails = [.. this._tails.Values];
+    Task.WaitAll(tails);
   }
 
   /// <summary>
@@ -194,6 +261,7 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
   private static bool _IsCheckpoint(string line) => line.Contains("\"chk\":true", StringComparison.Ordinal);
 
   private List<(IVolumeIO member, long checkpoint, List<string> lines)> _ReadPerMember() {
+    this._CatchUp();
     var perMember = new List<(IVolumeIO, long, List<string>)>();
     foreach (var member in this._Online) {
       if (!member.FileExists(JournalPath, false))
@@ -265,6 +333,9 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
   }
 
   public void Rewrite(IEnumerable<string> lines) {
+    // a line still on its way to a lagging mirror must land before the rewrite, never after it:
+    // after, it would bring back an intent the compaction has just retired
+    this._CatchUp();
     var snapshot = lines.ToArray();
     foreach (var member in this._Online)
       this._RewriteOne(member, snapshot);
