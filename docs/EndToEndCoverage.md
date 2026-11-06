@@ -7,13 +7,13 @@ real filesystem driver and a real browser.
 `.trx` results of the Windows and Linux CI jobs. Do not edit it by hand — a hand-kept matrix
 drifts the moment a test is added or starts failing, and then quietly misleads.
 
-Generated from run: [37009935811](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/37009935811).
+Generated from run: [42278830359](https://github.com/Hawkynt/DriveBenderUtility/actions/runs/42278830359).
 
-251 scenarios — 231 passing on at least one target, 0 failing.
+251 scenarios — 229 passing on at least one target, 2 failing.
 
 | Area | Scenario | What it covers | Windows | Linux |
 | --- | --- | --- | :---: | :---: |
-| BackgroundRace | `Delete_WhileACopyIsStillInFlight_ThenTheFileDoesNotComeBack` | A file deleted while the pool is still copying it stays deleted, rather than reappearing when the copy lands. | pass | pass |
+| BackgroundRace | `Delete_WhileACopyIsStillInFlight_ThenTheFileDoesNotComeBack` | A file deleted while the pool is still copying it stays deleted, rather than reappearing when the copy lands. | **FAIL** | **FAIL** |
 | BackgroundRace | `Overwrite_WhileTheHealerIsCopyingTheOldContent_ThenBothCopiesEndOnTheNewOne` | A file overwritten while the healer is copying the OLD content to a returning member ends with both copies on the NEW content. | pass | pass |
 | BackgroundRace | `Read_GivenAReturnedMemberLostItsCopies_ThenEveryFileIsStillServedFromTheSurvivor` | A member returns having lost its copies: every file is still readable at once from the surviving copy, without waiting for the heal. | pass | pass |
 | BackgroundRace | `Read_WhileTheHealerIsCopying_ThenItIsServedAtOnceRatherThanAtTheCopysPace` | A file stays readable at full speed while the healer is copying it to another member. | pass | pass |
@@ -164,7 +164,7 @@ Generated from run: [37009935811](https://github.com/Hawkynt/DriveBenderUtility/
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(RAM over SD card)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(RAM over SD card) | pass | pass |
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(SSD over HDD)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(SSD over HDD) | pass | pass |
 | SimulatedDevice | `Tiering_WhenTheBurstDrainsToTheSlowTier_ThenEveryByteArrivesIntact(SSD over SD card)` | , when The Burst Drains To The Slow Tier , then Every Byte Arrives Intact(SSD over SD card) | pass | pass |
-| SimulatedDevice | `Unmount_GivenBackgroundWorkIsStarved_ThenThePoolStillComesDownCleanly` | A pool whose background work is throttled to a crawl still unmounts cleanly, instead of having to be killed. | pass | pass |
+| SimulatedDevice | `Unmount_GivenBackgroundWorkIsStarved_ThenThePoolStillComesDownCleanly` | A pool whose background work is throttled to a crawl still unmounts cleanly, instead of having to be killed. | **FAIL** | **FAIL** |
 | Snapshot | `RemoveMedia_GivenTheMemberHoldsSnapshotVersions_ThenTheyAreStillRecoverable` | Removing a member from the pool takes its snapshot store with it, rather than discarding preserved versions. | pass | pass |
 | Snapshot | `Snapshot_GivenAFileIsDeleted_ThenItCanBeRestoredFromTheSnapshot` | A file deleted after a snapshot is still recoverable from it. | pass | pass |
 | Snapshot | `Snapshot_GivenAFileIsOverwritten_ThenItCanBeRestoredFromTheSnapshot` | A file overwritten after a snapshot is still recoverable from it, through the shipped CLI. | pass | pass |
