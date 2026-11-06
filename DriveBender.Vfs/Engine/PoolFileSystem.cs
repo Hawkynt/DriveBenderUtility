@@ -1,4 +1,5 @@
 ﻿using DivisonM.Vfs.Caching;
+using DivisonM.Vfs.Integrity;
 
 namespace DivisonM.Vfs.Engine;
 
@@ -58,6 +59,13 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   private readonly ReaderWriterLockSlim _snapshotTaking = new(LockRecursionPolicy.SupportsRecursion);
   private readonly IntegrityService _integrity;
   private readonly ReadVerifier _readVerifier;
+
+  /// <summary>Per-shard hashes and parity for files of a useful size (docs/Issues.md, "Integrity v2").</summary>
+  private readonly BlockIntegrity _blocks;
+
+  private Thread? _indexer;
+  private volatile bool _indexerStopping;
+  private readonly SemaphoreSlim _indexSignal = new(0);
   private readonly ActivityFeed _activity;
   // FR-RA, double-buffered: how many read-ahead chains one path may have running at once. With
   // ONE, the reader stalls at every window boundary — the chain that would fetch window N+1 is
@@ -450,6 +458,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._snapshots = new([.. members.Select(m => m.Io)], this._journal, this._clock, this.AdmitBulk);
     this._integrity = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.OnExternalEdit ?? ExternalEditPolicy.AcceptNewest, this.AdmitBulk);
     this._integrity.FileGuard = this._HoldForScrub;
+    // with the checksum database off, nothing is recorded about content — block indexes included
+    this._blocks = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.Parity ?? 2,
+      effectiveConfig.Integrity?.ChecksumDb == false ? long.MaxValue : SizeSpec.ParseBytes(effectiveConfig.Integrity?.BlockIndexMinSize ?? "64KiB"),
+      this.AdmitBulk);
+    this._writeWatch.Listener = this._blocks.Changed;
+    this._blocks.QueuedCallback = () => this._indexSignal.Release();
     this._readVerifier = new(this._integrity, this._Invalidate, this._RepairAfterReadCheck);
     this._activity = new(clock: this._clock);
     this._placement = new(
@@ -647,7 +661,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   /// <summary>Full checksum scrub: bit-rot repair and out-of-band reconciliation (FR-SCRUB, SAFE-OOB).</summary>
   public IReadOnlyList<IntegrityIssue> RunScrub() {
-    var issues = this._integrity.ScrubAll(this._Invalidate);
+    this.IndexAllFiles(); // a pool that predates block indexes acquires them here, in the background
+    var issues = this._integrity.ScrubAll(this._Invalidate).ToList();
+
+    // Rot on every copy is the end of the line for a copy-versus-copy scrub. A file's block parity
+    // may still rebuild it; what parity repairs is reported as repaired rather than as lost.
+    for (var i = 0; i < issues.Count; ++i)
+      if (issues[i].Kind == IntegrityIssueKind.BitRotUnrecoverable && this.RepairBlocks(issues[i].Path) is var repaired and > 0)
+        issues[i] = new(IntegrityIssueKind.BitRotRepaired, issues[i].Path,
+          $"Damaged on every copy; {repaired} shard(s) rebuilt from the file's parity");
     foreach (var issue in issues)
       this._activity.Publish(ActivityKind.Scrub, issue.Path, reason: $"{issue.Kind}: {issue.Message}");
 
@@ -817,6 +839,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     this._mountOptions = options;
     this._StartClosedPublisher();
+    this._StartIndexer();
 
     // Which paths the snapshots still point at the LIVE file for. Held in memory because it is
     // consulted before every write, and therefore rebuilt from the members here — without this a
@@ -836,6 +859,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
     // clean unmount: staged files publish and every owed copy applies before the mount releases (FR-CLEAN-UNMOUNT)
     this._StopClosedPublisher();
+    this._StopIndexer();
     if (this._PublishInParallel(this._staging.Keys.ToArray(), skipOpen: false) is { Count: > 0 } unpublished)
       throw new PoolFsException(PoolFsError.IoError,
         $"{unpublished.Count} file(s) could not be published before unmounting and stay under their temp names: {string.Join(", ", unpublished.Take(5))}");
@@ -3216,6 +3240,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// <summary>A write changed a file: its checksums are stale, and so is anything a read check concluded.</summary>
   private void _InvalidateChecksums(string normalized) {
     this._integrity.InvalidateFile(normalized);
+    this._blocks.Changed(normalized);
     this._readVerifier.Forget(normalized);
   }
 
@@ -3272,6 +3297,203 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         lease.Dispose();
         gate.Dispose();
       }
+    }
+  }
+
+  /// <summary>
+  /// Repairs damaged shards found by a read, in the background, under the path's write lease. The
+  /// damage is checked again there — a read can race a write, and only damage that is still there
+  /// once nothing can change the file is repaired. The correct bytes come from a copy whose own
+  /// index vouches for them at that range, or from parity; nothing the index does not vouch for is
+  /// ever written.
+  /// </summary>
+  private void _QueueShardRepair(string path, List<(PhysicalCopy Copy, IReadOnlyList<(int Stripe, int Shard)> Shards)> damaged) {
+    var found = damaged.Select(d => d.Copy).ToArray();
+    ThreadPool.QueueUserWorkItem(_ => {
+      try {
+        this.RepairBlocks(path, found);
+      } catch (Exception e) {
+        DriveBender.Logger($"[Warning]Repairing damaged shards of '{path}' did not complete: {e.Message}; the scrub will retry it");
+      }
+    });
+  }
+
+  /// <summary>
+  /// Checks every shard of a file's copies (or of <paramref name="only"/> those) against their block
+  /// indexes and repairs what is damaged, under the path's write lease. Returns how many shards were
+  /// repaired. A file without indexes, or one in motion, is left alone.
+  /// </summary>
+  public int RepairBlocks(string path, IReadOnlyCollection<PhysicalCopy>? only = null) {
+    var normalized = PoolPaths.Normalize(path);
+    using var namespaceHold = this._EnterNamespaceShared();
+    using var lease = this._handles.AcquireWrite(normalized);
+    if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized))
+      return 0; // in motion: the write path owns it now
+
+    var copies = this._placement.ResolveCopies(normalized);
+    var total = 0;
+    foreach (var copy in copies) {
+      if (only != null && !only.Contains(copy) || copy.Volume.Stat(normalized, copy.Shadow) is not { } meta
+          || this._blocks.IndexFor(copy, normalized, meta) is not { } index)
+        continue;
+
+      // every stripe again, from this copy, now that nothing can change it
+      var stillBad = new List<(int Stripe, int Shard)>();
+      using (var stream = copy.Volume.OpenRead(normalized, copy.Shadow))
+        for (var stripe = 0; stripe < index.StripeCount; ++stripe) {
+          var length = BlockIndex.StripeLength(index.Length, stripe);
+          var bytes = new byte[length];
+          stream.Seek(BlockIndex.StripeStart(stripe), SeekOrigin.Begin);
+          var read = 0;
+          while (read < length && stream.Read(bytes, read, length - read) is var got and > 0)
+            read += got;
+          stillBad.AddRange(this._blocks.Check(copy, normalized, BlockIndex.StripeStart(stripe), bytes.AsSpan(0, read)));
+        }
+
+      if (stillBad.Count == 0)
+        continue;
+
+      var repaired = this._blocks.RepairShards(copy, normalized, stillBad, (offset, count) => this._CorrectBytes(normalized, copies, copy, offset, count));
+      if (repaired > 0) {
+        this._Invalidate(normalized);
+        DriveBender.Logger($" - Repaired {repaired} damaged shard(s) of '{normalized}' on '{copy.Volume.DisplayName}'");
+        this._activity.Publish(ActivityKind.Recovery, normalized, toMember: copy.Volume.DisplayName, reason: $"{repaired} damaged shard(s) repaired");
+      }
+
+      total += repaired;
+    }
+
+    return total;
+  }
+
+  /// <summary>The correct bytes of a range: from another copy that its own index vouches for there, else from parity.</summary>
+  private byte[]? _CorrectBytes(string path, IReadOnlyList<PhysicalCopy> copies, PhysicalCopy damagedCopy, long offset, int count) {
+    foreach (var other in copies) {
+      if (other == damagedCopy)
+        continue;
+
+      try {
+        using var stream = other.Volume.OpenRead(path, other.Shadow);
+        stream.Seek(offset, SeekOrigin.Begin);
+        var bytes = new byte[count];
+        var read = 0;
+        while (read < count && stream.Read(bytes, read, count - read) is var got and > 0)
+          read += got;
+        if (read == count && this._blocks.Check(other, path, offset, bytes).Count == 0
+            && other.Volume.Stat(path, other.Shadow) is { } meta && this._blocks.IndexFor(other, path, meta) != null)
+          return bytes;
+      } catch (PoolFsException) {
+        // try the next one
+      }
+    }
+
+    return this._blocks.Rebuild(copies, path, offset, count);
+  }
+
+  /// <summary>Counters for the block layer: shards checked on read, shards repaired, files waiting for an index.</summary>
+  public (long Checked, long Repaired, int Queued) BlockIntegrityStats => (this._blocks.ShardsChecked, this._blocks.ShardsRepaired, this._blocks.Queued);
+
+  /// <summary>Queues every file of a useful size that has no current index (the scrub calls this).</summary>
+  public void IndexAllFiles() {
+    foreach (var path in this._AllLogicalFiles())
+      this._blocks.Enqueue(path);
+  }
+
+  /// <summary>Waits until no file is waiting for an index; false on timeout.</summary>
+  public bool WaitForIndexing(TimeSpan timeout) {
+    var deadline = DateTime.UtcNow + timeout;
+    while (this._blocks.Queued > 0 || Volatile.Read(ref this._indexing) > 0) {
+      if (DateTime.UtcNow >= deadline)
+        return false;
+      Thread.Sleep(10);
+    }
+
+    return true;
+  }
+
+  private int _indexing;
+
+  private void _StartIndexer() {
+    if (this._indexer != null || this.IsReadOnly || this._blocks.MinFileBytes == long.MaxValue)
+      return;
+
+    this._indexerStopping = false;
+    this._indexer = new Thread(this._RunIndexer) { IsBackground = true, Name = "pool-index", Priority = ThreadPriority.BelowNormal };
+    this._indexer.Start();
+  }
+
+  private void _StopIndexer() {
+    var worker = this._indexer;
+    if (worker == null)
+      return;
+
+    this._indexerStopping = true;
+    this._indexSignal.Release();
+    worker.Join();
+    this._indexer = null;
+  }
+
+  private void _RunIndexer() {
+    // files not settled yet when their turn came — written to, owed bytes, still staged — go round
+    // again a few seconds later rather than waiting for the next read or scrub to notice them
+    var later = new List<string>();
+    var retryAt = DateTime.UtcNow;
+    while (!this._indexerStopping) {
+      if (later.Count > 0 && DateTime.UtcNow >= retryAt) {
+        foreach (var waiting in later)
+          this._blocks.Enqueue(waiting);
+        later.Clear();
+      }
+
+      if (!this._blocks.TryDequeue(out var path)) {
+        this._indexSignal.Wait(later.Count > 0 ? TimeSpan.FromSeconds(2) : TimeSpan.FromSeconds(5));
+        continue;
+      }
+
+      Interlocked.Increment(ref this._indexing);
+      try {
+        if (!this.IndexFile(path)) {
+          if (later.Count == 0)
+            retryAt = DateTime.UtcNow + TimeSpan.FromSeconds(3);
+          later.Add(path);
+        }
+      } catch (Exception e) {
+        DriveBender.Logger($"[Warning]Could not index '{path}': {e.Message}");
+      } finally {
+        Interlocked.Decrement(ref this._indexing);
+      }
+    }
+  }
+
+  /// <summary>
+  /// Indexes one file: every copy is read without holding the file — watched instead, like the
+  /// healer — and the indexes are committed under its write lease only if nothing changed meanwhile.
+  /// </summary>
+  /// <returns>False when the file is not settled yet (still written, staged, or owed bytes) and should be tried again later.</returns>
+  public bool IndexFile(string path) {
+    var normalized = PoolPaths.Normalize(path);
+    if (this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized) || this._handles.IsOpenForWrite(normalized))
+      return false;
+
+    var copies = this._placement.ResolveCopies(normalized);
+    if (copies.Count == 0)
+      return true; // gone
+
+    var watch = this._writeWatch.Begin(normalized);
+    try {
+      var built = this._blocks.Build(normalized, copies);
+      if (built == null)
+        return true; // copies that disagree, or too small: the scrub settles the first
+
+      using var namespaceHold = this._EnterNamespaceShared();
+      using var lease = this._handles.AcquireWrite(normalized);
+      if (this._writeWatch.Changed(normalized, watch) || this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized))
+        return false; // it changed while it was read
+
+      this._blocks.Commit(normalized, built);
+      return true;
+    } finally {
+      this._writeWatch.End(normalized);
     }
   }
 
@@ -3410,7 +3632,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // has checksums that are stale by definition, and its content is legitimately in motion.
       var checkable = durableExpected && dataPath == path;
       var verification = this._readVerifier.Mode;
-      if (checkable && verification == ReadVerification.Before)
+      if (checkable && (verification == ReadVerification.Before || verification == ReadVerification.Blocks && length < this._blocks.MinFileBytes))
         copies = this._CheckedCopies(lease.File, handle, path, copies);
 
       this._ReadRange(path, dataPath, copies, buffer[..count], offset, count >= this._mirrorSplitThreshold,
@@ -3784,6 +4006,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     PoolFsException? lastError = null;
     byte[]? bestShort = null;
     string? bestShortMember = null;
+    var verify = this._readVerifier.Mode is ReadVerification.Blocks or ReadVerification.Before && !_IsStagedName(path);
+    List<(PhysicalCopy Copy, IReadOnlyList<(int Stripe, int Shard)> Shards)>? damaged = null;
+    var blockOffset = blockIndex * this._cache.Pages.BlockSize;
     foreach (var index in order) {
       var copy = copies[index];
       byte[] block;
@@ -3817,9 +4042,22 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         continue;
       }
 
+      // Checked against the copy's block index before a byte of it is served or cached: a damaged
+      // shard sends the read on to the next copy, exactly as an unreadable one does.
+      if (verify && block.Length > 0 && this._blocks.Check(copy, path, blockOffset, block) is { Count: > 0 } bad) {
+        (damaged ??= []).Add((copy, bad));
+        lastError = new(PoolFsError.IoError,
+          $"Copy of '{path}' on '{copy.Volume.DisplayName}' does not match its block index at {bad.Count} shard(s) of block {blockIndex}");
+        DriveBender.Logger($"[Warning]{lastError.Message} — trying another copy");
+        continue;
+      }
+
+      if (damaged != null)
+        this._QueueShardRepair(path, damaged);
+
       if (lastError != null)
         this._activity.Publish(ActivityKind.Recovery, path, block.Length, fromMember: copy.Volume.DisplayName,
-          reason: "read failover — a copy was unreadable or behind, another one served the block");
+          reason: damaged != null ? "a copy was damaged here; an intact one served the block" : "read failover — a copy was unreadable or behind, another one served the block");
 
       // a lock-free prefetch guards its Put with the epoch it captured before reading, so a write
       // that invalidated the path in the meantime rejects this now-stale block (SAFE-COHERE)
@@ -3828,6 +4066,22 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       else
         this._cache.Pages.Put(key, block);
       return block;
+    }
+
+    // Damaged on every copy that could be read: each copy's own parity may still rebuild it. What
+    // comes back is checked against that copy's shard hashes, so it is the recorded content or
+    // nothing — a read that cannot be repaired fails rather than hand over damaged bytes.
+    if (damaged != null) {
+      var length = expectedLength > 0 ? expectedLength : this._cache.Pages.BlockSize;
+      if (this._blocks.Rebuild(copies, path, blockOffset, length) is { } rebuilt && (expectedLength == 0 || rebuilt.Length == expectedLength)) {
+        DriveBender.Logger($"[Warning]'{path}' was damaged on every copy at block {blockIndex}; rebuilt from parity and served");
+        this._activity.Publish(ActivityKind.Recovery, path, rebuilt.Length, reason: "damaged on every copy; rebuilt from parity");
+        this._QueueShardRepair(path, damaged);
+        return rebuilt; // not cached: the next read goes to the repaired copies
+      }
+
+      throw new PoolFsException(PoolFsError.IoError,
+        $"'{path}' is damaged at block {blockIndex} on every copy, beyond what its parity can repair — refusing to serve damaged data");
     }
 
     // every copy fell short: the shortfall is real (or every holder is lagging identically).
@@ -5283,8 +5537,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     if (this._staging.ContainsKey(path) && !this._handles.IsOpen(path) && !this._DefersPublish(path) && !this._QueuesPublish(path))
       this._PublishStaged(path);
 
-    if (wrote)
+    if (wrote) {
       this._RememberSettledSize(path);
+      if (!this._handles.IsOpenForWrite(path))
+        this._blocks.Enqueue(path); // indexed once its publish and owed copies have settled
+    }
   }
 
   /// <summary>

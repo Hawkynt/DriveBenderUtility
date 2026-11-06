@@ -1,4 +1,4 @@
-namespace DivisonM.Vfs.Engine;
+﻿namespace DivisonM.Vfs.Engine;
 
 /// <summary>
 /// "Has this file's content changed since I started copying it?" — for the jobs that copy a file
@@ -51,8 +51,15 @@ public sealed class WriteWatch {
     }
   }
 
+  /// <summary>
+  /// Told of every change, watched or not — what must stop believing anything recorded about the
+  /// path's old content (the block indexes). Runs on the writer's thread, under its lease.
+  /// </summary>
+  public Action<string>? Listener { get; set; }
+
   /// <summary>Reports that <paramref name="path"/>'s content changed — call once the bytes have landed.</summary>
   public void Changed(string path) {
+    this.Listener?.Invoke(path);
     if (Volatile.Read(ref this._count) == 0)
       return; // nothing is being copied: the common case costs this read and nothing else
 
