@@ -662,8 +662,21 @@ public sealed class PoolFileSystem : IPoolFileSystem {
 
   /// <summary>Full checksum scrub: bit-rot repair and out-of-band reconciliation (FR-SCRUB, SAFE-OOB).</summary>
   public IReadOnlyList<IntegrityIssue> RunScrub() {
+    // Block indexes first: where a file has them, they know which shards rotted and can repair each
+    // copy from the others or from parity. Left to the copy-against-copy comparison, a copy rotted
+    // after its whole-file checksum went stale is indistinguishable from an edit, and its rot could
+    // be propagated over the intact copy. A full scrub reads every file anyway.
+    var blockRepairs = new List<IntegrityIssue>();
+    foreach (var path in this._AllLogicalFiles())
+      try {
+        if (this.RepairBlocks(path) is var shards and > 0)
+          blockRepairs.Add(new(IntegrityIssueKind.BitRotRepaired, path, $"{shards} damaged shard(s) repaired from the file's block index"));
+      } catch (Exception e) when (e is PoolFsException or IOException) {
+        DriveBender.Logger($"[Warning]Block check of '{path}' during the scrub failed: {e.Message}");
+      }
+
     this.IndexAllFiles(); // a pool that predates block indexes acquires them here, in the background
-    var issues = this._integrity.ScrubAll(this._Invalidate).ToList();
+    var issues = blockRepairs.Concat(this._integrity.ScrubAll(this._Invalidate)).ToList();
 
     // Rot on every copy is the end of the line for a copy-versus-copy scrub. A file's block parity
     // may still rebuild it; what parity repairs is reported as repaired rather than as lost.
@@ -861,6 +874,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     // clean unmount: staged files publish and every owed copy applies before the mount releases (FR-CLEAN-UNMOUNT)
     this._StopClosedPublisher();
     this._StopIndexer();
+
+    // A repair writes into the members on its own thread. One still running after the unmount could
+    // land on top of whatever the next mount writes there, so the unmount waits for them — bounded,
+    // like the rest of the shutdown; a repair that has not started by then finds the pool unmounted
+    // and leaves the damage to the next read or scrub.
+    var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+    while (Volatile.Read(ref this._repairsInFlight) > 0 && DateTime.UtcNow < deadline)
+      Thread.Sleep(10);
     if (this._PublishInParallel(this._staging.Keys.ToArray(), skipOpen: false) is { Count: > 0 } unpublished)
       throw new PoolFsException(PoolFsError.IoError,
         $"{unpublished.Count} file(s) could not be published before unmounting and stay under their temp names: {string.Join(", ", unpublished.Take(5))}");
@@ -1902,6 +1923,16 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// Batches were tried first and lost to plain synchronous closes under many writers: a batch
   /// waits for its slowest file before the next one starts, and the disk idles in between.
   /// </summary>
+  /// <summary>Puts a closed, still-staged file back in the publisher's queue (a publish of it failed).</summary>
+  private void _RequeueClosed(string path) {
+    if (this._closedPublishers == null || this._closedPublisherStopping || this._handles.IsOpen(path))
+      return; // the unmount, or the next close, publishes it
+
+    Interlocked.Increment(ref this._closedPublishesPending);
+    this._closedPublishes.Enqueue(path);
+    this._closedPublishSignal.Release();
+  }
+
   private void _StartClosedPublisher() {
     if (this._closedPublishers != null || this.IsReadOnly)
       return;
@@ -1942,20 +1973,23 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       }
 
       Interlocked.Decrement(ref this._closedPublishesPending);
-      if (!this._staging.ContainsKey(path) || this._handles.IsOpen(path))
-        continue; // published, deleted or renamed since, or reopened: its next close decides again
 
       try {
+        // Decided under the file's lease, not before it: a publish another thread is running (a
+        // settle, a snapshot, a back-pressured close) takes the file off the staging list before it
+        // renames, and a check made in between dropped a file whose publish then FAILED and put it
+        // back — staged again, and in nobody's queue.
         using var namespaceHold = this._EnterNamespaceShared();
-        this._PublishStaged(path);
-      } catch (Exception e) when (e is PoolFsException or IOException or UnauthorizedAccessException) {
+        using var lease = this._handles.AcquireWrite(path);
+        if (!this._staging.ContainsKey(path) || this._handles.IsOpen(path))
+          continue; // published, deleted or renamed since, or reopened: its next close decides again
+
+        this._PublishStagedLocked(path);
+      } catch (Exception e) when (e is not OutOfMemoryException) {
         // it stays staged; tried again shortly, and at the latest by the unmount
         DriveBender.Logger($"[Warning]Could not publish '{path}' yet: {e.Message}");
         Thread.Sleep(TimeSpan.FromMilliseconds(500)); // a failing disk is not retried in a tight loop
-        Interlocked.Increment(ref this._closedPublishesPending);
-        this._closedPublishes.Enqueue(path);
-      } catch (Exception e) {
-        DriveBender.Logger($"[Warning]Background publish of '{path}' failed: {e.Message}");
+        this._RequeueClosed(path);
       }
     }
   }
@@ -2132,6 +2166,11 @@ public sealed class PoolFileSystem : IPoolFileSystem {
         throw new PoolFsException(PoolFsError.NotFound, $"Path not found: {from}");
       }
 
+      // Both names stop having block indexes BEFORE anything moves: the rename completes its intent
+      // before the end of the move, and a crash in between left the target's old index on disk with
+      // nothing in the journal to say it had been replaced.
+      this._blocks.Changed(fromNormalized);
+      this._blocks.Changed(toNormalized);
       this._RenameFileLocked(from, to, flags, fromNormalized, toNormalized, sameFile, caseOnly, copies);
       return;
     }
@@ -3310,11 +3349,14 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   /// </summary>
   private void _QueueShardRepair(string path, List<(PhysicalCopy Copy, IReadOnlyList<(int Stripe, int Shard)> Shards)> damaged) {
     var found = damaged.Select(d => d.Copy).ToArray();
+    Interlocked.Increment(ref this._repairsInFlight);
     ThreadPool.QueueUserWorkItem(_ => {
       try {
         this.RepairBlocks(path, found);
       } catch (Exception e) {
         DriveBender.Logger($"[Warning]Repairing damaged shards of '{path}' did not complete: {e.Message}; the scrub will retry it");
+      } finally {
+        Interlocked.Decrement(ref this._repairsInFlight);
       }
     });
   }
@@ -3354,8 +3396,12 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (stillBad.Count == 0)
         continue;
 
+      if (!this.IsMounted)
+        return total; // an unmounted engine no longer owns the members
+
       var repaired = this._blocks.RepairShards(copy, normalized, stillBad, (offset, count) => this._CorrectBytes(normalized, copies, copy, offset, count));
       if (repaired > 0) {
+        this._writeWatch.Bump(normalized); // a job that read the copy before this repair must not commit what it read
         this._Invalidate(normalized);
         DriveBender.Logger($" - Repaired {repaired} damaged shard(s) of '{normalized}' on '{copy.Volume.DisplayName}'");
         this._activity.Publish(ActivityKind.Recovery, normalized, toMember: copy.Volume.DisplayName, reason: $"{repaired} damaged shard(s) repaired");
@@ -3413,6 +3459,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
   }
 
   private int _indexing;
+
+  /// <summary>Repairs queued by reads and not finished yet; the unmount waits for them.</summary>
+  private int _repairsInFlight;
 
   private void _StartIndexer() {
     if (this._indexer != null || this.IsReadOnly || this._blocks.MinFileBytes == long.MaxValue)
@@ -3511,7 +3560,24 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       if (this._writeWatch.Changed(normalized, watch) || this._staging.ContainsKey(normalized) || this._writeBuffer.IsDirty(normalized))
         return false; // it changed while it was read
 
-      this._blocks.Commit(normalized, built);
+      // A copy that already has a current index keeps it. Its content contradicting that index means
+      // the copy changed while its size and time did not — rot — and an index rebuilt now would take
+      // the rot for the content and throw away the parity that can still repair it.
+      var fresh = new List<(PhysicalCopy Copy, BlockIndex Index)>();
+      foreach (var (copy, index) in built) {
+        var current = copy.Volume.Stat(normalized, copy.Shadow) is { } meta ? this._blocks.IndexFor(copy, normalized, meta) : null;
+        if (current == null)
+          fresh.Add((copy, index));
+        else if (!current.SameContentAs(index)) {
+          lease.Dispose();
+          namespaceHold.Dispose();
+          this.RepairBlocks(normalized);
+          return true;
+        }
+      }
+
+      if (fresh.Count > 0)
+        this._blocks.Commit(normalized, fresh);
       return true;
     } finally {
       this._writeWatch.End(normalized);
@@ -5667,6 +5733,9 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // published at the name meanwhile) goes to the recycle bin first, where the bin is on
       this._KeepReplacedInBin(normalized, this._placement.ResolveCopies(normalized));
 
+      // the name's block indexes describe what is about to be replaced: gone before the first rename
+      this._blocks.Changed(normalized);
+
       var copies = striped ?? this._placement.ResolveCopies(stagedName);
 
       // Content first, name second: writes into the temp skipped their barriers, so each copy is
@@ -5700,6 +5769,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
       // dropped here, the copy set having changed part-way through.
       this._Invalidate(stagedName);
       this._staging[normalized] = createSequence;
+      this._RequeueClosed(normalized); // whoever ran this publish, the file must not wait for a later touch
       throw;
     }
 

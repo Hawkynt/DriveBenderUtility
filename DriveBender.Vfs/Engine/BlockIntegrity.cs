@@ -55,16 +55,21 @@ public sealed class BlockIntegrity(IReadOnlyList<IVolumeIO> members, int parityS
   /// once, are deleted in the background, and the file is queued to be indexed again once it settles.
   /// </summary>
   public void Changed(string normalized) {
+    // a staging temp never has an index, and marking every temp would grow the set without end
+    if (normalized.EndsWith("." + DriveBender.DriveBenderConstants.TEMP_EXTENSION, StringComparison.OrdinalIgnoreCase))
+      return;
+
     if (!this._stale.TryAdd(normalized, 0))
       return; // already stale: a file under continuous writes pays this once
 
-    // The mark set grows with every file written; past a bound it is emptied. That is safe because
-    // every marked path's indexes were deleted below when it was marked — the mark only spares later
-    // writes the deletion — so a path written again just pays it once more.
-    if (this._stale.Count > 200_000) {
-      this._stale.Clear();
-      this._stale.TryAdd(normalized, 0);
-    }
+    // The mark set grows with every file written; past a bound the marks whose indexes are known to
+    // be deleted are let go — the mark only spared later writes the deletion, so such a path written
+    // again just pays it once more. A path whose deletion FAILED keeps its mark: its old index may
+    // still be on a member, and the mark is all that keeps it from being believed.
+    if (this._stale.Count > 200_000)
+      foreach (var path in this._stale.Keys)
+        if (!this._undeleted.ContainsKey(path) && !PoolPaths.PathComparer.Equals(path, normalized))
+          this._stale.TryRemove(path, out _);
 
     foreach (var key in this._cache.Keys)
       if (PoolPaths.PathComparer.Equals(key.Path, normalized))
@@ -72,8 +77,14 @@ public sealed class BlockIntegrity(IReadOnlyList<IVolumeIO> members, int parityS
 
     // Deleted now, not in the background: a deleted file must leave nothing under its name, and an
     // index that outlives the content it describes is exactly what this layer must never have.
-    DeleteIndexes(members, normalized);
+    if (DeleteIndexes(members, normalized) && members.All(m => m.IsOnline))
+      this._undeleted.TryRemove(normalized, out _);
+    else
+      this._undeleted[normalized] = 0;
   }
+
+  /// <summary>Paths whose index deletion did not reach every member; their stale mark is never let go.</summary>
+  private readonly ConcurrentDictionary<string, byte> _undeleted = new(PoolPaths.PathComparer);
 
   /// <summary>Recovery: a write intent named this path, so whatever index it has may be stale.</summary>
 
@@ -119,6 +130,11 @@ public sealed class BlockIntegrity(IReadOnlyList<IVolumeIO> members, int parityS
 
     if (index != null && !index.Describes(meta.Length, meta.LastWriteTimeUtc))
       index = null; // an older version's index
+
+    // a change reported while the file was being read must win: caching what was read would bring
+    // back the index the change just deleted
+    if (this._stale.ContainsKey(normalized))
+      return null;
 
     if (this._cache.Count >= _MAX_CACHED)
       this._cache.Clear();
