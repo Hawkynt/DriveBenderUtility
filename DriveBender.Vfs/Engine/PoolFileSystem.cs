@@ -460,7 +460,7 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._integrity.FileGuard = this._HoldForScrub;
     // with the checksum database off, nothing is recorded about content — block indexes included
     this._blocks = new([.. members.Select(m => m.Io)], effectiveConfig.Integrity?.Parity ?? 2,
-      effectiveConfig.Integrity?.ChecksumDb == false ? long.MaxValue : SizeSpec.ParseBytes(effectiveConfig.Integrity?.BlockIndexMinSize ?? "64KiB"),
+      effectiveConfig.Integrity?.ChecksumDb == false ? long.MaxValue : Math.Max(1, SizeSpec.ParseBytes(effectiveConfig.Integrity?.BlockIndexMinSize ?? "1")),
       this.AdmitBulk);
     this._writeWatch.Listener = this._blocks.Changed;
     this._blocks.QueuedCallback = () => this._indexSignal.Release();
@@ -499,6 +499,15 @@ public sealed class PoolFileSystem : IPoolFileSystem {
     this._readVerifier.Mode = config.Integrity?.ChecksumDb == false
       ? ReadVerification.Never
       : config.Integrity?.VerifyReads ?? ReadVerification.Never;
+
+    // the repair strength and the protected size follow a live reload: new indexes use them, and
+    // existing ones keep the parity they record
+    if (this._blocks != null) {
+      this._blocks.ParityShards = config.Integrity?.Parity ?? 2;
+      this._blocks.MinFileBytes = config.Integrity?.ChecksumDb == false
+        ? long.MaxValue
+        : Math.Max(1, SizeSpec.ParseBytes(config.Integrity?.BlockIndexMinSize ?? "1"));
+    }
   }
 
   public PlacementResolver Placement => this._placement;

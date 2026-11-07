@@ -2878,3 +2878,17 @@ test that failed before its fix (`BlockAndJournalReviewTests`, `BlockIntegrityTe
   but the pool picks the readiest copy, and the intact one sometimes served everything. The test now
   makes the intact copy refuse its first read.
 
+### Changed: every file gets a block index, and the repair strength is a slider
+
+Files under 64 KiB had whole-file checksums only: rot was detected and repaired from another copy,
+but a file with no other copy (duplication 1, or a disk lost) could not be restored. Every file with
+content is now indexed by default (`integrity.blockIndexMinSize` 1), so even a single small copy is
+rebuilt from its own parity (`Read_GivenASmallFileWithNoOtherCopyThatRotted_…`, 1 byte to 60 KB).
+The price is one small index file per file and the indexer reading each new file once: on 4 KiB
+files, sustained durable throughput fell from about 590 to about 425 files/s with one writer
+(measured on a loaded host). Pools of many tiny files can raise the minimum.
+
+The dashboard's Settings has sliders for `integrity.parity` and `integrity.blockIndexMinSize`, each
+saying what the position costs and buys, and both now follow a live reload: indexes built from then
+on use the new strength, and existing ones keep the parity they record.
+

@@ -1124,7 +1124,7 @@ on typical HW).
     "onExternalEdit": "accept-newest",     // accept-newest | conflict-only | read-only-until-reconciled
     "verifyReads": "blocks",               // never | before | after | blocks — blocks: check each shard as served against its block index
     "parity": 2,                           // Reed-Solomon parity shards per stripe of 32: 0 | 1 | 2 | 4 | 8 | 16
-    "blockIndexMinSize": "64KiB",          // files from this size up get a block index (hashes + parity)
+    "blockIndexMinSize": "1",              // files from this size up get a block index (hashes + parity); 1 = every file
     "scrubberSchedule": "idle-weekly",     // (also under background); quick vs deep per §6.15
     "deepScrubSchedule": null              // e.g. "monthly"; full re-hash (Could)
   },

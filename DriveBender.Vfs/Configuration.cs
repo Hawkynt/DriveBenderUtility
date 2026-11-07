@@ -180,12 +180,12 @@ public enum ReadVerification {
   [JsonStringEnumMemberName("after")] After,
 
   /// <summary>
-  /// Files with a block index (integrity.blockIndexMinSize and up) are checked shard by shard as
-  /// they are served, which costs a hash at memory speed per shard read from disk and nothing on a
-  /// cache hit; a damaged shard is served from another copy or rebuilt from parity, and repaired.
-  /// Smaller files are checked whole before their first read, as with "before". A large file not
-  /// yet indexed is served as it is and indexed in the background — its first read never waits for
-  /// a whole-file hash.
+  /// Files with a block index (integrity.blockIndexMinSize and up, every non-empty file by default)
+  /// are checked shard by shard as they are served, which costs a hash at memory speed per shard read
+  /// from disk and nothing on a cache hit; a damaged shard is served from another copy or rebuilt from
+  /// parity, and repaired. Files below the minimum are checked whole before their first read, as with
+  /// "before". A file not yet indexed is served as it is and indexed in the background — its first
+  /// read never waits for a whole-file hash.
   /// </summary>
   [JsonStringEnumMemberName("blocks")] Blocks,
 }
@@ -350,7 +350,12 @@ public sealed record IntegrityConfig {
   /// </summary>
   [JsonPropertyName("parity")] public int? Parity { get; init; }
 
-  /// <summary>Files from this size up get a block index (per-shard hashes and parity). Default 64KiB.</summary>
+  /// <summary>
+  /// Files from this size up get a block index (per-shard hashes and parity). Default 1 byte: every
+  /// file that has content, so a small file can be restored from its own parity even where it has no
+  /// other copy. Each indexed file has a small index file beside it on its member, built in the
+  /// background; a pool of many tiny files that would rather not pay for those can raise this.
+  /// </summary>
   [JsonPropertyName("blockIndexMinSize")] public string? BlockIndexMinSize { get; init; }
   [JsonPropertyName("scrubberSchedule")] public string? ScrubberSchedule { get; init; }
   [JsonPropertyName("deepScrubSchedule")] public string? DeepScrubSchedule { get; init; }
@@ -543,7 +548,7 @@ public static class ConfigResolver {
       "onExternalEdit": "accept-newest",
       "verifyReads": "blocks",
       "parity": 2,
-      "blockIndexMinSize": "64KiB",
+      "blockIndexMinSize": "1",
       "scrubberSchedule": "idle-weekly",
       "deepScrubSchedule": null
     },

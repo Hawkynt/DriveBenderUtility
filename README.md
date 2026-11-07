@@ -65,6 +65,11 @@ goes away.
 - ✅ Parallel mirrored writes, parallel mirror-split reads (different offsets from
   different storages at once), per-block read failover, pooled positional I/O handles,
   background read-ahead
+- ✅ POSIX close: a close returns at once and the file is durable on every copy within about a
+  second (publishes run side by side, so their flushes share journal commits); `fsync` is
+  durable at once, and `write.closeIsDurable: true` makes every close wait for the disk
+- ✅ Renames into one folder share their folder flush; the journal is durable on two mirrors
+  and the rest catch up behind, so one slow disk does not set the pace of every create
 
 ### 💾 Advanced Duplication
 - ✅ Enable/disable duplication on folders
@@ -83,14 +88,21 @@ goes away.
   - Timestamp inconsistencies
   - Permission issues
   - Duplicate primaries
-- ✅ Every file from 64 KiB up carries a block index beside each copy: a hash per shard and
-  Reed-Solomon parity per 2 MiB stripe (`integrity.parity`: 1, 2, 4, 8 or 16 shards — about
-  3–50% of the file, default 2); the data files themselves are never touched
+- ✅ Every file with content carries a block index beside each copy: a hash per shard and
+  Reed-Solomon parity per 2 MiB stripe (`integrity.parity`: 1, 2, 4, 8 or 16 shards — 3.1–50% of
+  the file, default 2); the data files themselves are never touched
+- ✅ A file can be restored from its own parity even where it has no other copy — a
+  single-copy file, or rot in the same place on every copy (small files included)
+- ✅ Repair strength and the smallest protected file size are sliders in the dashboard's
+  Settings, and apply to a mounted pool live
 - ✅ Reads are checked shard by shard as they are served (`integrity.verifyReads: blocks`, the
   default) at memory speed; a damaged shard is served from another copy, or rebuilt from parity
   when every copy is damaged there, and the damaged copy is repaired in the background — a read
   that cannot be repaired fails rather than hand over wrong bytes
-- ✅ The scrub rebuilds from parity what a copy-against-copy comparison cannot: rot on every copy
+- ✅ The scrub repairs from the block indexes first, so rot is never mistaken for an edit and
+  copied over the intact copy, and it rebuilds from parity what no copy holds intact
+- ✅ An index is never trusted once its file changed — not even after a rewrite that kept the
+  length and the timestamp — so a repair can never roll an acknowledged write back
 - ✅ Automated repair with backup creation
 - ✅ Dry-run mode for safe testing
 - ✅ Deep scan capabilities
@@ -243,7 +255,8 @@ manifest never inlines), mount / unmount, add or remove members, set
 **duplication** (copies to keep — pool-wide or per folder/file glob; copies land
 on independent physical disks by default, SAFE-PHYS, with an opt-in to also keep
 copies on the same disk for bit-rot protection when no independent disk is free),
-edit **all pool settings** via a validated JSON editor, remove- and replace-media,
+edit **all pool settings** — including sliders for the Reed-Solomon repair strength and
+the smallest protected file size — or any setting via a validated JSON editor, remove- and replace-media,
 **browse the pool** with one column per storage showing exactly where every
 file/folder lives (✅ primary · 🔁 shadow · ❌ absent), run a **problem scan**
 with a full report (under-duplicated files, integrity issues, per-device SMART)
@@ -310,11 +323,13 @@ preference:
 - **Create a pool** — stack up members (local folder/drive, UNC, or any remote
   URI) with a per-member role and a folder browser; no JSON required.
 - **Settings** — every pool knob as a labelled control (mount location, write
-  policy, cache, background maintenance…), with an advanced JSON escape hatch.
+  policy, cache, background maintenance…), with an advanced JSON escape hatch. The
+  **repair strength** and the **smallest protected file size** are sliders that say
+  what each position costs and buys, and apply to a mounted pool live.
 
 ## ⚙️ How it works
 
-Seven diagrams for the parts that are hard to guess from the file list. They describe the engine as
+Nine diagrams for the parts that are hard to guess from the file list. They describe the engine as
 it is, not as it is planned — where something is not built yet, it says so.
 
 ### The pool: one namespace over many storages
@@ -423,10 +438,20 @@ sequenceDiagram
     Note over Engine: acknowledged once the ack quorum is durable
     Engine-->>App: ok
     App->>Engine: close
-    Engine->>A: atomic rename temp to final
-    Engine->>B: atomic rename temp to final
+    Engine-->>App: ok (POSIX: the close does not wait)
+    Note over Engine: a background publisher takes the file within about a second
+    Engine->>A: flush, then atomic rename temp to final
+    Engine->>B: flush, then atomic rename temp to final
     Note over Engine,B: copies still owed are held in the write buffer and completed in the background — the journal intent closes last
 ```
+
+A close returns at once, the way POSIX defines it: the file is made durable by a pool of background
+publishers within about a second, each copy flushed before it is renamed, and closes arriving
+together share their journal commits. An `fsync` publishes at once. A power cut in that window
+leaves the previous version (or no file, for a new one) — never a torn or mixed file. Anything that
+touches a closed file still waiting for its publish (open, delete, rename, restore, snapshot) has it
+published first, so it is never mistaken for a file still being written. `write.closeIsDurable:
+true` makes every close wait for the disk instead.
 
 A file still being written survives whatever happens to its name meanwhile. Renaming its folder
 takes it along, and the writer's later writes and its close land under the new name. Renaming
@@ -440,6 +465,61 @@ content is written beside the old, on the same disks, and replaces it by an atom
 rename at the last close. If a write failed and was never written again (no room,
 a disk that dropped), the old file is what remains; a new file in that state never
 appears. The cost: an overwrite briefly needs room for both versions.
+
+### Integrity: block indexes and parity
+
+Every copy of every file with content gets a block index, kept beside it on the same disk under
+`.drivebenderutility/blocks/` — the file itself is never touched, so a pool stays readable without
+this program. The index holds a hash per shard and Reed-Solomon parity per stripe: a stripe is 2 MiB
+in up to 32 shards (64 KiB each, smaller for short files so that small files pay about the same
+share), and `integrity.parity` sets how many parity shards each stripe gets.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#E3F2FD","primaryBorderColor":"#42A5F5","primaryTextColor":"#0D47A1","lineColor":"#78909C"}}}%%
+flowchart LR
+    R[read a block from a copy] --> C{every shard matches<br/>the copy's index?}
+    C -- yes --> S[serve and cache]
+    C -- no --> N{another copy<br/>matches?}
+    N -- yes --> S2[serve it] --> F[repair the damaged copy<br/>in the background]
+    N -- no --> P{a copy's own parity<br/>rebuilds it?}
+    P -- yes --> S3[serve the rebuilt shards] --> F
+    P -- no --> E[fail the read —<br/>never hand over wrong bytes]
+```
+
+| Parity per 32 shards | Extra space | Damaged shards rebuilt per 2 MiB |
+|---:|---:|---:|
+| 0 | 0% | none — damage is detected and repaired only from another copy |
+| 1 | 3.1% | 1 |
+| 2 (default) | 6.3% | 2 |
+| 4 | 12.5% | 4 |
+| 8 | 25% | 8 |
+| 16 | 50% | 16 |
+
+Indexes are built in the background once a file has settled, from every copy at once: copies that
+disagree, or a copy that contradicts its recorded whole-file checksum, get no index, so rot is never
+written down as the content to defend. A changed file loses its indexes before anyone can read the
+change, and recovery drops the indexes of everything an interrupted operation touched — an index that
+merely looks current would otherwise let a "repair" write old content over a newer acknowledged
+write. Checking costs a hash at memory speed per shard read from disk and nothing on a cache hit
+(measured: 3.2–4.6 GB/s checked against 3.0–4.2 GB/s unchecked on a 256 MiB file).
+
+The cost is in the background: one small index file per protected file, and the indexer reading each
+new file once. On a workload of 4 KiB files this lowered sustained durable throughput (one writer:
+about 590 to about 425 files/s), which is why the smallest protected size is a setting
+(`integrity.blockIndexMinSize`, default every file) and a slider.
+
+### What the pool protects against — and what it does not
+
+| Situation | Outcome |
+|---|---|
+| Power cut or crash during any operation | Every acknowledged write survives; an interrupted one is rolled forward or back, never half-applied |
+| Power cut within ~1 s of closing a file that was not fsynced | That save is lost (POSIX); the previous version is intact — or `write.closeIsDurable: true` |
+| A disk fails, with duplication 2 on independent disks | Nothing is lost; the pool heals itself back to full duplication |
+| Silent rot on one copy | Detected on read, the intact copy is served, the damaged one repaired |
+| Silent rot on every copy, or on a file's only copy | Rebuilt from the file's own parity, within its repair strength |
+| Rot beyond the repair strength on every copy | Detected, and the read fails instead of returning wrong bytes |
+| Every disk holding a file's copies lost | The file is lost — keep a backup elsewhere; snapshots share the pool's disks |
+| A file not indexed yet (just written, or an existing pool) | Served unchecked until the indexer or the scrub reaches it |
 
 ### Memory: three caches with different jobs
 

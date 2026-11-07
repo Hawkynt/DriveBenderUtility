@@ -1001,7 +1001,20 @@ const SETTINGS_SCHEMA = [
   ]],
   ["Integrity", [
     { path: "integrity.checksumDb", label: "Maintain a checksum database (enables scrub / heal)", type: "bool" },
+    { path: "integrity.parity", label: "Repair strength (Reed-Solomon parity)", type: "steps", defaultValue: 2,
+      steps: [0, 1, 2, 4, 8, 16],
+      show: v => v === 0
+        ? "Off — damage is still detected, but repaired only from another copy."
+        : `${v} parity piece${v > 1 ? "s" : ""} per 32 — ${+(v / 32 * 100).toFixed(1)}% extra space. Rebuilds up to ${v} damaged piece${v > 1 ? "s" : ""} in every 2 MiB of a file, even where no other copy is intact.` },
+    { path: "integrity.blockIndexMinSize", label: "Protect files from this size up", type: "steps", defaultValue: "1",
+      steps: ["1", "4KiB", "64KiB", "1MiB", "16MiB"],
+      show: v => ({ "1": "Every file with content — even a single small copy can be restored.",
+        "4KiB": "Files of 4 KiB and more. Tinier files are checked whole, but have no parity.",
+        "64KiB": "Files of 64 KiB and more. Smaller files are checked whole, but have no parity.",
+        "1MiB": "Files of 1 MiB and more — fewer index files for pools of many small files.",
+        "16MiB": "Only large files — the least background work; small files rely on their other copies." })[v] || v },
     { path: "integrity.verifyReads", label: "Check reads against the stored checksum", type: "enum", options: [
+      ["blocks", "Shard by shard as they are served — default; damage is served around, rebuilt from parity and repaired"],
       ["never", "Never — fastest; damage is found by scheduled checks only"],
       ["before", "Before handing data over — a damaged copy is skipped, the read fails only if every copy is damaged"],
       ["after", "After handing data over — full speed; damage is logged and repaired afterwards"]] },
@@ -1041,6 +1054,33 @@ async function settingsDialog(pool) {
       const cur = getPath(cfg, f.path);
       g.appendChild(el("label", null, f.label));
       let input;
+      if (f.type === "steps") {
+        // A slider over fixed stops. The leftmost stop means "inherit the default"; the readout
+        // says what the chosen position costs and buys, so nobody has to know what parity is.
+        const wrap = el("div", "steps");
+        const range = el("input");
+        range.type = "range"; range.min = 0; range.max = f.steps.length; range.step = 1;
+        const at = f.steps.findIndex(v => String(v) === String(cur));
+        range.value = at < 0 ? 0 : at + 1;
+        const ticks = el("div", "steps-ticks");
+        ticks.innerHTML = [`<span>default</span>`, ...f.steps.map(v => `<span>${v === "1" ? "all" : v}</span>`)].join("");
+        const readout = el("div", "steps-readout");
+        const meter = el("div", "steps-meter"); const fill = el("span"); meter.appendChild(fill);
+        const update = () => {
+          const i = +range.value;
+          const v = i === 0 ? f.defaultValue : f.steps[i - 1];
+          readout.textContent = (i === 0 ? "Default: " : "") + f.show(v);
+          fill.style.width = `${(i === 0 ? f.steps.indexOf(f.defaultValue) + 1 : i) / f.steps.length * 100}%`;
+          range.style.setProperty("--pos", `${i / f.steps.length * 100}%`);
+        };
+        range.oninput = update; update();
+        wrap.append(range, ticks, meter, readout);
+        g.appendChild(wrap);
+        // the save loop reads .value: inherit is "", otherwise the stop's value
+        input = { get value() { const i = +range.value; return i === 0 ? "" : String(f.steps[i - 1]); } };
+        controls.push({ f, input });
+        continue;
+      }
       if (f.type === "enum" || f.type === "bool") {
         input = el("select");
         const opts = f.type === "bool" ? [["true", "On"], ["false", "Off"]] : f.options;
@@ -1094,6 +1134,7 @@ async function settingsDialog(pool) {
         const v = input.value.trim();
         if (v === "") { deletePath(out, f.path); continue; }
         if (f.type === "bool") setPath(out, f.path, v === "true");
+        else if (f.type === "steps") setPath(out, f.path, typeof f.defaultValue === "number" ? parseInt(v, 10) : v);
         else if (f.type === "int") setPath(out, f.path, parseInt(v, 10));
         else if (f.type === "number") setPath(out, f.path, parseFloat(v));
         else setPath(out, f.path, v);
