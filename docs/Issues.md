@@ -2850,3 +2850,31 @@ tries the file's parity first and reports what it rebuilt as repaired.
 **Not covered.** Files below the minimum size (whole-file checks only), files not yet indexed, and
 damage beyond a stripe's parity on every copy, which is detected and refused, not repaired.
 
+### Resolved: an independent review of the close, journal and block-index changes
+
+The code above was reviewed afresh by someone who had not written it. Each finding is reproduced by a
+test that failed before its fix (`BlockAndJournalReviewTests`, `BlockIntegrityTests`).
+
+- **The scrub re-indexed files that already had a current index.** A copy that rotted after it was
+  indexed got a new index built from the rot, and the parity that could repair it was thrown away. A
+  current index is never replaced now; content that contradicts one is repaired. A full scrub also
+  repairs from the block indexes first, so a copy rotted after its whole-file checksum went stale is
+  not taken for an edit and propagated. A repair tells the watches, so an index build that read the
+  copy before the repair cannot commit.
+- **One failing journal mirror failed unrelated operations after they had happened.** A full disk
+  raises a plain IOException, which escaped the mirror's background append and poisoned its chain. The
+  next compaction threw inside whatever operation had triggered it: a rename was reported as failed
+  after it had renamed, leaving a ghost name, and in a pool down to two disks every write was refused.
+  A mirror's failure now stays with that mirror, in appends, rewrites and reads.
+- **A closed file could drop out of the publish queue.** The publisher decided outside the file's
+  lease, so a publish another thread was running and then failed left the file staged and in no queue.
+  It decides under the lease now, and a failed publish requeues the file.
+- **An old index could outlive its content.** A rename or a publish dropped the target's indexes only
+  after the move, so a crash in between left them. They go first now. A lookup racing a drop no longer
+  caches what it read, and a path whose index could not be deleted on every member keeps its stale mark.
+- **A repair could still be writing after the unmount.** The unmount waits for repairs under way, and a
+  repair does nothing once its engine is unmounted.
+- **The repair test failed now and then on CI.** It assumed the read would go to the damaged copy,
+  but the pool picks the readiest copy, and the intact one sometimes served everything. The test now
+  makes the intact copy refuse its first read.
+
