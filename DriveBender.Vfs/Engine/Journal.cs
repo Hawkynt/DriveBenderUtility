@@ -200,6 +200,13 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
       throw new PoolFsException(PoolFsError.IoError, "Journal intent could not be persisted on any member — refusing the mutation (SAFE-WAL)");
   }
 
+  /// <summary>
+  /// One mirror's append. Every failure stays here — a full disk raises a plain IOException, not a
+  /// PoolFsException — because an append runs behind the caller on a lagging mirror, and a failure
+  /// escaping it used to poison that mirror's chain: the next catch-up threw, at a compaction inside
+  /// some unrelated operation that had already done its work, and the application was told a rename
+  /// had failed after it had happened.
+  /// </summary>
   private static bool _AppendTo(IVolumeIO member, byte[] bytes) {
     try {
       using var stream = member.OpenWrite(JournalPath, false, true);
@@ -207,7 +214,7 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
       stream.Write(bytes, 0, bytes.Length);
       stream.Flush();
       return true;
-    } catch (PoolFsException e) {
+    } catch (Exception e) when (e is not OutOfMemoryException) {
       DriveBender.Logger($"[Warning]Journal append failed on '{member.DisplayName}': {e.Message}");
       return false;
     }
@@ -218,7 +225,12 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
     Task[] tails;
     lock (this._chainLock)
       tails = [.. this._tails.Values];
-    Task.WaitAll(tails);
+    try {
+      Task.WaitAll(tails);
+    } catch (AggregateException e) {
+      // a mirror's failure is that mirror's: it is logged where it happened, and reads combine the rest
+      DriveBender.Logger($"[Warning]A journal mirror could not catch up: {e.InnerException?.Message}");
+    }
   }
 
   /// <summary>
@@ -272,8 +284,8 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
         using var stream = member.OpenRead(JournalPath, false);
         using var reader = new StreamReader(stream, Encoding.UTF8);
         content = reader.ReadToEnd();
-      } catch (PoolFsException) {
-        continue;
+      } catch (Exception e) when (e is PoolFsException or IOException) {
+        continue; // an unreadable mirror is skipped; the others are combined
       }
 
       // the newest compaction this mirror took part in (0 when it was never compacted)
@@ -352,7 +364,9 @@ public sealed class MemberJournalStore(IReadOnlyList<IVolumeIO> members) : IJour
       }
 
       member.AtomicReplace(temp, JournalPath, false);
-    } catch (PoolFsException e) {
+    } catch (Exception e) when (e is not OutOfMemoryException) {
+      // one mirror failing a compaction keeps its longer history, which reads combine harmlessly;
+      // it must not fail the operation whose completion triggered the compaction
       DriveBender.Logger($"[Warning]Journal rewrite failed on '{member.DisplayName}': {e.Message}");
     }
   }
