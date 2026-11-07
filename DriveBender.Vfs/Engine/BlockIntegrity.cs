@@ -25,8 +25,10 @@ public sealed class BlockIntegrity(IReadOnlyList<IVolumeIO> members, int parityS
   private const string _SUFFIX = ".dbi";
   private const int _MAX_CACHED = 4096;
 
-  public int ParityShards { get; } = parityShards;
-  public long MinFileBytes { get; } = minFileBytes;
+  /// <summary>Parity for indexes built from now on; each index records its own, so a change never invalidates one.</summary>
+  public int ParityShards { get; set; } = parityShards;
+
+  public long MinFileBytes { get; set; } = minFileBytes;
 
   private readonly record struct CacheKey(Guid Member, bool Shadow, string Path);
   private readonly record struct Cached(long Length, long MTimeTicks, BlockIndex? Index);

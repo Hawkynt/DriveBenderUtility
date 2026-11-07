@@ -51,11 +51,11 @@ public class BlockIntegrityTests {
       }
   }
 
-  private PoolFileSystem _Engine(string extra = "") {
+  private PoolFileSystem _Engine(string extra = "", int duplication = 2) {
     var cache = new CacheInstance("bi" + Guid.NewGuid().ToString("N"),
       new() { Size = "4194304", BlockSize = "65536", MetadataEntries = 500, MetadataTtl = "1m" });
     var fs = new PoolFileSystem(_pool, [new(this._v1), new(this._v2)], cache,
-      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": 2, "readAhead": { "enabled": false }, "write": { "closeIsDurable": true } {{extra}} }"""));
+      ConfigResolver.ResolveEffective(null, $$"""{ "duplication": {{duplication}}, "readAhead": { "enabled": false }, "write": { "closeIsDurable": true } {{extra}} }"""));
     fs.Mount(new(@"X:\"));
     return fs;
   }
@@ -89,8 +89,8 @@ public class BlockIntegrityTests {
     => [.. new[] { this._v1, this._v2 }.SelectMany(v => new[] { false, true }.Where(s => v.FileExists(path, s)).Select(s => (v, s)))];
 
   /// <summary>A fresh engine, so nothing the previous one cached can hide what is on disk.</summary>
-  private PoolFileSystem _Indexed(string path, byte[] content, string extra = "") {
-    using (var writer = this._Engine(extra)) {
+  private PoolFileSystem _Indexed(string path, byte[] content, string extra = "", int duplication = 2) {
+    using (var writer = this._Engine(extra, duplication)) {
       _Write(writer, path, content);
       // the close queued it for the background indexer, which a direct call gives way to
       writer.WaitForIndexing(TimeSpan.FromSeconds(10));
@@ -100,7 +100,7 @@ public class BlockIntegrityTests {
     foreach (var (volume, shadow) in this._Copies(path))
       volume.FileExists(BlockIntegrity.IndexPathFor(path, shadow), false).Should().BeTrue("the premise: every copy has its index");
 
-    return this._Engine(extra);
+    return this._Engine(extra, duplication);
   }
 
   [Test]
@@ -279,6 +279,39 @@ public class BlockIntegrityTests {
     issues.Should().NotContain(i => i.Kind == IntegrityIssueKind.BitRotUnrecoverable);
     foreach (var (volume, shadow) in this._Copies("archive.bin"))
       volume.GetContent("archive.bin", shadow).Should().Equal(content);
+  }
+
+  [TestCase(1)]
+  [TestCase(100)]
+  [TestCase(4096)]
+  [TestCase(60_000)]
+  [Category("EdgeCase")]
+  public void Read_GivenASmallFileWithNoOtherCopyThatRotted_ThenItsOwnParityRestoresIt(int size) {
+    // one copy only: the file's own parity is the only thing that can bring it back
+    var content = new byte[size];
+    new Random(size).NextBytes(content);
+    using var fs = this._Indexed("note.txt", content, duplication: 1);
+    this._Copies("note.txt").Should().ContainSingle("premise: the file has no other copy");
+    var (volume, shadow) = this._Copies("note.txt")[0];
+    volume.CorruptSilently("note.txt", shadow, bytes => bytes[size / 2] ^= 0x5A);
+    this._AssertIndexedNow("note.txt");
+
+    _Read(fs, "note.txt").Should().Equal(content, "parity rebuilds what the only copy lost");
+    _Eventually(() => volume.GetContent("note.txt", shadow)!.SequenceEqual(content)).Should().BeTrue("and the copy itself is repaired");
+  }
+
+  [Test]
+  [Category("HappyPath")]
+  public void ReloadConfig_GivenANewRepairStrength_ThenNewIndexesUseIt() {
+    using var fs = this._Engine();
+    fs.ReloadConfig(ConfigResolver.ResolveEffective(null, """{ "duplication": 2, "integrity": { "parity": 8 } }"""));
+    _Write(fs, "fresh.bin", _Content());
+    fs.WaitForIndexing(TimeSpan.FromSeconds(10));
+    fs.IndexFile("fresh.bin");
+
+    foreach (var (volume, shadow) in this._Copies("fresh.bin"))
+      Integrity.BlockIndex.Deserialize(volume.GetContent(BlockIntegrity.IndexPathFor("fresh.bin", shadow), false)!)!.ParityShards
+        .Should().Be(8, "the slider's new strength applies without a remount");
   }
 
   /// <summary>The premise of a test about checked reads: every copy's index is intact and describes the copy right now.</summary>
