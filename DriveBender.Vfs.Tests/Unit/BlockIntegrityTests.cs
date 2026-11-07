@@ -92,7 +92,9 @@ public class BlockIntegrityTests {
   private PoolFileSystem _Indexed(string path, byte[] content, string extra = "") {
     using (var writer = this._Engine(extra)) {
       _Write(writer, path, content);
-      writer.IndexFile(path);
+      // the close queued it for the background indexer, which a direct call gives way to
+      writer.WaitForIndexing(TimeSpan.FromSeconds(10));
+      writer.IndexFile(path).Should().BeTrue("premise: the file is settled and can be indexed");
     }
 
     foreach (var (volume, shadow) in this._Copies(path))
@@ -116,10 +118,21 @@ public class BlockIntegrityTests {
     var content = _Content();
     using var fs = this._Indexed("film.bin", content);
     var (damaged, shadow) = this._Copies("film.bin")[0];
+    var (intact, _) = this._Copies("film.bin")[1];
     var stamped = damaged.Stat("film.bin", shadow)!.Value.LastWriteTimeUtc;
     damaged.CorruptSilently("film.bin", shadow, bytes => bytes[100_000] ^= 0xFF);
 
+    // Which copy serves a read is the pool's choice, and the intact one may serve every block —
+    // then nothing reads the damage, and the scrub is what finds it. The intact copy refuses its
+    // first read here, so this read has to go through the damaged one.
+    var refused = 0;
+    intact.BeforeOperation = (op, path) => {
+      if (op == VolumeOp.OpenRead && path == "film.bin" && Interlocked.Exchange(ref refused, 1) == 0)
+        throw new PoolFsException(PoolFsError.IoError, "transient");
+    };
+
     _Read(fs, "film.bin").Should().Equal(content, "a damaged shard is never served");
+    intact.BeforeOperation = null;
 
     _Eventually(() => damaged.GetContent("film.bin", shadow)!.SequenceEqual(content)).Should().BeTrue("the damaged copy is repaired");
     damaged.Stat("film.bin", shadow)!.Value.LastWriteTimeUtc.Should().Be(stamped, "a repair restores content, not the file's time");

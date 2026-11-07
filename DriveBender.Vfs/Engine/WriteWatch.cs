@@ -36,6 +36,20 @@ public sealed class WriteWatch {
       return !this._watched.TryGetValue(path, out var entry) || entry.Changes != token;
   }
 
+  /// <summary>
+  /// Counts a change for the watchers only, without telling the <see cref="Listener"/>: a repair that
+  /// restored content the block index already vouches for must still stop a job that read the file
+  /// before it, but the index itself stays true.
+  /// </summary>
+  public void Bump(string path) {
+    if (Volatile.Read(ref this._count) == 0)
+      return;
+
+    lock (this._lock)
+      if (this._watched.TryGetValue(path, out var entry))
+        this._watched[path] = (entry.Changes + 1, entry.Watchers);
+  }
+
   /// <summary>How many jobs are watching this path right now.</summary>
   public int Watchers(string path) {
     if (Volatile.Read(ref this._count) == 0)
